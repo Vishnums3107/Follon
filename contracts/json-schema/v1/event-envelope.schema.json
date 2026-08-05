@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/event-envelope.schema.json",
+  "title": "Follon Event Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id", "event_type", "schema_version", "event_time", "receive_time",
+    "account_id", "strategy_id", "instrument_id", "correlation_id", "causation_id",
+    "actor", "source", "payload", "software_version", "configuration_version"
+  ],
+  "properties": {
+    "event_id": { "$ref": "#/$defs/canonicalId" },
+    "event_type": { "type": "string", "pattern": "^[a-z]+(\\.[a-z_]+)+\\.v[1-9][0-9]*$" },
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "event_time": { "type": "string", "format": "date-time" },
+    "receive_time": { "type": "string", "format": "date-time" },
+    "account_id": { "anyOf": [{ "$ref": "#/$defs/canonicalId" }, { "type": "null" }] },
+    "strategy_id": { "anyOf": [{ "$ref": "#/$defs/canonicalId" }, { "type": "null" }] },
+    "instrument_id": { "anyOf": [{ "$ref": "#/$defs/canonicalId" }, { "type": "null" }] },
+    "correlation_id": { "$ref": "#/$defs/canonicalId" },
+    "causation_id": { "anyOf": [{ "$ref": "#/$defs/canonicalId" }, { "type": "null" }] },
+    "actor": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object" },
+    "software_version": { "type": "string", "minLength": 1 },
+    "configuration_version": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    }
+  }
+}

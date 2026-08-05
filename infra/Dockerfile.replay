@@ -1,0 +1,14 @@
+# Deterministic, non-live replay image. It contains no broker adapter or secret.
+FROM rust:1.97-slim AS build
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY apps apps
+COPY core core
+RUN cargo build --release -p follon-cli
+
+FROM debian:bookworm-slim
+RUN useradd --system --create-home --uid 10001 follon
+USER follon
+WORKDIR /app
+COPY --from=build /workspace/target/release/follon-replay /usr/local/bin/follon-replay
+ENTRYPOINT ["follon-replay"]

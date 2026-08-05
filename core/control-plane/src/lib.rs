@@ -1,0 +1,1620 @@
+//! Deterministic, non-live trading control-plane building blocks.
+//!
+//! This crate owns the first vertical slice only. It has no broker adapter,
+//! wall clock, database driver, or strategy-runtime dependency.
+
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::str::FromStr;
+
+use follon_domain::{
+    validate_canonical_id, AuditTrail, Bar, Decimal, DecimalError, DomainError, EventEnvelope,
+    EventPayload, Fill, OrderIntent, OrderState, OrderStateChange, OrderType, PnlSnapshot,
+    PositionSnapshot, RiskDecision, Side, TimeInForce,
+};
+use follon_instrument::{InstrumentRegistry, TradingCalendar};
+
+/// Error returned by the deterministic trading kernel.
+#[derive(Debug)]
+pub struct EngineError(pub String);
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+impl From<DomainError> for EngineError {
+    fn from(error: DomainError) -> Self {
+        Self(error.0)
+    }
+}
+
+impl From<DecimalError> for EngineError {
+    fn from(error: DecimalError) -> Self {
+        Self(error.0)
+    }
+}
+
+impl From<io::Error> for EngineError {
+    fn from(error: io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+/// A controllable logical UTC clock used by replay and tests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayClock {
+    now: String,
+}
+
+impl ReplayClock {
+    /// Starts the clock at a caller-provided UTC timestamp.
+    pub fn new(initial_time: impl Into<String>) -> Self {
+        Self {
+            now: initial_time.into(),
+        }
+    }
+
+    /// Returns the current logical timestamp.
+    pub fn now(&self) -> &str {
+        &self.now
+    }
+
+    /// Advances time explicitly. Production replay parsing will enforce UTC.
+    pub fn advance_to(&mut self, time: impl Into<String>) -> Result<(), EngineError> {
+        let time = time.into();
+        if time.is_empty() {
+            return Err(EngineError(
+                "replay clock cannot advance to an empty time".to_owned(),
+            ));
+        }
+        self.now = time;
+        Ok(())
+    }
+}
+
+/// Append-only destination for validated event envelopes.
+pub trait EventSink {
+    /// Persists one event exactly once by event identity.
+    fn append(&mut self, event: &EventEnvelope) -> Result<(), EngineError>;
+}
+
+/// In-memory event log used by deterministic tests and projections.
+#[derive(Default)]
+pub struct InMemoryEventStore {
+    events: Vec<EventEnvelope>,
+    event_ids: HashSet<String>,
+}
+
+impl InMemoryEventStore {
+    /// Returns events in their immutable append order.
+    pub fn events(&self) -> &[EventEnvelope] {
+        &self.events
+    }
+}
+
+impl EventSink for InMemoryEventStore {
+    fn append(&mut self, event: &EventEnvelope) -> Result<(), EngineError> {
+        event.validate()?;
+        if !self.event_ids.insert(event.event_id.clone()) {
+            return Err(EngineError(format!(
+                "duplicate event ID: {}",
+                event.event_id
+            )));
+        }
+        self.events.push(event.clone());
+        Ok(())
+    }
+}
+
+/// Newline-delimited, canonical JSON event store for the local replay slice.
+pub struct FileEventStore {
+    file: File,
+    event_ids: HashSet<String>,
+}
+
+impl FileEventStore {
+    /// Opens or creates an append-only local event log.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, EngineError> {
+        let path = path.as_ref();
+        let mut event_ids = HashSet::new();
+        if path.exists() {
+            for line in fs::read_to_string(path)?
+                .lines()
+                .filter(|line| !line.is_empty())
+            {
+                let event_id = extract_event_id(line).ok_or_else(|| {
+                    EngineError(
+                        "existing event log contains a malformed canonical event".to_owned(),
+                    )
+                })?;
+                if !event_ids.insert(event_id.to_owned()) {
+                    return Err(EngineError(
+                        "existing event log contains a duplicate event ID".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            file: OpenOptions::new().create(true).append(true).open(path)?,
+            event_ids,
+        })
+    }
+}
+
+/// A normalized historical bar paired with its source event time in UTC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalBar {
+    /// Source time in UTC, retained separately from local receipt time.
+    pub event_time: String,
+    /// Validated normalized market payload.
+    pub bar: Bar,
+}
+
+/// Immutable market prerequisites applied before a normalized bar reaches a strategy.
+pub struct MarketPreconditions<'a> {
+    /// Effective-dated canonical instrument reference data.
+    pub instruments: &'a InstrumentRegistry,
+    /// Explicit exchange-session dependency; never the local machine clock.
+    pub calendar: &'a dyn TradingCalendar,
+}
+
+impl MarketPreconditions<'_> {
+    fn validate(&self, bar: &Bar, event_time: &str) -> Result<(), EngineError> {
+        let version = self
+            .instruments
+            .resolve(&bar.instrument_id, event_time)
+            .ok_or_else(|| {
+                EngineError("no effective instrument reference data for market event".to_owned())
+            })?;
+        if version.instrument.trading_calendar_id != self.calendar.calendar_id() {
+            return Err(EngineError(
+                "instrument and replay calendar do not match".to_owned(),
+            ));
+        }
+        if !self.calendar.is_open_at(event_time) {
+            return Err(EngineError(
+                "market event is outside an explicit trading session".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Imports the deliberately small v1 historical-bar CSV format.
+///
+/// The initial importer accepts unquoted CSV only. Provider-specific parsers
+/// belong in adapters; this boundary receives already selected US equity/ETF
+/// rows and validates the canonical bar before it can reach a strategy.
+pub fn import_historical_bars(csv: &str) -> Result<Vec<HistoricalBar>, EngineError> {
+    const HEADER: &str =
+        "event_time,instrument_id,open,high,low,close,volume,interval_seconds,exchange_timezone";
+    let mut lines = csv.lines().filter(|line| !line.trim().is_empty());
+    let header = lines
+        .next()
+        .ok_or_else(|| EngineError("historical-bar CSV is empty".to_owned()))?;
+    if header.trim_start_matches('\u{feff}').trim_end_matches('\r') != HEADER {
+        return Err(EngineError(
+            "historical-bar CSV header does not match v1 contract".to_owned(),
+        ));
+    }
+    let mut bars = Vec::new();
+    for (index, line) in lines.enumerate() {
+        let fields: Vec<_> = line.split(',').map(str::trim).collect();
+        if fields.len() != 9 || !fields[0].ends_with('Z') {
+            return Err(EngineError(format!(
+                "invalid historical-bar row {}",
+                index + 2
+            )));
+        }
+        let decimal = |field: usize| -> Result<Decimal, EngineError> {
+            Decimal::from_str(fields[field]).map_err(|error| {
+                EngineError(format!("invalid decimal on row {}: {}", index + 2, error))
+            })
+        };
+        let interval_seconds = fields[7]
+            .parse::<u32>()
+            .map_err(|_| EngineError(format!("invalid interval on row {}", index + 2)))?;
+        let bar = Bar {
+            instrument_id: fields[1].to_owned(),
+            open: decimal(2)?,
+            high: decimal(3)?,
+            low: decimal(4)?,
+            close: decimal(5)?,
+            volume: decimal(6)?,
+            interval_seconds,
+            exchange_timezone: fields[8].to_owned(),
+        };
+        bar.validate()?;
+        bars.push(HistoricalBar {
+            event_time: fields[0].to_owned(),
+            bar,
+        });
+    }
+    if bars.is_empty() {
+        return Err(EngineError(
+            "historical-bar CSV contains no data rows".to_owned(),
+        ));
+    }
+    Ok(bars)
+}
+
+/// Loads normalized market-bar events from a canonical persisted NDJSON log.
+///
+/// Non-market events are retained as evidence in the source log but are not
+/// replay inputs. The loader rejects malformed, duplicate, and out-of-order
+/// source market events rather than silently repairing them.
+pub fn load_persisted_market_bars(
+    path: impl AsRef<std::path::Path>,
+) -> Result<Vec<HistoricalBar>, EngineError> {
+    let contents = fs::read_to_string(path)?;
+    let mut event_ids = HashSet::new();
+    let mut bars = Vec::new();
+    let mut previous_event_time: Option<String> = None;
+
+    for (index, line) in contents.lines().filter(|line| !line.is_empty()).enumerate() {
+        let record: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            EngineError(format!("invalid JSON event on line {}: {error}", index + 1))
+        })?;
+        let object = record
+            .as_object()
+            .ok_or_else(|| EngineError(format!("event line {} is not an object", index + 1)))?;
+        let event_id = json_required_string(object, "event_id", index + 1)?;
+        validate_canonical_id("event_id", event_id)?;
+        if !event_ids.insert(event_id.to_owned()) {
+            return Err(EngineError(format!(
+                "duplicate persisted event ID: {event_id}"
+            )));
+        }
+        if json_required_string(object, "event_type", index + 1)? != "market.bar.v1" {
+            continue;
+        }
+        let event_time = json_required_string(object, "event_time", index + 1)?.to_owned();
+        if !event_time.ends_with('Z')
+            || previous_event_time
+                .as_deref()
+                .is_some_and(|previous| event_time.as_str() < previous)
+        {
+            return Err(EngineError(format!(
+                "market event line {} has an invalid or out-of-order UTC event time",
+                index + 1
+            )));
+        }
+        let payload = object
+            .get("payload")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                EngineError(format!(
+                    "market event line {} has no object payload",
+                    index + 1
+                ))
+            })?;
+        let decimal = |field: &str| -> Result<Decimal, EngineError> {
+            Decimal::from_str(json_required_string(payload, field, index + 1)?).map_err(|error| {
+                EngineError(format!(
+                    "invalid {field} on event line {}: {error}",
+                    index + 1
+                ))
+            })
+        };
+        let interval_seconds = payload
+            .get("interval_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                EngineError(format!(
+                    "invalid interval_seconds on event line {}",
+                    index + 1
+                ))
+            })?;
+        let bar = Bar {
+            instrument_id: json_required_string(payload, "instrument_id", index + 1)?.to_owned(),
+            open: decimal("open")?,
+            high: decimal("high")?,
+            low: decimal("low")?,
+            close: decimal("close")?,
+            volume: decimal("volume")?,
+            interval_seconds,
+            exchange_timezone: json_required_string(payload, "exchange_timezone", index + 1)?
+                .to_owned(),
+        };
+        bar.validate()?;
+        previous_event_time = Some(event_time.clone());
+        bars.push(HistoricalBar { event_time, bar });
+    }
+    if bars.is_empty() {
+        return Err(EngineError(
+            "persisted event log contains no market bars".to_owned(),
+        ));
+    }
+    Ok(bars)
+}
+
+fn json_required_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    line: usize,
+) -> Result<&'a str, EngineError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| EngineError(format!("event line {line} has no {field}")))
+}
+
+fn extract_event_id(line: &str) -> Option<&str> {
+    let marker = "\"event_id\":\"";
+    let start = line.find(marker)? + marker.len();
+    let remainder = &line[start..];
+    let end = remainder.find('"')?;
+    Some(&remainder[..end])
+}
+
+impl EventSink for FileEventStore {
+    fn append(&mut self, event: &EventEnvelope) -> Result<(), EngineError> {
+        event.validate()?;
+        if !self.event_ids.insert(event.event_id.clone()) {
+            return Err(EngineError(format!(
+                "duplicate event ID: {}",
+                event.event_id
+            )));
+        }
+        self.file.write_all(event.canonical_json().as_bytes())?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+/// The only strategy interaction point in the trading kernel.
+pub trait Strategy {
+    /// Handles one normalized bar and may emit exactly one declarative intent.
+    fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError>;
+}
+
+/// Immutable identity expected from an isolated strategy worker process.
+#[derive(Clone, Debug)]
+pub struct StrategyWorkerIdentity {
+    /// Account context supplied to every callback.
+    pub account_id: String,
+    /// Canonical strategy identity.
+    pub strategy_id: String,
+    /// Immutable strategy release selected for this run.
+    pub strategy_version: String,
+    /// Immutable configuration selected for this run.
+    pub configuration_version: String,
+    /// SHA-256 identity of the complete declared strategy bundle.
+    pub strategy_bundle_hash: String,
+    /// Execution environment; the first worker implementation permits simulation only.
+    pub environment: String,
+}
+
+impl StrategyWorkerIdentity {
+    fn validate(&self) -> Result<(), EngineError> {
+        for (name, value) in [
+            ("account_id", self.account_id.as_str()),
+            ("strategy_id", self.strategy_id.as_str()),
+        ] {
+            validate_canonical_id(name, value)?;
+        }
+        if self.strategy_version.is_empty()
+            || self.configuration_version.is_empty()
+            || self.environment != "SIMULATION"
+            || !is_sha256(&self.strategy_bundle_hash)
+        {
+            return Err(EngineError("invalid strategy worker identity".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+/// Stdio adapter for the versioned isolated strategy-worker protocol.
+///
+/// The child receives only normalized market bars and immutable strategy
+/// context. Its output is parsed and validated as an intent before the risk
+/// engine sees it; a worker never receives adapters or credentials.
+pub struct ProcessStrategyWorker {
+    identity: StrategyWorkerIdentity,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl ProcessStrategyWorker {
+    /// Starts a worker process and verifies its announced immutable bundle identity.
+    pub fn spawn(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+    ) -> Result<Self, EngineError> {
+        identity.validate()?;
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("PYTHONIOENCODING", "utf-8");
+        if let Some(sdk_path) = std::env::var_os("FOLLON_STRATEGY_SDK_PATH") {
+            command.env("PYTHONPATH", sdk_path);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| EngineError(format!("strategy worker did not start: {error}")))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| EngineError("strategy worker stdin could not be captured".to_owned()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            EngineError("strategy worker stdout could not be captured".to_owned())
+        })?;
+        let mut worker = Self {
+            identity,
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        };
+        worker.verify_ready()?;
+        Ok(worker)
+    }
+
+    fn verify_ready(&mut self) -> Result<(), EngineError> {
+        let frame = self.read_frame()?;
+        let object = frame.as_object().ok_or_else(|| {
+            EngineError("strategy worker ready frame is not an object".to_owned())
+        })?;
+        if json_value_string(object, "type")? != "ready"
+            || json_value_u64(object, "protocol_version")? != 1
+            || json_value_string(object, "bundle_hash")? != self.identity.strategy_bundle_hash
+            || json_value_string(object, "strategy_id")? != self.identity.strategy_id
+            || json_value_string(object, "strategy_version")? != self.identity.strategy_version
+        {
+            return Err(EngineError(
+                "strategy worker does not match the declared immutable bundle".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_frame(&mut self) -> Result<serde_json::Value, EngineError> {
+        let mut line = String::new();
+        let bytes = self.stdout.read_line(&mut line)?;
+        if bytes == 0 {
+            return Err(EngineError(
+                "strategy worker closed stdout before returning a response".to_owned(),
+            ));
+        }
+        serde_json::from_str(&line)
+            .map_err(|error| EngineError(format!("strategy worker emitted invalid JSON: {error}")))
+    }
+
+    fn request_intent(
+        &mut self,
+        bar: &Bar,
+        replay_time: &str,
+    ) -> Result<Option<OrderIntent>, EngineError> {
+        let frame = serde_json::json!({
+            "protocol_version": 1,
+            "type": "market_bar",
+            "context": {
+                "account_id": self.identity.account_id,
+                "strategy_id": self.identity.strategy_id,
+                "strategy_version": self.identity.strategy_version,
+                "configuration_version": self.identity.configuration_version,
+                "replay_time": replay_time,
+                "environment": self.identity.environment,
+            },
+            "bar": {
+                "instrument_id": bar.instrument_id,
+                "open": bar.open.to_string(),
+                "high": bar.high.to_string(),
+                "low": bar.low.to_string(),
+                "close": bar.close.to_string(),
+                "volume": bar.volume.to_string(),
+                "interval_seconds": bar.interval_seconds,
+                "exchange_timezone": bar.exchange_timezone,
+            },
+        });
+        let serialized =
+            serde_json::to_string(&frame).expect("serializing a JSON worker frame cannot fail");
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| EngineError("strategy worker stdin is already closed".to_owned()))?;
+        stdin.write_all(serialized.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+
+        let response = self.read_frame()?;
+        let object = response
+            .as_object()
+            .ok_or_else(|| EngineError("strategy worker response is not an object".to_owned()))?;
+        if json_value_u64(object, "protocol_version")? != 1 {
+            return Err(EngineError(
+                "strategy worker returned an unsupported protocol version".to_owned(),
+            ));
+        }
+        match json_value_string(object, "type")? {
+            "strategy_output" => match object.get("intent") {
+                Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::Object(intent)) => {
+                    let intent = parse_worker_intent(intent)?;
+                    if intent.account_id != self.identity.account_id
+                        || intent.strategy_id != self.identity.strategy_id
+                        || intent.strategy_version != self.identity.strategy_version
+                        || intent.configuration_version != self.identity.configuration_version
+                        || intent.environment != self.identity.environment
+                    {
+                        return Err(EngineError(
+                            "worker intent does not match its immutable execution context"
+                                .to_owned(),
+                        ));
+                    }
+                    Ok(Some(intent))
+                }
+                _ => Err(EngineError(
+                    "strategy worker output has no nullable intent object".to_owned(),
+                )),
+            },
+            "error" => Err(EngineError(format!(
+                "strategy worker rejected the callback: {}",
+                json_value_string(object, "code")?
+            ))),
+            _ => Err(EngineError(
+                "strategy worker returned an unexpected frame type".to_owned(),
+            )),
+        }
+    }
+}
+
+impl Strategy for ProcessStrategyWorker {
+    fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError> {
+        self.request_intent(bar, replay_time)
+    }
+}
+
+impl Drop for ProcessStrategyWorker {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn json_value_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, EngineError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| EngineError(format!("strategy worker has no {field}")))
+}
+
+fn json_value_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, EngineError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| EngineError(format!("strategy worker has no unsigned {field}")))
+}
+
+fn parse_worker_intent(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<OrderIntent, EngineError> {
+    let side = match json_value_string(object, "side")? {
+        "BUY" => Side::Buy,
+        "SELL" => Side::Sell,
+        _ => return Err(EngineError("worker intent has an invalid side".to_owned())),
+    };
+    let order_type = match json_value_string(object, "order_type")? {
+        "MARKET" => OrderType::Market,
+        "LIMIT" => OrderType::Limit,
+        _ => {
+            return Err(EngineError(
+                "worker intent has an invalid order type".to_owned(),
+            ));
+        }
+    };
+    let time_in_force = match json_value_string(object, "time_in_force")? {
+        "DAY" => TimeInForce::Day,
+        "GTC" => TimeInForce::GoodTilCancelled,
+        _ => {
+            return Err(EngineError(
+                "worker intent has an invalid time in force".to_owned(),
+            ));
+        }
+    };
+    let limit_price = match object.get("limit_price") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(Decimal::from_str(value)?),
+        _ => {
+            return Err(EngineError(
+                "worker intent limit_price must be a decimal string or null".to_owned(),
+            ));
+        }
+    };
+    let intent = OrderIntent {
+        intent_id: json_value_string(object, "intent_id")?.to_owned(),
+        account_id: json_value_string(object, "account_id")?.to_owned(),
+        strategy_id: json_value_string(object, "strategy_id")?.to_owned(),
+        instrument_id: json_value_string(object, "instrument_id")?.to_owned(),
+        correlation_id: json_value_string(object, "correlation_id")?.to_owned(),
+        side,
+        quantity: Decimal::from_str(json_value_string(object, "quantity")?)?,
+        order_type,
+        limit_price,
+        time_in_force,
+        rationale: json_value_string(object, "rationale")?.to_owned(),
+        created_at: json_value_string(object, "created_at")?.to_owned(),
+        strategy_version: json_value_string(object, "strategy_version")?.to_owned(),
+        configuration_version: json_value_string(object, "configuration_version")?.to_owned(),
+        environment: json_value_string(object, "environment")?.to_owned(),
+    };
+    intent.validate()?;
+    Ok(intent)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A deterministic example strategy used by the first replay test.
+pub struct BuyOnceStrategy {
+    account_id: String,
+    strategy_id: String,
+    strategy_version: String,
+    configuration_version: String,
+    threshold: Decimal,
+    submitted: bool,
+}
+
+impl BuyOnceStrategy {
+    /// Creates a strategy that emits one market buy when close is at or below a threshold.
+    pub fn new(
+        account_id: impl Into<String>,
+        strategy_id: impl Into<String>,
+        strategy_version: impl Into<String>,
+        configuration_version: impl Into<String>,
+        threshold: Decimal,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            strategy_id: strategy_id.into(),
+            strategy_version: strategy_version.into(),
+            configuration_version: configuration_version.into(),
+            threshold,
+            submitted: false,
+        }
+    }
+}
+
+impl Strategy for BuyOnceStrategy {
+    fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError> {
+        if self.submitted || bar.close > self.threshold {
+            return Ok(None);
+        }
+        self.submitted = true;
+        Ok(Some(OrderIntent {
+            intent_id: "intent-example-000001".to_owned(),
+            account_id: self.account_id.clone(),
+            strategy_id: self.strategy_id.clone(),
+            instrument_id: bar.instrument_id.clone(),
+            correlation_id: "corr-example-000001".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(1)?,
+            order_type: OrderType::Market,
+            limit_price: None,
+            time_in_force: follon_domain::TimeInForce::Day,
+            rationale: "close crossed configured entry threshold".to_owned(),
+            created_at: replay_time.to_owned(),
+            strategy_version: self.strategy_version.clone(),
+            configuration_version: self.configuration_version.clone(),
+            environment: "SIMULATION".to_owned(),
+        }))
+    }
+}
+
+/// Versioned deterministic risk limits for the first vertical slice.
+#[derive(Clone, Debug)]
+pub struct RiskPolicy {
+    /// Immutable policy version used as decision evidence.
+    pub version: String,
+    /// Independent global control that blocks all new trading.
+    pub global_kill_switch: bool,
+    /// Maximum allowed absolute intent quantity.
+    pub max_quantity: Decimal,
+    /// Maximum allowed estimated notional at the current bar close.
+    pub max_notional: Decimal,
+}
+
+impl RiskPolicy {
+    /// Evaluates every executable request before an order exists.
+    pub fn evaluate(
+        &self,
+        intent: &OrderIntent,
+        bar: &Bar,
+        replay_time: &str,
+    ) -> Result<RiskDecision, EngineError> {
+        intent.validate()?;
+        let estimated_notional = intent.quantity.checked_mul(bar.close)?;
+        let mut reason_codes = Vec::new();
+        if self.global_kill_switch {
+            reason_codes.push("KILL_SWITCH_ACTIVE".to_owned());
+        }
+        if intent.quantity > self.max_quantity {
+            reason_codes.push("MAX_QUANTITY_EXCEEDED".to_owned());
+        }
+        if estimated_notional > self.max_notional {
+            reason_codes.push("MAX_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if bar.close <= Decimal::ZERO {
+            reason_codes.push("INVALID_MARK_PRICE".to_owned());
+        }
+        let approved = reason_codes.is_empty();
+        if approved {
+            reason_codes.push("APPROVED".to_owned());
+        }
+        Ok(RiskDecision {
+            decision_id: format!("risk-{}", intent.intent_id),
+            intent_id: intent.intent_id.clone(),
+            approved,
+            reason_codes,
+            policy_version: self.version.clone(),
+            decided_at: replay_time.to_owned(),
+            correlation_id: intent.correlation_id.clone(),
+            actor: "risk_engine".to_owned(),
+            evaluated_limits: format!(
+                "max_quantity={},max_notional={},estimated_notional={}",
+                self.max_quantity, self.max_notional, estimated_notional
+            ),
+        })
+    }
+}
+
+/// OMS order whose legal transitions are enforced independently of a broker.
+#[derive(Clone, Debug)]
+pub struct OmsOrder {
+    /// Client-generated idempotency identity.
+    pub order_id: String,
+    /// Original approved intent.
+    pub intent: OrderIntent,
+    /// Current lifecycle state.
+    pub state: OrderState,
+}
+
+impl OmsOrder {
+    /// Creates an OMS order after, and only after, a risk approval.
+    pub fn from_approved_intent(
+        intent: OrderIntent,
+        decision: &RiskDecision,
+    ) -> Result<Self, EngineError> {
+        if !decision.approved || decision.intent_id != intent.intent_id {
+            return Err(EngineError(
+                "an OMS order requires a matching risk approval".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id: format!("order-{}", intent.intent_id),
+            intent,
+            state: OrderState::Created,
+        })
+    }
+
+    /// Applies a legal lifecycle transition and returns the corresponding evidence.
+    pub fn transition(
+        &mut self,
+        next: OrderState,
+        reason: impl Into<String>,
+    ) -> Result<OrderStateChange, EngineError> {
+        if !is_valid_transition(self.state, next) {
+            return Err(EngineError(format!(
+                "invalid OMS transition {} -> {}",
+                self.state.as_str(),
+                next.as_str()
+            )));
+        }
+        let change = OrderStateChange {
+            order_id: self.order_id.clone(),
+            previous_state: Some(self.state),
+            new_state: next,
+            reason: reason.into(),
+        };
+        self.state = next;
+        Ok(change)
+    }
+}
+
+fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
+    matches!(
+        (from, to),
+        (
+            OrderState::Created,
+            OrderState::Approved | OrderState::RiskRejected
+        ) | (OrderState::Approved, OrderState::PendingSubmit)
+            | (
+                OrderState::PendingSubmit,
+                OrderState::Submitted | OrderState::Unknown
+            )
+            | (
+                OrderState::Submitted,
+                OrderState::Acknowledged | OrderState::Rejected | OrderState::Unknown
+            )
+            | (
+                OrderState::Acknowledged,
+                OrderState::PartiallyFilled
+                    | OrderState::Filled
+                    | OrderState::PendingCancel
+                    | OrderState::Unknown
+            )
+            | (
+                OrderState::PartiallyFilled,
+                OrderState::Filled | OrderState::PendingCancel | OrderState::Unknown
+            )
+            | (
+                OrderState::PendingCancel,
+                OrderState::Cancelled | OrderState::Unknown
+            )
+    )
+}
+
+/// Deterministic fill model used exclusively for non-live replay/simulation.
+#[derive(Clone, Debug)]
+pub struct DeterministicFillModel {
+    /// Slippage expressed in basis points, applied unfavourably.
+    pub slippage_bps: Decimal,
+    /// Exact flat fee per fill.
+    pub flat_fee: Decimal,
+}
+
+impl DeterministicFillModel {
+    /// Produces a fill if the current bar can satisfy the order model.
+    pub fn fill(
+        &self,
+        order: &OmsOrder,
+        bar: &Bar,
+        replay_time: &str,
+    ) -> Result<Option<Fill>, EngineError> {
+        let base_price = match order.intent.order_type {
+            OrderType::Market => bar.close,
+            OrderType::Limit => {
+                let limit = order
+                    .intent
+                    .limit_price
+                    .expect("validated limit order has a price");
+                match order.intent.side {
+                    Side::Buy if bar.low <= limit => std::cmp::min(bar.close, limit),
+                    Side::Sell if bar.high >= limit => std::cmp::max(bar.close, limit),
+                    _ => return Ok(None),
+                }
+            }
+        };
+        let basis_point = Decimal::from_integer(10_000)?;
+        let adjustment = base_price
+            .checked_mul(self.slippage_bps)?
+            .checked_div(basis_point)?;
+        let price = match order.intent.side {
+            Side::Buy => base_price.checked_add(adjustment)?,
+            Side::Sell => base_price.checked_sub(adjustment)?,
+        };
+        Ok(Some(Fill {
+            execution_id: format!("exec-{}", order.intent.intent_id),
+            order_id: order.order_id.clone(),
+            instrument_id: order.intent.instrument_id.clone(),
+            side: order.intent.side,
+            quantity: order.intent.quantity,
+            price,
+            fee: self.flat_fee,
+            executed_at: replay_time.to_owned(),
+        }))
+    }
+}
+
+/// Exact single-instrument portfolio projection for the first slice.
+#[derive(Clone, Debug)]
+pub struct Portfolio {
+    account_id: String,
+    instrument_id: String,
+    quantity: Decimal,
+    average_cost: Decimal,
+    realized_pnl: Decimal,
+}
+
+impl Portfolio {
+    /// Starts with no position and no realized P&L.
+    pub fn new(account_id: impl Into<String>, instrument_id: impl Into<String>) -> Self {
+        Self {
+            account_id: account_id.into(),
+            instrument_id: instrument_id.into(),
+            quantity: Decimal::ZERO,
+            average_cost: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
+        }
+    }
+
+    /// Applies a fill once to the internal ledger.
+    pub fn apply_fill(&mut self, fill: &Fill) -> Result<(), EngineError> {
+        if fill.instrument_id != self.instrument_id || fill.quantity <= Decimal::ZERO {
+            return Err(EngineError(
+                "fill does not match portfolio or has invalid quantity".to_owned(),
+            ));
+        }
+        match fill.side {
+            Side::Buy => {
+                let prior_cost = self.average_cost.checked_mul(self.quantity)?;
+                let fill_cost = fill
+                    .price
+                    .checked_mul(fill.quantity)?
+                    .checked_add(fill.fee)?;
+                let new_quantity = self.quantity.checked_add(fill.quantity)?;
+                self.average_cost = prior_cost
+                    .checked_add(fill_cost)?
+                    .checked_div(new_quantity)?;
+                self.quantity = new_quantity;
+            }
+            Side::Sell => {
+                if fill.quantity > self.quantity {
+                    return Err(EngineError(
+                        "first slice does not permit short positions".to_owned(),
+                    ));
+                }
+                let gross_realized = fill
+                    .price
+                    .checked_sub(self.average_cost)?
+                    .checked_mul(fill.quantity)?;
+                self.realized_pnl = self
+                    .realized_pnl
+                    .checked_add(gross_realized.checked_sub(fill.fee)?)?;
+                self.quantity = self.quantity.checked_sub(fill.quantity)?;
+                if self.quantity == Decimal::ZERO {
+                    self.average_cost = Decimal::ZERO;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a rebuildable position projection.
+    pub fn position_snapshot(&self) -> PositionSnapshot {
+        PositionSnapshot {
+            account_id: self.account_id.clone(),
+            instrument_id: self.instrument_id.clone(),
+            quantity: self.quantity,
+            average_cost: self.average_cost,
+            realized_pnl: self.realized_pnl,
+        }
+    }
+
+    /// Returns exact P&L at a supplied mark.
+    pub fn pnl_snapshot(&self, mark_price: Decimal) -> Result<PnlSnapshot, EngineError> {
+        let unrealized_pnl = mark_price
+            .checked_sub(self.average_cost)?
+            .checked_mul(self.quantity)?;
+        Ok(PnlSnapshot {
+            account_id: self.account_id.clone(),
+            instrument_id: self.instrument_id.clone(),
+            mark_price,
+            realized_pnl: self.realized_pnl,
+            unrealized_pnl,
+            total_pnl: self.realized_pnl.checked_add(unrealized_pnl)?,
+        })
+    }
+}
+
+/// Result projection of one processed historical bar.
+#[derive(Clone, Debug)]
+pub struct ReplayResult {
+    /// Events produced in causal append order.
+    pub events: Vec<EventEnvelope>,
+    /// Latest position projection when an execution occurred.
+    pub position: Option<PositionSnapshot>,
+    /// Latest P&L projection when an execution occurred.
+    pub pnl: Option<PnlSnapshot>,
+}
+
+/// Orchestrates a single deterministic historical-bar workflow.
+pub struct ReplayEngine {
+    /// Logical replay time.
+    pub clock: ReplayClock,
+    /// Immutable engine version included in every event.
+    pub software_version: String,
+    /// Immutable configuration version included in every event.
+    pub configuration_version: String,
+    sequence: u64,
+    policy: RiskPolicy,
+    fill_model: DeterministicFillModel,
+}
+
+impl ReplayEngine {
+    /// Creates a replay engine with explicit configuration and deterministic dependencies.
+    pub fn new(
+        initial_time: impl Into<String>,
+        software_version: impl Into<String>,
+        configuration_version: impl Into<String>,
+        policy: RiskPolicy,
+        fill_model: DeterministicFillModel,
+    ) -> Self {
+        Self {
+            clock: ReplayClock::new(initial_time),
+            software_version: software_version.into(),
+            configuration_version: configuration_version.into(),
+            sequence: 0,
+            policy,
+            fill_model,
+        }
+    }
+
+    /// Processes one historical bar through strategy, risk, OMS, simulation, and portfolio.
+    pub fn process_bar(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        account_id: &str,
+        event_time: &str,
+        bar: Bar,
+    ) -> Result<ReplayResult, EngineError> {
+        bar.validate()?;
+        self.clock.advance_to(event_time)?;
+        let mut events = Vec::new();
+        let market_correlation = format!("corr-market-{:012}", self.sequence + 1);
+        let market_event = self.emit(
+            sink,
+            EventPayload::MarketBar(bar.clone()),
+            event_time,
+            &market_correlation,
+            None,
+            "market_data",
+            "historical_import",
+            None,
+            None,
+            Some(&bar.instrument_id),
+        )?;
+        let market_event_id = market_event.event_id.clone();
+        events.push(market_event);
+
+        let Some(intent) = strategy.on_bar(&bar, self.clock.now())? else {
+            return Ok(ReplayResult {
+                events,
+                position: None,
+                pnl: None,
+            });
+        };
+        intent.validate()?;
+        if intent.account_id != account_id
+            || intent.configuration_version != self.configuration_version
+        {
+            return Err(EngineError(
+                "strategy intent does not match replay account or configuration".to_owned(),
+            ));
+        }
+
+        let current_time = self.clock.now().to_owned();
+        let intent_event = self.emit(
+            sink,
+            EventPayload::OrderIntent(intent.clone()),
+            &current_time,
+            &intent.correlation_id,
+            Some(&market_event_id),
+            &intent.strategy_id,
+            "strategy_worker",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let intent_event_id = intent_event.event_id.clone();
+        events.push(intent_event);
+
+        let decision = self.policy.evaluate(&intent, &bar, self.clock.now())?;
+        let current_time = self.clock.now().to_owned();
+        let decision_event = self.emit(
+            sink,
+            EventPayload::RiskDecision(decision.clone()),
+            &current_time,
+            &intent.correlation_id,
+            Some(&intent_event_id),
+            "risk_engine",
+            "trading_core",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let decision_event_id = decision_event.event_id.clone();
+        events.push(decision_event);
+
+        if !decision.approved {
+            let audit = self.audit_event(
+                sink,
+                &intent,
+                &decision_event_id,
+                events.iter().map(|event| event.event_id.clone()).collect(),
+                "intent was rejected before OMS order creation",
+            )?;
+            events.push(audit);
+            return Ok(ReplayResult {
+                events,
+                position: None,
+                pnl: None,
+            });
+        }
+
+        let mut order = OmsOrder::from_approved_intent(intent.clone(), &decision)?;
+        let created = OrderStateChange {
+            order_id: order.order_id.clone(),
+            previous_state: None,
+            new_state: OrderState::Created,
+            reason: "created from auditable risk approval".to_owned(),
+        };
+        self.emit_order_change(sink, &mut events, &intent, &decision_event_id, created)?;
+        for (state, reason) in [
+            (OrderState::Approved, "risk approval accepted by OMS"),
+            (
+                OrderState::PendingSubmit,
+                "queued for deterministic simulator",
+            ),
+            (OrderState::Submitted, "simulator submission accepted"),
+            (
+                OrderState::Acknowledged,
+                "simulator acknowledged submission",
+            ),
+        ] {
+            let change = order.transition(state, reason)?;
+            self.emit_order_change(sink, &mut events, &intent, &decision_event_id, change)?;
+        }
+
+        let Some(fill) = self.fill_model.fill(&order, &bar, self.clock.now())? else {
+            let audit = self.audit_event(
+                sink,
+                &intent,
+                &decision_event_id,
+                events.iter().map(|event| event.event_id.clone()).collect(),
+                "approved limit order remains acknowledged without a simulated fill",
+            )?;
+            events.push(audit);
+            return Ok(ReplayResult {
+                events,
+                position: None,
+                pnl: None,
+            });
+        };
+        let fill_change =
+            order.transition(OrderState::Filled, "deterministic simulator filled order")?;
+        self.emit_order_change(sink, &mut events, &intent, &decision_event_id, fill_change)?;
+        let current_time = self.clock.now().to_owned();
+        let fill_event = self.emit(
+            sink,
+            EventPayload::Fill(fill.clone()),
+            &current_time,
+            &intent.correlation_id,
+            events.last().map(|event| event.event_id.as_str()),
+            "simulator",
+            "simulator",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let fill_event_id = fill_event.event_id.clone();
+        events.push(fill_event);
+
+        let mut portfolio = Portfolio::new(account_id, &intent.instrument_id);
+        portfolio.apply_fill(&fill)?;
+        let position = portfolio.position_snapshot();
+        let current_time = self.clock.now().to_owned();
+        let position_event = self.emit(
+            sink,
+            EventPayload::Position(position.clone()),
+            &current_time,
+            &intent.correlation_id,
+            Some(&fill_event_id),
+            "portfolio_engine",
+            "trading_core",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let position_event_id = position_event.event_id.clone();
+        events.push(position_event);
+        let pnl = portfolio.pnl_snapshot(bar.close)?;
+        let current_time = self.clock.now().to_owned();
+        let pnl_event = self.emit(
+            sink,
+            EventPayload::Pnl(pnl.clone()),
+            &current_time,
+            &intent.correlation_id,
+            Some(&position_event_id),
+            "portfolio_engine",
+            "trading_core",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let pnl_event_id = pnl_event.event_id.clone();
+        events.push(pnl_event);
+        let audit = self.audit_event(
+            sink,
+            &intent,
+            &pnl_event_id,
+            events.iter().map(|event| event.event_id.clone()).collect(),
+            "source bar through simulated fill and exact portfolio update",
+        )?;
+        events.push(audit);
+        Ok(ReplayResult {
+            events,
+            position: Some(position),
+            pnl: Some(pnl),
+        })
+    }
+
+    /// Processes a bar only after its reference data and trading session resolve.
+    pub fn process_bar_with_market_preconditions(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        account_id: &str,
+        event_time: &str,
+        bar: Bar,
+        market: &MarketPreconditions<'_>,
+    ) -> Result<ReplayResult, EngineError> {
+        market.validate(&bar, event_time)?;
+        self.process_bar(sink, strategy, account_id, event_time, bar)
+    }
+
+    fn emit_order_change(
+        &mut self,
+        sink: &mut impl EventSink,
+        events: &mut Vec<EventEnvelope>,
+        intent: &OrderIntent,
+        causation_id: &str,
+        change: OrderStateChange,
+    ) -> Result<(), EngineError> {
+        let current_time = self.clock.now().to_owned();
+        let event = self.emit(
+            sink,
+            EventPayload::OrderState(change),
+            &current_time,
+            &intent.correlation_id,
+            Some(causation_id),
+            "oms",
+            "trading_core",
+            Some(&intent.account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        events.push(event);
+        Ok(())
+    }
+
+    fn audit_event(
+        &mut self,
+        sink: &mut impl EventSink,
+        intent: &OrderIntent,
+        causation_id: &str,
+        event_ids: Vec<String>,
+        summary: &str,
+    ) -> Result<EventEnvelope, EngineError> {
+        let current_time = self.clock.now().to_owned();
+        self.emit(
+            sink,
+            EventPayload::Audit(AuditTrail {
+                correlation_id: intent.correlation_id.clone(),
+                event_ids,
+                summary: summary.to_owned(),
+            }),
+            &current_time,
+            &intent.correlation_id,
+            Some(causation_id),
+            "audit",
+            "trading_core",
+            Some(&intent.account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        sink: &mut impl EventSink,
+        payload: EventPayload,
+        event_time: &str,
+        correlation_id: &str,
+        causation_id: Option<&str>,
+        actor: &str,
+        source: &str,
+        account_id: Option<&str>,
+        strategy_id: Option<&str>,
+        instrument_id: Option<&str>,
+    ) -> Result<EventEnvelope, EngineError> {
+        self.sequence += 1;
+        let event = EventEnvelope {
+            event_id: format!("evt-{:012}", self.sequence),
+            event_type: payload.event_type().to_owned(),
+            schema_version: 1,
+            event_time: event_time.to_owned(),
+            receive_time: self.clock.now().to_owned(),
+            account_id: account_id.map(str::to_owned),
+            strategy_id: strategy_id.map(str::to_owned),
+            instrument_id: instrument_id.map(str::to_owned),
+            correlation_id: correlation_id.to_owned(),
+            causation_id: causation_id.map(str::to_owned),
+            actor: actor.to_owned(),
+            source: source.to_owned(),
+            payload,
+            software_version: self.software_version.clone(),
+            configuration_version: self.configuration_version.clone(),
+        };
+        sink.append(&event)?;
+        Ok(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    use follon_instrument::{
+        AssetClass, Instrument, InstrumentVersion, StaticTradingCalendar, TradingSession,
+    };
+
+    use super::*;
+
+    fn bar() -> Bar {
+        Bar {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            open: Decimal::from_str("100.00").unwrap(),
+            high: Decimal::from_str("101.00").unwrap(),
+            low: Decimal::from_str("99.00").unwrap(),
+            close: Decimal::from_str("100.00").unwrap(),
+            volume: Decimal::from_str("1000").unwrap(),
+            interval_seconds: 60,
+            exchange_timezone: "America/New_York".to_owned(),
+        }
+    }
+
+    fn engine() -> ReplayEngine {
+        ReplayEngine::new(
+            "2026-01-02T14:30:00Z",
+            "core-0.1.0",
+            "cfg-example-1",
+            RiskPolicy {
+                version: "risk-example-1".to_owned(),
+                global_kill_switch: false,
+                max_quantity: Decimal::from_integer(10).unwrap(),
+                max_notional: Decimal::from_integer(10_000).unwrap(),
+            },
+            DeterministicFillModel {
+                slippage_bps: Decimal::from_str("0").unwrap(),
+                flat_fee: Decimal::from_str("0.10").unwrap(),
+            },
+        )
+    }
+
+    fn strategy() -> BuyOnceStrategy {
+        BuyOnceStrategy::new(
+            "acct-paper-001",
+            "strategy-example-001",
+            "strategy-example-v1",
+            "cfg-example-1",
+            Decimal::from_integer(100).unwrap(),
+        )
+    }
+
+    fn market_dependencies() -> (InstrumentRegistry, StaticTradingCalendar) {
+        let calendar = StaticTradingCalendar::new(
+            "cal.us_equities.nyse",
+            vec![TradingSession {
+                exchange_date: "2026-01-02".to_owned(),
+                opens_at: "2026-01-02T14:30:00Z".to_owned(),
+                closes_at: "2026-01-02T21:00:00Z".to_owned(),
+            }],
+        )
+        .unwrap();
+        let mut instruments = InstrumentRegistry::default();
+        instruments
+            .register(InstrumentVersion {
+                instrument: Instrument {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    symbol: "SPY".to_owned(),
+                    exchange_symbol: "SPY".to_owned(),
+                    asset_class: AssetClass::Etf,
+                    venue: "venue.nyse_arca".to_owned(),
+                    currency: "USD".to_owned(),
+                    broker_ids: BTreeMap::new(),
+                    tick_size: Decimal::from_str("0.01").unwrap(),
+                    lot_size: Decimal::from_integer(1).unwrap(),
+                    multiplier: Decimal::from_integer(1).unwrap(),
+                    trading_calendar_id: "cal.us_equities.nyse".to_owned(),
+                },
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference-test-1".to_owned(),
+            })
+            .unwrap();
+        (instruments, calendar)
+    }
+
+    #[test]
+    fn importer_validates_and_normalizes_a_historical_bar() {
+        let imported = import_historical_bars(
+            "event_time,instrument_id,open,high,low,close,volume,interval_seconds,exchange_timezone\n\
+             2026-01-02T14:31:00Z,inst.us_equity.spy,100,101,99,100,1000,60,America/New_York\n",
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].bar.close, Decimal::from_integer(100).unwrap());
+    }
+
+    #[test]
+    fn persisted_market_events_can_be_replayed_with_identical_output() {
+        let path = std::env::temp_dir().join(format!(
+            "follon-replay-{}-{}.ndjson",
+            std::process::id(),
+            "persisted-market-events"
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut source_engine = engine();
+        let mut source_strategy = strategy();
+        let mut file_store = FileEventStore::open(&path).unwrap();
+        let source = source_engine
+            .process_bar(
+                &mut file_store,
+                &mut source_strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        drop(file_store);
+
+        let persisted_input = load_persisted_market_bars(&path).unwrap();
+        assert_eq!(persisted_input.len(), 1);
+        let mut replay_engine = engine();
+        let mut replay_strategy = strategy();
+        let mut replay_store = InMemoryEventStore::default();
+        let replay = replay_engine
+            .process_bar(
+                &mut replay_store,
+                &mut replay_strategy,
+                "acct-paper-001",
+                &persisted_input[0].event_time,
+                persisted_input[0].bar.clone(),
+            )
+            .unwrap();
+        let source_json: Vec<_> = source
+            .events
+            .iter()
+            .map(EventEnvelope::canonical_json)
+            .collect();
+        let replay_json: Vec<_> = replay
+            .events
+            .iter()
+            .map(EventEnvelope::canonical_json)
+            .collect();
+        assert_eq!(source_json, replay_json);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn market_preconditions_block_bars_outside_an_explicit_session() {
+        let (instruments, calendar) = market_dependencies();
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let mut example_strategy = strategy();
+        assert!(replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut example_strategy,
+                "acct-paper-001",
+                "2026-01-02T21:00:00Z",
+                bar(),
+                &market,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn identical_inputs_produce_identical_canonical_events() {
+        let mut first_engine = engine();
+        let mut first_store = InMemoryEventStore::default();
+        let first = first_engine
+            .process_bar(
+                &mut first_store,
+                &mut strategy(),
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        let mut second_engine = engine();
+        let mut second_store = InMemoryEventStore::default();
+        let second = second_engine
+            .process_bar(
+                &mut second_store,
+                &mut strategy(),
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        let first_json: Vec<_> = first
+            .events
+            .iter()
+            .map(EventEnvelope::canonical_json)
+            .collect();
+        let second_json: Vec<_> = second
+            .events
+            .iter()
+            .map(EventEnvelope::canonical_json)
+            .collect();
+        assert_eq!(first_json, second_json);
+        assert!(first
+            .events
+            .iter()
+            .any(|event| event.event_type == "risk.decision.v1"));
+        assert!(first
+            .events
+            .iter()
+            .any(|event| event.event_type == "audit.trail.v1"));
+    }
+
+    #[test]
+    fn risk_rejection_cannot_create_an_oms_order() {
+        let mut replay = engine();
+        replay.policy.global_kill_switch = true;
+        let mut store = InMemoryEventStore::default();
+        let result = replay
+            .process_bar(
+                &mut store,
+                &mut strategy(),
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event.event_type == "risk.decision.v1"));
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| event.event_type == "order.state_changed.v1"));
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event.event_type == "audit.trail.v1"));
+    }
+
+    #[test]
+    fn invalid_oms_transition_is_rejected() {
+        let intent = strategy()
+            .on_bar(&bar(), "2026-01-02T14:31:00Z")
+            .unwrap()
+            .unwrap();
+        let decision = engine()
+            .policy
+            .evaluate(&intent, &bar(), "2026-01-02T14:31:00Z")
+            .unwrap();
+        let mut order = OmsOrder::from_approved_intent(intent, &decision).unwrap();
+        assert!(order
+            .transition(OrderState::Filled, "skip submission")
+            .is_err());
+    }
+}

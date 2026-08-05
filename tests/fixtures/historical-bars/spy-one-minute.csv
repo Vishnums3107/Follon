@@ -1,0 +1,2 @@
+event_time,instrument_id,open,high,low,close,volume,interval_seconds,exchange_timezone
+2026-01-02T14:31:00Z,inst.us_equity.spy,100.00000000,101.00000000,99.00000000,100.00000000,1000.00000000,60,America/New_York

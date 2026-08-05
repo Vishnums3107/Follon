@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/strategy-worker-frame.schema.json",
+  "title": "Follon Strategy Worker Frame v1",
+  "oneOf": [
+    { "$ref": "#/$defs/ready" },
+    { "$ref": "#/$defs/marketBar" },
+    { "$ref": "#/$defs/strategyOutput" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "base": {
+      "type": "object",
+      "properties": { "protocol_version": { "const": 1 }, "type": { "type": "string" } },
+      "required": ["protocol_version", "type"]
+    },
+    "ready": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "type": { "const": "ready" },
+            "bundle_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "strategy_id": { "$ref": "#/$defs/canonicalId" },
+            "strategy_version": { "type": "string", "minLength": 1 }
+          },
+          "required": ["bundle_hash", "strategy_id", "strategy_version"]
+        }
+      ]
+    },
+    "marketBar": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "type": { "const": "market_bar" },
+            "context": { "type": "object" },
+            "bar": { "type": "object" }
+          },
+          "required": ["context", "bar"]
+        }
+      ]
+    },
+    "strategyOutput": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "type": { "const": "strategy_output" },
+            "intent": { "type": ["object", "null"] }
+          },
+          "required": ["intent"]
+        }
+      ]
+    },
+    "error": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": { "type": { "const": "error" }, "code": { "type": "string", "minLength": 1 } },
+          "required": ["code"]
+        }
+      ]
+    }
+  }
+}

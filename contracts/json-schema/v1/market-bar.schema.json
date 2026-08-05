@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/market-bar.schema.json",
+  "title": "Normalized Historical Bar v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["instrument_id", "open", "high", "low", "close", "volume", "interval_seconds", "exchange_timezone"],
+  "properties": {
+    "instrument_id": { "type": "string", "pattern": "^[a-z0-9._-]+$" },
+    "open": { "$ref": "#/$defs/decimal" },
+    "high": { "$ref": "#/$defs/decimal" },
+    "low": { "$ref": "#/$defs/decimal" },
+    "close": { "$ref": "#/$defs/decimal" },
+    "volume": { "$ref": "#/$defs/decimal" },
+    "interval_seconds": { "type": "integer", "minimum": 1 },
+    "exchange_timezone": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "decimal": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]{1,8})?$"
+    }
+  }
+}

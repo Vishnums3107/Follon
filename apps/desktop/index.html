@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Follon ? Simulation Evidence</title>
+  </head>
+  <body>
+    <main id="app" aria-live="polite">
+      <h1>Simulation evidence</h1>
+      <p>SIMULATION — no broker connectivity</p>
+      <label>
+        Load canonical NDJSON event log
+        <input id="event-log-file" type="file" accept=".ndjson,application/x-ndjson,application/json" />
+      </label>
+      <p id="load-status">Choose a local event log or connect a server-owned evidence stream.</p>
+      <section id="evidence" aria-live="polite"></section>
+    </main>
+    <script type="module" src="./dist/main.js"></script>
+  </body>
+</html>

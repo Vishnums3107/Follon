@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package follon.trading.v1;
+
+// Versioned worker boundary. The Rust core validates every returned intent.
+service StrategyWorker {
+  rpc Replay(stream StrategyEvent) returns (stream StrategyOutput);
+}
+
+message StrategyEvent {
+  string event_id = 1;
+  string event_type = 2;
+  string event_time_utc = 3;
+  string receive_time_utc = 4;
+  string correlation_id = 5;
+  string causation_id = 6;
+  string configuration_version = 7;
+  oneof payload {
+    MarketBar bar = 20;
+    RiskDecision risk_decision = 21;
+    Fill fill = 22;
+  }
+}
+
+message StrategyOutput {
+  oneof payload {
+    OrderIntent order_intent = 1;
+    StrategyLog log = 2;
+  }
+}
+
+message MarketBar {
+  string instrument_id = 1;
+  string open = 2;
+  string high = 3;
+  string low = 4;
+  string close = 5;
+  string volume = 6;
+  uint32 interval_seconds = 7;
+  string exchange_timezone = 8;
+}
+
+message OrderIntent {
+  string intent_id = 1;
+  string account_id = 2;
+  string strategy_id = 3;
+  string instrument_id = 4;
+  string correlation_id = 5;
+  Side side = 6;
+  string quantity = 7;
+  OrderType order_type = 8;
+  optional string limit_price = 9;
+  TimeInForce time_in_force = 10;
+  string rationale = 11;
+  string created_at_utc = 12;
+  string strategy_version = 13;
+  string configuration_version = 14;
+  Environment environment = 15;
+}
+
+message RiskDecision {
+  string decision_id = 1;
+  string intent_id = 2;
+  bool approved = 3;
+  repeated string reason_codes = 4;
+  string policy_version = 5;
+  string decided_at_utc = 6;
+}
+
+message Fill {
+  string execution_id = 1;
+  string order_id = 2;
+  string instrument_id = 3;
+  Side side = 4;
+  string quantity = 5;
+  string price = 6;
+  string fee = 7;
+  string executed_at_utc = 8;
+}
+
+message StrategyLog {
+  string level = 1;
+  string message = 2;
+  string correlation_id = 3;
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_MARKET = 1;
+  ORDER_TYPE_LIMIT = 2;
+}
+
+enum TimeInForce {
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  TIME_IN_FORCE_DAY = 1;
+  TIME_IN_FORCE_GTC = 2;
+}
+
+enum Environment {
+  ENVIRONMENT_UNSPECIFIED = 0;
+  ENVIRONMENT_SIMULATION = 1;
+  ENVIRONMENT_PAPER = 2;
+  ENVIRONMENT_LIVE = 3;
+}

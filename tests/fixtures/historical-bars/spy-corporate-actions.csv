@@ -1,0 +1,2 @@
+action_id,instrument_id,action_type,effective_at,value
+action-split-001,inst.us_equity.spy,SPLIT,2026-01-03T00:00:00Z,2.00000000
