@@ -10,7 +10,7 @@
 # Local trading state and credentials
 data/
 var/
-secrets/
+/secrets/
 *.sqlite
 *.db
 
