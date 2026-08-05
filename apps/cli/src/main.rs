@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             slippage_bps: decimal("0")?,
             flat_fee: decimal("0.10")?,
         },
-    );
+    )?;
     let mut strategy = BuyOnceStrategy::new(
         "acct-paper-001",
         "strategy-example-001",

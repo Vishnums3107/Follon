@@ -20,10 +20,11 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
 - Fixed-point Rust domain types, immutable canonical event envelopes, and
   effective-dated instrument reference data.
 - Historical-bar CSV import, explicit replay clock and exchange-session model,
-  append-only local NDJSON event storage, deterministic risk/OMS/simulator and
-  portfolio evidence flow.
+  canonical timestamp/order validation, append-only local NDJSON event storage,
+  deterministic risk/OMS/simulator, and cumulative portfolio evidence flow.
 - Content-addressed bar/action datasets, deterministic backtest runner, exact
-  single-currency accounting, portable result artifacts, and local experiment
+  single-currency accounting, content-addressed configuration, portable
+  self-describing result artifacts, completion manifests, and local experiment
   metadata/export.
 - Python strategy contracts that can submit intents but cannot access adapters
   or credentials.

@@ -33,6 +33,11 @@ def _required_string(frame: dict[str, Any], name: str) -> str:
     return value
 
 
+def _require_exact_fields(frame: dict[str, Any], expected: set[str], name: str) -> None:
+    if set(frame) != expected:
+        raise WorkerProtocolError(f"{name} has missing or unknown fields")
+
+
 def _decimal(value: Any, name: str) -> Decimal:
     if not isinstance(value, str):
         raise WorkerProtocolError(f"{name} must be a decimal string")
@@ -43,6 +48,18 @@ def _decimal(value: Any, name: str) -> Decimal:
 
 
 def _context(payload: dict[str, Any]) -> StrategyContext:
+    _require_exact_fields(
+        payload,
+        {
+            "account_id",
+            "strategy_id",
+            "strategy_version",
+            "configuration_version",
+            "replay_time",
+            "environment",
+        },
+        "strategy context",
+    )
     return StrategyContext(
         account_id=_required_string(payload, "account_id"),
         strategy_id=_required_string(payload, "strategy_id"),
@@ -54,6 +71,20 @@ def _context(payload: dict[str, Any]) -> StrategyContext:
 
 
 def _bar(payload: dict[str, Any]) -> Bar:
+    _require_exact_fields(
+        payload,
+        {
+            "instrument_id",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "interval_seconds",
+            "exchange_timezone",
+        },
+        "market bar",
+    )
     interval_seconds = payload.get("interval_seconds")
     if not isinstance(interval_seconds, int) or isinstance(interval_seconds, bool):
         raise WorkerProtocolError("interval_seconds must be an integer")
@@ -76,6 +107,7 @@ def _read_frame(line: str) -> tuple[StrategyContext, Bar]:
         raise WorkerProtocolError("frame is not valid JSON") from error
     if not isinstance(frame, dict):
         raise WorkerProtocolError("frame must be a JSON object")
+    _require_exact_fields(frame, {"protocol_version", "type", "context", "bar"}, "frame")
     if frame.get("protocol_version") != PROTOCOL_VERSION:
         raise WorkerProtocolError("unsupported worker protocol version")
     if frame.get("type") != "market_bar":

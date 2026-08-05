@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[dependencies]
+time = { version = "0.3.44", features = ["parsing"] }
+
 [lib]
 path = "src/lib.rs"
 
