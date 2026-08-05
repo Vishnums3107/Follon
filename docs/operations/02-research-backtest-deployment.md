@@ -20,10 +20,11 @@ are complete.
   non-secret environment value accepted by the launcher.
 - Store source trade, bar, and action files in immutable versioned locations.
   Preserve the source files separately from their normalized dataset manifest.
-- Retain every JSON artifact, NDJSON event stream, Markdown report, and
-  experiment catalog under write-once or versioned object storage. The local
-  file adapter refuses conflicting overwrites but is not a replacement for
-  replicated object storage.
+- Retain every JSON artifact, NDJSON event stream, Markdown report, completion
+  manifest, exact configuration file, and experiment catalog under write-once
+  or versioned object storage. The local file adapter atomically publishes
+  immutable files and refuses conflicting overwrites, but is not a replacement
+  for replicated object storage.
 - Back up the local experiment catalog and artifacts, then rehearse restoring
   them and rerunning a known specification. Compare the artifact fingerprint,
   event-output hash, and report bytes.
@@ -32,10 +33,11 @@ are complete.
 
 ## Acceptance check
 
-For a candidate release, run the same command twice into two fresh artifact
-paths. The JSON artifacts, NDJSON event streams, and Markdown reports must be
-byte-identical. Re-running one path must be idempotent; attempting to reuse it
-for a different input must fail rather than overwrite evidence.
+For a candidate release, run both `follon-build-bars` and `follon-backtest`
+twice into fresh paths. Bars, JSON artifacts, NDJSON event streams, Markdown
+reports, completion manifests, and experiment records must be byte-identical.
+Verify every manifest digest. Re-running one path must be idempotent; attempting
+to reuse it for a different input must fail rather than overwrite evidence.
 
 ## Known first-release capability boundaries
 

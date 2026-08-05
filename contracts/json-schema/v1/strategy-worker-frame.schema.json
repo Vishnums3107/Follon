@@ -9,60 +9,164 @@
     { "$ref": "#/$defs/error" }
   ],
   "$defs": {
-    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
-    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
-    "base": {
-      "type": "object",
-      "properties": { "protocol_version": { "const": 1 }, "type": { "type": "string" } },
-      "required": ["protocol_version", "type"]
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$"
+    },
+    "positiveDecimal": {
+      "type": "string",
+      "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$"
+    },
+    "utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
     },
     "ready": {
-      "allOf": [
-        { "$ref": "#/$defs/base" },
-        {
-          "properties": {
-            "type": { "const": "ready" },
-            "bundle_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-            "strategy_id": { "$ref": "#/$defs/canonicalId" },
-            "strategy_version": { "type": "string", "minLength": 1 }
-          },
-          "required": ["bundle_hash", "strategy_id", "strategy_version"]
-        }
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle_hash",
+        "protocol_version",
+        "strategy_id",
+        "strategy_version",
+        "type"
+      ],
+      "properties": {
+        "bundle_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "protocol_version": { "const": 1 },
+        "strategy_id": { "$ref": "#/$defs/canonicalId" },
+        "strategy_version": { "type": "string", "minLength": 1 },
+        "type": { "const": "ready" }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "account_id",
+        "configuration_version",
+        "environment",
+        "replay_time",
+        "strategy_id",
+        "strategy_version"
+      ],
+      "properties": {
+        "account_id": { "$ref": "#/$defs/canonicalId" },
+        "configuration_version": { "type": "string", "minLength": 1 },
+        "environment": { "const": "SIMULATION" },
+        "replay_time": { "$ref": "#/$defs/utc" },
+        "strategy_id": { "$ref": "#/$defs/canonicalId" },
+        "strategy_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "bar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "close",
+        "exchange_timezone",
+        "high",
+        "instrument_id",
+        "interval_seconds",
+        "low",
+        "open",
+        "volume"
+      ],
+      "properties": {
+        "close": { "$ref": "#/$defs/positiveDecimal" },
+        "exchange_timezone": { "type": "string", "minLength": 1 },
+        "high": { "$ref": "#/$defs/positiveDecimal" },
+        "instrument_id": { "$ref": "#/$defs/canonicalId" },
+        "interval_seconds": { "type": "integer", "minimum": 1 },
+        "low": { "$ref": "#/$defs/positiveDecimal" },
+        "open": { "$ref": "#/$defs/positiveDecimal" },
+        "volume": { "type": "string", "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8})?$" }
+      }
     },
     "marketBar": {
-      "allOf": [
-        { "$ref": "#/$defs/base" },
-        {
-          "properties": {
-            "type": { "const": "market_bar" },
-            "context": { "type": "object" },
-            "bar": { "type": "object" }
-          },
-          "required": ["context", "bar"]
-        }
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bar", "context", "protocol_version", "type"],
+      "properties": {
+        "bar": { "$ref": "#/$defs/bar" },
+        "context": { "$ref": "#/$defs/context" },
+        "protocol_version": { "const": 1 },
+        "type": { "const": "market_bar" }
+      }
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "account_id",
+        "configuration_version",
+        "correlation_id",
+        "created_at",
+        "environment",
+        "instrument_id",
+        "intent_id",
+        "limit_price",
+        "order_type",
+        "quantity",
+        "rationale",
+        "side",
+        "strategy_id",
+        "strategy_version",
+        "time_in_force"
+      ],
+      "properties": {
+        "account_id": { "$ref": "#/$defs/canonicalId" },
+        "configuration_version": { "type": "string", "minLength": 1 },
+        "correlation_id": { "$ref": "#/$defs/canonicalId" },
+        "created_at": { "$ref": "#/$defs/utc" },
+        "environment": { "const": "SIMULATION" },
+        "instrument_id": { "$ref": "#/$defs/canonicalId" },
+        "intent_id": { "$ref": "#/$defs/canonicalId" },
+        "limit_price": {
+          "oneOf": [
+            { "$ref": "#/$defs/positiveDecimal" },
+            { "type": "null" }
+          ]
+        },
+        "order_type": { "enum": ["MARKET", "LIMIT"] },
+        "quantity": { "$ref": "#/$defs/positiveDecimal" },
+        "rationale": { "type": "string", "minLength": 1 },
+        "side": { "enum": ["BUY", "SELL"] },
+        "strategy_id": { "$ref": "#/$defs/canonicalId" },
+        "strategy_version": { "type": "string", "minLength": 1 },
+        "time_in_force": { "enum": ["DAY", "GTC"] }
+      }
     },
     "strategyOutput": {
-      "allOf": [
-        { "$ref": "#/$defs/base" },
-        {
-          "properties": {
-            "type": { "const": "strategy_output" },
-            "intent": { "type": ["object", "null"] }
-          },
-          "required": ["intent"]
-        }
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent", "protocol_version", "type"],
+      "properties": {
+        "intent": {
+          "oneOf": [
+            { "$ref": "#/$defs/intent" },
+            { "type": "null" }
+          ]
+        },
+        "protocol_version": { "const": 1 },
+        "type": { "const": "strategy_output" }
+      }
     },
     "error": {
-      "allOf": [
-        { "$ref": "#/$defs/base" },
-        {
-          "properties": { "type": { "const": "error" }, "code": { "type": "string", "minLength": 1 } },
-          "required": ["code"]
-        }
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "protocol_version", "type"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "protocol_version": { "const": 1 },
+        "type": { "const": "error" }
+      }
     }
   }
 }

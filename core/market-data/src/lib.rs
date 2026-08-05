@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use follon_domain::{validate_canonical_id, Bar, Decimal, DomainError};
+use follon_domain::{validate_canonical_id, validate_utc_timestamp, Bar, Decimal, DomainError};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -29,13 +29,10 @@ impl Trade {
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_canonical_id("instrument_id", &self.instrument_id)?;
         validate_canonical_id("trade_id", &self.trade_id)?;
-        if !self.event_time.ends_with('Z')
-            || OffsetDateTime::parse(&self.event_time, &Rfc3339).is_err()
-            || self.price <= Decimal::ZERO
-            || self.quantity <= Decimal::ZERO
-        {
+        validate_utc_timestamp("trade event_time", &self.event_time)?;
+        if self.price <= Decimal::ZERO || self.quantity <= Decimal::ZERO {
             return Err(DomainError(
-                "trade must have UTC time, positive price, and positive quantity".to_owned(),
+                "trade must have positive price and positive quantity".to_owned(),
             ));
         }
         Ok(())
@@ -71,7 +68,7 @@ impl BarBuilder {
         &self,
         trades: impl IntoIterator<Item = Trade>,
     ) -> Result<Vec<(String, Bar)>, MarketDataError> {
-        let mut grouped: BTreeMap<(String, i64), Vec<Trade>> = BTreeMap::new();
+        let mut grouped: BTreeMap<(i64, String), Vec<Trade>> = BTreeMap::new();
         let mut trade_ids = BTreeSet::new();
         let mut source_sequences = BTreeSet::new();
         for trade in trades {
@@ -92,12 +89,12 @@ impl BarBuilder {
             let bucket = timestamp.unix_timestamp().div_euclid(self.interval_seconds)
                 * self.interval_seconds;
             grouped
-                .entry((trade.instrument_id.clone(), bucket))
+                .entry((bucket, trade.instrument_id.clone()))
                 .or_default()
                 .push(trade);
         }
         let mut bars = Vec::with_capacity(grouped.len());
-        for ((instrument_id, bucket), mut bucket_trades) in grouped {
+        for ((bucket, instrument_id), mut bucket_trades) in grouped {
             bucket_trades.sort_by(|left, right| {
                 left.event_time
                     .cmp(&right.event_time)
@@ -279,12 +276,10 @@ impl CorporateAction {
         };
         validate_canonical_id("action_id", action_id)?;
         validate_canonical_id("instrument_id", instrument_id)?;
-        if !effective_at.ends_with('Z')
-            || OffsetDateTime::parse(effective_at, &Rfc3339).is_err()
-            || *value <= Decimal::ZERO
-        {
+        validate_utc_timestamp("corporate action effective_at", effective_at)?;
+        if *value <= Decimal::ZERO {
             return Err(DomainError(
-                "corporate action must have UTC time and positive value".to_owned(),
+                "corporate action must have a positive value".to_owned(),
             ));
         }
         Ok(())
@@ -456,9 +451,7 @@ impl From<follon_domain::DecimalError> for MarketDataError {
 }
 
 fn parse_utc(value: &str) -> Result<OffsetDateTime, MarketDataError> {
-    if !value.ends_with('Z') {
-        return Err(MarketDataError("timestamp must be UTC".to_owned()));
-    }
+    validate_utc_timestamp("timestamp", value)?;
     OffsetDateTime::parse(value, &Rfc3339).map_err(|error| MarketDataError(error.to_string()))
 }
 
@@ -492,6 +485,37 @@ mod tests {
         assert_eq!(bars[0].1.open, Decimal::from_integer(100).unwrap());
         assert_eq!(bars[0].1.close, Decimal::from_integer(101).unwrap());
         assert_eq!(bars[0].1.volume, Decimal::from_integer(3).unwrap());
+    }
+
+    #[test]
+    fn builder_emits_canonical_time_then_instrument_order() {
+        let mut earlier = trade("2026-01-02T14:30:01Z", 1, "90", "1");
+        earlier.instrument_id = "inst.us_equity.qqq".to_owned();
+        earlier.trade_id = "trade-qqq-001".to_owned();
+        let later = trade("2026-01-02T14:31:01Z", 1, "100", "1");
+        let bars = BarBuilder::new(60, "America/New_York")
+            .unwrap()
+            .build([later, earlier])
+            .unwrap();
+        assert_eq!(bars[0].0, "2026-01-02T14:30:00Z");
+        assert_eq!(bars[0].1.instrument_id, "inst.us_equity.qqq");
+        assert_eq!(bars[1].0, "2026-01-02T14:31:00Z");
+        assert_eq!(bars[1].1.instrument_id, "inst.us_equity.spy");
+    }
+
+    #[test]
+    fn market_data_rejects_noncanonical_utc_spellings() {
+        assert!(trade("2026-01-02T14:30:00.000Z", 1, "100", "1")
+            .validate()
+            .is_err());
+        assert!(CorporateAction::Split {
+            action_id: "action-split-001".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            effective_at: "2026-01-03T00:00:00+00:00".to_owned(),
+            ratio: Decimal::from_integer(2).unwrap(),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

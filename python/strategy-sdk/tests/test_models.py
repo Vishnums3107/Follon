@@ -1,4 +1,5 @@
 from decimal import Decimal
+from dataclasses import replace
 import unittest
 
 from follon_strategy_sdk import (
@@ -43,6 +44,14 @@ class ModelContractTests(unittest.TestCase):
                 configuration_version="cfg-v1",
                 replay_time="2026-01-02T14:30:00Z",
             )
+        with self.assertRaises(ValueError):
+            StrategyContext(
+                account_id="acct.paper.001",
+                strategy_id="strategy-test-001",
+                strategy_version="v1",
+                configuration_version="cfg-v1",
+                replay_time="2026-01-02T14:30:00+00:00",
+            )
 
     def test_bar_requires_consistent_ohlc(self) -> None:
         with self.assertRaises(ValueError):
@@ -52,6 +61,17 @@ class ModelContractTests(unittest.TestCase):
                 high=Decimal("99"),
                 low=Decimal("98"),
                 close=Decimal("100"),
+                volume=Decimal("1"),
+                interval_seconds=60,
+                exchange_timezone="America/New_York",
+            )
+        with self.assertRaises(ValueError):
+            Bar(
+                instrument_id="inst.us_equity.spy",
+                open=Decimal("0"),
+                high=Decimal("1"),
+                low=Decimal("0"),
+                close=Decimal("1"),
                 volume=Decimal("1"),
                 interval_seconds=60,
                 exchange_timezone="America/New_York",
@@ -80,7 +100,9 @@ class ModelContractTests(unittest.TestCase):
         provenance = BacktestProvenance(
             strategy_bundle_hash="a" * 64,
             dataset=dataset,
+            configuration_id="config.test",
             configuration_version="cfg-v1",
+            configuration_hash="b" * 64,
             seed=7,
             engine_version="engine-v1",
             starts_at="2026-01-02T14:30:00Z",
@@ -89,8 +111,14 @@ class ModelContractTests(unittest.TestCase):
         self.assertEqual(provenance.fingerprint(), provenance.fingerprint())
         self.assertEqual(
             provenance.fingerprint(),
-            "c48da6631f89a359ce7bb209530240f24519e171d8e07bdfe9e135633ae21f03",
+            "6c85e1e5453bcb9fedfe95787a14c73bdfbf5b51b35d058821098c00e8a084a3",
         )
+        self.assertNotEqual(
+            provenance.fingerprint(),
+            replace(provenance, configuration_hash="c" * 64).fingerprint(),
+        )
+        with self.assertRaises(ValueError):
+            replace(provenance, configuration_hash="A" * 64)
 
 
 if __name__ == "__main__":
