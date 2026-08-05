@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/order-intent.schema.json",
+  "title": "Order Intent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "intent_id", "account_id", "strategy_id", "instrument_id", "correlation_id", "side",
+    "quantity", "order_type", "limit_price", "time_in_force", "rationale", "created_at",
+    "strategy_version", "configuration_version", "environment"
+  ],
+  "properties": {
+    "intent_id": { "$ref": "#/$defs/id" },
+    "account_id": { "$ref": "#/$defs/id" },
+    "strategy_id": { "$ref": "#/$defs/id" },
+    "instrument_id": { "$ref": "#/$defs/id" },
+    "correlation_id": { "$ref": "#/$defs/id" },
+    "side": { "enum": ["BUY", "SELL"] },
+    "quantity": { "$ref": "#/$defs/positiveDecimal" },
+    "order_type": { "enum": ["MARKET", "LIMIT"] },
+    "limit_price": { "anyOf": [{ "$ref": "#/$defs/positiveDecimal" }, { "type": "null" }] },
+    "time_in_force": { "enum": ["DAY", "GTC"] },
+    "rationale": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "strategy_version": { "type": "string", "minLength": 1 },
+    "configuration_version": { "type": "string", "minLength": 1 },
+    "environment": { "enum": ["SIMULATION", "PAPER", "LIVE"] }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "positiveDecimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,8})?$" }
+  }
+}

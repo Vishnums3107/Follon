@@ -1,0 +1,14 @@
+{
+  "name": "@follon/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-only desktop shell for the Follon first vertical slice",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "5.8.3"
+  }
+}

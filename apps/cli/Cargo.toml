@@ -1,0 +1,26 @@
+[package]
+name = "follon-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+follon-backtest = { path = "../../core/backtest" }
+follon-control-plane = { path = "../../core/control-plane" }
+follon-domain = { path = "../../core/domain" }
+follon-instrument = { path = "../../core/instrument" }
+follon-market-data = { path = "../../core/market-data" }
+sha2 = "0.10.9"
+
+[[bin]]
+name = "follon-replay"
+path = "src/main.rs"
+
+[[bin]]
+name = "follon-backtest"
+path = "src/backtest.rs"
+
+[lints]
+workspace = true

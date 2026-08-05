@@ -1,0 +1,11 @@
+.git
+target
+node_modules
+**/node_modules
+dist
+var
+data
+secrets
+.env
+infra/.env
+Solo Trading Operating System Master Plan.pdf

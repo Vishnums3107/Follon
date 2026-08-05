@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/risk-decision.schema.json",
+  "title": "Risk Decision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_id", "intent_id", "approved", "reason_codes", "policy_version",
+    "decided_at", "correlation_id", "actor", "evaluated_limits", "source"
+  ],
+  "properties": {
+    "decision_id": { "$ref": "#/$defs/id" },
+    "intent_id": { "$ref": "#/$defs/id" },
+    "approved": { "type": "boolean" },
+    "reason_codes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "decided_at": { "type": "string", "format": "date-time" },
+    "correlation_id": { "$ref": "#/$defs/id" },
+    "actor": { "type": "string", "minLength": 1 },
+    "evaluated_limits": { "type": "string", "minLength": 1 },
+    "source": { "const": "risk" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 }
+  }
+}
