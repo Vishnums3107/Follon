@@ -18,8 +18,25 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/dependency-review-action@v4
-        if: github.event_name == 'pull_request'
+      # The initial repository commit contains only LICENSE, so GitHub cannot
+      # build a dependency graph for this bootstrap PR. Future PRs use the
+      # native review once the first application commit is on main.
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.sha != 'af73c9e9b24219d2c9b32bb17701dc5cafc5d918'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust advisory auditor
+        run: cargo install cargo-audit --locked
+      - name: Audit Rust dependencies
+        run: cargo audit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.20.0"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Audit Node dependencies
+        run: npm audit --package-lock-only --audit-level=high
+        working-directory: apps/desktop
 
   rust:
     runs-on: ubuntu-24.04
