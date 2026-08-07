@@ -17,7 +17,7 @@ decisions in [foundation readiness](01-foundation-readiness.md).
 | Desktop evidence shell | Implemented | `apps/desktop`, projection-only WebSocket view |
 | CI, dependency review, secret scanning | Configured | `.github/workflows/ci.yml` |
 
-## Gate status
+## Months 0–5 gate status
 
 The Months 0–5 non-live research engineering exit gate passed locally on
 2026-08-05:
@@ -43,10 +43,11 @@ cargo test --workspace
 cargo run -p follon-cli --bin follon-replay -- tests/fixtures/historical-bars/spy-one-minute.csv var/follon-events.ndjson
 ```
 
-Broker connectivity, paper trading, live execution, short selling, and
-cross-currency accounting remain explicitly out of scope. Passing this gate is
-deployment evidence for the bounded historical-research product, not approval
-for capital-bearing operation.
+Live execution, short selling, and cross-currency accounting remain explicitly
+out of scope. The later PAPER-control implementation is described separately in
+[Months 6–8 status](07-months-6-8-status.md). Passing this gate is deployment
+evidence for the bounded historical-research product, not approval for
+capital-bearing operation.
 
 ## Deployment artifact status
 

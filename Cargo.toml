@@ -4,9 +4,11 @@ members = [
     "core/instrument",
     "core/market-data",
     "core/backtest",
+    "core/paper",
     "core/secrets",
     "core/control-plane",
     "apps/cli",
+    "adapters/brokers/ibkr",
 ]
 resolver = "2"
 

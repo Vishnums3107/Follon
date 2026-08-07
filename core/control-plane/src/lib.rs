@@ -981,6 +981,30 @@ impl OmsOrder {
         })
     }
 
+    /// Rebuilds a previously persisted OMS order after validating its durable identity.
+    ///
+    /// Recovery is intentionally explicit: a restart may restore an order, but
+    /// it must never invent a new client identity or silently change a state.
+    pub fn recover(
+        order_id: impl Into<String>,
+        intent: OrderIntent,
+        state: OrderState,
+    ) -> Result<Self, EngineError> {
+        intent.validate()?;
+        let order_id = order_id.into();
+        validate_canonical_id("order_id", &order_id)?;
+        if order_id != format!("order-{}", intent.intent_id) {
+            return Err(EngineError(
+                "persisted OMS order ID does not match its intent identity".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id,
+            intent,
+            state,
+        })
+    }
+
     /// Applies a legal lifecycle transition and returns the corresponding evidence.
     pub fn transition(
         &mut self,
@@ -1034,6 +1058,14 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
             | (
                 OrderState::PendingCancel,
                 OrderState::Cancelled | OrderState::Unknown
+            )
+            | (
+                OrderState::Unknown,
+                OrderState::Acknowledged
+                    | OrderState::PartiallyFilled
+                    | OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
             )
     )
 }
@@ -1129,6 +1161,33 @@ impl Portfolio {
             average_cost: Decimal::ZERO,
             realized_pnl: Decimal::ZERO,
         }
+    }
+
+    /// Restores a persisted portfolio projection after validating its invariants.
+    pub fn recover(
+        account_id: impl Into<String>,
+        instrument_id: impl Into<String>,
+        quantity: Decimal,
+        average_cost: Decimal,
+        realized_pnl: Decimal,
+    ) -> Result<Self, EngineError> {
+        let account_id = account_id.into();
+        let instrument_id = instrument_id.into();
+        validate_canonical_id("portfolio account_id", &account_id)?;
+        validate_canonical_id("portfolio instrument_id", &instrument_id)?;
+        if quantity < Decimal::ZERO
+            || average_cost < Decimal::ZERO
+            || quantity == Decimal::ZERO && average_cost != Decimal::ZERO
+        {
+            return Err(EngineError("persisted portfolio is invalid".to_owned()));
+        }
+        Ok(Self {
+            account_id,
+            instrument_id,
+            quantity,
+            average_cost,
+            realized_pnl,
+        })
     }
 
     /// Applies a fill once to the internal ledger.

@@ -1,8 +1,10 @@
 # Desktop evidence shell
 
-This first client renders a server-owned, immutable event trail and current
-simulated P&L. It deliberately contains no action that can create an order,
-approve risk, or transmit to a broker.
+This client renders a server-owned immutable event trail or the versioned
+read-only PAPER operations dashboard, including kill switches, `UNKNOWN`
+orders, reconciliation incidents, positions, and the measured 30-day gate.
+It deliberately contains no action that can create, approve, cancel, or
+transmit an order.
 
 The eventual Tauri host will provide an authenticated WebSocket endpoint at
 `/api/v1/evidence`; this TypeScript shell is kept framework-light until the
