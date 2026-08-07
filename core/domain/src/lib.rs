@@ -6,6 +6,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
 /// Fixed decimal precision used by quantities and monetary values.
 pub const DECIMAL_SCALE: i128 = 100_000_000;
 
@@ -182,6 +185,22 @@ impl fmt::Display for DomainError {
 
 impl std::error::Error for DomainError {}
 
+/// Validates the canonical UTC timestamp representation used for deterministic ordering.
+///
+/// Follon deliberately accepts only second-precision `YYYY-MM-DDTHH:MM:SSZ`
+/// values at persistence and replay boundaries. This makes lexical ordering
+/// identical to temporal ordering and prevents equivalent instants from
+/// acquiring multiple hashes through offsets or fractional formatting.
+pub fn validate_utc_timestamp(name: &str, value: &str) -> Result<(), DomainError> {
+    if value.len() != 20 || !value.ends_with('Z') || OffsetDateTime::parse(value, &Rfc3339).is_err()
+    {
+        return Err(DomainError(format!(
+            "{name} must be canonical second-precision UTC"
+        )));
+    }
+    Ok(())
+}
+
 /// Side of an order intent or execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -264,9 +283,15 @@ impl Bar {
     /// Validates OHLC relationships and canonical identity before ingress.
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_canonical_id("instrument_id", &self.instrument_id)?;
-        if self.interval_seconds == 0 || self.volume < Decimal::ZERO {
+        if self.interval_seconds == 0
+            || self.open <= Decimal::ZERO
+            || self.high <= Decimal::ZERO
+            || self.low <= Decimal::ZERO
+            || self.close <= Decimal::ZERO
+            || self.volume < Decimal::ZERO
+        {
             return Err(DomainError(
-                "bar interval and volume must be positive".to_owned(),
+                "bar prices and interval must be positive and volume cannot be negative".to_owned(),
             ));
         }
         if self.high < self.low
@@ -331,6 +356,7 @@ impl OrderIntent {
         ] {
             validate_canonical_id(name, value)?;
         }
+        validate_utc_timestamp("intent created_at", &self.created_at)?;
         if self.quantity <= Decimal::ZERO || self.rationale.is_empty() || self.created_at.is_empty()
         {
             return Err(DomainError(
@@ -617,6 +643,8 @@ impl EventEnvelope {
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_canonical_id("event_id", &self.event_id)?;
         validate_canonical_id("correlation_id", &self.correlation_id)?;
+        validate_utc_timestamp("event_time", &self.event_time)?;
+        validate_utc_timestamp("receive_time", &self.receive_time)?;
         if self.event_type != self.payload.event_type()
             || self.schema_version == 0
             || self.event_time.is_empty()
@@ -720,6 +748,24 @@ mod tests {
         assert!(validate_canonical_id("instrument_id", "inst.us_equity.spy").is_ok());
         assert!(validate_canonical_id("instrument_id", "SPY").is_err());
         assert!(validate_canonical_id("instrument_id", "inst spy").is_err());
+    }
+
+    #[test]
+    fn timestamps_and_bar_prices_are_canonical_at_ingress() {
+        assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00Z").is_ok());
+        assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00.1Z").is_err());
+        assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00+00:00").is_err());
+        let invalid = Bar {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            open: Decimal::ZERO,
+            high: Decimal::ZERO,
+            low: Decimal::ZERO,
+            close: Decimal::ZERO,
+            volume: Decimal::ZERO,
+            interval_seconds: 60,
+            exchange_timezone: "America/New_York".to_owned(),
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

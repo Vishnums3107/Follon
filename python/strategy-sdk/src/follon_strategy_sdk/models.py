@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+import re
+
+
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 
 def _canonical_id(name: str, value: str) -> str:
@@ -19,6 +24,16 @@ def _decimal(name: str, value: Decimal, *, positive: bool = False) -> Decimal:
     exponent = value.as_tuple().exponent
     if exponent < -8:
         raise ValueError(f"{name} supports at most eight fractional digits")
+    return value
+
+
+def _utc(name: str, value: str) -> str:
+    if not isinstance(value, str) or _UTC_TIMESTAMP.fullmatch(value) is None:
+        raise ValueError(f"{name} must be canonical second-precision UTC")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise ValueError(f"{name} must be canonical second-precision UTC") from error
     return value
 
 
@@ -58,8 +73,9 @@ class Bar:
 
     def __post_init__(self) -> None:
         _canonical_id("instrument_id", self.instrument_id)
-        for name in ("open", "high", "low", "close", "volume"):
-            _decimal(name, getattr(self, name))
+        for name in ("open", "high", "low", "close"):
+            _decimal(name, getattr(self, name), positive=True)
+        _decimal("volume", self.volume)
         if self.interval_seconds <= 0 or self.volume < 0:
             raise ValueError("bar interval must be positive and volume cannot be negative")
         if not self.low <= self.open <= self.high or not self.low <= self.close <= self.high:
@@ -82,8 +98,9 @@ class StrategyContext:
     def __post_init__(self) -> None:
         _canonical_id("account_id", self.account_id)
         _canonical_id("strategy_id", self.strategy_id)
-        if not self.strategy_version or not self.configuration_version or not self.replay_time:
+        if not self.strategy_version or not self.configuration_version:
             raise ValueError("strategy and replay versions/timestamp are required")
+        _utc("replay_time", self.replay_time)
         if self.environment not in {"SIMULATION", "PAPER", "LIVE"}:
             raise ValueError("unsupported environment")
 
@@ -116,8 +133,9 @@ class OrderIntent:
             _decimal("limit_price", self.limit_price, positive=True)
         if (self.order_type is OrderType.LIMIT) != (self.limit_price is not None):
             raise ValueError("limit_price must be present only for a limit order")
-        if not self.rationale or not self.created_at or not self.strategy_version or not self.configuration_version:
+        if not self.rationale or not self.strategy_version or not self.configuration_version:
             raise ValueError("intent rationale, timestamp, and versions are required")
+        _utc("created_at", self.created_at)
         if self.environment not in {"SIMULATION", "PAPER", "LIVE"}:
             raise ValueError("unsupported environment")
 

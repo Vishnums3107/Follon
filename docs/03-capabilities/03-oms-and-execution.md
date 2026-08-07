@@ -4,7 +4,20 @@
 
 The order-management system owns client IDs, broker IDs, the lifecycle state machine, parent-child relationships, cancels/replaces, partial fills, rejections, time-in-force, duplicate-event handling, broker reconnection, restart recovery, and end-of-day reconciliation.
 
-## Initial execution methods
+## Implemented PAPER execution boundary
+
+- A versioned `PAPER` account and risk policy are validated before any OMS
+  state exists.
+- The OMS records `PENDING_SUBMIT` durably before adapter submission, uses its
+  generated order ID as the client idempotency key, and enters `UNKNOWN` on an
+  ambiguous submit or cancel.
+- Fresh instrument-matched market data is required at risk time. Working buy
+  orders reserve cash, preventing a second approval from overcommitting it.
+- The local IBKR paper model and the gateway adapter contract accept only the
+  PAPER environment. The gateway configuration is restricted to loopback TWS
+  paper port 7497 or Gateway paper port 4002.
+
+## Planned execution methods
 
 - Immediate market and limit order submission.
 - Passive limit order.

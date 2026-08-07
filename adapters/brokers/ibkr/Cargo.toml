@@ -1,5 +1,5 @@
 [package]
-name = "follon-domain"
+name = "follon-ibkr-paper-adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,8 +7,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-time = { version = "0.3.44", features = ["parsing"] }
+follon-paper = { path = "../../../core/paper" }
+follon-domain = { path = "../../../core/domain" }
 
 [lib]
 path = "src/lib.rs"
 
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 //! This crate owns the first vertical slice only. It has no broker adapter,
 //! wall clock, database driver, or strategy-runtime dependency.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -11,9 +11,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 
 use follon_domain::{
-    validate_canonical_id, AuditTrail, Bar, Decimal, DecimalError, DomainError, EventEnvelope,
-    EventPayload, Fill, OrderIntent, OrderState, OrderStateChange, OrderType, PnlSnapshot,
-    PositionSnapshot, RiskDecision, Side, TimeInForce,
+    validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar, Decimal, DecimalError,
+    DomainError, EventEnvelope, EventPayload, Fill, OrderIntent, OrderState, OrderStateChange,
+    OrderType, PnlSnapshot, PositionSnapshot, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{InstrumentRegistry, TradingCalendar};
 
@@ -55,10 +55,10 @@ pub struct ReplayClock {
 
 impl ReplayClock {
     /// Starts the clock at a caller-provided UTC timestamp.
-    pub fn new(initial_time: impl Into<String>) -> Self {
-        Self {
-            now: initial_time.into(),
-        }
+    pub fn new(initial_time: impl Into<String>) -> Result<Self, EngineError> {
+        let now = initial_time.into();
+        validate_utc_timestamp("replay clock initial time", &now)?;
+        Ok(Self { now })
     }
 
     /// Returns the current logical timestamp.
@@ -69,10 +69,9 @@ impl ReplayClock {
     /// Advances time explicitly. Production replay parsing will enforce UTC.
     pub fn advance_to(&mut self, time: impl Into<String>) -> Result<(), EngineError> {
         let time = time.into();
-        if time.is_empty() {
-            return Err(EngineError(
-                "replay clock cannot advance to an empty time".to_owned(),
-            ));
+        validate_utc_timestamp("replay clock time", &time)?;
+        if time < self.now {
+            return Err(EngineError("replay clock cannot move backwards".to_owned()));
         }
         self.now = time;
         Ok(())
@@ -125,15 +124,25 @@ impl FileEventStore {
         let path = path.as_ref();
         let mut event_ids = HashSet::new();
         if path.exists() {
-            for line in fs::read_to_string(path)?
+            for (index, line) in fs::read_to_string(path)?
                 .lines()
                 .filter(|line| !line.is_empty())
+                .enumerate()
             {
-                let event_id = extract_event_id(line).ok_or_else(|| {
-                    EngineError(
-                        "existing event log contains a malformed canonical event".to_owned(),
-                    )
-                })?;
+                let record = parse_canonical_event(line, index + 1)?;
+                let object = record.as_object().expect("validated event is an object");
+                let event_id = json_required_string(object, "event_id", index + 1)?;
+                if let Some(causation_id) = object
+                    .get("causation_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if !event_ids.contains(causation_id) {
+                        return Err(EngineError(format!(
+                            "event line {} references a causation ID that has not been persisted",
+                            index + 1
+                        )));
+                    }
+                }
                 if !event_ids.insert(event_id.to_owned()) {
                     return Err(EngineError(
                         "existing event log contains a duplicate event ID".to_owned(),
@@ -205,14 +214,19 @@ pub fn import_historical_bars(csv: &str) -> Result<Vec<HistoricalBar>, EngineErr
         ));
     }
     let mut bars = Vec::new();
+    let mut identities = BTreeSet::new();
+    let mut previous_key: Option<(String, String)> = None;
     for (index, line) in lines.enumerate() {
         let fields: Vec<_> = line.split(',').map(str::trim).collect();
-        if fields.len() != 9 || !fields[0].ends_with('Z') {
+        if fields.len() != 9 {
             return Err(EngineError(format!(
                 "invalid historical-bar row {}",
                 index + 2
             )));
         }
+        validate_utc_timestamp("historical bar event_time", fields[0]).map_err(|error| {
+            EngineError(format!("invalid historical-bar row {}: {error}", index + 2))
+        })?;
         let decimal = |field: usize| -> Result<Decimal, EngineError> {
             Decimal::from_str(fields[field]).map_err(|error| {
                 EngineError(format!("invalid decimal on row {}: {}", index + 2, error))
@@ -232,6 +246,23 @@ pub fn import_historical_bars(csv: &str) -> Result<Vec<HistoricalBar>, EngineErr
             exchange_timezone: fields[8].to_owned(),
         };
         bar.validate()?;
+        let key = (fields[0].to_owned(), bar.instrument_id.clone());
+        if !identities.insert(key.clone()) {
+            return Err(EngineError(format!(
+                "duplicate historical bar on row {}",
+                index + 2
+            )));
+        }
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| key < *previous)
+        {
+            return Err(EngineError(format!(
+                "historical-bar rows are not in canonical event-time/instrument order at row {}",
+                index + 2
+            )));
+        }
+        previous_key = Some(key);
         bars.push(HistoricalBar {
             event_time: fields[0].to_owned(),
             bar,
@@ -256,12 +287,11 @@ pub fn load_persisted_market_bars(
     let contents = fs::read_to_string(path)?;
     let mut event_ids = HashSet::new();
     let mut bars = Vec::new();
-    let mut previous_event_time: Option<String> = None;
+    let mut previous_market_key: Option<(String, String)> = None;
+    let mut bar_identities = BTreeSet::new();
 
     for (index, line) in contents.lines().filter(|line| !line.is_empty()).enumerate() {
-        let record: serde_json::Value = serde_json::from_str(line).map_err(|error| {
-            EngineError(format!("invalid JSON event on line {}: {error}", index + 1))
-        })?;
+        let record = parse_canonical_event(line, index + 1)?;
         let object = record
             .as_object()
             .ok_or_else(|| EngineError(format!("event line {} is not an object", index + 1)))?;
@@ -276,16 +306,6 @@ pub fn load_persisted_market_bars(
             continue;
         }
         let event_time = json_required_string(object, "event_time", index + 1)?.to_owned();
-        if !event_time.ends_with('Z')
-            || previous_event_time
-                .as_deref()
-                .is_some_and(|previous| event_time.as_str() < previous)
-        {
-            return Err(EngineError(format!(
-                "market event line {} has an invalid or out-of-order UTC event time",
-                index + 1
-            )));
-        }
         let payload = object
             .get("payload")
             .and_then(serde_json::Value::as_object)
@@ -325,7 +345,18 @@ pub fn load_persisted_market_bars(
                 .to_owned(),
         };
         bar.validate()?;
-        previous_event_time = Some(event_time.clone());
+        let key = (event_time.clone(), bar.instrument_id.clone());
+        if !bar_identities.insert(key.clone())
+            || previous_market_key
+                .as_ref()
+                .is_some_and(|previous| key < *previous)
+        {
+            return Err(EngineError(format!(
+                "market event line {} is duplicate or out of canonical order",
+                index + 1
+            )));
+        }
+        previous_market_key = Some(key);
         bars.push(HistoricalBar { event_time, bar });
     }
     if bars.is_empty() {
@@ -348,12 +379,66 @@ fn json_required_string<'a>(
         .ok_or_else(|| EngineError(format!("event line {line} has no {field}")))
 }
 
-fn extract_event_id(line: &str) -> Option<&str> {
-    let marker = "\"event_id\":\"";
-    let start = line.find(marker)? + marker.len();
-    let remainder = &line[start..];
-    let end = remainder.find('"')?;
-    Some(&remainder[..end])
+fn parse_canonical_event(line: &str, line_number: usize) -> Result<serde_json::Value, EngineError> {
+    let record: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+        EngineError(format!("invalid JSON event on line {line_number}: {error}"))
+    })?;
+    if serde_json::to_string(&record).map_err(|error| EngineError(error.to_string()))? != line {
+        return Err(EngineError(format!(
+            "event line {line_number} is not canonical JSON"
+        )));
+    }
+    let object = record
+        .as_object()
+        .ok_or_else(|| EngineError(format!("event line {line_number} is not an object")))?;
+    let event_id = json_required_string(object, "event_id", line_number)?;
+    let correlation_id = json_required_string(object, "correlation_id", line_number)?;
+    validate_canonical_id("event_id", event_id)?;
+    validate_canonical_id("correlation_id", correlation_id)?;
+    for field in [
+        "event_type",
+        "actor",
+        "source",
+        "software_version",
+        "configuration_version",
+    ] {
+        json_required_string(object, field, line_number)?;
+    }
+    validate_utc_timestamp(
+        "persisted event_time",
+        json_required_string(object, "event_time", line_number)?,
+    )?;
+    validate_utc_timestamp(
+        "persisted receive_time",
+        json_required_string(object, "receive_time", line_number)?,
+    )?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || !object
+            .get("payload")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(EngineError(format!(
+            "event line {line_number} has an invalid schema or payload"
+        )));
+    }
+    for field in ["account_id", "strategy_id", "instrument_id", "causation_id"] {
+        if let Some(value) = object.get(field) {
+            if !value.is_null() {
+                let identifier = value.as_str().ok_or_else(|| {
+                    EngineError(format!("event line {line_number} has invalid {field}"))
+                })?;
+                validate_canonical_id(field, identifier)?;
+            }
+        } else {
+            return Err(EngineError(format!(
+                "event line {line_number} has no {field}"
+            )));
+        }
+    }
+    Ok(record)
 }
 
 impl EventSink for FileEventStore {
@@ -368,6 +453,7 @@ impl EventSink for FileEventStore {
         self.file.write_all(event.canonical_json().as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.flush()?;
+        self.file.sync_data()?;
         Ok(())
     }
 }
@@ -470,6 +556,17 @@ impl ProcessStrategyWorker {
         let object = frame.as_object().ok_or_else(|| {
             EngineError("strategy worker ready frame is not an object".to_owned())
         })?;
+        require_exact_json_fields(
+            object,
+            &[
+                "bundle_hash",
+                "protocol_version",
+                "strategy_id",
+                "strategy_version",
+                "type",
+            ],
+            "strategy worker ready frame",
+        )?;
         if json_value_string(object, "type")? != "ready"
             || json_value_u64(object, "protocol_version")? != 1
             || json_value_string(object, "bundle_hash")? != self.identity.strategy_bundle_hash
@@ -542,31 +639,54 @@ impl ProcessStrategyWorker {
             ));
         }
         match json_value_string(object, "type")? {
-            "strategy_output" => match object.get("intent") {
-                Some(serde_json::Value::Null) => Ok(None),
-                Some(serde_json::Value::Object(intent)) => {
-                    let intent = parse_worker_intent(intent)?;
-                    if intent.account_id != self.identity.account_id
-                        || intent.strategy_id != self.identity.strategy_id
-                        || intent.strategy_version != self.identity.strategy_version
-                        || intent.configuration_version != self.identity.configuration_version
-                        || intent.environment != self.identity.environment
-                    {
-                        return Err(EngineError(
-                            "worker intent does not match its immutable execution context"
-                                .to_owned(),
-                        ));
+            "strategy_output" => {
+                require_exact_json_fields(
+                    object,
+                    &["intent", "protocol_version", "type"],
+                    "strategy worker output frame",
+                )?;
+                match object.get("intent") {
+                    Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::Object(intent)) => {
+                        let intent = parse_worker_intent(intent)?;
+                        if intent.account_id != self.identity.account_id
+                            || intent.strategy_id != self.identity.strategy_id
+                            || intent.strategy_version != self.identity.strategy_version
+                            || intent.configuration_version != self.identity.configuration_version
+                            || intent.environment != self.identity.environment
+                        {
+                            return Err(EngineError(
+                                "worker intent does not match its immutable execution context"
+                                    .to_owned(),
+                            ));
+                        }
+                        Ok(Some(intent))
                     }
-                    Ok(Some(intent))
+                    _ => Err(EngineError(
+                        "strategy worker output has no nullable intent object".to_owned(),
+                    )),
                 }
-                _ => Err(EngineError(
-                    "strategy worker output has no nullable intent object".to_owned(),
-                )),
-            },
-            "error" => Err(EngineError(format!(
-                "strategy worker rejected the callback: {}",
-                json_value_string(object, "code")?
-            ))),
+            }
+            "error" => {
+                let has_valid_fields = object.keys().all(|field| {
+                    matches!(
+                        field.as_str(),
+                        "code" | "message" | "protocol_version" | "type"
+                    )
+                }) && matches!(object.len(), 3 | 4);
+                if !has_valid_fields {
+                    return Err(EngineError(
+                        "strategy worker error frame has missing or unknown fields".to_owned(),
+                    ));
+                }
+                if object.contains_key("message") {
+                    json_value_string(object, "message")?;
+                }
+                Err(EngineError(format!(
+                    "strategy worker rejected the callback: {}",
+                    json_value_string(object, "code")?
+                )))
+            }
             _ => Err(EngineError(
                 "strategy worker returned an unexpected frame type".to_owned(),
             )),
@@ -611,9 +731,43 @@ fn json_value_u64(
         .ok_or_else(|| EngineError(format!("strategy worker has no unsigned {field}")))
 }
 
+fn require_exact_json_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    context: &str,
+) -> Result<(), EngineError> {
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err(EngineError(format!(
+            "{context} has missing or unknown fields"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_worker_intent(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<OrderIntent, EngineError> {
+    require_exact_json_fields(
+        object,
+        &[
+            "account_id",
+            "configuration_version",
+            "correlation_id",
+            "created_at",
+            "environment",
+            "instrument_id",
+            "intent_id",
+            "limit_price",
+            "order_type",
+            "quantity",
+            "rationale",
+            "side",
+            "strategy_id",
+            "strategy_version",
+            "time_in_force",
+        ],
+        "strategy worker intent",
+    )?;
     let side = match json_value_string(object, "side")? {
         "BUY" => Side::Buy,
         "SELL" => Side::Sell,
@@ -668,7 +822,10 @@ fn parse_worker_intent(
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A deterministic example strategy used by the first replay test.
@@ -741,6 +898,17 @@ pub struct RiskPolicy {
 }
 
 impl RiskPolicy {
+    /// Validates policy identity and positive deterministic limits at engine construction.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.version.is_empty()
+            || self.max_quantity <= Decimal::ZERO
+            || self.max_notional <= Decimal::ZERO
+        {
+            return Err(EngineError("invalid deterministic risk policy".to_owned()));
+        }
+        Ok(())
+    }
+
     /// Evaluates every executable request before an order exists.
     pub fn evaluate(
         &self,
@@ -813,6 +981,30 @@ impl OmsOrder {
         })
     }
 
+    /// Rebuilds a previously persisted OMS order after validating its durable identity.
+    ///
+    /// Recovery is intentionally explicit: a restart may restore an order, but
+    /// it must never invent a new client identity or silently change a state.
+    pub fn recover(
+        order_id: impl Into<String>,
+        intent: OrderIntent,
+        state: OrderState,
+    ) -> Result<Self, EngineError> {
+        intent.validate()?;
+        let order_id = order_id.into();
+        validate_canonical_id("order_id", &order_id)?;
+        if order_id != format!("order-{}", intent.intent_id) {
+            return Err(EngineError(
+                "persisted OMS order ID does not match its intent identity".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id,
+            intent,
+            state,
+        })
+    }
+
     /// Applies a legal lifecycle transition and returns the corresponding evidence.
     pub fn transition(
         &mut self,
@@ -867,6 +1059,14 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
                 OrderState::PendingCancel,
                 OrderState::Cancelled | OrderState::Unknown
             )
+            | (
+                OrderState::Unknown,
+                OrderState::Acknowledged
+                    | OrderState::PartiallyFilled
+                    | OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+            )
     )
 }
 
@@ -880,6 +1080,20 @@ pub struct DeterministicFillModel {
 }
 
 impl DeterministicFillModel {
+    /// Validates fees and slippage before a simulation begins.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        let ten_thousand = Decimal::from_integer(10_000)?;
+        if self.slippage_bps < Decimal::ZERO
+            || self.slippage_bps >= ten_thousand
+            || self.flat_fee < Decimal::ZERO
+        {
+            return Err(EngineError(
+                "fill slippage must be in [0, 10000) bps and fees cannot be negative".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Produces a fill if the current bar can satisfy the order model.
     pub fn fill(
         &self,
@@ -909,6 +1123,11 @@ impl DeterministicFillModel {
             Side::Buy => base_price.checked_add(adjustment)?,
             Side::Sell => base_price.checked_sub(adjustment)?,
         };
+        if price <= Decimal::ZERO {
+            return Err(EngineError(
+                "deterministic fill model produced a non-positive price".to_owned(),
+            ));
+        }
         Ok(Some(Fill {
             execution_id: format!("exec-{}", order.intent.intent_id),
             order_id: order.order_id.clone(),
@@ -942,6 +1161,33 @@ impl Portfolio {
             average_cost: Decimal::ZERO,
             realized_pnl: Decimal::ZERO,
         }
+    }
+
+    /// Restores a persisted portfolio projection after validating its invariants.
+    pub fn recover(
+        account_id: impl Into<String>,
+        instrument_id: impl Into<String>,
+        quantity: Decimal,
+        average_cost: Decimal,
+        realized_pnl: Decimal,
+    ) -> Result<Self, EngineError> {
+        let account_id = account_id.into();
+        let instrument_id = instrument_id.into();
+        validate_canonical_id("portfolio account_id", &account_id)?;
+        validate_canonical_id("portfolio instrument_id", &instrument_id)?;
+        if quantity < Decimal::ZERO
+            || average_cost < Decimal::ZERO
+            || quantity == Decimal::ZERO && average_cost != Decimal::ZERO
+        {
+            return Err(EngineError("persisted portfolio is invalid".to_owned()));
+        }
+        Ok(Self {
+            account_id,
+            instrument_id,
+            quantity,
+            average_cost,
+            realized_pnl,
+        })
     }
 
     /// Applies a fill once to the internal ledger.
@@ -1035,6 +1281,7 @@ pub struct ReplayEngine {
     sequence: u64,
     policy: RiskPolicy,
     fill_model: DeterministicFillModel,
+    portfolios: BTreeMap<(String, String), Portfolio>,
 }
 
 impl ReplayEngine {
@@ -1045,15 +1292,25 @@ impl ReplayEngine {
         configuration_version: impl Into<String>,
         policy: RiskPolicy,
         fill_model: DeterministicFillModel,
-    ) -> Self {
-        Self {
-            clock: ReplayClock::new(initial_time),
-            software_version: software_version.into(),
-            configuration_version: configuration_version.into(),
+    ) -> Result<Self, EngineError> {
+        let software_version = software_version.into();
+        let configuration_version = configuration_version.into();
+        if software_version.is_empty() || configuration_version.is_empty() {
+            return Err(EngineError(
+                "engine and configuration versions are required".to_owned(),
+            ));
+        }
+        policy.validate()?;
+        fill_model.validate()?;
+        Ok(Self {
+            clock: ReplayClock::new(initial_time)?,
+            software_version,
+            configuration_version,
             sequence: 0,
             policy,
             fill_model,
-        }
+            portfolios: BTreeMap::new(),
+        })
     }
 
     /// Processes one historical bar through strategy, risk, OMS, simulation, and portfolio.
@@ -1207,9 +1464,17 @@ impl ReplayEngine {
         let fill_event_id = fill_event.event_id.clone();
         events.push(fill_event);
 
-        let mut portfolio = Portfolio::new(account_id, &intent.instrument_id);
-        portfolio.apply_fill(&fill)?;
-        let position = portfolio.position_snapshot();
+        let (position, pnl) = {
+            let portfolio = self
+                .portfolios
+                .entry((account_id.to_owned(), intent.instrument_id.clone()))
+                .or_insert_with(|| Portfolio::new(account_id, &intent.instrument_id));
+            portfolio.apply_fill(&fill)?;
+            (
+                portfolio.position_snapshot(),
+                portfolio.pnl_snapshot(bar.close)?,
+            )
+        };
         let current_time = self.clock.now().to_owned();
         let position_event = self.emit(
             sink,
@@ -1225,7 +1490,6 @@ impl ReplayEngine {
         )?;
         let position_event_id = position_event.event_id.clone();
         events.push(position_event);
-        let pnl = portfolio.pnl_snapshot(bar.close)?;
         let current_time = self.clock.now().to_owned();
         let pnl_event = self.emit(
             sink,
@@ -1399,6 +1663,7 @@ mod tests {
                 flat_fee: Decimal::from_str("0.10").unwrap(),
             },
         )
+        .unwrap()
     }
 
     fn strategy() -> BuyOnceStrategy {
@@ -1616,5 +1881,120 @@ mod tests {
         assert!(order
             .transition(OrderState::Filled, "skip submission")
             .is_err());
+    }
+
+    #[test]
+    fn replay_clock_rejects_noncanonical_and_backward_time() {
+        assert!(ReplayClock::new("2026-01-02T14:30:00+00:00").is_err());
+        let mut clock = ReplayClock::new("2026-01-02T14:30:00Z").unwrap();
+        assert!(clock.advance_to("2026-01-02T14:29:59Z").is_err());
+        assert_eq!(clock.now(), "2026-01-02T14:30:00Z");
+    }
+
+    #[test]
+    fn historical_bar_import_rejects_duplicate_and_out_of_order_rows() {
+        let header = "event_time,instrument_id,open,high,low,close,volume,interval_seconds,exchange_timezone";
+        let first = "2026-01-02T14:31:00Z,inst.us_equity.spy,100,101,99,100,10,60,America/New_York";
+        let earlier =
+            "2026-01-02T14:30:00Z,inst.us_equity.spy,100,101,99,100,10,60,America/New_York";
+        assert!(import_historical_bars(&format!("{header}\n{first}\n{first}\n")).is_err());
+        assert!(import_historical_bars(&format!("{header}\n{first}\n{earlier}\n")).is_err());
+    }
+
+    #[test]
+    fn worker_boundary_rejects_unknown_fields_and_noncanonical_hashes() {
+        let mut intent = serde_json::json!({
+            "account_id": "acct.paper.001",
+            "configuration_version": "cfg-v1",
+            "correlation_id": "corr-worker-001",
+            "created_at": "2026-01-02T14:31:00Z",
+            "environment": "SIMULATION",
+            "instrument_id": "inst.us_equity.spy",
+            "intent_id": "intent-worker-001",
+            "limit_price": null,
+            "order_type": "MARKET",
+            "quantity": "1",
+            "rationale": "worker boundary test",
+            "side": "BUY",
+            "strategy_id": "strategy-worker-001",
+            "strategy_version": "v1",
+            "time_in_force": "DAY"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(parse_worker_intent(&intent).is_ok());
+        intent.insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(parse_worker_intent(&intent).is_err());
+
+        let identity = StrategyWorkerIdentity {
+            account_id: "acct.paper.001".to_owned(),
+            strategy_id: "strategy-worker-001".to_owned(),
+            strategy_version: "v1".to_owned(),
+            configuration_version: "cfg-v1".to_owned(),
+            strategy_bundle_hash: "A".repeat(64),
+            environment: "SIMULATION".to_owned(),
+        };
+        assert!(identity.validate().is_err());
+    }
+
+    #[test]
+    fn replay_engine_accumulates_portfolio_state_across_fills() {
+        struct BuyEveryBar {
+            sequence: u32,
+        }
+
+        impl Strategy for BuyEveryBar {
+            fn on_bar(
+                &mut self,
+                bar: &Bar,
+                replay_time: &str,
+            ) -> Result<Option<OrderIntent>, EngineError> {
+                self.sequence += 1;
+                Ok(Some(OrderIntent {
+                    intent_id: format!("intent-cumulative-{:03}", self.sequence),
+                    account_id: "acct-paper-001".to_owned(),
+                    strategy_id: "strategy-cumulative-001".to_owned(),
+                    instrument_id: bar.instrument_id.clone(),
+                    correlation_id: format!("corr-cumulative-{:03}", self.sequence),
+                    side: Side::Buy,
+                    quantity: Decimal::from_integer(1)?,
+                    order_type: OrderType::Market,
+                    limit_price: None,
+                    time_in_force: TimeInForce::Day,
+                    rationale: "cumulative portfolio regression".to_owned(),
+                    created_at: replay_time.to_owned(),
+                    strategy_version: "v1".to_owned(),
+                    configuration_version: "cfg-example-1".to_owned(),
+                    environment: "SIMULATION".to_owned(),
+                }))
+            }
+        }
+
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = BuyEveryBar { sequence: 0 };
+        replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:30:00Z",
+                bar(),
+            )
+            .unwrap();
+        let second = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert_eq!(
+            second.position.unwrap().quantity,
+            Decimal::from_integer(2).unwrap()
+        );
     }
 }

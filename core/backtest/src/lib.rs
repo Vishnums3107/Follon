@@ -13,10 +13,14 @@ use follon_control_plane::{
     EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
 };
 use follon_domain::{
-    validate_canonical_id, Bar, Decimal, DecimalError, DomainError, EventPayload, Fill, Side,
+    validate_canonical_id, validate_utc_timestamp, Bar, Decimal, DecimalError, DomainError,
+    EventPayload, Fill, Side,
 };
 use follon_market_data::CorporateAction;
 use sha2::{Digest, Sha256};
+
+/// Published cross-runtime provenance fingerprint contract version.
+pub const BACKTEST_PROVENANCE_VERSION: u32 = 2;
 
 /// Versioned, content-addressed normalized dataset supplied to a backtest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +113,20 @@ impl DatasetManifest {
         }
         Ok(())
     }
+
+    /// Stable JSON representation embedded in every portable result artifact.
+    pub fn canonical_json(&self) -> String {
+        format!(
+            "{{\"content_hash\":{},\"dataset_id\":{},\"dataset_version\":{},\"ends_at\":{},\"reference_data_version\":{},\"starts_at\":{},\"universe_id\":{}}}",
+            json_string(&self.content_hash),
+            json_string(&self.dataset_id),
+            json_string(&self.dataset_version),
+            json_string(&self.ends_at),
+            json_string(&self.reference_data_version),
+            json_string(&self.starts_at),
+            json_string(&self.universe_id),
+        )
+    }
 }
 
 /// Complete immutable specification of one reproducible backtest.
@@ -118,8 +136,12 @@ pub struct BacktestSpec {
     pub strategy_bundle_hash: String,
     /// Versioned normalized input data.
     pub dataset: DatasetManifest,
+    /// Canonical configuration family identity.
+    pub configuration_id: String,
     /// Immutable configuration version.
     pub configuration_version: String,
+    /// SHA-256 of the canonical configuration document.
+    pub configuration_hash: String,
     /// Explicit deterministic seed, even when the initial fill model has no randomness.
     pub seed: u64,
     /// Backtest engine version.
@@ -134,8 +156,10 @@ impl BacktestSpec {
     /// Validates every input required for a reproducible decision artifact.
     pub fn validate(&self) -> Result<(), BacktestError> {
         self.dataset.validate()?;
+        validate_canonical_id("configuration_id", &self.configuration_id)?;
         if !is_sha256(&self.strategy_bundle_hash)
             || self.configuration_version.is_empty()
+            || !is_sha256(&self.configuration_hash)
             || self.engine_version.is_empty()
             || !is_utc(&self.starts_at)
             || !is_utc(&self.ends_at)
@@ -154,19 +178,40 @@ impl BacktestSpec {
     pub fn fingerprint(&self) -> Result<String, BacktestError> {
         self.validate()?;
         Ok(sha256(&format!(
-            "strategy={}\ndataset_id={}\ndataset_version={}\ndataset_hash={}\nreference_data={}\nuniverse={}\nconfig={}\nseed={}\nengine={}\nstarts={}\nends={}\n",
+            "provenance={}\nstrategy={}\ndataset_id={}\ndataset_version={}\ndataset_hash={}\nreference_data={}\nuniverse={}\nconfig_id={}\nconfig_version={}\nconfig_hash={}\nseed={}\nengine={}\nstarts={}\nends={}\n",
+            BACKTEST_PROVENANCE_VERSION,
             self.strategy_bundle_hash,
             self.dataset.dataset_id,
             self.dataset.dataset_version,
             self.dataset.content_hash,
             self.dataset.reference_data_version,
             self.dataset.universe_id,
+            self.configuration_id,
             self.configuration_version,
+            self.configuration_hash,
             self.seed,
             self.engine_version,
             self.starts_at,
             self.ends_at,
         )))
+    }
+
+    /// Stable, self-describing JSON representation of every declared run input.
+    pub fn canonical_json(&self) -> Result<String, BacktestError> {
+        self.validate()?;
+        Ok(format!(
+            "{{\"configuration_hash\":{},\"configuration_id\":{},\"configuration_version\":{},\"dataset\":{},\"ends_at\":{},\"engine_version\":{},\"provenance_version\":{},\"seed\":{},\"starts_at\":{},\"strategy_bundle_hash\":{}}}",
+            json_string(&self.configuration_hash),
+            json_string(&self.configuration_id),
+            json_string(&self.configuration_version),
+            self.dataset.canonical_json(),
+            json_string(&self.ends_at),
+            json_string(&self.engine_version),
+            BACKTEST_PROVENANCE_VERSION,
+            self.seed,
+            json_string(&self.starts_at),
+            json_string(&self.strategy_bundle_hash),
+        ))
     }
 }
 
@@ -545,6 +590,8 @@ impl PerformanceReport {
 /// Immutable record attached to a completed result; without it the result is exploratory only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BacktestArtifact {
+    /// Complete immutable specification needed to reconstruct this result.
+    pub specification: BacktestSpec,
     /// Fingerprint of all declared run inputs.
     pub specification_fingerprint: String,
     /// SHA-256 fingerprint of canonical output event lines in append order.
@@ -584,6 +631,7 @@ impl BacktestArtifact {
         performance: PerformanceReport,
     ) -> Result<Self, BacktestError> {
         Ok(Self {
+            specification: spec.clone(),
             specification_fingerprint: spec.fingerprint()?,
             event_output_hash: sha256(&canonical_events.join("\n")),
             report,
@@ -607,12 +655,15 @@ impl BacktestArtifact {
     /// Portable canonical JSON suitable for an immutable result artifact.
     pub fn canonical_json(&self) -> String {
         format!(
-            "{{\"accounting_entries\":{},\"artifact_schema_version\":1,\"artifact_fingerprint\":\"{}\",\"event_output_hash\":\"{}\",\"performance\":{},\"report\":{},\"specification_fingerprint\":\"{}\"}}",
+            "{{\"accounting_entries\":{},\"artifact_schema_version\":2,\"artifact_fingerprint\":\"{}\",\"event_output_hash\":\"{}\",\"performance\":{},\"report\":{},\"specification\":{},\"specification_fingerprint\":\"{}\"}}",
             accounting_entries_json(&self.accounting_entries),
             self.fingerprint(),
             self.event_output_hash,
             self.performance.canonical_json(),
             self.report.canonical_json(),
+            self.specification
+                .canonical_json()
+                .expect("validated artifact specification remains valid"),
             self.specification_fingerprint,
         )
     }
@@ -623,6 +674,7 @@ impl BacktestArtifact {
             "# Follon Backtest Report\n\n\
              - Artifact fingerprint: `{}`\n\
              - Specification fingerprint: `{}`\n\
+             - Configuration: `{}` / `{}` (`{}`)\n\
              - Event-output hash: `{}`\n\n\
              ## Performance\n\n\
              | Metric | Exact value |\n\
@@ -641,6 +693,9 @@ impl BacktestArtifact {
              | --- | ---: | ---: | ---: |\n",
             self.fingerprint(),
             self.specification_fingerprint,
+            self.specification.configuration_id,
+            self.specification.configuration_version,
+            self.specification.configuration_hash,
             self.event_output_hash,
             self.performance.starting_equity,
             self.report.currency,
@@ -760,8 +815,13 @@ impl ExperimentRecord {
     pub fn validate(&self) -> Result<(), BacktestError> {
         validate_canonical_id("experiment_id", &self.experiment_id)?;
         validate_canonical_id("run_id", &self.run_id)?;
-        for key in self.tags.keys() {
+        for (key, value) in &self.tags {
             validate_canonical_id("experiment tag", key)?;
+            if value.is_empty() || value.len() > 256 {
+                return Err(BacktestError(
+                    "experiment tag values must contain 1 to 256 characters".to_owned(),
+                ));
+            }
         }
         if !is_sha256(&self.specification_fingerprint)
             || !is_sha256(&self.event_output_hash)
@@ -797,9 +857,28 @@ impl ExperimentRecord {
     pub fn from_canonical_json(value: &str) -> Result<Self, BacktestError> {
         let frame: serde_json::Value = serde_json::from_str(value)
             .map_err(|error| BacktestError(format!("invalid experiment JSON: {error}")))?;
+        if serde_json::to_string(&frame).map_err(|error| BacktestError(error.to_string()))? != value
+        {
+            return Err(BacktestError(
+                "experiment record is not canonical JSON".to_owned(),
+            ));
+        }
         let object = frame
             .as_object()
             .ok_or_else(|| BacktestError("experiment record is not an object".to_owned()))?;
+        let expected_fields = BTreeSet::from([
+            "artifact_fingerprint",
+            "event_output_hash",
+            "experiment_id",
+            "run_id",
+            "specification_fingerprint",
+            "tags",
+        ]);
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_fields {
+            return Err(BacktestError(
+                "experiment record has missing or unknown fields".to_owned(),
+            ));
+        }
         let tags = object
             .get("tags")
             .and_then(serde_json::Value::as_object)
@@ -970,24 +1049,41 @@ impl BacktestInput {
         if self.bars.is_empty() {
             return Err(BacktestError("backtest input contains no bars".to_owned()));
         }
-        let mut previous_time = None;
+        let mut previous_key: Option<(String, String)> = None;
+        let mut bar_identities = BTreeSet::new();
+        let mut instrument_ids = BTreeSet::new();
         let mut dataset_bars = Vec::with_capacity(self.bars.len());
         for historical_bar in &self.bars {
             historical_bar.bar.validate()?;
+            let key = (
+                historical_bar.event_time.clone(),
+                historical_bar.bar.instrument_id.clone(),
+            );
             if !is_utc(&historical_bar.event_time)
-                || previous_time
-                    .as_deref()
-                    .is_some_and(|time| historical_bar.event_time.as_str() < time)
+                || !bar_identities.insert(key.clone())
+                || previous_key
+                    .as_ref()
+                    .is_some_and(|previous| key < *previous)
             {
                 return Err(BacktestError(
-                    "backtest input bars must be ordered canonical UTC".to_owned(),
+                    "backtest input bars must be unique and ordered by canonical UTC/instrument"
+                        .to_owned(),
                 ));
             }
-            previous_time = Some(historical_bar.event_time.clone());
+            previous_key = Some(key);
+            instrument_ids.insert(historical_bar.bar.instrument_id.clone());
             dataset_bars.push((
                 historical_bar.event_time.clone(),
                 historical_bar.bar.clone(),
             ));
+        }
+        for action in &self.corporate_actions {
+            if !instrument_ids.contains(action.instrument_id()) {
+                return Err(BacktestError(format!(
+                    "corporate action references an instrument outside the dataset: {}",
+                    action.instrument_id()
+                )));
+            }
         }
         let actual = DatasetManifest::from_market_data(
             &spec.dataset.dataset_id,
@@ -1212,17 +1308,20 @@ fn hash_market_data(
     actions: &[CorporateAction],
 ) -> Result<String, BacktestError> {
     let mut canonical = String::new();
-    let mut previous = None;
+    let mut previous: Option<(String, String)> = None;
+    let mut identities = BTreeSet::new();
     for (event_time, bar) in bars {
         bar.validate()?;
+        let key = (event_time.clone(), bar.instrument_id.clone());
         if !is_utc(event_time)
-            || previous
-                .as_deref()
-                .is_some_and(|time| event_time.as_str() < time)
+            || !identities.insert(key.clone())
+            || previous.as_ref().is_some_and(|value| key < *value)
         {
-            return Err(BacktestError("bars must be ordered UTC input".to_owned()));
+            return Err(BacktestError(
+                "bars must be unique and ordered by canonical UTC/instrument".to_owned(),
+            ));
         }
-        previous = Some(event_time.clone());
+        previous = Some(key);
         writeln!(
             canonical,
             "{event_time}|{}|{}|{}|{}|{}|{}|{}|{}",
@@ -1263,11 +1362,14 @@ fn sha256(value: &str) -> String {
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn is_utc(value: &str) -> bool {
-    value.len() >= 20 && value.ends_with('Z')
+    validate_utc_timestamp("timestamp", value).is_ok()
 }
 
 fn json_string(value: &str) -> String {
@@ -1337,7 +1439,9 @@ mod tests {
         let spec = BacktestSpec {
             strategy_bundle_hash: "a".repeat(64),
             dataset,
+            configuration_id: "config.test".to_owned(),
             configuration_version: "cfg-v1".to_owned(),
+            configuration_hash: "b".repeat(64),
             seed: 7,
             engine_version: "engine-v1".to_owned(),
             starts_at: "2026-01-02T14:30:00Z".to_owned(),
@@ -1345,8 +1449,17 @@ mod tests {
         };
         assert_eq!(
             spec.fingerprint().unwrap(),
-            "c48da6631f89a359ce7bb209530240f24519e171d8e07bdfe9e135633ae21f03"
+            "6c85e1e5453bcb9fedfe95787a14c73bdfbf5b51b35d058821098c00e8a084a3"
         );
+        let mut changed_configuration = spec.clone();
+        changed_configuration.configuration_hash = "c".repeat(64);
+        assert_ne!(
+            spec.fingerprint().unwrap(),
+            changed_configuration.fingerprint().unwrap()
+        );
+        let mut uppercase_hash = spec;
+        uppercase_hash.configuration_hash = "A".repeat(64);
+        assert!(uppercase_hash.validate().is_err());
     }
 
     #[test]
@@ -1456,6 +1569,7 @@ mod tests {
                 flat_fee: Decimal::from_str("0.10").unwrap(),
             },
         )
+        .unwrap()
     }
 
     fn runner_input() -> BacktestInput {
@@ -1505,7 +1619,9 @@ mod tests {
                 &input.corporate_actions,
             )
             .unwrap(),
+            configuration_id: "config.test".to_owned(),
             configuration_version: "cfg-v1".to_owned(),
+            configuration_hash: "b".repeat(64),
             seed: 7,
             engine_version: "engine-v1".to_owned(),
             starts_at: "2026-01-02T14:30:00Z".to_owned(),
@@ -1573,7 +1689,11 @@ mod tests {
             .contains("## Accounting entries"));
         let artifact_json: serde_json::Value =
             serde_json::from_str(&first.artifact.canonical_json()).unwrap();
-        assert_eq!(artifact_json["artifact_schema_version"], 1);
+        assert_eq!(artifact_json["artifact_schema_version"], 2);
+        assert_eq!(
+            artifact_json["specification"]["configuration_hash"],
+            "b".repeat(64)
+        );
         assert_eq!(artifact_json["performance"]["trade_count"], 1);
     }
 

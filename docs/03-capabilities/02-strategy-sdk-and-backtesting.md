@@ -17,8 +17,10 @@ It may not access a broker adapter or credentials.
 ## Local worker transport
 
 The supported Months 3â€“5 worker is a versioned, line-delimited JSON process
-protocol. It starts by announcing the SHA-256 hash of its complete declared
-Python bundle, strategy identity, and strategy version. The control plane
+protocol. It starts by announcing the SHA-256 hash of its declared Python
+bundle, installed SDK source, and Python runtime identity, plus the strategy
+identity and strategy version. Third-party dependencies must be vendored into
+the declared strategy tree. The control plane
 checks that identity against the backtest specification before it sends the
 first normalized bar. Each callback receives only immutable strategy context
 and a normalized bar, and returns either one validated intent or `null`.
@@ -36,7 +38,12 @@ The backtester uses the same strategy API and event model as production. It must
 
 ## Reproducibility record
 
-Every completed backtest records the strategy bundle hash, versioned dataset, configuration version, seed, engine version, time range, instrument universe definition, and generated artifacts. A result without this record is exploratory output, not a reproducible decision artifact.
+Every completed backtest records the strategy bundle hash, versioned and
+content-addressed dataset, exact configuration ID/version/content hash, seed,
+engine version, time range, instrument universe definition, and generated
+artifacts. The portable artifact embeds this complete specification, and a
+completion manifest binds each output file by SHA-256. A result without this
+record is exploratory output, not a reproducible decision artifact.
 
 ## Exit condition
 

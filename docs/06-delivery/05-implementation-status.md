@@ -17,16 +17,21 @@ decisions in [foundation readiness](01-foundation-readiness.md).
 | Desktop evidence shell | Implemented | `apps/desktop`, projection-only WebSocket view |
 | CI, dependency review, secret scanning | Configured | `.github/workflows/ci.yml` |
 
-## Gate status
+## Months 0–5 gate status
 
-The Months 0–2 engineering exit gate passed locally on 2026-08-05:
+The Months 0–5 non-live research engineering exit gate passed locally on
+2026-08-05:
 
 - `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
   `cargo clippy --workspace --all-targets -- -D warnings` pass.
-- `cargo test --workspace` passes all 12 Rust tests, including persisted-event replay and session enforcement.
+- `cargo test --workspace --all-targets` passes all 34 Rust tests, including
+  canonical persisted-event recovery, cumulative accounting, content-addressed
+  configuration, corporate actions, and immutable artifact publication.
 - Python contract tests, JSON-schema parsing, and TypeScript typechecking pass.
-- Two clean CLI runs against the same fixture produced byte-for-byte identical
-  persisted NDJSON event logs.
+- Two fresh end-to-end runs produced byte-for-byte identical normalized bars,
+  JSON artifacts, persisted NDJSON events, Markdown reports, completion
+  manifests, and experiment records. Repeating a completed run in place was
+  idempotent.
 - The evidence client builds to static JavaScript and validates a local NDJSON
   causal chain before rendering it.
 
@@ -38,9 +43,11 @@ cargo test --workspace
 cargo run -p follon-cli --bin follon-replay -- tests/fixtures/historical-bars/spy-one-minute.csv var/follon-events.ndjson
 ```
 
-Broker connectivity, paper trading, and live execution remain explicitly out of
-scope. The next permitted roadmap work is Months 3–5: reproducible backtesting,
-corporate-action-aware datasets, accounting, reports, and experiment metadata.
+Live execution, short selling, and cross-currency accounting remain explicitly
+out of scope. The later PAPER-control implementation is described separately in
+[Months 6–8 status](07-months-6-8-status.md). Passing this gate is deployment
+evidence for the bounded historical-research product, not approval for
+capital-bearing operation.
 
 ## Deployment artifact status
 

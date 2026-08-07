@@ -9,6 +9,32 @@ export type EvidenceEvent = Readonly<{
   payload: Record<string, unknown>;
 }>;
 
+export type PaperDashboard = Readonly<{
+  dashboard_schema_version: 1;
+  environment: "PAPER";
+  account_id: string;
+  configuration_fingerprint: string;
+  persistence_healthy: boolean;
+  internal_cash: string;
+  working_orders: number;
+  unknown_orders: number;
+  active_kill_switches: readonly string[];
+  unexplained_incidents: number;
+  last_reconciled_at: string | null;
+  last_reconciliation_clean: boolean | null;
+  clean_paper_days: number;
+  required_paper_days: 30;
+  promotion_eligible: boolean;
+  positions: readonly PaperDashboardPosition[];
+}>;
+
+export type PaperDashboardPosition = Readonly<{
+  instrument_id: string;
+  quantity: string;
+  average_cost: string;
+  realized_pnl: string;
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -36,6 +62,20 @@ export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
     throw new Error("The selected event log is empty.");
   }
   return events;
+}
+
+/** Parses a server-owned paper-operations snapshot; it never creates an action. */
+export function parsePaperDashboard(json: string): PaperDashboard {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Paper dashboard is not valid JSON.");
+  }
+  if (!isPaperDashboard(value)) {
+    throw new Error("Paper dashboard does not match the v1 read-only contract.");
+  }
+  return value;
 }
 
 const phaseByEventType: Readonly<Record<string, string>> = {
@@ -101,6 +141,78 @@ export function renderEvidence(root: HTMLElement, events: readonly EvidenceEvent
   }
 }
 
+/** Renders paper risk and reconciliation state without offering trading controls. */
+export function renderPaperDashboard(root: HTMLElement, dashboard: PaperDashboard): void {
+  root.replaceChildren();
+  const heading = document.createElement("h1");
+  heading.textContent = "Paper operations dashboard";
+  root.append(heading);
+
+  const environment = document.createElement("p");
+  environment.textContent = `Environment: ${dashboard.environment}. This screen is read-only.`;
+  root.append(environment);
+
+  const summary = document.createElement("dl");
+  const values: ReadonlyArray<readonly [string, string]> = [
+    ["Account", dashboard.account_id],
+    ["Configuration", dashboard.configuration_fingerprint],
+    ["Durable journal", dashboard.persistence_healthy ? "Healthy" : "FAILED — operations halted"],
+    ["Internal cash", dashboard.internal_cash],
+    ["Working orders", String(dashboard.working_orders)],
+    ["Unknown orders", String(dashboard.unknown_orders)],
+    ["Unexplained discrepancies", String(dashboard.unexplained_incidents)],
+    ["Last reconciliation", dashboard.last_reconciled_at ?? "Not yet reconciled"],
+    ["Last reconciliation result", dashboard.last_reconciliation_clean === null
+      ? "Not yet reconciled"
+      : dashboard.last_reconciliation_clean ? "Clean" : "Discrepancy detected"],
+    ["Paper-day gate", `${dashboard.clean_paper_days}/${dashboard.required_paper_days}`],
+    ["Promotion status", dashboard.promotion_eligible ? "Evidence gate complete" : "Evidence gate incomplete"],
+  ];
+  for (const [label, value] of values) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = value;
+    summary.append(term, detail);
+  }
+  root.append(summary);
+
+  const killSwitches = document.createElement("p");
+  killSwitches.textContent = dashboard.active_kill_switches.length === 0
+    ? "Kill switches: clear"
+    : `Kill switches: ${dashboard.active_kill_switches.join(", ")}`;
+  root.append(killSwitches);
+
+  const positionsHeading = document.createElement("h2");
+  positionsHeading.textContent = "Internal positions";
+  root.append(positionsHeading);
+  if (dashboard.positions.length === 0) {
+    const empty = document.createElement("p");
+    empty.textContent = "No internal paper positions.";
+    root.append(empty);
+    return;
+  }
+  const table = document.createElement("table");
+  const header = document.createElement("tr");
+  for (const label of ["Instrument", "Quantity", "Average cost", "Realized P&L"]) {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = label;
+    header.append(cell);
+  }
+  table.append(header);
+  for (const position of dashboard.positions) {
+    const row = document.createElement("tr");
+    for (const value of [position.instrument_id, position.quantity, position.average_cost, position.realized_pnl]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    table.append(row);
+  }
+  root.append(table);
+}
+
 function latestPortfolio(events: readonly EvidenceEvent[]): Record<string, unknown> | undefined {
   return [...events].reverse().find((event) => event.event_type === "portfolio.pnl_updated.v1")?.payload;
 }
@@ -123,4 +235,71 @@ function isEvidenceEvent(value: unknown): value is EvidenceEvent {
     typeof candidate.payload === "object" &&
     !Array.isArray(candidate.payload)
   );
+}
+
+function isPaperDashboard(value: unknown): value is PaperDashboard {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  const expected = new Set([
+    "dashboard_schema_version", "environment", "account_id", "configuration_fingerprint", "persistence_healthy", "internal_cash", "working_orders",
+    "unknown_orders", "active_kill_switches", "unexplained_incidents", "last_reconciled_at", "last_reconciliation_clean", "clean_paper_days",
+    "required_paper_days", "promotion_eligible", "positions",
+  ]);
+  if (Object.keys(candidate).length !== expected.size || Object.keys(candidate).some((key) => !expected.has(key))) {
+    return false;
+  }
+  return (
+    candidate.dashboard_schema_version === 1 &&
+    candidate.environment === "PAPER" &&
+    isCanonicalId(candidate.account_id) &&
+    typeof candidate.configuration_fingerprint === "string" && /^[a-f0-9]{64}$/.test(candidate.configuration_fingerprint) &&
+    typeof candidate.persistence_healthy === "boolean" &&
+    isDecimal(candidate.internal_cash) &&
+    isNonNegativeInteger(candidate.working_orders) &&
+    isNonNegativeInteger(candidate.unknown_orders) &&
+    Array.isArray(candidate.active_kill_switches) &&
+    candidate.active_kill_switches.every((value) => typeof value === "string" && value.length > 0) &&
+    new Set(candidate.active_kill_switches).size === candidate.active_kill_switches.length &&
+    isNonNegativeInteger(candidate.unexplained_incidents) &&
+    (candidate.last_reconciled_at === null || isUtcTimestamp(candidate.last_reconciled_at)) &&
+    (candidate.last_reconciliation_clean === null || typeof candidate.last_reconciliation_clean === "boolean") &&
+    (candidate.last_reconciled_at === null) === (candidate.last_reconciliation_clean === null) &&
+    isNonNegativeInteger(candidate.clean_paper_days) &&
+    candidate.required_paper_days === 30 &&
+    typeof candidate.promotion_eligible === "boolean" &&
+    Array.isArray(candidate.positions) &&
+    candidate.positions.every(isPaperDashboardPosition)
+  );
+}
+
+function isPaperDashboardPosition(value: unknown): value is PaperDashboardPosition {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    Object.keys(candidate).length === 4 &&
+    isCanonicalId(candidate.instrument_id) &&
+    isDecimal(candidate.quantity) &&
+    isDecimal(candidate.average_cost) &&
+    isDecimal(candidate.realized_pnl)
+  );
+}
+
+function isCanonicalId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9._-]+$/.test(value);
+}
+
+function isDecimal(value: unknown): value is string {
+  return typeof value === "string" && /^-?[0-9]+(?:\.[0-9]{1,8})?$/.test(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isUtcTimestamp(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value);
 }

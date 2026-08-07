@@ -71,6 +71,42 @@ class WorkerProtocolTests(unittest.TestCase):
         source_root = Path(__file__).parents[1] / "src" / "follon_strategy_sdk"
         self.assertEqual(strategy_bundle_hash(source_root), strategy_bundle_hash(source_root))
 
+    def test_worker_rejects_unknown_protocol_fields(self) -> None:
+        frame = {
+            "protocol_version": PROTOCOL_VERSION,
+            "type": "market_bar",
+            "unexpected": True,
+            "context": {
+                "account_id": "acct-paper-001",
+                "strategy_id": "strategy-worker-001",
+                "strategy_version": "v1",
+                "configuration_version": "cfg-v1",
+                "replay_time": "2026-01-02T14:30:00Z",
+                "environment": "SIMULATION",
+            },
+            "bar": {
+                "instrument_id": "inst.us_equity.spy",
+                "open": "100",
+                "high": "101",
+                "low": "99",
+                "close": "100",
+                "volume": "10",
+                "interval_seconds": 60,
+                "exchange_timezone": "America/New_York",
+            },
+        }
+        source = StringIO(json.dumps(frame) + "\n")
+        destination = StringIO()
+        bundle = StrategyBundle(
+            strategy_id="strategy-worker-001",
+            strategy_version="v1",
+            bundle_hash="a" * 64,
+        )
+
+        self.assertEqual(run_worker(EmitOneIntent(), bundle, source, destination), 2)
+        frames = [json.loads(line) for line in destination.getvalue().splitlines()]
+        self.assertEqual(frames[1]["code"], "INVALID_FRAME")
+
 
 if __name__ == "__main__":
     unittest.main()

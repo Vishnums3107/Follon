@@ -15,6 +15,13 @@ Use decimal or fixed-point arithmetic. Binary floating point is not permitted fo
 
 Compare internal orders, executions, positions, balances, and cash with broker records at reconnect, end of day, and scheduled checkpoints. Differences create incidents with evidence; they are never silently overwritten.
 
+The PAPER implementation compares order IDs, lifecycle state, filled quantity,
+positions (including broker-only instruments), and cash. Each difference is a
+durable incident. A human explanation is separately recorded; an unexplained
+incident blocks the 30-paper-day gate. A day can count only from a supplied,
+closed session in the versioned exchange calendar and a clean independent
+reconciliation after its close.
+
 ## Audit and incident replay
 
 From an incident ID, an operator must be able to reconstruct:

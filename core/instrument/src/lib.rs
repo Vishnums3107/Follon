@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use follon_domain::{validate_canonical_id, Decimal, DomainError};
+use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, DomainError};
 
 /// Asset classes accepted in the first release while retaining extension names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,13 +106,16 @@ impl InstrumentVersion {
     /// Validates dates sufficiently for deterministic lexical UTC comparison.
     pub fn validate(&self) -> Result<(), DomainError> {
         self.instrument.validate()?;
-        if !is_utc(&self.effective_from)
-            || self.reference_version.is_empty()
-            || self
-                .effective_to
-                .as_deref()
-                .is_some_and(|time| !is_utc(time) || time <= self.effective_from.as_str())
-        {
+        validate_utc_timestamp("instrument effective_from", &self.effective_from)?;
+        if let Some(effective_to) = &self.effective_to {
+            validate_utc_timestamp("instrument effective_to", effective_to)?;
+            if effective_to <= &self.effective_from {
+                return Err(DomainError(
+                    "instrument version has invalid effective dates".to_owned(),
+                ));
+            }
+        }
+        if self.reference_version.is_empty() {
             return Err(DomainError(
                 "instrument version has invalid effective dates".to_owned(),
             ));
@@ -189,11 +192,9 @@ pub struct TradingSession {
 impl TradingSession {
     /// Validates a session without using local machine time.
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.exchange_date.is_empty()
-            || !is_utc(&self.opens_at)
-            || !is_utc(&self.closes_at)
-            || self.opens_at >= self.closes_at
-        {
+        validate_utc_timestamp("session opens_at", &self.opens_at)?;
+        validate_utc_timestamp("session closes_at", &self.closes_at)?;
+        if self.exchange_date.len() != 10 || self.opens_at >= self.closes_at {
             return Err(DomainError("trading session is invalid".to_owned()));
         }
         Ok(())
@@ -232,6 +233,11 @@ impl StaticTradingCalendar {
     ) -> Result<Self, DomainError> {
         let calendar_id = calendar_id.into();
         validate_canonical_id("calendar_id", &calendar_id)?;
+        if sessions.is_empty() {
+            return Err(DomainError(
+                "trading calendar must contain at least one explicit session".to_owned(),
+            ));
+        }
         for session in &sessions {
             session.validate()?;
         }
@@ -259,10 +265,6 @@ impl TradingCalendar for StaticTradingCalendar {
             .iter()
             .find(|session| session.contains(utc_time))
     }
-}
-
-fn is_utc(value: &str) -> bool {
-    value.len() >= 20 && value.ends_with('Z')
 }
 
 #[cfg(test)]
@@ -321,6 +323,7 @@ mod tests {
 
     #[test]
     fn calendar_requires_explicit_regular_session() {
+        assert!(StaticTradingCalendar::new("cal.us_equities.nyse", Vec::new()).is_err());
         let calendar = StaticTradingCalendar::new(
             "cal.us_equities.nyse",
             vec![TradingSession {

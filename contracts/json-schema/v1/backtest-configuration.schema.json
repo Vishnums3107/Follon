@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/backtest-configuration.schema.json",
+  "title": "Follon Backtest Configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "configuration_id",
+    "configuration_version",
+    "engine_version",
+    "seed",
+    "starts_at",
+    "ends_at",
+    "account",
+    "dataset",
+    "strategy",
+    "risk",
+    "execution",
+    "calendar",
+    "instruments"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "configuration_id": { "$ref": "#/$defs/canonicalId" },
+    "configuration_version": { "type": "string", "minLength": 1 },
+    "engine_version": { "type": "string", "minLength": 1 },
+    "seed": { "type": "integer", "minimum": 0 },
+    "starts_at": { "$ref": "#/$defs/utc" },
+    "ends_at": { "$ref": "#/$defs/utc" },
+    "account": { "$ref": "#/$defs/account" },
+    "dataset": { "$ref": "#/$defs/dataset" },
+    "strategy": { "$ref": "#/$defs/strategy" },
+    "risk": { "$ref": "#/$defs/risk" },
+    "execution": { "$ref": "#/$defs/execution" },
+    "calendar": { "$ref": "#/$defs/calendar" },
+    "instruments": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/instrument" }
+    }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9._-]+$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$"
+    },
+    "positiveDecimal": {
+      "type": "string",
+      "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$"
+    },
+    "utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account_id", "currency", "initial_cash"],
+      "properties": {
+        "account_id": { "$ref": "#/$defs/canonicalId" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "initial_cash": { "$ref": "#/$defs/decimal" }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataset_id", "dataset_version", "reference_data_version", "universe_id"],
+      "properties": {
+        "dataset_id": { "$ref": "#/$defs/canonicalId" },
+        "dataset_version": { "type": "string", "minLength": 1 },
+        "reference_data_version": { "type": "string", "minLength": 1 },
+        "universe_id": { "$ref": "#/$defs/canonicalId" }
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy_id", "strategy_version", "builtin_entry_threshold"],
+      "properties": {
+        "strategy_id": { "$ref": "#/$defs/canonicalId" },
+        "strategy_version": { "type": "string", "minLength": 1 },
+        "builtin_entry_threshold": { "$ref": "#/$defs/positiveDecimal" }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "global_kill_switch", "max_quantity", "max_notional"],
+      "properties": {
+        "policy_version": { "type": "string", "minLength": 1 },
+        "global_kill_switch": { "type": "boolean" },
+        "max_quantity": { "$ref": "#/$defs/positiveDecimal" },
+        "max_notional": { "$ref": "#/$defs/positiveDecimal" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slippage_bps", "flat_fee"],
+      "properties": {
+        "slippage_bps": { "$ref": "#/$defs/decimal" },
+        "flat_fee": { "$ref": "#/$defs/decimal" }
+      }
+    },
+    "calendar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calendar_id", "sessions"],
+      "properties": {
+        "calendar_id": { "$ref": "#/$defs/canonicalId" },
+        "sessions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["exchange_date", "opens_at", "closes_at"],
+            "properties": {
+              "exchange_date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+              "opens_at": { "$ref": "#/$defs/utc" },
+              "closes_at": { "$ref": "#/$defs/utc" }
+            }
+          }
+        }
+      }
+    },
+    "instrument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instrument_id",
+        "symbol",
+        "exchange_symbol",
+        "asset_class",
+        "venue",
+        "currency",
+        "tick_size",
+        "lot_size",
+        "multiplier",
+        "trading_calendar_id",
+        "effective_from",
+        "reference_version"
+      ],
+      "properties": {
+        "instrument_id": { "$ref": "#/$defs/canonicalId" },
+        "symbol": { "type": "string", "minLength": 1 },
+        "exchange_symbol": { "type": "string", "minLength": 1 },
+        "asset_class": { "enum": ["EQUITY", "ETF"] },
+        "venue": { "$ref": "#/$defs/canonicalId" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "broker_ids": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        },
+        "tick_size": { "$ref": "#/$defs/positiveDecimal" },
+        "lot_size": { "$ref": "#/$defs/positiveDecimal" },
+        "multiplier": { "$ref": "#/$defs/positiveDecimal" },
+        "trading_calendar_id": { "$ref": "#/$defs/canonicalId" },
+        "effective_from": { "$ref": "#/$defs/utc" },
+        "effective_to": {
+          "oneOf": [
+            { "$ref": "#/$defs/utc" },
+            { "type": "null" }
+          ]
+        },
+        "reference_version": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
