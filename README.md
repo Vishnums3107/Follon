@@ -2,10 +2,13 @@
 
 Follon is a risk-first, multi-asset trading operating system for advanced independent traders and small professional teams. Its defining requirement is **research-to-live parity**: a strategy must behave equivalently in research, deterministic replay, simulation, paper trading, and controlled live execution.
 
-This repository is in its **non-live foundation** stage. It contains the
+This repository is in its **non-live and PAPER-only engineering** stage. It contains the
 decomposed product plan, versioned contracts, a deterministic historical replay
-slice, an isolated strategy SDK, and an evidence-only desktop shell. It has no
-broker connectivity, credentials, paper-trading adapter, or live execution.
+slice, an isolated strategy SDK, a durable PAPER OMS/control boundary, and an
+evidence-only desktop shell. It has no live-execution path, live credentials,
+or live broker endpoint. The checked-in IBKR implementation is a paper-only
+adapter contract and deterministic local model; connecting a real IBKR paper
+gateway remains subject to the documented operator gates.
 
 ## Start here
 
@@ -28,7 +31,11 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   metadata/export.
 - Python strategy contracts that can submit intents but cannot access adapters
   or credentials.
-- A TypeScript desktop evidence projection that cannot alter trading state.
+- A PAPER-only OMS with versioned risk limits, fresh-market checks, cash
+  reservation, durable evidence/restart recovery, reconciliation, kill
+  switches, reconnect handling, and deterministic broker fault injection.
+- A TypeScript desktop evidence projection that cannot alter trading state,
+  including a read-only PAPER operations dashboard.
 - JSON Schema, Protobuf, CI, dependency review, secret scanning, and an initial
   threat model.
 

@@ -101,3 +101,29 @@ dependencies must be vendored under the declared bundle root. The control plane
 verifies the worker's bundle hash, strategy identity, and version before
 accepting a callback. Any protocol error, changed hash, or context-mismatched
 intent fails the backtest before it can be treated as a decision artifact.
+
+## PAPER operations status and kill switch
+
+`follon-paper-status` opens a fail-closed PAPER-only journal, validates the
+versioned configuration, and writes an immutable read-only dashboard snapshot:
+
+```powershell
+cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-dashboard.json --config tests/fixtures/config/paper-v1.json
+```
+
+The command accepts no live environment, endpoint, or credential option. A
+local operator can persist one independent emergency control in the same
+durable journal while obtaining a refreshed dashboard:
+
+```powershell
+cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-kill-active.json --config tests/fixtures/config/paper-v1.json --activate global
+cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-kill-cleared.json --config tests/fixtures/config/paper-v1.json --deactivate global
+```
+
+Supported scopes are `global`, `account:<canonical-id>`,
+`strategy:<canonical-id>`, and `instrument:<canonical-id>`. Treat write access
+to the journal and the local operator command as a privileged production
+capability; the command is intentionally independent of broker availability.
+Because a control action changes the dashboard, it requires an unused immutable
+output path and refuses to mutate the journal if that evidence path already
+exists.

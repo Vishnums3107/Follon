@@ -1,4 +1,10 @@
-import { EvidenceEvent, parseEvidenceLog, renderEvidence } from "./evidence";
+import {
+  EvidenceEvent,
+  parseEvidenceLog,
+  parsePaperDashboard,
+  renderEvidence,
+  renderPaperDashboard,
+} from "./evidence";
 
 const root = document.querySelector<HTMLElement>("#evidence");
 if (root === null) {
@@ -19,9 +25,17 @@ fileInput.addEventListener("change", async () => {
     return;
   }
   try {
-    events = parseEvidenceLog(await file.text());
-    renderEvidence(root, events);
-    status.textContent = `Loaded ${events.length} immutable events from ${file.name}.`;
+    const contents = await file.text();
+    try {
+      const dashboard = parsePaperDashboard(contents);
+      events = [];
+      renderPaperDashboard(root, dashboard);
+      status.textContent = `Loaded read-only PAPER operations state from ${file.name}.`;
+    } catch {
+      events = parseEvidenceLog(contents);
+      renderEvidence(root, events);
+      status.textContent = `Loaded ${events.length} immutable events from ${file.name}.`;
+    }
   } catch (error) {
     status.textContent = error instanceof Error ? error.message : "Unable to load event evidence.";
     renderEvidence(root, []);
@@ -35,9 +49,16 @@ if (streamParameter !== null) {
   const stream = new WebSocket(streamParameter);
   stream.addEventListener("message", (message) => {
     try {
-      const next = parseEvidenceLog(`${String(message.data)}\n`)[0];
-      events = [...events, next];
-      renderEvidence(root, events);
+      const payload = String(message.data);
+      try {
+        const dashboard = parsePaperDashboard(payload);
+        events = [];
+        renderPaperDashboard(root, dashboard);
+      } catch {
+        const next = parseEvidenceLog(`${payload}\n`)[0];
+        events = [...events, next];
+        renderEvidence(root, events);
+      }
     } catch {
       status.textContent = "Received an invalid evidence event from the configured stream.";
     }

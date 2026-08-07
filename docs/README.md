@@ -28,6 +28,8 @@ Use the [source map](00-source-map.md) to locate every section of the original p
 9. [Implementation status](06-delivery/05-implementation-status.md)
 10. [Months 3–5 status](06-delivery/06-months-3-5-status.md)
 
+11. [Months 6–8 status](06-delivery/07-months-6-8-status.md)
+
 ## Document conventions
 
 - Use UTC for stored event times; retain exchange-local context where relevant.

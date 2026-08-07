@@ -2,12 +2,13 @@
 
 ## Supported deployment boundary
 
-This release is deployable as a **non-live research and simulation service**.
+The historical subsystem is deployable as a **non-live research and simulation service**.
 It imports immutable historical data, runs isolated strategy workers, writes
 reproducible artifacts, and maintains exact local accounting. It deliberately
-has no broker adapter, credential path, paper-trading control, or live-trading
-flag. Those operations remain prohibited until their separate roadmap gates
-are complete.
+has no live broker adapter, credential path, or live-trading flag. Its separate
+PAPER-only control boundary is described in
+[Months 6–8 status](../06-delivery/07-months-6-8-status.md); it is not a live
+trading authorization.
 
 ## Required deployment controls
 
