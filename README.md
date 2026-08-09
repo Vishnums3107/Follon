@@ -2,13 +2,16 @@
 
 Follon is a risk-first, multi-asset trading operating system for advanced independent traders and small professional teams. Its defining requirement is **research-to-live parity**: a strategy must behave equivalently in research, deterministic replay, simulation, paper trading, and controlled live execution.
 
-This repository is in its **non-live and PAPER-only engineering** stage. It contains the
+This repository is in its **non-connected controlled-live engineering** stage. It contains the
 decomposed product plan, versioned contracts, a deterministic historical replay
 slice, an isolated strategy SDK, a durable PAPER OMS/control boundary, and an
-evidence-only desktop shell. It has no live-execution path, live credentials,
-or live broker endpoint. The checked-in IBKR implementation is a paper-only
-adapter contract and deterministic local model; connecting a real IBKR paper
-gateway remains subject to the documented operator gates.
+evidence-only desktop shell. It also contains a controlled-live safety kernel
+for hash-chained audit, four-eyes activation/approvals, shadow/canary limits,
+reconciliation, and monitoring. It has no checked-in live credentials, secret
+provider, authenticated approval service, or live broker endpoint. The
+checked-in IBKR implementation is a paper-only adapter contract and
+deterministic local model; connecting any broker remains subject to the
+documented operator gates.
 
 ## Start here
 
@@ -35,7 +38,13 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   reservation, durable evidence/restart recovery, reconciliation, kill
   switches, reconnect handling, and deterministic broker fault injection.
 - A TypeScript desktop evidence projection that cannot alter trading state,
-  including a read-only PAPER operations dashboard.
+  including read-only PAPER and controlled-live monitoring dashboards.
+- A controlled-live safety kernel with opaque credential references, zeroizing
+  secret-material boundary, time-bounded four-eyes activations and approvals,
+  shadow/canary separation, independent reconciliation, hash-chained durable
+  audit, disaster-recovery status, and a 60-session evidence gate. The supplied
+  status CLI is intentionally incapable of connecting to or submitting at a
+  broker.
 - JSON Schema, Protobuf, CI, dependency review, secret scanning, and an initial
   threat model.
 

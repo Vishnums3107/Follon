@@ -5,6 +5,7 @@ members = [
     "core/market-data",
     "core/backtest",
     "core/paper",
+    "core/live",
     "core/secrets",
     "core/control-plane",
     "apps/cli",

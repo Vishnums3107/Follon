@@ -20,6 +20,9 @@ paper gateway or any hosted deployment. It does not approve live trading.
 | Client ? control plane | Forged state transition or misleading environment | Client is projection-only; dashboard declares `PAPER`, validates a strict server-owned schema, and offers no state-changing control |
 | Event store ? replay | Event deletion, mutation, or duplicate processing | Append-only canonical events, event-ID idempotency, causal links, deterministic replay comparison |
 | Local developer machine | Secrets in code, fixtures, or logs | `.gitignore`, no credentials in the SDK, fixture review, and secret scanning required before broker work |
+| Approval/control-plane ? live core | Self-approval, altered limits, replayed order approval | Time-bounded four-eyes activation and single-use approval bind to exact intent/configuration hashes; an authenticated identity/role service remains required before connection |
+| Live core ? live adapter | Credential disclosure, unintended transmission, ambiguous network outcome | Opaque secret references and zeroizing secret material reach only the adapter boundary; durable pending state precedes submission and ambiguity is `UNKNOWN` until reconciliation |
+| Audit journal ? recovery | Journal tampering, rollback, inherited stale broker session | Process-exclusive fsynced SHA-256 hash chain is verified on open; mismatch fails closed; recovery always starts disconnected and requires synchronization/reconciliation |
 
 ## First-slice attack and failure cases
 
@@ -35,9 +38,17 @@ paper gateway or any hosted deployment. It does not approve live trading.
 5. A network loss is treated as a failed order/cancel. Mitigation: the OMS
    durably enters `UNKNOWN`, reconnects, drains evidence, then reconciles;
    it never blindly retries an ambiguous submit.
-6. A simulator or paper result is misrepresented as live. Mitigation: the
-   client is projection-only; this milestone accepts only the literal `PAPER`
-   environment and has no live endpoint or credential surface.
+6. A simulator, PAPER, or controlled-live monitor result is misrepresented.
+   Mitigation: the client is projection-only; strict dashboard schemas declare
+   `PAPER` or `LIVE` plus mode, and the client has no credential or order-action
+   surface.
+7. A live operator approves their own order or reuses an approval. Mitigation:
+   activation and order approvals reject matching requester/approver identities,
+   bind exact hashes, expire, and record consumption before broker submission.
+8. A reconciliation difference is concealed by replacing local accounting.
+   Mitigation: live reconciliation never overwrites either source; it creates
+   immutable incidents, and only an attributable explanation changes the
+   unresolved-incident projection.
 
 ## Required before a real IBKR paper gateway is connected
 

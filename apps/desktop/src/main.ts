@@ -1,8 +1,10 @@
 import {
   EvidenceEvent,
   parseEvidenceLog,
+  parseLiveMonitoringDashboard,
   parsePaperDashboard,
   renderEvidence,
+  renderLiveMonitoringDashboard,
   renderPaperDashboard,
 } from "./evidence";
 
@@ -27,14 +29,21 @@ fileInput.addEventListener("change", async () => {
   try {
     const contents = await file.text();
     try {
-      const dashboard = parsePaperDashboard(contents);
+      const dashboard = parseLiveMonitoringDashboard(contents);
       events = [];
-      renderPaperDashboard(root, dashboard);
-      status.textContent = `Loaded read-only PAPER operations state from ${file.name}.`;
+      renderLiveMonitoringDashboard(root, dashboard);
+      status.textContent = `Loaded read-only controlled-live monitoring state from ${file.name}.`;
     } catch {
-      events = parseEvidenceLog(contents);
-      renderEvidence(root, events);
-      status.textContent = `Loaded ${events.length} immutable events from ${file.name}.`;
+      try {
+        const dashboard = parsePaperDashboard(contents);
+        events = [];
+        renderPaperDashboard(root, dashboard);
+        status.textContent = `Loaded read-only PAPER operations state from ${file.name}.`;
+      } catch {
+        events = parseEvidenceLog(contents);
+        renderEvidence(root, events);
+        status.textContent = `Loaded ${events.length} immutable events from ${file.name}.`;
+      }
     }
   } catch (error) {
     status.textContent = error instanceof Error ? error.message : "Unable to load event evidence.";
@@ -51,13 +60,19 @@ if (streamParameter !== null) {
     try {
       const payload = String(message.data);
       try {
-        const dashboard = parsePaperDashboard(payload);
+        const dashboard = parseLiveMonitoringDashboard(payload);
         events = [];
-        renderPaperDashboard(root, dashboard);
+        renderLiveMonitoringDashboard(root, dashboard);
       } catch {
-        const next = parseEvidenceLog(`${payload}\n`)[0];
-        events = [...events, next];
-        renderEvidence(root, events);
+        try {
+          const dashboard = parsePaperDashboard(payload);
+          events = [];
+          renderPaperDashboard(root, dashboard);
+        } catch {
+          const next = parseEvidenceLog(`${payload}\n`)[0];
+          events = [...events, next];
+          renderEvidence(root, events);
+        }
       }
     } catch {
       status.textContent = "Received an invalid evidence event from the configured stream.";

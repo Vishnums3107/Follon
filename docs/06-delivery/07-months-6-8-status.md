@@ -43,6 +43,9 @@ fingerprint, gateway version, and every reconciliation result as evidence.
 ## Explicit boundary
 
 This repository does not contain a production TWS/Gateway wire-protocol client,
-secret provider, authenticated control-plane API, or any live broker route.
-Those are required before a connected paper deployment and are mandatory before
-the Months 9–11 controlled-live gate. No current command accepts `LIVE`.
+managed secret provider, authenticated control-plane API, or connected live
+broker route. The Months 9–11 safety kernel now accepts a controlled `LIVE`
+configuration only for its deliberately read-only monitoring command; that
+command has an adapter which rejects all broker operations. A connected live
+deployment still requires the external controls documented in the Months 9–11
+status and runbook.

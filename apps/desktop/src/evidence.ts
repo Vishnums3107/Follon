@@ -35,6 +35,29 @@ export type PaperDashboardPosition = Readonly<{
   realized_pnl: string;
 }>;
 
+export type LiveMonitoringDashboard = Readonly<{
+  dashboard_schema_version: 1;
+  environment: "LIVE";
+  mode: "SHADOW" | "CANARY";
+  account_id: string;
+  configuration_fingerprint: string;
+  broker_connected: boolean;
+  audit_healthy: boolean;
+  audit_sequence: number;
+  audit_head_hash: string;
+  active_kill_switches: readonly string[];
+  working_orders: number;
+  unknown_orders: number;
+  unresolved_incidents: number;
+  last_reconciled_at: string | null;
+  last_reconciliation_clean: boolean | null;
+  clean_live_days: number;
+  required_live_days: 60;
+  promotion_eligible: boolean;
+  internal_cash: string;
+  positions: readonly PaperDashboardPosition[];
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -74,6 +97,20 @@ export function parsePaperDashboard(json: string): PaperDashboard {
   }
   if (!isPaperDashboard(value)) {
     throw new Error("Paper dashboard does not match the v1 read-only contract.");
+  }
+  return value;
+}
+
+/** Parses a controlled-live monitoring projection; this format has no action fields. */
+export function parseLiveMonitoringDashboard(json: string): LiveMonitoringDashboard {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Controlled-live monitoring dashboard is not valid JSON.");
+  }
+  if (!isLiveMonitoringDashboard(value)) {
+    throw new Error("Controlled-live monitoring dashboard does not match the v1 read-only contract.");
   }
   return value;
 }
@@ -213,6 +250,80 @@ export function renderPaperDashboard(root: HTMLElement, dashboard: PaperDashboar
   root.append(table);
 }
 
+/** Renders audited controlled-live state without exposing credentials or order controls. */
+export function renderLiveMonitoringDashboard(root: HTMLElement, dashboard: LiveMonitoringDashboard): void {
+  root.replaceChildren();
+  const heading = document.createElement("h1");
+  heading.textContent = "Controlled-live monitoring dashboard";
+  root.append(heading);
+
+  const boundary = document.createElement("p");
+  boundary.textContent = `Environment: LIVE / ${dashboard.mode}. Monitoring only; no credential, approval, or order control is available here.`;
+  root.append(boundary);
+
+  const summary = document.createElement("dl");
+  const values: ReadonlyArray<readonly [string, string]> = [
+    ["Account", dashboard.account_id],
+    ["Configuration", dashboard.configuration_fingerprint],
+    ["Audit journal", dashboard.audit_healthy ? `Healthy (sequence ${dashboard.audit_sequence})` : "FAILED — controlled operations halted"],
+    ["Audit head", dashboard.audit_head_hash],
+    ["Broker session", dashboard.broker_connected ? "Connected" : "Disconnected / reconnect required"],
+    ["Internal cash", dashboard.internal_cash],
+    ["Working orders", String(dashboard.working_orders)],
+    ["Unknown orders", String(dashboard.unknown_orders)],
+    ["Unresolved discrepancies", String(dashboard.unresolved_incidents)],
+    ["Last reconciliation", dashboard.last_reconciled_at ?? "Not yet reconciled"],
+    ["Last reconciliation result", dashboard.last_reconciliation_clean === null
+      ? "Not yet reconciled"
+      : dashboard.last_reconciliation_clean ? "Clean" : "Discrepancy detected"],
+    ["Controlled-live-day gate", `${dashboard.clean_live_days}/${dashboard.required_live_days}`],
+    ["Promotion status", dashboard.promotion_eligible ? "Evidence gate complete" : "Evidence gate incomplete"],
+  ];
+  for (const [label, value] of values) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = value;
+    summary.append(term, detail);
+  }
+  root.append(summary);
+
+  const killSwitches = document.createElement("p");
+  killSwitches.textContent = dashboard.active_kill_switches.length === 0
+    ? "Kill switches: clear"
+    : `Kill switches: ${dashboard.active_kill_switches.join(", ")}`;
+  root.append(killSwitches);
+
+  const positionsHeading = document.createElement("h2");
+  positionsHeading.textContent = "Internal positions";
+  root.append(positionsHeading);
+  if (dashboard.positions.length === 0) {
+    const empty = document.createElement("p");
+    empty.textContent = "No internal controlled-live positions.";
+    root.append(empty);
+    return;
+  }
+  const table = document.createElement("table");
+  const header = document.createElement("tr");
+  for (const label of ["Instrument", "Quantity", "Average cost", "Realized P&L"]) {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = label;
+    header.append(cell);
+  }
+  table.append(header);
+  for (const position of dashboard.positions) {
+    const row = document.createElement("tr");
+    for (const value of [position.instrument_id, position.quantity, position.average_cost, position.realized_pnl]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    table.append(row);
+  }
+  root.append(table);
+}
+
 function latestPortfolio(events: readonly EvidenceEvent[]): Record<string, unknown> | undefined {
   return [...events].reverse().find((event) => event.event_type === "portfolio.pnl_updated.v1")?.payload;
 }
@@ -274,6 +385,47 @@ function isPaperDashboard(value: unknown): value is PaperDashboard {
   );
 }
 
+function isLiveMonitoringDashboard(value: unknown): value is LiveMonitoringDashboard {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  const expected = new Set([
+    "dashboard_schema_version", "environment", "mode", "account_id", "configuration_fingerprint", "broker_connected", "audit_healthy",
+    "audit_sequence", "audit_head_hash", "active_kill_switches", "working_orders", "unknown_orders", "unresolved_incidents",
+    "last_reconciled_at", "last_reconciliation_clean", "clean_live_days", "required_live_days", "promotion_eligible", "internal_cash", "positions",
+  ]);
+  if (Object.keys(candidate).length !== expected.size || Object.keys(candidate).some((key) => !expected.has(key))) {
+    return false;
+  }
+  return (
+    candidate.dashboard_schema_version === 1 &&
+    candidate.environment === "LIVE" &&
+    (candidate.mode === "SHADOW" || candidate.mode === "CANARY") &&
+    isCanonicalId(candidate.account_id) &&
+    isHash(candidate.configuration_fingerprint) &&
+    typeof candidate.broker_connected === "boolean" &&
+    typeof candidate.audit_healthy === "boolean" &&
+    isPositiveInteger(candidate.audit_sequence) &&
+    isHash(candidate.audit_head_hash) &&
+    Array.isArray(candidate.active_kill_switches) &&
+    candidate.active_kill_switches.every((entry) => typeof entry === "string" && entry.length > 0) &&
+    new Set(candidate.active_kill_switches).size === candidate.active_kill_switches.length &&
+    isNonNegativeInteger(candidate.working_orders) &&
+    isNonNegativeInteger(candidate.unknown_orders) &&
+    isNonNegativeInteger(candidate.unresolved_incidents) &&
+    (candidate.last_reconciled_at === null || isUtcTimestamp(candidate.last_reconciled_at)) &&
+    (candidate.last_reconciliation_clean === null || typeof candidate.last_reconciliation_clean === "boolean") &&
+    (candidate.last_reconciled_at === null) === (candidate.last_reconciliation_clean === null) &&
+    isNonNegativeInteger(candidate.clean_live_days) &&
+    candidate.required_live_days === 60 &&
+    typeof candidate.promotion_eligible === "boolean" &&
+    isDecimal(candidate.internal_cash) &&
+    Array.isArray(candidate.positions) &&
+    candidate.positions.every(isPaperDashboardPosition)
+  );
+}
+
 function isPaperDashboardPosition(value: unknown): value is PaperDashboardPosition {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -298,6 +450,14 @@ function isDecimal(value: unknown): value is string {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return isNonNegativeInteger(value) && value > 0;
+}
+
+function isHash(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 function isUtcTimestamp(value: unknown): value is string {

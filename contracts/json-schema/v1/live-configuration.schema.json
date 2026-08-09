@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/live-configuration.schema.json",
+  "title": "Follon Controlled Live Configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "configuration_id", "configuration_version", "account", "risk", "kill_switch_version", "activation"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "configuration_id": { "$ref": "#/$defs/canonicalId" },
+    "configuration_version": { "type": "string", "minLength": 1 },
+    "account": { "$ref": "#/$defs/account" },
+    "risk": { "$ref": "#/$defs/risk" },
+    "kill_switch_version": { "type": "string", "minLength": 1 },
+    "activation": { "$ref": "#/$defs/activation" }
+  },
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "positiveDecimal": { "type": "string", "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$" },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account_id", "currency", "initial_cash", "max_deployed_capital", "environment", "credential_reference"],
+      "properties": {
+        "account_id": { "$ref": "#/$defs/canonicalId" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "initial_cash": { "$ref": "#/$defs/positiveDecimal" },
+        "max_deployed_capital": { "$ref": "#/$defs/positiveDecimal" },
+        "environment": { "const": "LIVE" },
+        "credential_reference": { "$ref": "#/$defs/canonicalId" }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "trading_calendar_id", "max_order_quantity", "max_order_notional", "canary_max_order_notional", "canary_max_orders", "max_open_orders", "max_position_quantity", "max_realized_loss", "max_market_data_age_seconds"],
+      "properties": {
+        "policy_version": { "type": "string", "minLength": 1 },
+        "trading_calendar_id": { "$ref": "#/$defs/canonicalId" },
+        "max_order_quantity": { "$ref": "#/$defs/positiveDecimal" },
+        "max_order_notional": { "$ref": "#/$defs/positiveDecimal" },
+        "canary_max_order_notional": { "$ref": "#/$defs/positiveDecimal" },
+        "canary_max_orders": { "type": "integer", "minimum": 1 },
+        "max_open_orders": { "type": "integer", "minimum": 1 },
+        "max_position_quantity": { "$ref": "#/$defs/positiveDecimal" },
+        "max_realized_loss": { "$ref": "#/$defs/decimal" },
+        "max_market_data_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activation_id", "mode", "requested_by", "approved_by", "activated_at", "expires_at"],
+      "properties": {
+        "activation_id": { "$ref": "#/$defs/canonicalId" },
+        "mode": { "enum": ["SHADOW", "CANARY"] },
+        "requested_by": { "$ref": "#/$defs/canonicalId" },
+        "approved_by": { "$ref": "#/$defs/canonicalId" },
+        "activated_at": { "$ref": "#/$defs/utc" },
+        "expires_at": { "$ref": "#/$defs/utc" }
+      }
+    }
+  }
+}
