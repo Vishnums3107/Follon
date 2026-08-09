@@ -30,6 +30,10 @@ Use the [source map](00-source-map.md) to locate every section of the original p
 
 11. [Months 6–8 status](06-delivery/07-months-6-8-status.md)
 
+12. [Months 9–11 status](06-delivery/08-months-9-11-status.md)
+
+13. [Controlled-live runbook](operations/02-controlled-live-runbook.md)
+
 ## Document conventions
 
 - Use UTC for stored event times; retain exchange-local context where relevant.

@@ -72,8 +72,10 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-instrument",
+ "follon-live",
  "follon-market-data",
  "follon-paper",
+ "follon-secrets",
  "serde",
  "serde_json",
  "sha2",
@@ -108,6 +110,21 @@ name = "follon-instrument"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+]
+
+[[package]]
+name = "follon-live"
+version = "0.1.0"
+dependencies = [
+ "follon-control-plane",
+ "follon-domain",
+ "follon-instrument",
+ "follon-secrets",
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
 ]
 
 [[package]]

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/live-monitoring-dashboard.schema.json",
+  "title": "Follon Controlled Live Monitoring Dashboard v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dashboard_schema_version", "environment", "mode", "account_id", "configuration_fingerprint", "broker_connected", "audit_healthy", "audit_sequence", "audit_head_hash", "active_kill_switches", "working_orders", "unknown_orders", "unresolved_incidents", "last_reconciled_at", "last_reconciliation_clean", "clean_live_days", "required_live_days", "promotion_eligible", "internal_cash", "positions"],
+  "properties": {
+    "dashboard_schema_version": { "const": 1 },
+    "environment": { "const": "LIVE" },
+    "mode": { "enum": ["SHADOW", "CANARY"] },
+    "account_id": { "$ref": "#/$defs/canonicalId" },
+    "configuration_fingerprint": { "$ref": "#/$defs/hash" },
+    "broker_connected": { "type": "boolean" },
+    "audit_healthy": { "type": "boolean" },
+    "audit_sequence": { "type": "integer", "minimum": 1 },
+    "audit_head_hash": { "$ref": "#/$defs/hash" },
+    "active_kill_switches": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "working_orders": { "type": "integer", "minimum": 0 },
+    "unknown_orders": { "type": "integer", "minimum": 0 },
+    "unresolved_incidents": { "type": "integer", "minimum": 0 },
+    "last_reconciled_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/utc" }] },
+    "last_reconciliation_clean": { "type": ["boolean", "null"] },
+    "clean_live_days": { "type": "integer", "minimum": 0 },
+    "required_live_days": { "const": 60 },
+    "promotion_eligible": { "type": "boolean" },
+    "internal_cash": { "$ref": "#/$defs/decimal" },
+    "positions": { "type": "array", "items": { "$ref": "#/$defs/position" } }
+  },
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instrument_id", "quantity", "average_cost", "realized_pnl"],
+      "properties": {
+        "instrument_id": { "$ref": "#/$defs/canonicalId" },
+        "quantity": { "$ref": "#/$defs/decimal" },
+        "average_cost": { "$ref": "#/$defs/decimal" },
+        "realized_pnl": { "$ref": "#/$defs/decimal" }
+      }
+    }
+  }
+}
