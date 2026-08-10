@@ -11,6 +11,9 @@ permissions:
 jobs:
   security:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
