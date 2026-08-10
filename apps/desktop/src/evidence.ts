@@ -10,11 +10,14 @@ export type EvidenceEvent = Readonly<{
 }>;
 
 export type PaperDashboard = Readonly<{
-  dashboard_schema_version: 1;
+  dashboard_schema_version: 2;
   environment: "PAPER";
   account_id: string;
   configuration_fingerprint: string;
+  broker_connected: boolean;
   persistence_healthy: boolean;
+  audit_sequence: number;
+  audit_head_hash: string;
   internal_cash: string;
   working_orders: number;
   unknown_orders: number;
@@ -25,6 +28,7 @@ export type PaperDashboard = Readonly<{
   clean_paper_days: number;
   required_paper_days: 30;
   promotion_eligible: boolean;
+  complete_auditability: boolean;
   positions: readonly PaperDashboardPosition[];
 }>;
 
@@ -36,7 +40,7 @@ export type PaperDashboardPosition = Readonly<{
 }>;
 
 export type LiveMonitoringDashboard = Readonly<{
-  dashboard_schema_version: 1;
+  dashboard_schema_version: 2;
   environment: "LIVE";
   mode: "SHADOW" | "CANARY";
   account_id: string;
@@ -54,6 +58,7 @@ export type LiveMonitoringDashboard = Readonly<{
   clean_live_days: number;
   required_live_days: 60;
   promotion_eligible: boolean;
+  complete_auditability: boolean;
   internal_cash: string;
   positions: readonly PaperDashboardPosition[];
 }>;
@@ -193,6 +198,9 @@ export function renderPaperDashboard(root: HTMLElement, dashboard: PaperDashboar
   const values: ReadonlyArray<readonly [string, string]> = [
     ["Account", dashboard.account_id],
     ["Configuration", dashboard.configuration_fingerprint],
+    ["Broker session", dashboard.broker_connected ? "Connected" : "Disconnected / reconnect required"],
+    ["Audit sequence", String(dashboard.audit_sequence)],
+    ["Audit head", dashboard.audit_head_hash],
     ["Durable journal", dashboard.persistence_healthy ? "Healthy" : "FAILED — operations halted"],
     ["Internal cash", dashboard.internal_cash],
     ["Working orders", String(dashboard.working_orders)],
@@ -204,6 +212,7 @@ export function renderPaperDashboard(root: HTMLElement, dashboard: PaperDashboar
       : dashboard.last_reconciliation_clean ? "Clean" : "Discrepancy detected"],
     ["Paper-day gate", `${dashboard.clean_paper_days}/${dashboard.required_paper_days}`],
     ["Promotion status", dashboard.promotion_eligible ? "Evidence gate complete" : "Evidence gate incomplete"],
+    ["Complete auditability", dashboard.complete_auditability ? "Yes" : "No"],
   ];
   for (const [label, value] of values) {
     const term = document.createElement("dt");
@@ -277,6 +286,7 @@ export function renderLiveMonitoringDashboard(root: HTMLElement, dashboard: Live
       ? "Not yet reconciled"
       : dashboard.last_reconciliation_clean ? "Clean" : "Discrepancy detected"],
     ["Controlled-live-day gate", `${dashboard.clean_live_days}/${dashboard.required_live_days}`],
+    ["Complete auditability", dashboard.complete_auditability ? "Yes" : "No"],
     ["Promotion status", dashboard.promotion_eligible ? "Evidence gate complete" : "Evidence gate incomplete"],
   ];
   for (const [label, value] of values) {
@@ -354,19 +364,22 @@ function isPaperDashboard(value: unknown): value is PaperDashboard {
   }
   const candidate = value as Record<string, unknown>;
   const expected = new Set([
-    "dashboard_schema_version", "environment", "account_id", "configuration_fingerprint", "persistence_healthy", "internal_cash", "working_orders",
+    "dashboard_schema_version", "environment", "account_id", "configuration_fingerprint", "broker_connected", "persistence_healthy", "audit_sequence", "audit_head_hash", "internal_cash", "working_orders",
     "unknown_orders", "active_kill_switches", "unexplained_incidents", "last_reconciled_at", "last_reconciliation_clean", "clean_paper_days",
-    "required_paper_days", "promotion_eligible", "positions",
+    "required_paper_days", "promotion_eligible", "complete_auditability", "positions",
   ]);
   if (Object.keys(candidate).length !== expected.size || Object.keys(candidate).some((key) => !expected.has(key))) {
     return false;
   }
   return (
-    candidate.dashboard_schema_version === 1 &&
+    candidate.dashboard_schema_version === 2 &&
     candidate.environment === "PAPER" &&
     isCanonicalId(candidate.account_id) &&
     typeof candidate.configuration_fingerprint === "string" && /^[a-f0-9]{64}$/.test(candidate.configuration_fingerprint) &&
+    typeof candidate.broker_connected === "boolean" &&
     typeof candidate.persistence_healthy === "boolean" &&
+    isNonNegativeInteger(candidate.audit_sequence) &&
+    isHash(candidate.audit_head_hash) &&
     isDecimal(candidate.internal_cash) &&
     isNonNegativeInteger(candidate.working_orders) &&
     isNonNegativeInteger(candidate.unknown_orders) &&
@@ -380,6 +393,7 @@ function isPaperDashboard(value: unknown): value is PaperDashboard {
     isNonNegativeInteger(candidate.clean_paper_days) &&
     candidate.required_paper_days === 30 &&
     typeof candidate.promotion_eligible === "boolean" &&
+    typeof candidate.complete_auditability === "boolean" &&
     Array.isArray(candidate.positions) &&
     candidate.positions.every(isPaperDashboardPosition)
   );
@@ -393,13 +407,13 @@ function isLiveMonitoringDashboard(value: unknown): value is LiveMonitoringDashb
   const expected = new Set([
     "dashboard_schema_version", "environment", "mode", "account_id", "configuration_fingerprint", "broker_connected", "audit_healthy",
     "audit_sequence", "audit_head_hash", "active_kill_switches", "working_orders", "unknown_orders", "unresolved_incidents",
-    "last_reconciled_at", "last_reconciliation_clean", "clean_live_days", "required_live_days", "promotion_eligible", "internal_cash", "positions",
+    "last_reconciled_at", "last_reconciliation_clean", "clean_live_days", "required_live_days", "promotion_eligible", "complete_auditability", "internal_cash", "positions",
   ]);
   if (Object.keys(candidate).length !== expected.size || Object.keys(candidate).some((key) => !expected.has(key))) {
     return false;
   }
   return (
-    candidate.dashboard_schema_version === 1 &&
+    candidate.dashboard_schema_version === 2 &&
     candidate.environment === "LIVE" &&
     (candidate.mode === "SHADOW" || candidate.mode === "CANARY") &&
     isCanonicalId(candidate.account_id) &&
@@ -420,6 +434,7 @@ function isLiveMonitoringDashboard(value: unknown): value is LiveMonitoringDashb
     isNonNegativeInteger(candidate.clean_live_days) &&
     candidate.required_live_days === 60 &&
     typeof candidate.promotion_eligible === "boolean" &&
+    typeof candidate.complete_auditability === "boolean" &&
     isDecimal(candidate.internal_cash) &&
     Array.isArray(candidate.positions) &&
     candidate.positions.every(isPaperDashboardPosition)

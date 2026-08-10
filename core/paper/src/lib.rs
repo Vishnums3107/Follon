@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -17,7 +17,7 @@ use follon_domain::{
     validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent, OrderState,
     OrderType, RiskDecision, Side, TimeInForce,
 };
-use follon_instrument::TradingSession;
+use follon_instrument::{TradingCalendar, TradingSession};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -874,6 +874,8 @@ pub struct PaperPromotionStatus {
     pub required_paper_days: u32,
     /// Count of differences that still lack an explanation.
     pub unexplained_incidents: u32,
+    /// Whether the complete gate history is protected by the durable audit chain.
+    pub complete_auditability: bool,
     /// Whether the evidence gate is complete.
     pub eligible_for_next_gate: bool,
 }
@@ -889,8 +891,14 @@ pub struct PaperDashboard {
     pub account_id: String,
     /// SHA-256 fingerprint of the immutable operational configuration.
     pub configuration_fingerprint: String,
+    /// Whether the broker session is currently considered usable.
+    pub broker_connected: bool,
     /// Whether every required local journal write has completed successfully in this process.
     pub persistence_healthy: bool,
+    /// Current durable audit record sequence, or zero for a non-durable test service.
+    pub audit_sequence: u64,
+    /// SHA-256 audit-chain head, or the all-zero genesis hash before durable initialization.
+    pub audit_head_hash: String,
     /// Exact internally-accounted cash rendered as a decimal string.
     pub internal_cash: String,
     /// Number of non-terminal orders.
@@ -911,6 +919,8 @@ pub struct PaperDashboard {
     pub required_paper_days: u32,
     /// Whether the measured paper gate has completed.
     pub promotion_eligible: bool,
+    /// Whether the gate has continuous durable audit evidence.
+    pub complete_auditability: bool,
     /// Positions rendered deterministically by instrument.
     pub positions: Vec<PaperDashboardPosition>,
 }
@@ -929,7 +939,25 @@ pub struct PaperDashboardPosition {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct PersistentJournalRecord {
+#[serde(untagged)]
+enum PersistentJournalRecord {
+    V3(PersistentJournalRecordV3),
+    V2(PersistentJournalRecordV2),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentJournalRecordV3 {
+    schema_version: u32,
+    sequence: u64,
+    previous_hash: String,
+    state: PersistentPaperState,
+    entry_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentJournalRecordV2 {
     schema_version: u32,
     sequence: u64,
     state: PersistentPaperState,
@@ -951,6 +979,25 @@ struct PersistentPaperState {
     last_reconciliation_clean: Option<bool>,
     paper_days: BTreeMap<String, PersistentPaperDay>,
     next_reconciliation: u64,
+    #[serde(default)]
+    broker_connected: bool,
+    #[serde(default)]
+    latest_reconciliation: Option<PersistentReconciliationReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentReconciliationReport {
+    reconciliation_id: String,
+    reconciled_at: String,
+    issues: Vec<PersistentReconciliationIssue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentReconciliationIssue {
+    incident_id: String,
+    category: String,
+    subject: String,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1024,7 +1071,8 @@ struct PersistentPaperDay {
     clean: bool,
 }
 
-const PAPER_JOURNAL_SCHEMA_VERSION: u32 = 2;
+const PAPER_JOURNAL_SCHEMA_VERSION: u32 = 3;
+const LEGACY_PAPER_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const MAX_PAPER_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Durable append-only state journal for one paper OMS account.
@@ -1037,6 +1085,7 @@ pub struct FilePaperJournal {
     path: PathBuf,
     file: File,
     next_sequence: u64,
+    previous_hash: String,
     latest: Option<PersistentPaperState>,
 }
 
@@ -1044,20 +1093,48 @@ impl FilePaperJournal {
     /// Opens and verifies an existing journal before accepting new snapshots.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PaperError> {
         let path = path.as_ref().to_path_buf();
+        if path.exists()
+            && fs::symlink_metadata(&path)
+                .map_err(|error| PaperError(error.to_string()))?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(PaperError(
+                "paper journal path must not be a symbolic link".to_owned(),
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| PaperError(error.to_string()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| PaperError(error.to_string()))?;
+        file.try_lock_exclusive().map_err(|error| {
+            PaperError(format!(
+                "paper journal is already open by another operator/process: {error}"
+            ))
+        })?;
         let mut latest = None;
         let mut next_sequence = 1;
-        if path.exists() {
-            let byte_count = fs::metadata(&path)
-                .map_err(|error| PaperError(error.to_string()))?
-                .len();
-            if byte_count > MAX_PAPER_JOURNAL_BYTES {
-                return Err(PaperError(format!(
-                    "paper journal exceeds the {} byte recovery limit; rotate and archive it before restart",
-                    MAX_PAPER_JOURNAL_BYTES
-                )));
-            }
-            let contents =
-                fs::read_to_string(&path).map_err(|error| PaperError(error.to_string()))?;
+        let mut previous_hash = "0".repeat(64);
+        let mut modern_record_seen = false;
+        let byte_count = file
+            .metadata()
+            .map_err(|error| PaperError(error.to_string()))?
+            .len();
+        if byte_count > MAX_PAPER_JOURNAL_BYTES {
+            return Err(PaperError(format!(
+                "paper journal exceeds the {} byte recovery limit; rotate and archive it before restart",
+                MAX_PAPER_JOURNAL_BYTES
+            )));
+        }
+        if byte_count > 0 {
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .map_err(|error| PaperError(error.to_string()))?;
             for (index, line) in contents.lines().enumerate() {
                 if line.is_empty() {
                     return Err(PaperError(format!(
@@ -1077,36 +1154,44 @@ impl FilePaperJournal {
                         index + 1
                     )));
                 }
-                if record.schema_version != PAPER_JOURNAL_SCHEMA_VERSION
-                    || record.sequence != next_sequence
-                {
-                    return Err(PaperError(format!(
-                        "paper journal line {} has invalid schema or sequence",
-                        index + 1
-                    )));
+                match record {
+                    PersistentJournalRecord::V3(record) => {
+                        if record.schema_version != PAPER_JOURNAL_SCHEMA_VERSION
+                            || record.sequence != next_sequence
+                            || record.previous_hash != previous_hash
+                            || record.entry_hash != paper_record_hash(&record)?
+                        {
+                            return Err(PaperError(format!(
+                                "paper journal integrity check failed at line {}",
+                                index + 1
+                            )));
+                        }
+                        modern_record_seen = true;
+                        previous_hash = record.entry_hash;
+                        latest = Some(record.state);
+                    }
+                    PersistentJournalRecord::V2(record) => {
+                        if modern_record_seen
+                            || record.schema_version != LEGACY_PAPER_JOURNAL_SCHEMA_VERSION
+                            || record.sequence != next_sequence
+                        {
+                            return Err(PaperError(format!(
+                                "paper journal legacy record is invalid at line {}",
+                                index + 1
+                            )));
+                        }
+                        previous_hash = legacy_paper_record_hash(&previous_hash, line);
+                        latest = Some(record.state);
+                    }
                 }
                 next_sequence += 1;
-                latest = Some(record.state);
             }
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| PaperError(error.to_string()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| PaperError(error.to_string()))?;
-        file.try_lock_exclusive().map_err(|error| {
-            PaperError(format!(
-                "paper journal is already open by another operator/process: {error}"
-            ))
-        })?;
         Ok(Self {
             path,
             file,
             next_sequence,
+            previous_hash,
             latest,
         })
     }
@@ -1120,23 +1205,52 @@ impl FilePaperJournal {
         self.latest.as_ref()
     }
 
+    fn sequence(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
+
+    fn head_hash(&self) -> &str {
+        &self.previous_hash
+    }
+
     fn append(&mut self, state: PersistentPaperState) -> Result<(), PaperError> {
-        let record = PersistentJournalRecord {
+        let mut record = PersistentJournalRecordV3 {
             schema_version: PAPER_JOURNAL_SCHEMA_VERSION,
             sequence: self.next_sequence,
+            previous_hash: self.previous_hash.clone(),
             state,
+            entry_hash: String::new(),
         };
-        let serialized =
-            serde_json::to_string(&record).map_err(|error| PaperError(error.to_string()))?;
+        record.entry_hash = paper_record_hash(&record)?;
+        let serialized = serde_json::to_string(&PersistentJournalRecord::V3(record.clone()))
+            .map_err(|error| PaperError(error.to_string()))?;
         self.file
             .write_all(serialized.as_bytes())
             .and_then(|_| self.file.write_all(b"\n"))
             .and_then(|_| self.file.sync_data())
             .map_err(|error| PaperError(error.to_string()))?;
         self.next_sequence += 1;
+        self.previous_hash = record.entry_hash;
         self.latest = Some(record.state);
         Ok(())
     }
+}
+
+fn paper_record_hash(record: &PersistentJournalRecordV3) -> Result<String, PaperError> {
+    let mut unsigned = record.clone();
+    unsigned.entry_hash.clear();
+    let canonical = serde_json::to_string(&PersistentJournalRecord::V3(unsigned))
+        .map_err(|error| PaperError(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+fn legacy_paper_record_hash(previous_hash: &str, canonical_line: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"follon-paper-journal-v2-anchor");
+    hasher.update(previous_hash.as_bytes());
+    hasher.update((canonical_line.len() as u64).to_be_bytes());
+    hasher.update(canonical_line.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Paper-only OMS service with independent accounting and mandatory reconciliation.
@@ -1145,6 +1259,7 @@ pub struct PaperTradingService<B> {
     risk_policy: PaperRiskPolicy,
     kill_switches: KillSwitchRegistry,
     broker: B,
+    broker_connected: bool,
     cash: Decimal,
     orders: BTreeMap<String, PaperOrder>,
     risk_evidence: BTreeMap<String, PaperRiskEvidence>,
@@ -1153,6 +1268,7 @@ pub struct PaperTradingService<B> {
     incidents: BTreeMap<String, ReconciliationIncident>,
     last_reconciled_at: Option<String>,
     last_reconciliation_clean: Option<bool>,
+    latest_reconciliation: Option<ReconciliationReport>,
     paper_days: BTreeMap<String, PersistentPaperDay>,
     next_reconciliation: u64,
     persistence_healthy: bool,
@@ -1175,6 +1291,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             risk_policy,
             kill_switches,
             broker,
+            broker_connected: true,
             orders: BTreeMap::new(),
             risk_evidence: BTreeMap::new(),
             portfolios: BTreeMap::new(),
@@ -1182,6 +1299,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             incidents: BTreeMap::new(),
             last_reconciled_at: None,
             last_reconciliation_clean: None,
+            latest_reconciliation: None,
             paper_days: BTreeMap::new(),
             next_reconciliation: 1,
             persistence_healthy: true,
@@ -1202,6 +1320,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         let mut service = Self::new(account, risk_policy, kill_switches, broker)?;
         if let Some(state) = latest {
             service.restore(state)?;
+            // An external broker session never survives process recovery.
+            service.broker_connected = false;
         }
         service.journal = Some(journal);
         if service
@@ -1275,6 +1395,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if intent.account_id != self.account.account_id {
             return Err(PaperError(
                 "paper intent account does not match service".to_owned(),
+            ));
+        }
+        if !self.broker_connected {
+            return Err(PaperError(
+                "paper broker session is disconnected; reconnect and reconcile before submission"
+                    .to_owned(),
             ));
         }
         if market.instrument_id != intent.instrument_id {
@@ -1405,6 +1531,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 order
                     .oms
                     .transition(OrderState::Unknown, "PAPER_TRANSPORT_OUTCOME_UNKNOWN")?;
+                self.broker_connected = false;
                 self.persist()?;
                 Err(error)
             }
@@ -1414,6 +1541,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     /// Requests cancellation. A transport failure leaves the order explicitly `UNKNOWN`.
     pub fn cancel_order(&mut self, order_id: &str) -> Result<(), PaperError> {
         self.ensure_persistence_healthy()?;
+        if !self.broker_connected {
+            return Err(PaperError(
+                "paper broker session is disconnected; reconnect and reconcile before cancellation"
+                    .to_owned(),
+            ));
+        }
         let state = self
             .orders
             .get(order_id)
@@ -1435,6 +1568,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             self.order_mut(order_id)?
                 .oms
                 .transition(OrderState::Unknown, "PAPER_CANCEL_OUTCOME_UNKNOWN")?;
+            self.broker_connected = false;
             self.persist()?;
             return Err(error);
         }
@@ -1445,7 +1579,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     /// Drains broker evidence, applies unique executions, and preserves every ambiguity.
     pub fn synchronize(&mut self) -> Result<usize, PaperError> {
         self.ensure_persistence_healthy()?;
-        let events = self.broker.poll()?;
+        if !self.broker_connected {
+            return Err(PaperError(
+                "paper broker session is disconnected".to_owned(),
+            ));
+        }
+        let events = match self.broker.poll() {
+            Ok(events) => events,
+            Err(error) => {
+                self.broker_connected = false;
+                self.persist()?;
+                return Err(error);
+            }
+        };
         let count = events.len();
         for event in events {
             self.apply_broker_event(event)?;
@@ -1460,7 +1606,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         reconciled_at: &str,
     ) -> Result<ReconciliationReport, PaperError> {
         self.ensure_persistence_healthy()?;
-        self.broker.reconnect()?;
+        if let Err(error) = self.broker.reconnect() {
+            self.broker_connected = false;
+            self.persist()?;
+            return Err(error);
+        }
+        self.broker_connected = true;
         self.synchronize()?;
         self.reconcile(reconciled_at)
     }
@@ -1469,7 +1620,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     pub fn reconcile(&mut self, reconciled_at: &str) -> Result<ReconciliationReport, PaperError> {
         self.ensure_persistence_healthy()?;
         validate_utc_timestamp("paper reconciliation time", reconciled_at)?;
-        let snapshot = self.broker.snapshot(&self.account.account_id)?;
+        if !self.broker_connected {
+            return Err(PaperError(
+                "paper broker session is disconnected; reconnect before reconciliation".to_owned(),
+            ));
+        }
+        let snapshot = match self.broker.snapshot(&self.account.account_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.broker_connected = false;
+                self.persist()?;
+                return Err(error);
+            }
+        };
         validate_broker_snapshot(&snapshot)?;
         let reconciliation_id = format!("reconciliation-{:08}", self.next_reconciliation);
         self.next_reconciliation += 1;
@@ -1612,6 +1775,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         };
         self.last_reconciled_at = Some(reconciled_at.to_owned());
         self.last_reconciliation_clean = Some(report.is_clean());
+        self.latest_reconciliation = Some(report.clone());
         self.persist()?;
         Ok(report)
     }
@@ -1647,9 +1811,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         &mut self,
         paper_session: &PaperTradingSession,
         report: &ReconciliationReport,
+        calendar: &dyn TradingCalendar,
     ) -> Result<(), PaperError> {
         self.ensure_persistence_healthy()?;
         paper_session.validate()?;
+        if calendar.calendar_id() != self.risk_policy.trading_calendar_id
+            || calendar.calendar_id() != paper_session.calendar_id
+            || calendar.session_for_exchange_date(&paper_session.session.exchange_date)
+                != Some(&paper_session.session)
+        {
+            return Err(PaperError(
+                "paper-day gate requires the exact session from the configured calendar".to_owned(),
+            ));
+        }
         if paper_session.calendar_id != self.risk_policy.trading_calendar_id {
             return Err(PaperError(
                 "paper-session calendar does not match the configured paper calendar".to_owned(),
@@ -1663,7 +1837,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         );
         if self.last_reconciled_at.as_deref() != Some(report.reconciled_at.as_str())
             || self.last_reconciliation_clean != Some(report.is_clean())
+            || self.latest_reconciliation.as_ref() != Some(report)
             || report.reconciliation_id != expected_reconciliation_id
+            || !report.is_clean()
         {
             return Err(PaperError(
                 "paper-session gate requires the latest actual reconciliation report".to_owned(),
@@ -1674,13 +1850,17 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 "paper-session reconciliation must occur at or after the session close".to_owned(),
             ));
         }
-        let clean = report.is_clean() && self.unexplained_incident_count() == 0;
+        if self.unexplained_incident_count() != 0 {
+            return Err(PaperError(
+                "paper-session gate refuses unresolved reconciliation incidents".to_owned(),
+            ));
+        }
         let exchange_date = &paper_session.session.exchange_date;
         let day = PersistentPaperDay {
             calendar_id: paper_session.calendar_id.clone(),
             session_opens_at: paper_session.session.opens_at.clone(),
             session_closes_at: paper_session.session.closes_at.clone(),
-            clean,
+            clean: true,
         };
         match self.paper_days.get(exchange_date) {
             Some(existing) if *existing == day => Ok(()),
@@ -1700,11 +1880,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     pub fn promotion_status(&self) -> PaperPromotionStatus {
         let clean_paper_days = self.paper_days.values().filter(|day| day.clean).count() as u32;
         let unexplained_incidents = self.unexplained_incident_count();
+        let complete_auditability = self.persistence_healthy
+            && self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.sequence() > 0);
         PaperPromotionStatus {
             clean_paper_days,
             required_paper_days: 30,
             unexplained_incidents,
-            eligible_for_next_gate: clean_paper_days >= 30 && unexplained_incidents == 0,
+            complete_auditability,
+            eligible_for_next_gate: clean_paper_days >= 30
+                && unexplained_incidents == 0
+                && complete_auditability,
         }
     }
 
@@ -1725,11 +1913,22 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             })
             .collect();
         PaperDashboard {
-            dashboard_schema_version: 1,
+            dashboard_schema_version: 2,
             environment: self.account.environment.clone(),
             account_id: self.account.account_id.clone(),
             configuration_fingerprint: self.configuration_fingerprint(),
+            broker_connected: self.broker_connected,
             persistence_healthy: self.persistence_healthy,
+            audit_sequence: self
+                .journal
+                .as_ref()
+                .map(FilePaperJournal::sequence)
+                .unwrap_or(0),
+            audit_head_hash: self
+                .journal
+                .as_ref()
+                .map(|journal| journal.head_hash().to_owned())
+                .unwrap_or_else(|| "0".repeat(64)),
             internal_cash: self.cash.to_string(),
             working_orders: self.orders.values().filter(|order| order.working()).count() as u32,
             unknown_orders: self
@@ -1744,6 +1943,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             clean_paper_days: status.clean_paper_days,
             required_paper_days: status.required_paper_days,
             promotion_eligible: status.eligible_for_next_gate,
+            complete_auditability: status.complete_auditability,
             positions,
         }
     }
@@ -1801,6 +2001,16 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         }
         if estimated_notional > self.risk_policy.max_order_notional {
             reasons.push("MAX_ORDER_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if self
+            .orders
+            .values()
+            .any(|order| order.oms.state == OrderState::Unknown)
+        {
+            reasons.push("UNKNOWN_ORDER_REQUIRES_RECONCILIATION".to_owned());
+        }
+        if self.unexplained_incident_count() > 0 {
+            reasons.push("UNEXPLAINED_INCIDENTS_REQUIRE_REVIEW".to_owned());
         }
         if context.open_orders >= self.risk_policy.max_open_orders {
             reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
@@ -2092,6 +2302,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             last_reconciliation_clean: self.last_reconciliation_clean,
             paper_days: self.paper_days.clone(),
             next_reconciliation: self.next_reconciliation,
+            broker_connected: self.broker_connected,
+            latest_reconciliation: self
+                .latest_reconciliation
+                .as_ref()
+                .map(PersistentReconciliationReport::from),
         }
     }
 
@@ -2236,6 +2451,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         for (date, paper_day) in &state.paper_days {
             validate_exchange_date(date)?;
             validate_canonical_id("persisted paper calendar_id", &paper_day.calendar_id)?;
+            if paper_day.calendar_id != self.risk_policy.trading_calendar_id {
+                return Err(PaperError(
+                    "persisted paper-day calendar does not match supplied policy".to_owned(),
+                ));
+            }
             let session = TradingSession {
                 exchange_date: date.clone(),
                 opens_at: paper_day.session_opens_at.clone(),
@@ -2260,6 +2480,38 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 "persisted reconciliation sequence is invalid".to_owned(),
             ));
         }
+        let latest_reconciliation = state
+            .latest_reconciliation
+            .map(ReconciliationReport::try_from)
+            .transpose()?;
+        match (
+            &latest_reconciliation,
+            &state.last_reconciled_at,
+            state.last_reconciliation_clean,
+        ) {
+            (Some(report), Some(reconciled_at), Some(clean))
+                if report.reconciled_at == *reconciled_at && report.is_clean() == clean => {}
+            (None, None, None) => {}
+            // Legacy v2 journals did not retain the exact report. Recovery is allowed,
+            // but that legacy checkpoint cannot be used to record a new gate day.
+            (None, Some(_), Some(_)) => {}
+            _ => {
+                return Err(PaperError(
+                    "persisted paper reconciliation evidence is inconsistent".to_owned(),
+                ))
+            }
+        }
+        if let Some(report) = &latest_reconciliation {
+            let expected = format!(
+                "reconciliation-{:08}",
+                state.next_reconciliation.saturating_sub(1)
+            );
+            if report.reconciliation_id != expected {
+                return Err(PaperError(
+                    "persisted latest paper reconciliation identity is invalid".to_owned(),
+                ));
+            }
+        }
         self.orders = orders;
         self.risk_evidence = risk_evidence;
         self.portfolios = portfolios;
@@ -2268,29 +2520,37 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.incidents = incidents;
         self.last_reconciled_at = state.last_reconciled_at;
         self.last_reconciliation_clean = state.last_reconciliation_clean;
+        self.latest_reconciliation = latest_reconciliation;
         self.paper_days = state.paper_days;
         self.next_reconciliation = state.next_reconciliation;
+        self.broker_connected = state.broker_connected;
         Ok(())
     }
 
     fn configuration_fingerprint(&self) -> String {
-        let material = format!(
-            "account_id={};currency={};initial_cash={};environment={};risk_version={};trading_calendar_id={};max_order_quantity={};max_order_notional={};max_open_orders={};max_position_quantity={};max_realized_loss={};max_market_data_age_seconds={};kill_switch_version={}",
-            self.account.account_id,
-            self.account.currency,
-            self.account.initial_cash,
-            self.account.environment,
-            self.risk_policy.version,
-            self.risk_policy.trading_calendar_id,
-            self.risk_policy.max_order_quantity,
-            self.risk_policy.max_order_notional,
-            self.risk_policy.max_open_orders,
-            self.risk_policy.max_position_quantity,
-            self.risk_policy.max_realized_loss,
-            self.risk_policy.max_market_data_age_seconds,
-            self.kill_switches.version,
-        );
-        format!("{:x}", Sha256::digest(material.as_bytes()))
+        let initial_cash = self.account.initial_cash.to_string();
+        let max_order_quantity = self.risk_policy.max_order_quantity.to_string();
+        let max_order_notional = self.risk_policy.max_order_notional.to_string();
+        let max_open_orders = self.risk_policy.max_open_orders.to_string();
+        let max_position_quantity = self.risk_policy.max_position_quantity.to_string();
+        let max_realized_loss = self.risk_policy.max_realized_loss.to_string();
+        let max_market_data_age_seconds = self.risk_policy.max_market_data_age_seconds.to_string();
+        hash_fingerprint_parts(&[
+            "paper-configuration-v1",
+            &self.account.account_id,
+            &self.account.currency,
+            &initial_cash,
+            &self.account.environment,
+            &self.risk_policy.version,
+            &self.risk_policy.trading_calendar_id,
+            &max_order_quantity,
+            &max_order_notional,
+            &max_open_orders,
+            &max_position_quantity,
+            &max_realized_loss,
+            &max_market_data_age_seconds,
+            &self.kill_switches.version,
+        ])
     }
 
     fn unexplained_incident_count(&self) -> u32 {
@@ -2299,6 +2559,15 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .filter(|incident| incident.unexplained())
             .count() as u32
     }
+}
+
+fn hash_fingerprint_parts(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn transition_to_acknowledged(order: &mut PaperOrder, reason: &str) -> Result<(), PaperError> {
@@ -2431,6 +2700,61 @@ impl TryFrom<PersistentRiskEvidence> for PaperRiskEvidence {
             intent,
             decision,
             market: PaperMarketData::try_from(evidence.market)?,
+        })
+    }
+}
+
+impl From<&ReconciliationReport> for PersistentReconciliationReport {
+    fn from(report: &ReconciliationReport) -> Self {
+        Self {
+            reconciliation_id: report.reconciliation_id.clone(),
+            reconciled_at: report.reconciled_at.clone(),
+            issues: report
+                .issues
+                .iter()
+                .map(|issue| PersistentReconciliationIssue {
+                    incident_id: issue.incident_id.clone(),
+                    category: issue.category.clone(),
+                    subject: issue.subject.clone(),
+                    detail: issue.detail.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistentReconciliationReport> for ReconciliationReport {
+    type Error = PaperError;
+
+    fn try_from(value: PersistentReconciliationReport) -> Result<Self, Self::Error> {
+        validate_canonical_id(
+            "persisted paper reconciliation_id",
+            &value.reconciliation_id,
+        )?;
+        validate_utc_timestamp("persisted paper reconciliation time", &value.reconciled_at)?;
+        let mut incident_ids = BTreeSet::new();
+        let mut issues = Vec::with_capacity(value.issues.len());
+        for issue in value.issues {
+            validate_canonical_id("persisted paper incident_id", &issue.incident_id)?;
+            validate_broker_reason("persisted paper issue category", &issue.category)?;
+            validate_broker_reason("persisted paper issue subject", &issue.subject)?;
+            validate_broker_reason("persisted paper issue detail", &issue.detail)?;
+            if !incident_ids.insert(issue.incident_id.clone()) {
+                return Err(PaperError(
+                    "persisted paper reconciliation repeats an incident ID".to_owned(),
+                ));
+            }
+            issues.push(ReconciliationIssue {
+                incident_id: issue.incident_id,
+                category: issue.category,
+                subject: issue.subject,
+                detail: issue.detail,
+            });
+        }
+        Ok(Self {
+            reconciliation_id: value.reconciliation_id,
+            reconciled_at: value.reconciled_at,
+            issues,
         })
     }
 }
@@ -2578,6 +2902,7 @@ fn parse_kill_switch_scope(value: &str) -> Result<KillSwitchScope, PaperError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use follon_instrument::StaticTradingCalendar;
 
     fn account() -> PaperAccount {
         PaperAccount {
@@ -2650,14 +2975,27 @@ mod tests {
     }
 
     fn paper_session(exchange_date: &str) -> PaperTradingSession {
+        let (opens_at, closes_at) = if exchange_date >= "2026-03-09" {
+            ("13:30:00Z", "20:00:00Z")
+        } else {
+            ("14:30:00Z", "21:00:00Z")
+        };
         PaperTradingSession {
             calendar_id: "cal.us_equities.nyse.v1".to_owned(),
             session: TradingSession {
                 exchange_date: exchange_date.to_owned(),
-                opens_at: format!("{exchange_date}T14:30:00Z"),
-                closes_at: format!("{exchange_date}T21:00:00Z"),
+                opens_at: format!("{exchange_date}T{opens_at}"),
+                closes_at: format!("{exchange_date}T{closes_at}"),
             },
         }
+    }
+
+    fn paper_calendar(sessions: &[PaperTradingSession]) -> StaticTradingCalendar {
+        StaticTradingCalendar::new(
+            "cal.us_equities.nyse.v1",
+            sessions.iter().map(|value| value.session.clone()).collect(),
+        )
+        .expect("test paper calendar")
     }
 
     struct CashAndPositionMismatchBroker;
@@ -2725,11 +3063,13 @@ mod tests {
         assert!(report.is_clean());
         let mut wrong_calendar = paper_session("2026-01-02");
         wrong_calendar.calendar_id = "cal.other.v1".to_owned();
+        let configured_session = paper_session("2026-01-02");
+        let calendar = paper_calendar(std::slice::from_ref(&configured_session));
         assert!(service
-            .record_paper_session(&wrong_calendar, &report)
+            .record_paper_session(&wrong_calendar, &report, &calendar)
             .is_err());
         service
-            .record_paper_session(&paper_session("2026-01-02"), &report)
+            .record_paper_session(&configured_session, &report, &calendar)
             .unwrap();
         let dashboard = service.dashboard();
         assert_eq!(dashboard.working_orders, 0);
@@ -2870,6 +3210,39 @@ mod tests {
     }
 
     #[test]
+    fn paper_journal_refuses_a_tampered_hash_chain() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-tampered.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&journal_path);
+        let paper_account = account();
+        let service = PaperTradingService::open_durable(
+            paper_account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&paper_account).unwrap(),
+            &journal_path,
+        )
+        .expect("durable service");
+        drop(service);
+        let original = fs::read_to_string(&journal_path).expect("read journal");
+        let tampered = original.replacen("100000.00000000", "100001.00000000", 1);
+        assert_ne!(tampered, original);
+        fs::write(&journal_path, tampered).expect("tamper journal");
+
+        assert!(PaperTradingService::open_durable(
+            paper_account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&paper_account).unwrap(),
+            &journal_path,
+        )
+        .is_err());
+        fs::remove_file(journal_path).unwrap();
+    }
+
+    #[test]
     fn duplicate_broker_execution_is_idempotent_and_ambiguous_submit_reconciles() {
         let account = account();
         let adapter = IbkrPaperAdapter::new(&account).unwrap();
@@ -2980,8 +3353,22 @@ mod tests {
             &journal_path,
         )
         .is_err());
-        let mut gate_service = service();
-        for date in [
+        let gate_journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-{}.ndjson",
+            std::process::id(),
+            "thirty-day-gate"
+        ));
+        let _ = fs::remove_file(&gate_journal_path);
+        let gate_account = account.clone();
+        let mut gate_service = PaperTradingService::open_durable(
+            gate_account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&gate_account).unwrap(),
+            &gate_journal_path,
+        )
+        .unwrap();
+        let dates = [
             "2026-03-02",
             "2026-03-03",
             "2026-03-04",
@@ -3012,16 +3399,21 @@ mod tests {
             "2026-04-09",
             "2026-04-10",
             "2026-04-13",
-        ] {
+        ];
+        let gate_sessions: Vec<_> = dates.iter().map(|date| paper_session(date)).collect();
+        let gate_calendar = paper_calendar(&gate_sessions);
+        for (date, session) in dates.into_iter().zip(&gate_sessions) {
             let report = gate_service
                 .reconcile(&format!("{date}T21:00:00Z"))
                 .unwrap();
             assert!(report.is_clean());
             gate_service
-                .record_paper_session(&paper_session(date), &report)
+                .record_paper_session(session, &report, &gate_calendar)
                 .unwrap();
         }
         assert!(gate_service.promotion_status().eligible_for_next_gate);
+        drop(gate_service);
+        fs::remove_file(gate_journal_path).unwrap();
         fs::remove_file(journal_path).unwrap();
     }
 }

@@ -24,7 +24,7 @@ The Months 0–5 non-live research engineering exit gate passed locally on
 
 - `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
   `cargo clippy --workspace --all-targets -- -D warnings` pass.
-- `cargo test --workspace --all-targets` passes all 34 Rust tests, including
+- `cargo test --workspace --all-targets` passes the full Rust suite, including
   canonical persisted-event recovery, cumulative accounting, content-addressed
   configuration, corporate actions, and immutable artifact publication.
 - Python contract tests, JSON-schema parsing, and TypeScript typechecking pass.

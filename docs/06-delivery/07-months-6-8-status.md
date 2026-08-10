@@ -11,19 +11,20 @@ trading.
 | --- | --- | --- |
 | Paper OMS and lifecycle safety | `PaperTradingService` creates a durable `PENDING_SUBMIT` record before crossing the broker boundary; ambiguous outcomes become `UNKNOWN` and can only be resolved by evidence/reconciliation | Implemented and tested |
 | Pre-trade risk | Versioned limits cover order quantity/notional, open orders, long-only position size, aggregate realized loss, fresh instrument-matched market data, available cash, and cash reserved for working buys | Implemented and tested |
-| IBKR paper boundary | `IbkrPaperAdapter` is a deterministic paper-contract model; `adapters/brokers/ibkr` provides a loopback/PAPER-only gateway adapter contract for an audited TWS/Gateway transport | Implemented; real vendor transport remains an explicit deployment prerequisite |
+| IBKR paper boundary | `IbkrPaperAdapter` is a deterministic model. `IbkrPaperBridgeProcessTransport` starts a fixed executable without a shell, enforces a bounded correlated JSON-line protocol, and poisons timed-out/malformed sessions. `python/ibkr-gateway` uses the official Python TWS API and permits only loopback PAPER ports. | Implemented and contract-tested; an operator-managed PAPER TWS/Gateway session is still required |
 | Reconciliation and accounting | Independent broker order/state/fill, position, and cash snapshots are compared without overwrite; every difference becomes a durable incident | Implemented and tested |
 | Kill switches | Global, account, strategy, and instrument scopes reject new work independently of strategy or broker health; local CLI activation/deactivation is journaled | Implemented and tested |
 | Restart/reconnect | A process-exclusive, append-only fsynced journal snapshots recover orders, positions, executions, risk evidence, incidents, session-gate records, and immutable configuration fingerprint; bounded recovery prevents unbounded reads, and any journal write failure halts later state-changing operations; reconnect drains evidence then reconciles | Implemented and tested |
 | Fault injection | Disconnect, ambiguous-submit, and duplicate-event cases are deterministic and exercised in the broker wrapper tests | Implemented and tested |
-| Dashboard | Strict v1 JSON schema, immutable status-snapshot CLI, and desktop read-only projection expose PAPER environment, fingerprint, orders, kill switches, reconciliation, positions, and gate state | Implemented and typechecked |
-| 30-paper-day gate | The service records only closed explicit exchange sessions with a clean reconciliation and no unexplained incident; records are immutable per date | Gate mechanism implemented; observed evidence is currently **0/30** |
+| Dashboard | Strict v2 JSON schema, immutable status-snapshot CLI, and desktop read-only projection expose PAPER environment, connection state, audit head, fingerprint, orders, kill switches, reconciliation, positions, and gate state | Implemented and typechecked |
+| 30-paper-day gate | The service records only the exact closed session resolved from the configured versioned calendar, with the latest clean reconciliation, no unexplained incident, and a durable hash-chained audit; records are immutable per date | Gate mechanism implemented and tested; observed evidence is currently **0/30** |
 
 ## Operational acceptance sequence
 
-1. Pin and review a real `IbkrPaperGatewayTransport` implementation against the
-   configured local paper TWS/Gateway endpoint. Record the client and gateway
-   versions; do not introduce a live endpoint or live credentials.
+1. Pin and review the official TWS API distribution, Python interpreter,
+   `follon_ibkr_gateway.py`, instrument map, client ID, and local PAPER
+   TWS/Gateway configuration. Record all versions; do not introduce a live port
+   or broker credential into Follon configuration.
 2. Run the PAPER service with a filesystem ACL that restricts the durable
    journal and the kill-switch command to the dedicated operator identity.
    Copy journal snapshots to immutable/versioned storage and rehearse restore.
@@ -42,10 +43,10 @@ fingerprint, gateway version, and every reconciliation result as evidence.
 
 ## Explicit boundary
 
-This repository does not contain a production TWS/Gateway wire-protocol client,
-managed secret provider, authenticated control-plane API, or connected live
-broker route. The Months 9–11 safety kernel now accepts a controlled `LIVE`
-configuration only for its deliberately read-only monitoring command; that
-command has an adapter which rejects all broker operations. A connected live
-deployment still requires the external controls documented in the Months 9–11
-status and runbook.
+This repository contains a PAPER-only bridge to the official TWS API, not a
+connected or certified broker deployment. It contains no authenticated
+control-plane API or connected live broker route. The Months 9–11 safety
+kernel accepts a controlled `LIVE` configuration only for its deliberately
+read-only monitoring command; that command has an adapter which rejects all
+broker operations. A connected live deployment still requires the external
+controls documented in the Months 9–11 status and runbook.

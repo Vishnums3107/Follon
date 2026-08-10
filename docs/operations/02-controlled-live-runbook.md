@@ -17,7 +17,8 @@ repository.
 4. A managed secret provider has a least-privilege policy for the opaque
    reference. Test rotation in a non-production environment. Never paste a
    credential into configuration, shell history, journal, ticket, dashboard, or
-   support channel.
+   support channel. The fixed helper must use an absolute reviewed executable,
+   emit only the secret on stdout, and spawn no descendant processes.
 5. The broker adapter version, gateway endpoint policy, reconnect behavior, and
    fault-injection results are reviewed and pinned. A status-only executable is
    not a broker adapter and cannot satisfy this criterion.
@@ -45,9 +46,11 @@ repository.
    result—stop and reconcile it before further entry work.
 6. Reconcile after reconnects, broker notifications, and the session close. Do
    not overwrite internal state with broker state merely to make a report clean.
-7. Count a session only after its explicit close and the latest clean
-   reconciliation. Archive the configuration, activation, approvals, journal
-   segment, dashboard snapshot, broker snapshot, and reconciliation report.
+7. Count a session only when it exactly matches the session selected from the
+   pinned versioned trading calendar, after its explicit close and the latest
+   clean reconciliation. Archive the calendar artifact, configuration,
+   activation, approvals, journal segment, dashboard snapshot, broker snapshot,
+   and reconciliation report.
 
 ## Kill-switch and incident procedure
 

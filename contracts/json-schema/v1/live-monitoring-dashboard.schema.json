@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://follon.dev/contracts/v1/live-monitoring-dashboard.schema.json",
-  "title": "Follon Controlled Live Monitoring Dashboard v1",
+  "title": "Follon Controlled Live Monitoring Dashboard v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["dashboard_schema_version", "environment", "mode", "account_id", "configuration_fingerprint", "broker_connected", "audit_healthy", "audit_sequence", "audit_head_hash", "active_kill_switches", "working_orders", "unknown_orders", "unresolved_incidents", "last_reconciled_at", "last_reconciliation_clean", "clean_live_days", "required_live_days", "promotion_eligible", "internal_cash", "positions"],
+  "required": ["dashboard_schema_version", "environment", "mode", "account_id", "configuration_fingerprint", "broker_connected", "audit_healthy", "audit_sequence", "audit_head_hash", "active_kill_switches", "working_orders", "unknown_orders", "unresolved_incidents", "last_reconciled_at", "last_reconciliation_clean", "clean_live_days", "required_live_days", "promotion_eligible", "complete_auditability", "internal_cash", "positions"],
   "properties": {
-    "dashboard_schema_version": { "const": 1 },
+    "dashboard_schema_version": { "const": 2 },
     "environment": { "const": "LIVE" },
     "mode": { "enum": ["SHADOW", "CANARY"] },
     "account_id": { "$ref": "#/$defs/canonicalId" },
@@ -24,6 +24,7 @@
     "clean_live_days": { "type": "integer", "minimum": 0 },
     "required_live_days": { "const": 60 },
     "promotion_eligible": { "type": "boolean" },
+    "complete_auditability": { "type": "boolean" },
     "internal_cash": { "$ref": "#/$defs/decimal" },
     "positions": { "type": "array", "items": { "$ref": "#/$defs/position" } }
   },

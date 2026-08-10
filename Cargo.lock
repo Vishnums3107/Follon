@@ -103,6 +103,8 @@ version = "0.1.0"
 dependencies = [
  "follon-domain",
  "follon-paper",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

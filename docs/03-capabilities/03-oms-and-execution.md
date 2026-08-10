@@ -16,6 +16,9 @@ The order-management system owns client IDs, broker IDs, the lifecycle state mac
 - The local IBKR paper model and the gateway adapter contract accept only the
   PAPER environment. The gateway configuration is restricted to loopback TWS
   paper port 7497 or Gateway paper port 4002.
+- The concrete process transport starts only a fixed absolute executable,
+  exchanges bounded correlated protocol messages over private pipes, and marks
+  the session unhealthy after timeout, broken output, or protocol mismatch.
 
 ## Planned execution methods
 

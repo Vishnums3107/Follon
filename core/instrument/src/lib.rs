@@ -212,6 +212,8 @@ pub trait TradingCalendar: Send + Sync {
     fn calendar_id(&self) -> &str;
     /// Looks up the session that contains a supplied UTC instant.
     fn session_at(&self, utc_time: &str) -> Option<&TradingSession>;
+    /// Resolves the configured exchange session for an exact exchange-local date.
+    fn session_for_exchange_date(&self, exchange_date: &str) -> Option<&TradingSession>;
 
     /// States whether an order is permitted to enter the regular session.
     fn is_open_at(&self, utc_time: &str) -> bool {
@@ -264,6 +266,12 @@ impl TradingCalendar for StaticTradingCalendar {
         self.sessions
             .iter()
             .find(|session| session.contains(utc_time))
+    }
+
+    fn session_for_exchange_date(&self, exchange_date: &str) -> Option<&TradingSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.exchange_date == exchange_date)
     }
 }
 

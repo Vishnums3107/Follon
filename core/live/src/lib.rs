@@ -17,7 +17,7 @@ use follon_domain::{
     validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent, OrderState,
     RiskDecision, Side,
 };
-use follon_instrument::TradingSession;
+use follon_instrument::{TradingCalendar, TradingSession};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -781,6 +781,8 @@ pub struct LiveMonitoringDashboard {
     pub required_live_days: u32,
     /// Whether the next gate is eligible.
     pub promotion_eligible: bool,
+    /// Whether every retained live-state transition is covered by the durable audit chain.
+    pub complete_auditability: bool,
     /// Exact internal cash.
     pub internal_cash: String,
     /// Current position rows, deterministic by instrument.
@@ -1917,12 +1919,20 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         session: &TradingSession,
         report: &LiveReconciliationReport,
         actor: &str,
+        calendar: &dyn TradingCalendar,
     ) -> Result<(), LiveError> {
         self.ensure_audit_healthy()?;
         self.require_canary_active(&report.reconciled_at)?;
         validate_canonical_id("live day actor", actor)?;
         session.validate()?;
         validate_exchange_date(&session.exchange_date)?;
+        if calendar.calendar_id() != self.policy.trading_calendar_id
+            || calendar.session_for_exchange_date(&session.exchange_date) != Some(session)
+        {
+            return Err(LiveError(
+                "live-day gate requires the exact session from the configured calendar".to_owned(),
+            ));
+        }
         if self.activation.mode != LiveRunMode::Canary
             || !report.is_clean()
             || self.latest_reconciliation.as_ref() != Some(report)
@@ -1998,7 +2008,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             })
             .collect();
         LiveMonitoringDashboard {
-            dashboard_schema_version: 1,
+            dashboard_schema_version: 2,
             environment: self.account.environment.clone(),
             mode: self.activation.mode.as_str().to_owned(),
             account_id: self.account.account_id.clone(),
@@ -2020,6 +2030,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             clean_live_days: promotion.clean_live_days,
             required_live_days: promotion.required_live_days,
             promotion_eligible: promotion.eligible_for_next_gate,
+            complete_auditability: promotion.complete_auditability,
             internal_cash: self.cash.to_string(),
             positions,
         }
@@ -3157,6 +3168,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use follon_domain::{OrderType, TimeInForce};
+    use follon_instrument::StaticTradingCalendar;
 
     use super::*;
 
@@ -3348,6 +3360,24 @@ mod tests {
         }
     }
 
+    fn live_session(exchange_date: &str) -> TradingSession {
+        let (opens_at, closes_at) = if exchange_date >= "2026-03-09" {
+            ("13:30:00Z", "20:00:00Z")
+        } else {
+            ("14:30:00Z", "21:00:00Z")
+        };
+        TradingSession {
+            exchange_date: exchange_date.to_owned(),
+            opens_at: format!("{exchange_date}T{opens_at}"),
+            closes_at: format!("{exchange_date}T{closes_at}"),
+        }
+    }
+
+    fn live_calendar(sessions: &[TradingSession]) -> StaticTradingCalendar {
+        StaticTradingCalendar::new("calendar.nyse.v1", sessions.to_vec())
+            .expect("test live calendar")
+    }
+
     fn approval_for(
         service: &LiveTradingService<TestBroker>,
         intent: &OrderIntent,
@@ -3439,16 +3469,10 @@ mod tests {
             .reconcile("operator.approver.001", "2026-01-02T21:01:00Z")
             .expect("independent reconciliation");
         assert!(report.is_clean());
+        let session = live_session("2026-01-02");
+        let calendar = live_calendar(std::slice::from_ref(&session));
         service
-            .record_live_session(
-                &TradingSession {
-                    exchange_date: "2026-01-02".to_owned(),
-                    opens_at: "2026-01-02T14:30:00Z".to_owned(),
-                    closes_at: "2026-01-02T21:00:00Z".to_owned(),
-                },
-                &report,
-                "operator.approver.001",
-            )
+            .record_live_session(&session, &report, "operator.approver.001", &calendar)
             .expect("post-close clean evidence");
         let dashboard = service.monitoring_dashboard();
         assert_eq!(dashboard.clean_live_days, 1);
@@ -3459,6 +3483,109 @@ mod tests {
         let recovered = test_service(LiveRunMode::Canary, &path);
         assert!(!recovered.monitoring_dashboard().broker_connected);
         assert_eq!(recovered.monitoring_dashboard().clean_live_days, 1);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn sixty_configured_clean_sessions_are_required_and_recoverable() {
+        let path = journal_path("sixty-day-gate");
+        let dates = [
+            "2026-01-02",
+            "2026-01-05",
+            "2026-01-06",
+            "2026-01-07",
+            "2026-01-08",
+            "2026-01-09",
+            "2026-01-12",
+            "2026-01-13",
+            "2026-01-14",
+            "2026-01-15",
+            "2026-01-16",
+            "2026-01-20",
+            "2026-01-21",
+            "2026-01-22",
+            "2026-01-23",
+            "2026-01-26",
+            "2026-01-27",
+            "2026-01-28",
+            "2026-01-29",
+            "2026-01-30",
+            "2026-02-02",
+            "2026-02-03",
+            "2026-02-04",
+            "2026-02-05",
+            "2026-02-06",
+            "2026-02-09",
+            "2026-02-10",
+            "2026-02-11",
+            "2026-02-12",
+            "2026-02-13",
+            "2026-02-17",
+            "2026-02-18",
+            "2026-02-19",
+            "2026-02-20",
+            "2026-02-23",
+            "2026-02-24",
+            "2026-02-25",
+            "2026-02-26",
+            "2026-02-27",
+            "2026-03-02",
+            "2026-03-03",
+            "2026-03-04",
+            "2026-03-05",
+            "2026-03-06",
+            "2026-03-09",
+            "2026-03-10",
+            "2026-03-11",
+            "2026-03-12",
+            "2026-03-13",
+            "2026-03-16",
+            "2026-03-17",
+            "2026-03-18",
+            "2026-03-19",
+            "2026-03-20",
+            "2026-03-23",
+            "2026-03-24",
+            "2026-03-25",
+            "2026-03-26",
+            "2026-03-27",
+            "2026-03-30",
+        ];
+        assert_eq!(dates.len(), 60);
+        let sessions: Vec<_> = dates.iter().map(|date| live_session(date)).collect();
+        let calendar = live_calendar(&sessions);
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:01:00Z",
+            )
+            .expect("managed-secret connection");
+
+        for (index, session) in sessions.iter().enumerate() {
+            let report = service
+                .reconcile("operator.approver.001", &session.closes_at)
+                .expect("clean independent reconciliation");
+            assert!(report.is_clean());
+            service
+                .record_live_session(session, &report, "operator.approver.001", &calendar)
+                .expect("calendar-backed session evidence");
+            assert_eq!(service.promotion_status().clean_live_days, index as u32 + 1);
+            assert_eq!(
+                service.promotion_status().eligible_for_next_gate,
+                index == 59
+            );
+        }
+        drop(service);
+
+        let recovered = test_service(LiveRunMode::Canary, &path);
+        let promotion = recovered.promotion_status();
+        assert_eq!(promotion.clean_live_days, 60);
+        assert!(promotion.complete_auditability);
+        assert!(promotion.eligible_for_next_gate);
+        assert!(!recovered.monitoring_dashboard().broker_connected);
+        drop(recovered);
         std::fs::remove_file(path).expect("remove test journal");
     }
 

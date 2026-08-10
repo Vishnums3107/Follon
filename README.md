@@ -7,11 +7,13 @@ decomposed product plan, versioned contracts, a deterministic historical replay
 slice, an isolated strategy SDK, a durable PAPER OMS/control boundary, and an
 evidence-only desktop shell. It also contains a controlled-live safety kernel
 for hash-chained audit, four-eyes activation/approvals, shadow/canary limits,
-reconciliation, and monitoring. It has no checked-in live credentials, secret
-provider, authenticated approval service, or live broker endpoint. The
-checked-in IBKR implementation is a paper-only adapter contract and
-deterministic local model; connecting any broker remains subject to the
-documented operator gates.
+reconciliation, and monitoring. It has no checked-in live credentials,
+authenticated approval service, or live broker endpoint. A fixed-process
+managed-secret provider is available for an audited vault/keychain helper, but
+no provider or credential is configured by the repository. The checked-in IBKR
+implementation includes a PAPER-only official-API process bridge and a
+deterministic local model; connecting it still requires an operator-managed TWS
+or IB Gateway PAPER session and the documented acceptance gates.
 
 ## Start here
 
@@ -36,11 +38,13 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   or credentials.
 - A PAPER-only OMS with versioned risk limits, fresh-market checks, cash
   reservation, durable evidence/restart recovery, reconciliation, kill
-  switches, reconnect handling, and deterministic broker fault injection.
+  switches, reconnect handling, deterministic broker fault injection, and a
+  bounded process transport for the official IBKR Python TWS API bridge.
 - A TypeScript desktop evidence projection that cannot alter trading state,
   including read-only PAPER and controlled-live monitoring dashboards.
 - A controlled-live safety kernel with opaque credential references, zeroizing
-  secret-material boundary, time-bounded four-eyes activations and approvals,
+  secret-material boundary, a no-shell managed-helper provider, time-bounded
+  four-eyes activations and approvals,
   shadow/canary separation, independent reconciliation, hash-chained durable
   audit, disaster-recovery status, and a 60-session evidence gate. The supplied
   status CLI is intentionally incapable of connecting to or submitting at a
