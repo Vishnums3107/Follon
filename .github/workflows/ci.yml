@@ -21,12 +21,13 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # The initial repository commit contains only LICENSE, so GitHub cannot
-      # build a dependency graph for this bootstrap PR. Future PRs use the
-      # native review once the first application commit is on main.
+      # Private repositories without GitHub Advanced Security cannot run the
+      # native dependency-review action. Opt in with this repository variable
+      # only after GitHub reports the feature as supported; lockfile audits
+      # below remain mandatory in either case.
       - name: Review dependency changes
         uses: actions/dependency-review-action@v4
-        if: github.event_name == 'pull_request' && github.event.pull_request.base.sha != 'af73c9e9b24219d2c9b32bb17701dc5cafc5d918'
+        if: github.event_name == 'pull_request' && vars.DEPENDENCY_REVIEW_ENABLED == 'true'
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Rust advisory auditor
         run: cargo install cargo-audit --locked

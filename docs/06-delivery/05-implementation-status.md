@@ -15,7 +15,7 @@ decisions in [foundation readiness](01-foundation-readiness.md).
 | Explicit exchange-session model | Implemented and active | `core/instrument::StaticTradingCalendar` blocks out-of-session replay bars |
 | Python strategy SDK boundary | Implemented | `python/strategy-sdk` and example strategy |
 | Desktop evidence shell | Implemented | `apps/desktop`, projection-only WebSocket view |
-| CI, dependency review, secret scanning | Configured | `.github/workflows/ci.yml` |
+| CI, lockfile advisory audits, secret scanning | Configured | `.github/workflows/ci.yml`; native dependency review is an explicit opt-in when the repository plan supports it |
 
 ## Months 0–5 gate status
 
