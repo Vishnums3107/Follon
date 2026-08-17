@@ -1,0 +1,16 @@
+# Restricted operator image for evidence-only commercial controls.
+# It contains no broker adapter, credential, payment, or network client.
+FROM rust:1.97-slim AS build
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY apps apps
+COPY core core
+COPY adapters adapters
+RUN cargo build --release -p follon-cli --bin follon-admin
+
+FROM debian:bookworm-slim
+RUN useradd --system --create-home --uid 10001 follon
+USER follon
+WORKDIR /app
+COPY --from=build /workspace/target/release/follon-admin /usr/local/bin/follon-admin
+ENTRYPOINT ["follon-admin"]

@@ -3,19 +3,120 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Follon — Evidence and Paper Operations</title>
+    <title>Follon | Trading Operations Dashboard</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main id="app" aria-live="polite">
-      <h1>Follon evidence and operations monitoring</h1>
-      <p>Read-only evidence. This client cannot submit, approve, cancel, or transmit an order.</p>
-      <label>
-        Load canonical NDJSON event log, PAPER dashboard, or controlled-live monitoring JSON
-        <input id="event-log-file" type="file" accept=".ndjson,application/x-ndjson,application/json,.json" />
-      </label>
-      <p id="load-status">Choose a local event log or connect a server-owned evidence stream.</p>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Follon evidence dashboard home">
+        <span class="brand-mark" aria-hidden="true">F</span>
+        <span>Follon</span>
+      </a>
+      <nav class="header-nav" aria-label="Dashboard sections">
+        <a href="#system">System</a>
+        <a href="#workspaces">Workspaces</a>
+        <a href="#capabilities">Capabilities</a>
+        <a href="#artifacts">Evidence</a>
+      </nav>
+      <span class="environment-badge">READ ONLY</span>
+    </header>
+    <main id="app">
+      <section class="hero" aria-labelledby="dashboard-title">
+        <p class="eyebrow">Unified trading operations</p>
+        <h1 id="dashboard-title">One view across the Follon system.</h1>
+        <p class="intro">Monitor research, replay, PAPER, controlled-live safety, operations, options, and commercial evidence from a single deployment surface.</p>
+        <div class="safety-note"><strong>Safety boundary</strong><span>This dashboard verifies and displays evidence. Broker actions, kill switches, approvals, credentials, payments, privacy deletion, and release signing remain in their hardened operator boundaries.</span></div>
+      </section>
+
+      <section id="workspaces" class="dashboard-section" aria-labelledby="workspaces-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">Integrated application</p><h2 id="workspaces-title">Operator workspaces</h2></div>
+          <p class="section-copy">Ten purpose-built views over the complete implemented research, trading-control, operations, options, and commercial evidence model.</p>
+        </div>
+        <div class="workspace-shell">
+          <aside class="workspace-sidebar" aria-label="Dashboard workspaces">
+            <p class="workspace-nav-label">Monitor</p>
+            <button class="workspace-card workspace-active" type="button" data-workspace="command-center"><span>Command Center</span><small>System and gate health</small></button>
+            <p class="workspace-nav-label">Research</p>
+            <button class="workspace-card" type="button" data-workspace="research-lab"><span>Research Lab</span><small>Datasets and experiments</small></button>
+            <button class="workspace-card" type="button" data-workspace="strategy-studio"><span>Strategy Studio</span><small>Versions and deployment</small></button>
+            <button class="workspace-card" type="button" data-workspace="backtest-explorer"><span>Backtest Explorer</span><small>Runs and comparisons</small></button>
+            <p class="workspace-nav-label">Operate</p>
+            <button class="workspace-card" type="button" data-workspace="execution-blotter"><span>Execution Blotter</span><small>OMS lifecycle evidence</small></button>
+            <button class="workspace-card" type="button" data-workspace="risk-cockpit"><span>Risk Cockpit</span><small>Limits and alerts</small></button>
+            <button class="workspace-card" type="button" data-workspace="portfolio"><span>Portfolio</span><small>Positions and attribution</small></button>
+            <button class="workspace-card" type="button" data-workspace="replay-incidents"><span>Replay &amp; Incidents</span><small>Causal reconstruction</small></button>
+            <button class="workspace-card" type="button" data-workspace="journal"><span>Journal</span><small>Audit chains</small></button>
+            <p class="workspace-nav-label">Govern</p>
+            <button class="workspace-card" type="button" data-workspace="administration"><span>Administration</span><small>Commercial and deployment</small></button>
+          </aside>
+          <section id="workspace-detail" class="workspace-detail" aria-live="polite" aria-labelledby="workspace-detail-title">
+            <div class="workspace-detail-heading">
+              <div><p class="eyebrow">Active workspace</p><h3 id="workspace-detail-title">Command Center</h3></div>
+              <div class="workspace-header-actions"><span id="workspace-artifact-count" class="workspace-count">Loading evidence</span><button id="refresh-workspace" type="button">Refresh workspace</button></div>
+            </div>
+            <p id="workspace-detail-copy" class="workspace-detail-copy">System health, acceptance gates, and evidence from every implemented Follon capability.</p>
+            <div id="workspace-feature-badges" class="workspace-badges"></div>
+            <div id="workspace-summary" class="workspace-summary" aria-label="Workspace summary"></div>
+            <div id="workspace-canvas" class="workspace-canvas">
+              <div class="workspace-loading"><strong>Loading integrated workspace</strong><span>Reading bounded, immutable system projections…</span></div>
+            </div>
+            <details class="workspace-capability-drawer">
+              <summary>Implementation scope and capabilities</summary>
+              <ul id="workspace-capabilities" class="workspace-capabilities"></ul>
+              <div id="workspace-evidence" class="workspace-evidence-list" hidden></div>
+            </details>
+          </section>
+        </div>
+      </section>
+
+      <section id="system" class="dashboard-section" aria-labelledby="system-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">Runtime</p><h2 id="system-title">System health</h2></div>
+          <button id="refresh-system" type="button">Refresh health</button>
+        </div>
+        <div id="system-overview" class="metric-grid" aria-live="polite"></div>
+      </section>
+
+      <section id="capabilities" class="dashboard-section" aria-labelledby="capabilities-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">Product map</p><h2 id="capabilities-title">Implemented capabilities</h2></div>
+          <p class="section-copy">A gate marked open means code exists, but required real operating or customer evidence has not yet been observed.</p>
+        </div>
+        <div id="coverage-summary" class="metric-grid coverage-summary" aria-live="polite">
+          <article class="metric-card"><p class="metric-label">Coverage</p><p class="metric-value">Loading</p><p class="metric-detail">Reading the implementation catalog</p></article>
+        </div>
+        <div id="feature-catalog" class="feature-grid"></div>
+      </section>
+
+      <section id="artifacts" class="source-panel" aria-label="Evidence source">
+        <div>
+          <p class="eyebrow">Evidence explorer</p>
+          <h2>Inspect immutable artifacts</h2>
+          <p>Browse JSON, NDJSON, Markdown, and CSV evidence recursively indexed from the local <code>var</code> folder. Content is always rendered as inert text or validated structures.</p>
+        </div>
+        <div class="source-actions">
+          <label class="field-label" for="feature-filter">Feature area</label>
+          <select id="feature-filter" aria-label="Filter evidence by feature"><option value="all">All features</option></select>
+          <label class="field-label" for="artifact-search">Search artifacts</label>
+          <input id="artifact-search" type="search" placeholder="Name, type, or feature" autocomplete="off" />
+          <label class="field-label" for="server-evidence">Available evidence</label>
+          <div class="control-row">
+            <select id="server-evidence" aria-label="Available server evidence" disabled>
+              <option>Loading local evidence…</option>
+            </select>
+            <button id="refresh-evidence" type="button">Refresh</button>
+          </div>
+          <label class="upload-label" for="event-log-file">Or choose a local evidence file</label>
+          <input id="event-log-file" type="file" accept=".ndjson,.json,.md,.csv,application/x-ndjson,application/json,text/markdown,text/csv" />
+        </div>
+      </section>
+      <p id="load-status" class="status" role="status">Loading local Follon evidence…</p>
+      <div class="artifact-toolbar"><span id="artifact-meta">No artifact selected</span><a id="download-artifact" class="download-link" href="#" hidden>Download original</a></div>
       <section id="evidence" aria-live="polite"></section>
     </main>
-    <script type="module" src="./dist/main.js"></script>
+    <footer>Follon unified dashboard · Evidence-first · No browser-based trading controls</footer>
+    <script type="module" src="/dist/main.js"></script>
   </body>
 </html>

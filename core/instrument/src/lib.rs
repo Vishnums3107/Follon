@@ -3,7 +3,7 @@
 //! Reference data and calendars are selected by replay time; this crate never
 //! queries a machine clock or treats a display ticker as a durable identity.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, DomainError};
 
@@ -14,7 +14,7 @@ pub enum AssetClass {
     Equity,
     /// Exchange-traded fund.
     Etf,
-    /// Reserved extension point; no option-chain behavior exists yet.
+    /// Listed option contract; versioned option-chain behavior is owned by `follon-options`.
     Option,
     /// Reserved extension point; no futures behavior exists yet.
     Future,
@@ -206,6 +206,46 @@ impl TradingSession {
     }
 }
 
+/// Explicit point-in-time trading suspension used by deterministic replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradingHalt {
+    /// Stable identity retained in the version-controlled configuration.
+    pub halt_id: String,
+    /// Optional instrument scope. `None` represents a venue-wide halt.
+    pub instrument_id: Option<String>,
+    /// UTC inclusive start of the halt.
+    pub starts_at: String,
+    /// UTC exclusive end of the halt.
+    pub ends_at: String,
+    /// Human-readable source or reason for the suspension.
+    pub reason: String,
+}
+
+impl TradingHalt {
+    /// Validates identity, scope, time range, and explanation.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_canonical_id("halt_id", &self.halt_id)?;
+        if let Some(instrument_id) = &self.instrument_id {
+            validate_canonical_id("halt instrument_id", instrument_id)?;
+        }
+        validate_utc_timestamp("halt starts_at", &self.starts_at)?;
+        validate_utc_timestamp("halt ends_at", &self.ends_at)?;
+        if self.starts_at >= self.ends_at || self.reason.trim().is_empty() {
+            return Err(DomainError("trading halt is invalid".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Whether this halt suspends the instrument at the supplied UTC instant.
+    pub fn contains(&self, instrument_id: &str, utc_time: &str) -> bool {
+        self.instrument_id
+            .as_deref()
+            .is_none_or(|scope| scope == instrument_id)
+            && self.starts_at.as_str() <= utc_time
+            && utc_time < self.ends_at.as_str()
+    }
+}
+
 /// Explicit session source used by market-data and risk checks.
 pub trait TradingCalendar: Send + Sync {
     /// Stable calendar identity.
@@ -219,19 +259,35 @@ pub trait TradingCalendar: Send + Sync {
     fn is_open_at(&self, utc_time: &str) -> bool {
         self.session_at(utc_time).is_some()
     }
+
+    /// States whether an instrument can trade, including explicit halt windows.
+    fn is_instrument_open_at(&self, instrument_id: &str, utc_time: &str) -> bool {
+        let _ = instrument_id;
+        self.is_open_at(utc_time)
+    }
 }
 
 /// Static, version-controlled calendar appropriate for historical replay fixtures.
 pub struct StaticTradingCalendar {
     calendar_id: String,
     sessions: Vec<TradingSession>,
+    halts: Vec<TradingHalt>,
 }
 
 impl StaticTradingCalendar {
     /// Creates an explicit calendar after rejecting overlapping or malformed sessions.
     pub fn new(
         calendar_id: impl Into<String>,
+        sessions: Vec<TradingSession>,
+    ) -> Result<Self, DomainError> {
+        Self::new_with_halts(calendar_id, sessions, Vec::new())
+    }
+
+    /// Creates an explicit calendar with version-controlled trading suspensions.
+    pub fn new_with_halts(
+        calendar_id: impl Into<String>,
         mut sessions: Vec<TradingSession>,
+        mut halts: Vec<TradingHalt>,
     ) -> Result<Self, DomainError> {
         let calendar_id = calendar_id.into();
         validate_canonical_id("calendar_id", &calendar_id)?;
@@ -250,9 +306,40 @@ impl StaticTradingCalendar {
         {
             return Err(DomainError("trading calendar sessions overlap".to_owned()));
         }
+        let mut halt_ids = HashSet::new();
+        for halt in &halts {
+            halt.validate()?;
+            if !halt_ids.insert(halt.halt_id.as_str()) {
+                return Err(DomainError("trading halt IDs must be unique".to_owned()));
+            }
+            if !sessions.iter().any(|session| {
+                session.opens_at <= halt.starts_at && halt.ends_at <= session.closes_at
+            }) {
+                return Err(DomainError(
+                    "trading halt must be contained by an explicit session".to_owned(),
+                ));
+            }
+        }
+        if halts.iter().enumerate().any(|(index, left)| {
+            halts.iter().skip(index + 1).any(|right| {
+                left.instrument_id == right.instrument_id
+                    && left.starts_at < right.ends_at
+                    && right.starts_at < left.ends_at
+            })
+        }) {
+            return Err(DomainError(
+                "trading halt windows with the same scope overlap".to_owned(),
+            ));
+        }
+        halts.sort_by(|left, right| {
+            left.starts_at
+                .cmp(&right.starts_at)
+                .then_with(|| left.halt_id.cmp(&right.halt_id))
+        });
         Ok(Self {
             calendar_id,
             sessions,
+            halts,
         })
     }
 }
@@ -272,6 +359,14 @@ impl TradingCalendar for StaticTradingCalendar {
         self.sessions
             .iter()
             .find(|session| session.exchange_date == exchange_date)
+    }
+
+    fn is_instrument_open_at(&self, instrument_id: &str, utc_time: &str) -> bool {
+        self.is_open_at(utc_time)
+            && !self
+                .halts
+                .iter()
+                .any(|halt| halt.contains(instrument_id, utc_time))
     }
 }
 
@@ -330,6 +425,25 @@ mod tests {
     }
 
     #[test]
+    fn registry_fails_closed_after_an_instrument_effective_end() {
+        let mut registry = InstrumentRegistry::default();
+        registry
+            .register(version(
+                "2026-01-01T00:00:00Z",
+                Some("2026-02-01T00:00:00Z"),
+                "SPY",
+            ))
+            .unwrap();
+
+        assert!(registry
+            .resolve("inst.us_equity.spy", "2026-01-31T23:59:59Z")
+            .is_some());
+        assert!(registry
+            .resolve("inst.us_equity.spy", "2026-02-01T00:00:00Z")
+            .is_none());
+    }
+
+    #[test]
     fn calendar_requires_explicit_regular_session() {
         assert!(StaticTradingCalendar::new("cal.us_equities.nyse", Vec::new()).is_err());
         let calendar = StaticTradingCalendar::new(
@@ -343,5 +457,80 @@ mod tests {
         .unwrap();
         assert!(calendar.is_open_at("2026-01-02T14:31:00Z"));
         assert!(!calendar.is_open_at("2026-01-02T21:00:00Z"));
+    }
+
+    #[test]
+    fn calendar_applies_venue_and_instrument_halts_at_exact_boundaries() {
+        let calendar = StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![TradingSession {
+                exchange_date: "2026-01-02".to_owned(),
+                opens_at: "2026-01-02T14:30:00Z".to_owned(),
+                closes_at: "2026-01-02T21:00:00Z".to_owned(),
+            }],
+            vec![
+                TradingHalt {
+                    halt_id: "halt.venue.001".to_owned(),
+                    instrument_id: None,
+                    starts_at: "2026-01-02T15:00:00Z".to_owned(),
+                    ends_at: "2026-01-02T15:05:00Z".to_owned(),
+                    reason: "venue volatility pause".to_owned(),
+                },
+                TradingHalt {
+                    halt_id: "halt.spy.001".to_owned(),
+                    instrument_id: Some("inst.us_equity.spy".to_owned()),
+                    starts_at: "2026-01-02T16:00:00Z".to_owned(),
+                    ends_at: "2026-01-02T16:10:00Z".to_owned(),
+                    reason: "instrument news pending".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(!calendar.is_instrument_open_at("inst.us_equity.spy", "2026-01-02T15:00:00Z"));
+        assert!(!calendar.is_instrument_open_at("inst.us_equity.qqq", "2026-01-02T15:04:59Z"));
+        assert!(!calendar.is_instrument_open_at("inst.us_equity.spy", "2026-01-02T16:09:59Z"));
+        assert!(calendar.is_instrument_open_at("inst.us_equity.qqq", "2026-01-02T16:09:59Z"));
+        assert!(calendar.is_instrument_open_at("inst.us_equity.spy", "2026-01-02T16:10:00Z"));
+    }
+
+    #[test]
+    fn calendar_rejects_malformed_or_ambiguous_halts() {
+        let session = TradingSession {
+            exchange_date: "2026-01-02".to_owned(),
+            opens_at: "2026-01-02T14:30:00Z".to_owned(),
+            closes_at: "2026-01-02T21:00:00Z".to_owned(),
+        };
+        let halt = TradingHalt {
+            halt_id: "halt.spy.001".to_owned(),
+            instrument_id: Some("inst.us_equity.spy".to_owned()),
+            starts_at: "2026-01-02T15:00:00Z".to_owned(),
+            ends_at: "2026-01-02T15:10:00Z".to_owned(),
+            reason: "news pending".to_owned(),
+        };
+        let mut overlapping = halt.clone();
+        overlapping.halt_id = "halt.spy.002".to_owned();
+        overlapping.starts_at = "2026-01-02T15:05:00Z".to_owned();
+        overlapping.ends_at = "2026-01-02T15:15:00Z".to_owned();
+        assert!(StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![session.clone()],
+            vec![halt, overlapping],
+        )
+        .is_err());
+
+        let outside_session = TradingHalt {
+            halt_id: "halt.venue.after-hours".to_owned(),
+            instrument_id: None,
+            starts_at: "2026-01-02T21:00:00Z".to_owned(),
+            ends_at: "2026-01-02T21:05:00Z".to_owned(),
+            reason: "invalid after-hours halt".to_owned(),
+        };
+        assert!(StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![session],
+            vec![outside_session],
+        )
+        .is_err());
     }
 }

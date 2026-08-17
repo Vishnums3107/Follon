@@ -4,6 +4,17 @@ This record maps implemented work to the roadmap gates. It is not a release
 approval and does not override the unchecked legal, customer, and deployment
 decisions in [foundation readiness](01-foundation-readiness.md).
 
+## Active gate and scope freeze
+
+The active work is Release 1 replay-to-paper acceptance and founder-led
+customer validation. Later-phase primitives are present, but their external
+gates are still open: **0/30** observed paper sessions, **0/60** controlled-live
+sessions, **0/5** unaided design partners, **0** independent broker-backed
+options reconciliation sessions, and no paying-customer evidence. Do not add a
+broker, asset class, India order flow, FIX, multi-account/team surface, or more
+commercial infrastructure until the earlier gates in the
+[roadmap](03-roadmap-and-gates.md) are independently evidenced.
+
 ## Months 0–2: foundation
 
 | Requirement | Status | Evidence |
@@ -51,8 +62,56 @@ capital-bearing operation.
 
 ## Deployment artifact status
 
-`infra/compose.dev.yml` provisions loopback-only non-production PostgreSQL and
-MinIO, while `infra/Dockerfile.replay` builds a non-live replay image. The
-Docker engine was unavailable on the local host during verification, so the
-container build/run check remains required in CI or on a machine with Docker
-Desktop's Linux engine running.
+`infra/compose.dev.yml` provisions loopback-only non-production PostgreSQL,
+MinIO, and the dashboard. `infra/Dockerfile.replay` builds the non-live replay
+image, while the opt-in storage tool image publishes Parquet, maintains the
+DuckDB catalog, and verifies immutable MinIO upload/recovery. All development
+containers were built and exercised locally on 2026-08-17.
+
+## Months 12–14 operator-workbench status
+
+The local risk cockpit, attribution, alerts, schedule planner, parameter/config
+validation, journal, reports, replay-facing desktop view, and strict contracts
+are implemented as deterministic evidence workflows. The related status record
+is [Months 12–14 status](09-months-12-14-status.md). The required external
+design-partner adoption result is not yet observed: **0/5** partners have
+completed normal work unaided in repository evidence.
+
+## Months 15–17 options status
+
+The deterministic European-options model, chain fingerprint, implied
+volatility/Greeks, multi-leg expiry scenarios, option-book reconciliation, CLI
+artifacts, desktop evidence view, and strict contracts are implemented. The
+external broker-backed acceptance result remains unobserved: **0 sessions**.
+See [Months 15–17 status](10-months-15-17-status.md) for the model boundary and
+required production evidence.
+
+## Months 18–20 commercial-controls status
+
+Local provisioning, subscription-evidence, privacy/retention, signed-release,
+and self-host-readiness primitives are implemented and tested. They do not
+process payment or demonstrate adoption. The external commercial gate remains
+unobserved: **0/10** paying professionals and **0/3** paying organizations in
+repository evidence. See [Months 18–20 status](11-months-18-20-status.md).
+
+## Unified dashboard integration
+
+All implemented capability domains and the ten documented primary screens have
+workspace-specific read-only projections in the Docker dashboard, including
+runtime/gate health, datasets, experiments, strategy identities, backtest
+comparison, OMS lifecycle evidence, risk, portfolio/attribution, causal replay,
+journals, options, and commercial/deployment status. Recursive source evidence
+and explicit source/documentation/gate metadata remain available. External and
+not-yet-implemented product work is recorded without being marked complete. See the
+[dashboard feature integration status](12-dashboard-feature-integration-status.md).
+
+## Documentation-driven continuation
+
+The first four internal steps are implemented: explicit
+spread with limit protection, point-in-time halt controls, and persistent
+latency/partial-fill simulation, followed by deterministic Parquet, validated
+DuckDB registration, and immutable S3-compatible storage. Effective-dated
+instrument lookup also has a fail-closed post-end regression test. Production
+storage policy, real operating evidence, and external production gates remain
+distinct. Continue in the ordered
+[step-by-step implementation matrix](13-step-by-step-implementation-matrix.md).

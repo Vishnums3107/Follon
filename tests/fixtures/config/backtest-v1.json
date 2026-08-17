@@ -29,8 +29,11 @@
     "max_notional": "10000"
   },
   "execution": {
+    "spread_bps": "0",
     "slippage_bps": "0",
-    "flat_fee": "0.10"
+    "flat_fee": "0.10",
+    "latency_bars": 0,
+    "max_fill_quantity": null
   },
   "calendar": {
     "calendar_id": "cal.us-equities.nyse",

@@ -1565,8 +1565,11 @@ mod tests {
                 max_notional: Decimal::from_integer(10_000).unwrap(),
             },
             DeterministicFillModel {
+                spread_bps: Decimal::ZERO,
                 slippage_bps: Decimal::ZERO,
                 flat_fee: Decimal::from_str("0.10").unwrap(),
+                latency_bars: 0,
+                max_fill_quantity: None,
             },
         )
         .unwrap()

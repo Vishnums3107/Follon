@@ -1,0 +1,21 @@
+# Read-only local evidence dashboard. It contains no broker adapter or credentials.
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS build
+WORKDIR /workspace
+COPY apps/desktop/package.json apps/desktop/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY apps/desktop/ ./
+RUN npm run build
+
+FROM python:3.13-alpine@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    FOLLON_DASHBOARD_STATIC_ROOT=/srv/follon \
+    FOLLON_EVIDENCE_ROOT=/var/follon
+RUN adduser -D -u 10001 follon
+COPY --from=build /workspace/index.html /srv/follon/index.html
+COPY --from=build /workspace/styles.css /srv/follon/styles.css
+COPY --from=build /workspace/favicon.svg /srv/follon/favicon.svg
+COPY --from=build /workspace/dist /srv/follon/dist
+COPY apps/desktop/server.py /app/server.py
+USER follon
+EXPOSE 8080
+ENTRYPOINT ["python", "/app/server.py"]

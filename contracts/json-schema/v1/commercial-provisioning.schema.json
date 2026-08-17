@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/commercial-provisioning.schema.json",
+  "title": "Follon Commercial Tenant Provisioning v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commercial_provisioning_schema_version", "tenant_id", "workspace_id", "plan", "retention_policy_id", "self_hosted", "provisioned_at"],
+  "properties": {
+    "commercial_provisioning_schema_version": { "const": 1 },
+    "tenant_id": { "$ref": "#/$defs/id" },
+    "workspace_id": { "$ref": "#/$defs/id" },
+    "plan": { "enum": ["PROFESSIONAL", "ORGANIZATION", "SELF_HOSTED"] },
+    "retention_policy_id": { "$ref": "#/$defs/id" },
+    "self_hosted": { "type": "boolean" },
+    "provisioned_at": { "$ref": "#/$defs/utc" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "plan": { "const": "SELF_HOSTED" } } },
+      "then": { "properties": { "self_hosted": { "const": true } } },
+      "else": { "properties": { "self_hosted": { "const": false } } }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
+  }
+}

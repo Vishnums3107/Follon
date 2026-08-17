@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.local/contracts/v1/storage-dataset-receipt.schema.json",
+  "title": "Follon immutable Parquet dataset receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "storage_receipt_schema_version",
+    "dataset_id",
+    "dataset_version",
+    "parquet_file",
+    "parquet_sha256",
+    "source_sha256",
+    "row_count",
+    "starts_at",
+    "ends_at"
+  ],
+  "properties": {
+    "storage_receipt_schema_version": { "const": 1 },
+    "dataset_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "dataset_version": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "parquet_file": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*[.]parquet$" },
+    "parquet_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "source_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "row_count": { "type": "integer", "minimum": 1 },
+    "starts_at": { "type": "string", "format": "date-time" },
+    "ends_at": { "type": "string", "format": "date-time" }
+  }
+}

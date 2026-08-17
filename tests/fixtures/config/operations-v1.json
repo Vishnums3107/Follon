@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "environment": "PAPER",
+  "account": {
+    "account_id": "acct.paper.001",
+    "currency": "USD"
+  },
+  "configuration": {
+    "configuration_id": "config.operations.paper",
+    "configuration_version": "2026.08.10.1"
+  },
+  "reproducibility": {
+    "strategy_id": "strategy.mean_revert",
+    "strategy_version": "1.2.0",
+    "strategy_bundle_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dataset_id": "dataset.us_equities",
+    "dataset_version": "2026.08.10",
+    "dataset_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "replay_event_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "parameters": {
+    "parameter_set_id": "params.mean_revert",
+    "revision": "7",
+    "previous_revision": null,
+    "previous_parameter_set_fingerprint": null,
+    "values": [
+      {
+        "parameter_id": "entry_zscore",
+        "value": "2.0",
+        "minimum": "1.0",
+        "maximum": "3.0",
+        "control": "STANDARD",
+        "approval": null
+      },
+      {
+        "parameter_id": "risk.max_gross_exposure",
+        "value": "10000",
+        "minimum": "1000",
+        "maximum": "20000",
+        "control": "TWO_PERSON",
+        "approval": {
+          "approval_id": "approval.risk-limits.7",
+          "requested_by": "operator.alice",
+          "approved_by": "operator.bob",
+          "approved_at": "2026-08-10T15:00:00Z",
+          "approval_subject_hash": "ff03b5ea56cb3948f933f5e0a7d0c3e2b4ff67d8d94204abf8e047c92eadac90",
+          "authorization_policy_hash": "eaf39b7e34c44b5c698a39cafbc4a5d33447dd0ced98fc354120c9e99156f4d8",
+          "approval_evidence_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      {
+        "parameter_id": "risk.max_single_instrument_exposure",
+        "value": "6000",
+        "minimum": "100",
+        "maximum": "10000",
+        "control": "TWO_PERSON",
+        "approval": {
+          "approval_id": "approval.risk-limits.7",
+          "requested_by": "operator.alice",
+          "approved_by": "operator.bob",
+          "approved_at": "2026-08-10T15:00:00Z",
+          "approval_subject_hash": "ff03b5ea56cb3948f933f5e0a7d0c3e2b4ff67d8d94204abf8e047c92eadac90",
+          "authorization_policy_hash": "eaf39b7e34c44b5c698a39cafbc4a5d33447dd0ced98fc354120c9e99156f4d8",
+          "approval_evidence_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      {
+        "parameter_id": "risk.max_drawdown_bps",
+        "value": "1000",
+        "minimum": "100",
+        "maximum": "5000",
+        "control": "TWO_PERSON",
+        "approval": {
+          "approval_id": "approval.risk-limits.7",
+          "requested_by": "operator.alice",
+          "approved_by": "operator.bob",
+          "approved_at": "2026-08-10T15:00:00Z",
+          "approval_subject_hash": "ff03b5ea56cb3948f933f5e0a7d0c3e2b4ff67d8d94204abf8e047c92eadac90",
+          "authorization_policy_hash": "eaf39b7e34c44b5c698a39cafbc4a5d33447dd0ced98fc354120c9e99156f4d8",
+          "approval_evidence_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      {
+        "parameter_id": "risk.max_working_orders",
+        "value": "5",
+        "minimum": "1",
+        "maximum": "100",
+        "control": "TWO_PERSON",
+        "approval": {
+          "approval_id": "approval.risk-limits.7",
+          "requested_by": "operator.alice",
+          "approved_by": "operator.bob",
+          "approved_at": "2026-08-10T15:00:00Z",
+          "approval_subject_hash": "ff03b5ea56cb3948f933f5e0a7d0c3e2b4ff67d8d94204abf8e047c92eadac90",
+          "authorization_policy_hash": "eaf39b7e34c44b5c698a39cafbc4a5d33447dd0ced98fc354120c9e99156f4d8",
+          "approval_evidence_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      {
+        "parameter_id": "risk.max_unknown_orders",
+        "value": "0",
+        "minimum": "0",
+        "maximum": "100",
+        "control": "TWO_PERSON",
+        "approval": {
+          "approval_id": "approval.risk-limits.7",
+          "requested_by": "operator.alice",
+          "approved_by": "operator.bob",
+          "approved_at": "2026-08-10T15:00:00Z",
+          "approval_subject_hash": "ff03b5ea56cb3948f933f5e0a7d0c3e2b4ff67d8d94204abf8e047c92eadac90",
+          "authorization_policy_hash": "eaf39b7e34c44b5c698a39cafbc4a5d33447dd0ced98fc354120c9e99156f4d8",
+          "approval_evidence_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      {
+        "parameter_id": "risk.max_unresolved_incidents",
+        "value": "0",
+        "minimum": "0",
+        "maximum": "100",
+        "control": "TWO_PERSON",
+        "approval": {
+          "approval_id": "approval.risk-limits.7",
+          "requested_by": "operator.alice",
+          "approved_by": "operator.bob",
+          "approved_at": "2026-08-10T15:00:00Z",
+          "approval_subject_hash": "ff03b5ea56cb3948f933f5e0a7d0c3e2b4ff67d8d94204abf8e047c92eadac90",
+          "authorization_policy_hash": "eaf39b7e34c44b5c698a39cafbc4a5d33447dd0ced98fc354120c9e99156f4d8",
+          "approval_evidence_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      }
+    ]
+  },
+  "valuation": {
+    "starting_equity": "10000",
+    "cash": "3250",
+    "peak_equity": "12000"
+  },
+  "positions": [
+    {
+      "instrument_id": "inst.us_equity.spy",
+      "quantity": "50",
+      "mark_price": "110",
+      "average_cost": "100",
+      "realized_pnl": "50"
+    },
+    {
+      "instrument_id": "inst.us_equity.msft",
+      "quantity": "10",
+      "mark_price": "250",
+      "average_cost": "240",
+      "realized_pnl": "20"
+    }
+  ],
+  "risk_limits": {
+    "max_gross_exposure": "10000",
+    "max_single_instrument_exposure": "6000",
+    "max_drawdown_bps": "1000",
+    "max_working_orders": 5,
+    "max_unknown_orders": 0,
+    "max_unresolved_incidents": 0
+  },
+  "operational_health": {
+    "audit_healthy": true,
+    "reconciliation_healthy": true,
+    "broker_connected": true,
+    "active_kill_switches": [],
+    "working_orders": 1,
+    "unknown_orders": 0,
+    "unresolved_incidents": 0
+  },
+  "attribution_entries": [
+    {
+      "entry_id": "attribution.realized.spy",
+      "occurred_at": "2026-08-10T15:00:00Z",
+      "instrument_id": "inst.us_equity.spy",
+      "category": "REALIZED_PNL",
+      "amount": "50"
+    },
+    {
+      "entry_id": "attribution.unrealized.spy",
+      "occurred_at": "2026-08-10T16:00:00Z",
+      "instrument_id": "inst.us_equity.spy",
+      "category": "UNREALIZED_PNL",
+      "amount": "500"
+    },
+    {
+      "entry_id": "attribution.unrealized.msft",
+      "occurred_at": "2026-08-10T16:00:00Z",
+      "instrument_id": "inst.us_equity.msft",
+      "category": "UNREALIZED_PNL",
+      "amount": "100"
+    },
+    {
+      "entry_id": "attribution.fees.spy",
+      "occurred_at": "2026-08-10T16:00:00Z",
+      "instrument_id": "inst.us_equity.spy",
+      "category": "FEES",
+      "amount": "-10"
+    },
+    {
+      "entry_id": "attribution.dividend.msft",
+      "occurred_at": "2026-08-10T16:00:00Z",
+      "instrument_id": "inst.us_equity.msft",
+      "category": "DIVIDENDS",
+      "amount": "5"
+    }
+  ],
+  "schedules": [
+    {
+      "schedule_id": "schedule.reconcile",
+      "purpose": "Reconcile the paper account",
+      "time_utc": "21:15",
+      "enabled": true,
+      "last_completed_at": null
+    },
+    {
+      "schedule_id": "schedule.daily_report",
+      "purpose": "Publish the daily operations report",
+      "time_utc": "21:30",
+      "enabled": true,
+      "last_completed_at": null
+    }
+  ]
+}

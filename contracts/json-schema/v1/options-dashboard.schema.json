@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/options-dashboard.schema.json",
+  "title": "Follon Deterministic Options Dashboard v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["analytics", "as_of", "chain", "configuration_file_hash", "model_version", "option_dashboard_schema_version", "reconciliation", "run_identity", "strategy"],
+  "properties": {
+    "analytics": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/analytics" } },
+    "as_of": { "$ref": "#/$defs/utc" },
+    "chain": { "$ref": "#/$defs/chain" },
+    "configuration_file_hash": { "$ref": "#/$defs/hash" },
+    "model_version": { "const": "follon-european-black-scholes-fixed-v1" },
+    "option_dashboard_schema_version": { "const": 1 },
+    "reconciliation": { "$ref": "#/$defs/reconciliation" },
+    "run_identity": { "$ref": "#/$defs/runIdentity" },
+    "strategy": { "$ref": "#/$defs/strategy" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "chain": { "type": "object", "additionalProperties": false, "required": ["chain_id", "chain_snapshot_hash", "currency", "reference_version", "underlying_instrument_id", "underlying_mark"], "properties": { "chain_id": { "$ref": "#/$defs/id" }, "chain_snapshot_hash": { "$ref": "#/$defs/hash" }, "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }, "reference_version": { "$ref": "#/$defs/id" }, "underlying_instrument_id": { "$ref": "#/$defs/id" }, "underlying_mark": { "$ref": "#/$defs/decimal" } } },
+    "analytics": { "type": "object", "additionalProperties": false, "required": ["ask", "bid", "delta", "expiration_at", "gamma", "implied_volatility", "market_premium", "model_price", "option_id", "rho", "right", "strike", "theta", "vega"], "properties": { "ask": { "$ref": "#/$defs/decimal" }, "bid": { "$ref": "#/$defs/decimal" }, "delta": { "$ref": "#/$defs/decimal" }, "expiration_at": { "$ref": "#/$defs/utc" }, "gamma": { "$ref": "#/$defs/decimal" }, "implied_volatility": { "$ref": "#/$defs/decimal" }, "market_premium": { "$ref": "#/$defs/decimal" }, "model_price": { "$ref": "#/$defs/decimal" }, "option_id": { "$ref": "#/$defs/id" }, "rho": { "$ref": "#/$defs/decimal" }, "right": { "enum": ["CALL", "PUT"] }, "strike": { "$ref": "#/$defs/decimal" }, "theta": { "$ref": "#/$defs/decimal" }, "vega": { "$ref": "#/$defs/decimal" } } },
+    "reconciliation": { "type": "object", "additionalProperties": false, "required": ["backtest_book", "clean", "issues", "live_book", "paper_book", "reconciled_at"], "properties": { "backtest_book": { "$ref": "#/$defs/backtestBook" }, "clean": { "type": "boolean" }, "issues": { "type": "array", "items": { "$ref": "#/$defs/issue" } }, "live_book": { "$ref": "#/$defs/liveBook" }, "paper_book": { "$ref": "#/$defs/paperBook" }, "reconciled_at": { "$ref": "#/$defs/utc" } }, "allOf": [{ "if": { "properties": { "clean": { "const": true } }, "required": ["clean"] }, "then": { "properties": { "issues": { "maxItems": 0 } } } }, { "if": { "properties": { "clean": { "const": false } }, "required": ["clean"] }, "then": { "properties": { "issues": { "minItems": 1 } } } }] },
+    "bookEvidence": { "type": "object", "additionalProperties": false, "required": ["account_id", "book_hash", "environment", "run_identity", "run_identity_hash", "source_export_hash", "source_export_id"], "properties": { "account_id": { "$ref": "#/$defs/id" }, "book_hash": { "$ref": "#/$defs/hash" }, "environment": { "enum": ["BACKTEST", "PAPER", "LIVE"] }, "run_identity": { "$ref": "#/$defs/runIdentity" }, "run_identity_hash": { "$ref": "#/$defs/hash" }, "source_export_hash": { "$ref": "#/$defs/hash" }, "source_export_id": { "$ref": "#/$defs/id" } } },
+    "backtestBook": { "allOf": [{ "$ref": "#/$defs/bookEvidence" }, { "properties": { "environment": { "const": "BACKTEST" } } }] },
+    "paperBook": { "allOf": [{ "$ref": "#/$defs/bookEvidence" }, { "properties": { "environment": { "const": "PAPER" } } }] },
+    "liveBook": { "allOf": [{ "$ref": "#/$defs/bookEvidence" }, { "properties": { "environment": { "const": "LIVE" } } }] },
+    "issue": { "type": "object", "additionalProperties": false, "required": ["category", "expected", "observed", "subject"], "properties": { "category": { "enum": ["IDENTITY_MISMATCH", "CASH_MISMATCH", "POSITION_MISMATCH"] }, "expected": { "type": "string" }, "observed": { "type": "string" }, "subject": { "type": "string", "minLength": 1 } } },
+    "runIdentity": { "type": "object", "additionalProperties": false, "required": ["chain_snapshot_hash", "configuration_hash", "dataset_hash", "model_version", "replay_event_hash", "strategy_bundle_hash"], "properties": { "chain_snapshot_hash": { "$ref": "#/$defs/hash" }, "configuration_hash": { "$ref": "#/$defs/hash" }, "dataset_hash": { "$ref": "#/$defs/hash" }, "model_version": { "const": "follon-european-black-scholes-fixed-v1" }, "replay_event_hash": { "$ref": "#/$defs/hash" }, "strategy_bundle_hash": { "$ref": "#/$defs/hash" } } },
+    "strategy": { "type": "object", "additionalProperties": false, "required": ["scenarios", "strategy_id", "strategy_version"], "properties": { "scenarios": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/scenario" } }, "strategy_id": { "$ref": "#/$defs/id" }, "strategy_version": { "type": "string", "minLength": 1 } } },
+    "scenario": { "type": "object", "additionalProperties": false, "required": ["legs", "total_pnl", "underlying_price"], "properties": { "legs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/scenarioLeg" } }, "total_pnl": { "$ref": "#/$defs/decimal" }, "underlying_price": { "$ref": "#/$defs/decimal" } } },
+    "scenarioLeg": { "type": "object", "additionalProperties": false, "required": ["intrinsic_value", "leg_id", "option_id", "pnl"], "properties": { "intrinsic_value": { "$ref": "#/$defs/decimal" }, "leg_id": { "$ref": "#/$defs/id" }, "option_id": { "$ref": "#/$defs/id" }, "pnl": { "$ref": "#/$defs/decimal" } } }
+  }
+}

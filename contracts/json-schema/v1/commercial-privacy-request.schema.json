@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/commercial-privacy-request.schema.json",
+  "title": "Follon Pseudonymous Privacy Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["privacy_request_schema_version", "request_id", "tenant_id", "subject_hash", "kind", "requested_at"],
+  "properties": {
+    "privacy_request_schema_version": { "const": 1 },
+    "request_id": { "$ref": "#/$defs/id" },
+    "tenant_id": { "$ref": "#/$defs/id" },
+    "subject_hash": { "$ref": "#/$defs/hash" },
+    "kind": { "enum": ["ACCESS", "ERASURE"] },
+    "requested_at": { "$ref": "#/$defs/utc" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
+  }
+}

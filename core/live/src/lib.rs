@@ -374,6 +374,33 @@ impl LiveBrokerOrderRequest {
     }
 }
 
+/// A price-only, risk-reducing modification of a working live limit order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveBrokerReplaceRequest {
+    /// Immutable OMS client identity.
+    pub client_order_id: String,
+    /// Current broker-native order identity being superseded.
+    pub previous_broker_order_id: String,
+    /// New positive limit price.
+    pub limit_price: Decimal,
+}
+
+impl LiveBrokerReplaceRequest {
+    fn validate(&self) -> Result<(), LiveError> {
+        validate_canonical_id("live replace client_order_id", &self.client_order_id)?;
+        validate_canonical_id(
+            "live replace previous_broker_order_id",
+            &self.previous_broker_order_id,
+        )?;
+        if self.limit_price <= Decimal::ZERO {
+            return Err(LiveError(
+                "live replacement limit price must be positive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Broker result for one idempotent live submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveBrokerSubmitResult {
@@ -426,6 +453,43 @@ pub enum LiveBrokerEvent {
         /// OMS client idempotency key.
         client_order_id: String,
         /// Stable cancellation reason.
+        reason: String,
+    },
+    /// Broker rejected a requested cancellation; the order remains working.
+    CancelRejected {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Stable broker reason.
+        reason: String,
+    },
+    /// Broker observed time-in-force expiry.
+    Expired {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Stable broker reason.
+        reason: String,
+    },
+    /// Broker observed a modification request before its result is known.
+    ReplaceRequested {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Current broker order identity being replaced.
+        previous_broker_order_id: String,
+    },
+    /// Broker accepted a modification and assigned a new native order identity.
+    Replaced {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Previous broker order identity.
+        previous_broker_order_id: String,
+        /// Replacement broker order identity.
+        broker_order_id: String,
+    },
+    /// Broker rejected a modification; the prior broker version remains working.
+    ReplaceRejected {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Stable broker reason.
         reason: String,
     },
     /// Broker rejection confirmation.
@@ -481,6 +545,13 @@ pub trait LiveBrokerAdapter {
     ) -> Result<LiveBrokerSubmitResult, LiveError>;
     /// Requests cancellation by client idempotency identity.
     fn cancel(&mut self, client_order_id: &str) -> Result<(), LiveError>;
+    /// Requests a price-only replacement. The result arrives through [`LiveBrokerEvent`].
+    fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
+        request.validate()?;
+        Err(LiveError(
+            "live broker adapter does not support order replacement".to_owned(),
+        ))
+    }
     /// Drains normalized asynchronous broker evidence.
     fn poll(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError>;
     /// Gets independent broker state for reconciliation.
@@ -602,6 +673,10 @@ pub struct LiveOrder {
     pub decision: LiveRiskDecision,
     /// Broker identity after it becomes known.
     pub broker_order_id: Option<String>,
+    /// Every broker-native order identity issued for this immutable OMS order.
+    pub broker_order_versions: Vec<String>,
+    /// State to restore after a replacement acceptance or rejection.
+    replace_return_state: Option<OrderState>,
     /// Exact independently-accounted fill quantity.
     pub filled_quantity: Decimal,
 }
@@ -858,6 +933,10 @@ struct PersistentLiveOrder {
     market: PersistentMarketData,
     decision: PersistentRiskDecision,
     broker_order_id: Option<String>,
+    #[serde(default)]
+    broker_order_versions: Vec<String>,
+    #[serde(default)]
+    replace_return_state: Option<String>,
     filled_quantity: String,
 }
 
@@ -1549,6 +1628,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 market,
                 decision: decision.clone(),
                 broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                replace_return_state: None,
                 filled_quantity: Decimal::ZERO,
             },
         );
@@ -1579,7 +1660,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 order
                     .oms
                     .transition(OrderState::Acknowledged, "LIVE_BROKER_ACKNOWLEDGED")?;
-                order.broker_order_id = Some(broker_order_id);
+                order.broker_order_id = Some(broker_order_id.clone());
+                order.broker_order_versions.push(broker_order_id);
                 let state = order.oms.state;
                 self.persist(
                     "live.order.acknowledged.v1",
@@ -1670,6 +1752,84 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         self.persist("live.order.cancel_sent.v1", actor, occurred_at, order_id)
     }
 
+    /// Requests a price-only replacement that cannot increase the approved limit risk.
+    ///
+    /// Replacement preserves the exact approved intent's quantity, side, and
+    /// identity. It is therefore limited to a more conservative limit price and
+    /// remains subject to the active canary window and durable audit trail.
+    pub fn replace_order(
+        &mut self,
+        order_id: &str,
+        replacement_limit_price: Decimal,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<(), LiveError> {
+        self.ensure_audit_healthy()?;
+        self.require_canary_active(occurred_at)?;
+        validate_canonical_id("live replacement actor", actor)?;
+        if !self.broker_connected {
+            return Err(LiveError(
+                "live canary broker session is not connected; reconcile before replacement"
+                    .to_owned(),
+            ));
+        }
+        let request = {
+            let order = self.order_mut(order_id)?;
+            if !matches!(
+                order.oms.state,
+                OrderState::Acknowledged | OrderState::PartiallyFilled
+            ) {
+                return Err(LiveError(
+                    "only acknowledged or partially filled live orders may be replaced".to_owned(),
+                ));
+            }
+            let prior_limit = order.oms.intent.limit_price.ok_or_else(|| {
+                LiveError("only live limit orders support price replacement".to_owned())
+            })?;
+            if replacement_limit_price <= Decimal::ZERO
+                || (order.oms.intent.side == Side::Buy && replacement_limit_price > prior_limit)
+                || (order.oms.intent.side == Side::Sell && replacement_limit_price < prior_limit)
+            {
+                return Err(LiveError(
+                    "live replacement may only reduce the originally approved limit risk"
+                        .to_owned(),
+                ));
+            }
+            let previous_broker_order_id = order.broker_order_id.clone().ok_or_else(|| {
+                LiveError("live replacement requires an acknowledged broker order ID".to_owned())
+            })?;
+            order.replace_return_state = Some(order.oms.state);
+            order
+                .oms
+                .transition(OrderState::PendingReplace, "LIVE_REPLACE_REQUESTED")?;
+            LiveBrokerReplaceRequest {
+                client_order_id: order.oms.order_id.clone(),
+                previous_broker_order_id,
+                limit_price: replacement_limit_price,
+            }
+        };
+        self.persist(
+            "live.order.pending_replace.v1",
+            actor,
+            occurred_at,
+            order_id,
+        )?;
+        if let Err(error) = self.broker.replace(&request) {
+            self.order_mut(order_id)?
+                .oms
+                .transition(OrderState::Unknown, "LIVE_REPLACE_OUTCOME_UNKNOWN")?;
+            self.broker_connected = false;
+            self.persist(
+                "live.order.replace_unknown.v1",
+                actor,
+                occurred_at,
+                order_id,
+            )?;
+            return Err(error);
+        }
+        self.persist("live.order.replace_sent.v1", actor, occurred_at, order_id)
+    }
+
     /// Drains broker evidence and applies each unique execution exactly once.
     pub fn synchronize(&mut self, actor: &str, occurred_at: &str) -> Result<usize, LiveError> {
         self.ensure_audit_healthy()?;
@@ -1696,13 +1856,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         let count = events.len();
         for event in events {
             self.apply_broker_event(event)?;
+            self.persist(
+                "live.broker.event_applied.v1",
+                actor,
+                occurred_at,
+                "broker-event",
+            )?;
         }
-        self.persist(
-            "live.broker.events_synchronized.v1",
-            actor,
-            occurred_at,
-            "broker-events",
-        )?;
         Ok(count)
     }
 
@@ -1737,11 +1897,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         let reconciliation_id = format!("reconciliation-{:08}", self.next_reconciliation);
         self.next_reconciliation += 1;
         let mut raw_issues = Vec::new();
-        let broker_orders: BTreeMap<_, _> = snapshot
-            .orders
-            .iter()
-            .map(|order| (order.client_order_id.as_str(), order))
-            .collect();
+        let mut broker_orders: BTreeMap<&str, Vec<&LiveBrokerOrderSnapshot>> = BTreeMap::new();
+        for broker_order in &snapshot.orders {
+            broker_orders
+                .entry(broker_order.client_order_id.as_str())
+                .or_default()
+                .push(broker_order);
+        }
         for (order_id, internal) in &self.orders {
             match broker_orders.get(order_id.as_str()) {
                 None if internal.working() => raw_issues.push((
@@ -1749,38 +1911,68 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     order_id.clone(),
                     "internal working order is absent from broker snapshot".to_owned(),
                 )),
-                Some(broker) => {
-                    if internal.broker_order_id.as_deref() != Some(broker.broker_order_id.as_str())
-                    {
+                Some(brokers) => {
+                    let broker = internal.broker_order_id.as_ref().and_then(|current| {
+                        brokers
+                            .iter()
+                            .copied()
+                            .find(|candidate| candidate.broker_order_id == *current)
+                    });
+                    if broker.is_none() {
                         raw_issues.push((
                             "BROKER_ORDER_ID_MISMATCH",
                             order_id.clone(),
                             format!(
-                                "internal={:?},broker={}",
-                                internal.broker_order_id, broker.broker_order_id
+                                "internal_current={:?},broker_versions={}",
+                                internal.broker_order_id,
+                                brokers
+                                    .iter()
+                                    .map(|candidate| candidate.broker_order_id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
                             ),
                         ));
                     }
-                    if internal.filled_quantity != broker.filled_quantity {
+                    if brokers.iter().any(|candidate| {
+                        !internal
+                            .broker_order_versions
+                            .contains(&candidate.broker_order_id)
+                    }) {
+                        raw_issues.push((
+                            "BROKER_ORDER_VERSION_MISMATCH",
+                            order_id.clone(),
+                            "broker snapshot includes an unrecognized broker order version"
+                                .to_owned(),
+                        ));
+                    }
+                    let broker_filled =
+                        brokers.iter().try_fold(Decimal::ZERO, |total, candidate| {
+                            total
+                                .checked_add(candidate.filled_quantity)
+                                .map_err(LiveError::from)
+                        })?;
+                    if internal.filled_quantity != broker_filled {
                         raw_issues.push((
                             "FILLED_QUANTITY_MISMATCH",
                             order_id.clone(),
                             format!(
-                                "internal={},broker={}",
-                                internal.filled_quantity, broker.filled_quantity
+                                "internal={},broker={broker_filled}",
+                                internal.filled_quantity,
                             ),
                         ));
                     }
-                    if internal.oms.state != broker.state {
-                        raw_issues.push((
-                            "ORDER_STATE_MISMATCH",
-                            order_id.clone(),
-                            format!(
-                                "internal={},broker={}",
-                                internal.oms.state.as_str(),
-                                broker.state.as_str()
-                            ),
-                        ));
+                    if let Some(broker) = broker {
+                        if internal.oms.state != broker.state {
+                            raw_issues.push((
+                                "ORDER_STATE_MISMATCH",
+                                order_id.clone(),
+                                format!(
+                                    "internal={},broker={}",
+                                    internal.oms.state.as_str(),
+                                    broker.state.as_str()
+                                ),
+                            ));
+                        }
                     }
                 }
                 None => {}
@@ -2203,12 +2395,24 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 let order = self.order_mut(&client_order_id)?;
                 if let Some(existing) = &order.broker_order_id {
                     if existing != &broker_order_id {
+                        if order.broker_order_versions.contains(&broker_order_id) {
+                            return Ok(());
+                        }
                         return Err(LiveError(
-                            "broker reused a live client ID with different broker ID".to_owned(),
+                            "broker reused a live client ID with an unrecognized broker ID"
+                                .to_owned(),
                         ));
                     }
                 }
-                order.broker_order_id = Some(broker_order_id);
+                if order.broker_order_id.is_none() {
+                    order.broker_order_id = Some(broker_order_id.clone());
+                }
+                if !order.broker_order_versions.contains(&broker_order_id) {
+                    order.broker_order_versions.push(broker_order_id);
+                }
+                if !order.working() {
+                    return Ok(());
+                }
                 transition_to_acknowledged(order, "LIVE_BROKER_ACKNOWLEDGEMENT")?;
             }
             LiveBrokerEvent::Execution {
@@ -2227,19 +2431,34 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 if quantity <= Decimal::ZERO || price <= Decimal::ZERO || fee < Decimal::ZERO {
                     return Err(LiveError("live execution values are invalid".to_owned()));
                 }
-                if !self.execution_ids.insert(execution_id.clone()) {
+                if self.execution_ids.contains(&execution_id) {
                     return Ok(());
                 }
                 let (instrument_id, side, order_id) = {
                     let order = self.order_mut(&client_order_id)?;
                     if let Some(existing) = &order.broker_order_id {
-                        if existing != &broker_order_id {
+                        if existing != &broker_order_id
+                            && !order.broker_order_versions.contains(&broker_order_id)
+                        {
                             return Err(LiveError(
-                                "live execution broker ID does not match order".to_owned(),
+                                "live execution has an unrecognized broker order version"
+                                    .to_owned(),
                             ));
                         }
                     } else {
-                        order.broker_order_id = Some(broker_order_id);
+                        order.broker_order_id = Some(broker_order_id.clone());
+                    }
+                    if !order.broker_order_versions.contains(&broker_order_id) {
+                        order.broker_order_versions.push(broker_order_id.clone());
+                    }
+                    if matches!(
+                        order.oms.state,
+                        OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+                    ) {
+                        order.oms.transition(
+                            OrderState::Unknown,
+                            "LATE_LIVE_BROKER_EXECUTION_AFTER_TERMINAL",
+                        )?;
                     }
                     transition_to_acknowledged(order, "LIVE_EXECUTION_CONFIRMED_ORDER")?;
                     let total = order.filled_quantity.checked_add(quantity)?;
@@ -2266,6 +2485,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         order.oms.order_id.clone(),
                     )
                 };
+                self.execution_ids.insert(execution_id.clone());
                 let fill = Fill {
                     execution_id,
                     order_id,
@@ -2299,21 +2519,138 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             } => {
                 validate_canonical_id("live cancellation client_order_id", &client_order_id)?;
                 validate_reason("live cancellation reason", &reason)?;
+                transition_to_terminal(
+                    self.order_mut(&client_order_id)?,
+                    OrderState::Cancelled,
+                    &reason,
+                )?;
+            }
+            LiveBrokerEvent::CancelRejected {
+                client_order_id,
+                reason,
+            } => {
+                validate_canonical_id("live cancellation client_order_id", &client_order_id)?;
+                validate_reason("live cancel rejection reason", &reason)?;
                 let order = self.order_mut(&client_order_id)?;
                 match order.oms.state {
-                    OrderState::Acknowledged | OrderState::PartiallyFilled => {
-                        order
-                            .oms
-                            .transition(OrderState::PendingCancel, "LIVE_BROKER_CANCEL_OBSERVED")?;
-                        order.oms.transition(OrderState::Cancelled, reason)?;
-                    }
                     OrderState::PendingCancel | OrderState::Unknown => {
-                        order.oms.transition(OrderState::Cancelled, reason)?;
+                        restore_working_state(order, "LIVE_BROKER_CANCEL_REJECTED")?;
                     }
-                    OrderState::Cancelled => {}
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
                     _ => {
                         return Err(LiveError(
-                            "live cancellation is incompatible with OMS state".to_owned(),
+                            "live cancel rejection is incompatible with OMS state".to_owned(),
+                        ))
+                    }
+                }
+            }
+            LiveBrokerEvent::Expired {
+                client_order_id,
+                reason,
+            } => {
+                validate_canonical_id("live expiry client_order_id", &client_order_id)?;
+                validate_reason("live expiry reason", &reason)?;
+                transition_to_terminal(
+                    self.order_mut(&client_order_id)?,
+                    OrderState::Expired,
+                    &reason,
+                )?;
+            }
+            LiveBrokerEvent::ReplaceRequested {
+                client_order_id,
+                previous_broker_order_id,
+            } => {
+                validate_canonical_id("live replacement client_order_id", &client_order_id)?;
+                validate_canonical_id(
+                    "live replacement previous_order_id",
+                    &previous_broker_order_id,
+                )?;
+                let order = self.order_mut(&client_order_id)?;
+                if order.broker_order_id.as_deref() != Some(previous_broker_order_id.as_str()) {
+                    return Err(LiveError(
+                        "live replacement does not match active broker order".to_owned(),
+                    ));
+                }
+                match order.oms.state {
+                    OrderState::Acknowledged | OrderState::PartiallyFilled => {
+                        order.replace_return_state = Some(order.oms.state);
+                        order.oms.transition(
+                            OrderState::PendingReplace,
+                            "LIVE_BROKER_REPLACE_REQUESTED",
+                        )?;
+                    }
+                    OrderState::PendingReplace => {}
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
+                    _ => {
+                        return Err(LiveError(
+                            "live replacement is incompatible with OMS state".to_owned(),
+                        ))
+                    }
+                }
+            }
+            LiveBrokerEvent::Replaced {
+                client_order_id,
+                previous_broker_order_id,
+                broker_order_id,
+            } => {
+                validate_canonical_id("live replacement client_order_id", &client_order_id)?;
+                validate_canonical_id(
+                    "live replacement previous_order_id",
+                    &previous_broker_order_id,
+                )?;
+                validate_canonical_id("live replacement_order_id", &broker_order_id)?;
+                let order = self.order_mut(&client_order_id)?;
+                if order.broker_order_id.as_deref() != Some(previous_broker_order_id.as_str()) {
+                    if order.broker_order_versions.contains(&broker_order_id) {
+                        return Ok(());
+                    }
+                    return Err(LiveError(
+                        "live replacement does not match active broker order".to_owned(),
+                    ));
+                }
+                match order.oms.state {
+                    OrderState::PendingReplace | OrderState::Unknown => {
+                        if !order.broker_order_versions.contains(&broker_order_id) {
+                            order.broker_order_versions.push(broker_order_id.clone());
+                        }
+                        order.broker_order_id = Some(broker_order_id);
+                        restore_replacement_state(order, "LIVE_BROKER_REPLACED")?;
+                    }
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
+                    _ => {
+                        return Err(LiveError(
+                            "live replacement is incompatible with OMS state".to_owned(),
+                        ))
+                    }
+                }
+            }
+            LiveBrokerEvent::ReplaceRejected {
+                client_order_id,
+                reason,
+            } => {
+                validate_canonical_id("live replacement client_order_id", &client_order_id)?;
+                validate_reason("live replacement rejection reason", &reason)?;
+                let order = self.order_mut(&client_order_id)?;
+                match order.oms.state {
+                    OrderState::PendingReplace | OrderState::Unknown => {
+                        restore_replacement_state(order, "LIVE_BROKER_REPLACE_REJECTED")?;
+                    }
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
+                    _ => {
+                        return Err(LiveError(
+                            "live replacement rejection is incompatible with OMS state".to_owned(),
                         ))
                     }
                 }
@@ -2324,24 +2661,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             } => {
                 validate_canonical_id("live rejection client_order_id", &client_order_id)?;
                 validate_reason("live rejection reason", &reason)?;
-                let order = self.order_mut(&client_order_id)?;
-                match order.oms.state {
-                    OrderState::PendingSubmit => {
-                        order
-                            .oms
-                            .transition(OrderState::Submitted, "LIVE_BROKER_REJECTION_OBSERVED")?;
-                        order.oms.transition(OrderState::Rejected, reason)?;
-                    }
-                    OrderState::Submitted | OrderState::Unknown => {
-                        order.oms.transition(OrderState::Rejected, reason)?;
-                    }
-                    OrderState::Rejected => {}
-                    _ => {
-                        return Err(LiveError(
-                            "live rejection is incompatible with OMS state".to_owned(),
-                        ))
-                    }
-                }
+                transition_to_terminal(
+                    self.order_mut(&client_order_id)?,
+                    OrderState::Rejected,
+                    &reason,
+                )?;
             }
         }
         Ok(())
@@ -2417,6 +2741,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             market: PersistentMarketData::from(&order.market),
                             decision: PersistentRiskDecision::from(&order.decision),
                             broker_order_id: order.broker_order_id.clone(),
+                            broker_order_versions: order.broker_order_versions.clone(),
+                            replace_return_state: order
+                                .replace_return_state
+                                .map(OrderState::as_str)
+                                .map(str::to_owned),
                             filled_quantity: order.filled_quantity.to_string(),
                         },
                     )
@@ -2543,6 +2872,28 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             if let Some(broker_order_id) = &persisted.broker_order_id {
                 validate_canonical_id("persisted live broker_order_id", broker_order_id)?;
             }
+            let mut broker_order_versions = persisted.broker_order_versions;
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                if broker_order_versions.is_empty() {
+                    broker_order_versions.push(broker_order_id.clone());
+                }
+            }
+            let mut unique_versions = BTreeSet::new();
+            for broker_order_id in &broker_order_versions {
+                validate_canonical_id("persisted live broker_order_version", broker_order_id)?;
+                if !unique_versions.insert(broker_order_id) {
+                    return Err(LiveError(
+                        "persisted live broker order versions are duplicated".to_owned(),
+                    ));
+                }
+            }
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                if !unique_versions.contains(broker_order_id) {
+                    return Err(LiveError(
+                        "persisted active live broker ID is absent from versions".to_owned(),
+                    ));
+                }
+            }
             let filled_quantity =
                 decimal("persisted live filled quantity", &persisted.filled_quantity)?;
             if filled_quantity < Decimal::ZERO || filled_quantity > intent.quantity {
@@ -2555,6 +2906,16 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 intent,
                 parse_order_state(&persisted.state)?,
             )?;
+            let replace_return_state = persisted
+                .replace_return_state
+                .as_deref()
+                .map(parse_order_state)
+                .transpose()?;
+            if oms.state == OrderState::PendingReplace && replace_return_state.is_none() {
+                return Err(LiveError(
+                    "persisted pending live replacement has no return state".to_owned(),
+                ));
+            }
             orders.insert(
                 order_id,
                 LiveOrder {
@@ -2563,6 +2924,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     market,
                     decision,
                     broker_order_id: persisted.broker_order_id,
+                    broker_order_versions,
+                    replace_return_state,
                     filled_quantity,
                 },
             );
@@ -2815,12 +3178,82 @@ fn transition_to_acknowledged(order: &mut LiveOrder, reason: &str) -> Result<(),
         OrderState::Submitted | OrderState::Unknown => {
             order.oms.transition(OrderState::Acknowledged, reason)?;
         }
-        OrderState::Acknowledged | OrderState::PartiallyFilled | OrderState::Filled => {}
+        OrderState::Acknowledged
+        | OrderState::PartiallyFilled
+        | OrderState::Filled
+        | OrderState::PendingCancel
+        | OrderState::PendingReplace => {}
         _ => {
             return Err(LiveError(
                 "broker acknowledgement is incompatible with live OMS state".to_owned(),
             ))
         }
+    }
+    Ok(())
+}
+
+fn restore_working_state(order: &mut LiveOrder, reason: &str) -> Result<(), LiveError> {
+    let state = if order.filled_quantity == Decimal::ZERO {
+        OrderState::Acknowledged
+    } else {
+        OrderState::PartiallyFilled
+    };
+    order.oms.transition(state, reason)?;
+    Ok(())
+}
+
+fn restore_replacement_state(order: &mut LiveOrder, reason: &str) -> Result<(), LiveError> {
+    let state = order.replace_return_state.take().unwrap_or_else(|| {
+        if order.filled_quantity == Decimal::ZERO {
+            OrderState::Acknowledged
+        } else {
+            OrderState::PartiallyFilled
+        }
+    });
+    order.oms.transition(state, reason)?;
+    Ok(())
+}
+
+fn transition_to_terminal(
+    order: &mut LiveOrder,
+    terminal: OrderState,
+    reason: &str,
+) -> Result<(), LiveError> {
+    debug_assert!(matches!(
+        terminal,
+        OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+    ));
+    match order.oms.state {
+        OrderState::PendingSubmit => {
+            order.oms.transition(OrderState::Submitted, reason)?;
+            order.oms.transition(terminal, reason)?;
+        }
+        OrderState::Submitted
+        | OrderState::Acknowledged
+        | OrderState::PartiallyFilled
+        | OrderState::PendingCancel
+        | OrderState::PendingReplace
+        | OrderState::Unknown => {
+            order.oms.transition(terminal, reason)?;
+        }
+        state if state == terminal => {}
+        OrderState::Filled | OrderState::Cancelled | OrderState::Rejected | OrderState::Expired => {
+        }
+        _ => {
+            return Err(LiveError(
+                "live broker terminal event is incompatible with OMS state".to_owned(),
+            ))
+        }
+    }
+    if matches!(
+        order.oms.state,
+        OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+    ) && order.filled_quantity >= order.oms.intent.quantity
+    {
+        return Err(LiveError(
+            "non-filled live terminal state cannot have cumulative quantity equal to requested quantity"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2835,17 +3268,20 @@ fn validate_reason(name: &str, value: &str) -> Result<(), LiveError> {
 }
 
 fn validate_broker_snapshot(snapshot: &LiveBrokerAccountSnapshot) -> Result<(), LiveError> {
-    let mut client_order_ids = BTreeSet::new();
+    let mut order_versions = BTreeSet::new();
     let mut broker_order_ids = BTreeSet::new();
     for order in &snapshot.orders {
         validate_canonical_id("live snapshot client_order_id", &order.client_order_id)?;
         validate_canonical_id("live snapshot broker_order_id", &order.broker_order_id)?;
         if order.filled_quantity < Decimal::ZERO
-            || !client_order_ids.insert(order.client_order_id.as_str())
+            || !order_versions.insert((
+                order.client_order_id.as_str(),
+                order.broker_order_id.as_str(),
+            ))
             || !broker_order_ids.insert(order.broker_order_id.as_str())
         {
             return Err(LiveError(
-                "live snapshot has duplicate order IDs or negative fills".to_owned(),
+                "live snapshot has duplicate broker order versions or negative fills".to_owned(),
             ));
         }
     }
@@ -2890,6 +3326,7 @@ fn parse_order_state(value: &str) -> Result<OrderState, LiveError> {
         "PARTIALLY_FILLED" => Ok(OrderState::PartiallyFilled),
         "FILLED" => Ok(OrderState::Filled),
         "PENDING_CANCEL" => Ok(OrderState::PendingCancel),
+        "PENDING_REPLACE" => Ok(OrderState::PendingReplace),
         "CANCELLED" => Ok(OrderState::Cancelled),
         "REJECTED" => Ok(OrderState::Rejected),
         "EXPIRED" => Ok(OrderState::Expired),

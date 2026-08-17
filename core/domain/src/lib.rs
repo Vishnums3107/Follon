@@ -420,6 +420,8 @@ pub enum OrderState {
     Filled,
     /// Cancellation is in progress.
     PendingCancel,
+    /// A risk-preserving broker modification is in progress.
+    PendingReplace,
     /// Cancellation completed.
     Cancelled,
     /// External system rejected the order.
@@ -444,6 +446,7 @@ impl OrderState {
             Self::PartiallyFilled => "PARTIALLY_FILLED",
             Self::Filled => "FILLED",
             Self::PendingCancel => "PENDING_CANCEL",
+            Self::PendingReplace => "PENDING_REPLACE",
             Self::Cancelled => "CANCELLED",
             Self::Rejected => "REJECTED",
             Self::Expired => "EXPIRED",

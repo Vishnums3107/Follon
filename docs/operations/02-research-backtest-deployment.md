@@ -23,9 +23,10 @@ trading authorization.
   Preserve the source files separately from their normalized dataset manifest.
 - Retain every JSON artifact, NDJSON event stream, Markdown report, completion
   manifest, exact configuration file, and experiment catalog under write-once
-  or versioned object storage. The local file adapter atomically publishes
-  immutable files and refuses conflicting overwrites, but is not a replacement
-  for replicated object storage.
+  or versioned object storage. The storage adapter refuses conflicting
+  overwrites, verifies remote objects after publication, and verifies recovered
+  content. Production still requires reviewed encryption/key custody,
+  retention/object lock, replication, monitoring, and restore drills.
 - Back up the local experiment catalog and artifacts, then rehearse restoring
   them and rerunning a known specification. Compare the artifact fingerprint,
   event-output hash, and report bytes.
@@ -40,11 +41,22 @@ reports, completion manifests, and experiment records must be byte-identical.
 Verify every manifest digest. Re-running one path must be idempotent; attempting
 to reuse it for a different input must fail rather than overwrite evidence.
 
+Publish canonical bars to immutable Parquet, register them in DuckDB, publish a
+backtest artifact to the versioned S3-compatible store, and recover it to a new
+path. Confirm the original, object metadata, and recovered SHA-256 values are
+identical. The exact local commands are documented in
+[`python/storage-adapter/README.md`](../../python/storage-adapter/README.md).
+
 ## Known first-release capability boundaries
 
 Accounting is exact but deliberately limited to a single currency and long
 positions. The runner rejects short positions, cross-currency accounting,
 duplicate executions, duplicate corporate actions, out-of-session bars, and
-input that does not match its declared dataset manifest. Delistings, halts,
-borrow, latency, partial-fill, and spread models must be added before using a
-result as evidence for a strategy that depends on those market conditions.
+input that does not match its declared dataset manifest. Replay now fails
+closed at an instrument's effective end and supports explicit venue/instrument
+halts, full-spread/half-spread pricing, adverse slippage, bar-based latency, and
+per-bar partial fills. Economic delisting settlement is still required for
+strategies that depend on delisting outcomes. Borrow is not modeled because the
+ledger rejects shorts; capital allocation is not modeled because the supported
+boundary is one explicit account. Do not use a result as evidence for a
+strategy that depends on either excluded behavior.

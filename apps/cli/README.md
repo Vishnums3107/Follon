@@ -127,3 +127,77 @@ capability; the command is intentionally independent of broker availability.
 Because a control action changes the dashboard, it requires an unused immutable
 output path and refuses to mutate the journal if that evidence path already
 exists.
+
+## Deterministic operations workbench
+
+`follon-operations` creates local evidence artifacts from an explicitly
+versioned configuration and an explicit UTC projection time. It has no broker,
+credential, order-control, wall-clock, or background-execution capability.
+
+```powershell
+cargo run -p follon-cli --bin follon-operations -- validate-config tests/fixtures/config/operations-v1.json
+cargo run -p follon-cli --bin follon-operations -- dashboard tests/fixtures/config/operations-v1.json var/operations-dashboard.json --as-of 2026-08-10T16:30:00Z --journal var/follon-operations.journal.ndjson
+cargo run -p follon-cli --bin follon-operations -- report tests/fixtures/config/operations-v1.json var/operations-report.md --as-of 2026-08-10T16:30:00Z --journal var/follon-operations.journal.ndjson
+cargo run -p follon-cli --bin follon-operations -- schedule tests/fixtures/config/operations-v1.json var/operations-schedule.json --as-of 2026-08-10T16:30:00Z --journal var/follon-operations.journal.ndjson
+```
+
+The dashboard/report bind exact source configuration bytes, parameter-set,
+strategy bundle, dataset, replay event, and selected-time identities. The only
+stateful operation is an explicit non-secret journal append with a unique
+idempotency key:
+
+```powershell
+cargo run -p follon-cli --bin follon-operations -- journal --journal var/follon-operations.journal.ndjson --entry-id journal.report.20260810 --event-type operations.report_generated.v1 --actor operator.alice --occurred-at 2026-08-10T16:30:00Z --detail report_hash=<sha256>
+```
+
+The journal is exclusive, fsynced, and SHA-256 chained. It is not a secret
+store or a replacement for the controlled-live audit journal. See the
+[operator workbench runbook](../../docs/operations/03-operator-workbench-runbook.md)
+for the evidence procedure and the separate design-partner adoption gate.
+
+## Deterministic options evidence
+
+`follon-options` accepts a frozen, versioned **European** option-chain snapshot
+and emits reproducible analytics/scenario/reconciliation evidence. It does not
+connect to a broker or offer an order, exercise, or assignment action.
+
+```powershell
+cargo run -p follon-cli --bin follon-options -- validate-config tests/fixtures/config/options-v1.json
+cargo run -p follon-cli --bin follon-options -- analyze tests/fixtures/config/options-v1.json var/options-dashboard.json
+cargo run -p follon-cli --bin follon-options -- report tests/fixtures/config/options-v1.json var/options-report.md
+```
+
+The outer dashboard configuration identity is computed from the exact loaded
+configuration bytes. Each BACKTEST, PAPER, and LIVE book must independently
+supply its own strategy/data/config/replay/chain/model identity, source
+account/export ID, normalized source-export hash, `as_of`, and currency; the
+source hash is re-computed from the complete declared book before it is
+accepted. That checks internal consistency of the declared export—it is not a
+substitute for ingesting or verifying a raw broker export. Reconciliation
+requires an explicit `reconciled_at` UTC instant and compares books without
+overwriting a discrepancy. See
+[Months 15–17 status](../../docs/06-delivery/10-months-15-17-status.md) for the
+European-only boundary and the external broker-backed acceptance gate.
+
+## Commercial controls, privacy, and signed releases
+
+`follon-admin` is a local, evidence-only commercial-control CLI. It records
+typed tenant provisioning and externally evidenced subscription facts in an
+exclusive, fsynced, hash-chained ledger; it does not call a payment provider,
+accept cards, authenticate customers, or handle raw customer identity. It also
+produces hash-bound privacy/retention plans, performs an explicitly confirmed
+single-file deletion, and builds/verifies Ed25519-signed release evidence.
+
+```powershell
+cargo run -p follon-cli --bin follon-admin -- provision tests/fixtures/config/commercial-provisioning-v1.json --ledger var/commercial.ndjson --event-id event.provision.acme.001 --actor operator.alice
+cargo run -p follon-cli --bin follon-admin -- subscription tests/fixtures/config/commercial-subscription-v1.json --ledger var/commercial.ndjson --event-id event.subscription.acme.001 --actor billing.stripe --observed-at 2026-08-12T09:01:00Z
+cargo run -p follon-cli --bin follon-admin -- entitlement tenant.acme --ledger var/commercial.ndjson --as-of 2026-08-12T10:00:00Z
+```
+
+Plans, receipts, manifests, signatures, trusted public-key records, and
+self-host readiness outputs are immutable and idempotent only when their exact
+bytes match. Release private keys must remain in a managed offline/CI signing
+boundary and must never be placed in this repository, a container image, or a
+self-host deployment. The [commercial/self-hosting runbook](../../docs/operations/04-commercial-self-hosting-runbook.md)
+and [privacy/retention runbook](../../docs/operations/05-privacy-retention-runbook.md)
+contain the required operating procedure and boundaries.

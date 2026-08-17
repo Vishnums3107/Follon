@@ -2,6 +2,12 @@
 
 Follon is a risk-first, multi-asset trading operating system for advanced independent traders and small professional teams. Its defining requirement is **research-to-live parity**: a strategy must behave equivalently in research, deterministic replay, simulation, paper trading, and controlled live execution.
 
+The complete capability set is a reference architecture, not a fixed 24-month
+solo-founder commitment. The active scope is the US-equities Release 1
+replay-to-paper workflow and customer validation; later-phase code remains
+technical evidence until the operational and commercial gates in the
+[roadmap](docs/06-delivery/03-roadmap-and-gates.md) pass.
+
 This repository is in its **non-connected controlled-live engineering** stage. It contains the
 decomposed product plan, versioned contracts, a deterministic historical replay
 slice, an isolated strategy SDK, a durable PAPER OMS/control boundary, and an
@@ -41,7 +47,23 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   switches, reconnect handling, deterministic broker fault injection, and a
   bounded process transport for the official IBKR Python TWS API bridge.
 - A TypeScript desktop evidence projection that cannot alter trading state,
-  including read-only PAPER and controlled-live monitoring dashboards.
+  including read-only PAPER, controlled-live monitoring, and operations
+  workbench dashboards.
+- A Docker-packaged unified web dashboard for all implemented evidence areas,
+  dependency health, artifact filtering/downloads, and explicit acceptance-gate
+  visibility. The browser surface remains read-only by design.
+- A deterministic operator workbench for fixed-point risk cockpit projections,
+  attributable accounting movements, stable alerts, explicit-time schedule
+  planning with typed due-time completions, predecessor-linked parameter
+  validation, tamper-evident operations journal records, immutable reports,
+  and replay/configuration evidence. It has
+  no broker, credential, wall-clock, background-execution, or order-control
+  capability.
+- A deterministic European-options core for versioned chain snapshots,
+  fixed-point implied volatility/Greeks, multi-leg expiry scenarios, and
+  explicit-time BACKTEST/PAPER/LIVE option-book reconciliation with
+  separately fingerprinted declared export provenance. It is evidence-only and does
+  not contain a broker options-order, exercise, assignment, or credential path.
 - A controlled-live safety kernel with opaque credential references, zeroizing
   secret-material boundary, a no-shell managed-helper provider, time-bounded
   four-eyes activations and approvals,
@@ -49,6 +71,13 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   audit, disaster-recovery status, and a 60-session evidence gate. The supplied
   status CLI is intentionally incapable of connecting to or submitting at a
   broker.
+- Commercial-control and self-hosting primitives: typed, hash-chained tenant
+  provisioning/subscription evidence; deterministic entitlements; pseudonymous
+  privacy and retention plans with per-file confirmation; immutable execution
+  receipts; Ed25519-signed release manifests; and restricted self-host readiness
+  verification. These controls neither process payments nor prove customer
+  adoption—the paying-customer gate remains external, independently evidenced
+  work.
 - JSON Schema, Protobuf, CI, dependency review, secret scanning, and an initial
   threat model.
 

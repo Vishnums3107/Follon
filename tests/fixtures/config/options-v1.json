@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "reconciled_at": "2026-08-10T16:31:00Z",
+  "chain": {
+    "chain_id": "chain.spy.2026.12.18",
+    "underlying_instrument_id": "inst.us_equity.spy",
+    "snapshot_at": "2026-08-10T16:30:00Z",
+    "underlying_mark": "100",
+    "reference_version": "ref.options.1",
+    "contracts": [
+      {
+        "option_id": "opt.spy.20261218.c100",
+        "underlying_instrument_id": "inst.us_equity.spy",
+        "expiration_at": "2026-12-18T21:00:00Z",
+        "strike": "100",
+        "right": "CALL",
+        "multiplier": "100",
+        "currency": "USD",
+        "reference_version": "ref.options.1"
+      },
+      {
+        "option_id": "opt.spy.20261218.c105",
+        "underlying_instrument_id": "inst.us_equity.spy",
+        "expiration_at": "2026-12-18T21:00:00Z",
+        "strike": "105",
+        "right": "CALL",
+        "multiplier": "100",
+        "currency": "USD",
+        "reference_version": "ref.options.1"
+      },
+      {
+        "option_id": "opt.spy.20261218.p95",
+        "underlying_instrument_id": "inst.us_equity.spy",
+        "expiration_at": "2026-12-18T21:00:00Z",
+        "strike": "95",
+        "right": "PUT",
+        "multiplier": "100",
+        "currency": "USD",
+        "reference_version": "ref.options.1"
+      }
+    ],
+    "quotes": [
+      {
+        "option_id": "opt.spy.20261218.c100",
+        "observed_at": "2026-08-10T16:30:00Z",
+        "bid": "5.10",
+        "ask": "5.30",
+        "last": "5.20",
+        "volume": 12,
+        "open_interest": 100
+      },
+      {
+        "option_id": "opt.spy.20261218.c105",
+        "observed_at": "2026-08-10T16:30:00Z",
+        "bid": "2.80",
+        "ask": "3.00",
+        "last": "2.90",
+        "volume": 9,
+        "open_interest": 80
+      },
+      {
+        "option_id": "opt.spy.20261218.p95",
+        "observed_at": "2026-08-10T16:30:00Z",
+        "bid": "2.30",
+        "ask": "2.50",
+        "last": "2.40",
+        "volume": 8,
+        "open_interest": 90
+      }
+    ]
+  },
+  "risk_free_rate": "0.04",
+  "strategy": {
+    "strategy_id": "strategy.spy.call_spread",
+    "strategy_version": "1",
+    "legs": [
+      {
+        "leg_id": "leg.long_call",
+        "option_id": "opt.spy.20261218.c100",
+        "side": "LONG",
+        "quantity": "1",
+        "entry_premium": "5.20"
+      },
+      {
+        "leg_id": "leg.short_call",
+        "option_id": "opt.spy.20261218.c105",
+        "side": "SHORT",
+        "quantity": "1",
+        "entry_premium": "2.90"
+      }
+    ]
+  },
+  "expiry_scenarios": ["90", "100", "105", "110"],
+  "books": {
+    "backtest": {
+      "account_id": "acct.options.backtest",
+      "source_export_id": "export.options.backtest.001",
+      "source_export_hash": "83d46ae9389aee52697900bafcbf089127d905dd957073cdbeab872b30c3d3da",
+      "as_of": "2026-08-10T16:30:00Z",
+      "currency": "USD",
+      "run_identity": {
+        "strategy_bundle_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "configuration_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dataset_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "replay_event_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "chain_snapshot_hash": "33bc3d3907764504e21b24c65986d9f1bb4705eeabace2f2531137ff6dfd984f",
+        "model_version": "follon-european-black-scholes-fixed-v1"
+      },
+      "cash": "9770",
+      "positions": [
+        { "option_id": "opt.spy.20261218.c100", "quantity": "1", "average_entry_premium": "5.20", "mark_premium": "5.20", "realized_pnl": "0" },
+        { "option_id": "opt.spy.20261218.c105", "quantity": "-1", "average_entry_premium": "2.90", "mark_premium": "2.90", "realized_pnl": "0" }
+      ]
+    },
+    "paper": {
+      "account_id": "acct.options.paper",
+      "source_export_id": "export.options.paper.001",
+      "source_export_hash": "10438a191c1d8455cde3d116bb16108765813182b574de9ab2277cce51541f0a",
+      "as_of": "2026-08-10T16:30:00Z",
+      "currency": "USD",
+      "run_identity": {
+        "strategy_bundle_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "configuration_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dataset_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "replay_event_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "chain_snapshot_hash": "33bc3d3907764504e21b24c65986d9f1bb4705eeabace2f2531137ff6dfd984f",
+        "model_version": "follon-european-black-scholes-fixed-v1"
+      },
+      "cash": "9770",
+      "positions": [
+        { "option_id": "opt.spy.20261218.c100", "quantity": "1", "average_entry_premium": "5.20", "mark_premium": "5.20", "realized_pnl": "0" },
+        { "option_id": "opt.spy.20261218.c105", "quantity": "-1", "average_entry_premium": "2.90", "mark_premium": "2.90", "realized_pnl": "0" }
+      ]
+    },
+    "live": {
+      "account_id": "acct.options.live",
+      "source_export_id": "export.options.live.001",
+      "source_export_hash": "f79c8c3ea4bca14c0e97114728f691834b28a662249e59ed98460dce16e0bea4",
+      "as_of": "2026-08-10T16:30:00Z",
+      "currency": "USD",
+      "run_identity": {
+        "strategy_bundle_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "configuration_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dataset_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "replay_event_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "chain_snapshot_hash": "33bc3d3907764504e21b24c65986d9f1bb4705eeabace2f2531137ff6dfd984f",
+        "model_version": "follon-european-black-scholes-fixed-v1"
+      },
+      "cash": "9770",
+      "positions": [
+        { "option_id": "opt.spy.20261218.c100", "quantity": "1", "average_entry_premium": "5.20", "mark_premium": "5.20", "realized_pnl": "0" },
+        { "option_id": "opt.spy.20261218.c105", "quantity": "-1", "average_entry_premium": "2.90", "mark_premium": "2.90", "realized_pnl": "0" }
+      ]
+    }
+  }
+}

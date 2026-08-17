@@ -6,7 +6,8 @@
   "description": "Evidence-only desktop shell for the Follon first vertical slice",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "build": "tsc",
+    "test:evidence": "npm run build && node test/evidence-contract.mjs && node test/browser-module-contract.mjs"
   },
   "devDependencies": {
     "typescript": "5.8.3"

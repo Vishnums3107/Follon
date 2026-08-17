@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "follon-storage-adapter"
+version = "0.1.0"
+description = "Immutable Parquet, DuckDB, and S3-compatible storage boundary for Follon"
+requires-python = ">=3.10"
+dependencies = [
+  "boto3==1.43.55",
+  "duckdb==1.5.5",
+  "pyarrow==25.0.0",
+]
+
+[project.scripts]
+follon-storage = "follon_storage_adapter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

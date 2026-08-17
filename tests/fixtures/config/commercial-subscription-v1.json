@@ -1,0 +1,12 @@
+{
+  "commercial_subscription_schema_version": 1,
+  "subscription_id": "subscription.acme.001",
+  "tenant_id": "tenant.acme",
+  "plan": "PROFESSIONAL",
+  "status": "PAID",
+  "effective_at": "2026-08-12T09:00:00Z",
+  "expires_at": "2026-09-12T09:00:00Z",
+  "payment_provider": "stripe",
+  "external_customer_ref": "customer.acme.001",
+  "payment_evidence_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

@@ -1,0 +1,16 @@
+# Explicit storage job image; no broker adapter or dashboard write surface.
+FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a AS build
+WORKDIR /build
+COPY python/storage-adapter/ ./
+RUN python -m pip wheel --disable-pip-version-check --wheel-dir /wheels .
+
+FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+RUN useradd --system --create-home --uid 10002 follon-storage
+COPY --from=build /wheels /wheels
+RUN python -m pip install --disable-pip-version-check --no-index --find-links /wheels follon-storage-adapter \
+    && rm -rf /wheels
+USER follon-storage
+WORKDIR /work
+ENTRYPOINT ["follon-storage"]

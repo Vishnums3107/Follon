@@ -187,9 +187,13 @@ impl MarketPreconditions<'_> {
                 "instrument and replay calendar do not match".to_owned(),
             ));
         }
-        if !self.calendar.is_open_at(event_time) {
+        if !self
+            .calendar
+            .is_instrument_open_at(&bar.instrument_id, event_time)
+        {
             return Err(EngineError(
-                "market event is outside an explicit trading session".to_owned(),
+                "market event is outside an explicit tradable session or occurs during a configured halt"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -1042,22 +1046,52 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
             )
             | (
                 OrderState::Submitted,
-                OrderState::Acknowledged | OrderState::Rejected | OrderState::Unknown
+                OrderState::Acknowledged
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired
+                    | OrderState::Unknown
             )
             | (
                 OrderState::Acknowledged,
                 OrderState::PartiallyFilled
                     | OrderState::Filled
                     | OrderState::PendingCancel
+                    | OrderState::PendingReplace
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired
                     | OrderState::Unknown
             )
             | (
                 OrderState::PartiallyFilled,
-                OrderState::Filled | OrderState::PendingCancel | OrderState::Unknown
+                OrderState::Filled
+                    | OrderState::PendingCancel
+                    | OrderState::PendingReplace
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired
+                    | OrderState::Unknown
             )
             | (
                 OrderState::PendingCancel,
-                OrderState::Cancelled | OrderState::Unknown
+                OrderState::Acknowledged
+                    | OrderState::PartiallyFilled
+                    | OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired
+                    | OrderState::Unknown
+            )
+            | (
+                OrderState::PendingReplace,
+                OrderState::Acknowledged
+                    | OrderState::PartiallyFilled
+                    | OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired
+                    | OrderState::Unknown
             )
             | (
                 OrderState::Unknown,
@@ -1066,6 +1100,15 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
                     | OrderState::Filled
                     | OrderState::Cancelled
                     | OrderState::Rejected
+                    | OrderState::Expired
+                    | OrderState::PendingReplace
+            )
+            // A newly discovered execution is authoritative evidence.  Preserve the
+            // previously persisted terminal state, enter UNKNOWN, then resolve from
+            // the broker evidence rather than silently dropping the execution.
+            | (
+                OrderState::Cancelled | OrderState::Rejected | OrderState::Expired,
+                OrderState::Unknown
             )
     )
 }
@@ -1073,22 +1116,39 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
 /// Deterministic fill model used exclusively for non-live replay/simulation.
 #[derive(Clone, Debug)]
 pub struct DeterministicFillModel {
+    /// Full quoted bid/ask spread in basis points. A fill pays half the spread.
+    pub spread_bps: Decimal,
     /// Slippage expressed in basis points, applied unfavourably.
     pub slippage_bps: Decimal,
     /// Exact flat fee per fill.
     pub flat_fee: Decimal,
+    /// Number of complete market bars to wait before the first fill attempt.
+    pub latency_bars: u32,
+    /// Optional maximum quantity executable on each eligible market bar.
+    pub max_fill_quantity: Option<Decimal>,
 }
 
 impl DeterministicFillModel {
-    /// Validates fees and slippage before a simulation begins.
+    /// Validates fees, spread, and slippage before a simulation begins.
     pub fn validate(&self) -> Result<(), EngineError> {
         let ten_thousand = Decimal::from_integer(10_000)?;
-        if self.slippage_bps < Decimal::ZERO
+        let two = Decimal::from_integer(2)?;
+        let half_spread_bps = self.spread_bps.checked_div(two)?;
+        let adverse_bps = self.slippage_bps.checked_add(half_spread_bps)?;
+        if self.spread_bps < Decimal::ZERO
+            || self.spread_bps >= ten_thousand
+            || self.slippage_bps < Decimal::ZERO
             || self.slippage_bps >= ten_thousand
+            || adverse_bps >= ten_thousand
             || self.flat_fee < Decimal::ZERO
+            || self.latency_bars > 1_000_000
+            || self
+                .max_fill_quantity
+                .is_some_and(|quantity| quantity <= Decimal::ZERO)
         {
             return Err(EngineError(
-                "fill slippage must be in [0, 10000) bps and fees cannot be negative".to_owned(),
+                "fill spread and slippage must be in [0, 10000) bps, their combined adverse adjustment must be below 10000 bps, fees cannot be negative, latency cannot exceed 1000000 bars, and an optional fill cap must be positive"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -1101,6 +1161,29 @@ impl DeterministicFillModel {
         bar: &Bar,
         replay_time: &str,
     ) -> Result<Option<Fill>, EngineError> {
+        self.fill_quantity(
+            order,
+            bar,
+            replay_time,
+            order.intent.quantity,
+            format!("exec-{}", order.intent.intent_id),
+        )
+    }
+
+    fn fill_quantity(
+        &self,
+        order: &OmsOrder,
+        bar: &Bar,
+        replay_time: &str,
+        quantity: Decimal,
+        execution_id: String,
+    ) -> Result<Option<Fill>, EngineError> {
+        if quantity <= Decimal::ZERO || quantity > order.intent.quantity {
+            return Err(EngineError(
+                "simulated fill quantity must be positive and cannot exceed order quantity"
+                    .to_owned(),
+            ));
+        }
         let base_price = match order.intent.order_type {
             OrderType::Market => bar.close,
             OrderType::Limit => {
@@ -1115,25 +1198,39 @@ impl DeterministicFillModel {
                 }
             }
         };
-        let basis_point = Decimal::from_integer(10_000)?;
-        let adjustment = base_price
+        let basis_points = Decimal::from_integer(10_000)?;
+        let full_spread_divisor = Decimal::from_integer(20_000)?;
+        let spread_adjustment = base_price
+            .checked_mul(self.spread_bps)?
+            .checked_div(full_spread_divisor)?;
+        let slippage_adjustment = base_price
             .checked_mul(self.slippage_bps)?
-            .checked_div(basis_point)?;
+            .checked_div(basis_points)?;
+        let adverse_adjustment = spread_adjustment.checked_add(slippage_adjustment)?;
         let price = match order.intent.side {
-            Side::Buy => base_price.checked_add(adjustment)?,
-            Side::Sell => base_price.checked_sub(adjustment)?,
+            Side::Buy => base_price.checked_add(adverse_adjustment)?,
+            Side::Sell => base_price.checked_sub(adverse_adjustment)?,
         };
         if price <= Decimal::ZERO {
             return Err(EngineError(
                 "deterministic fill model produced a non-positive price".to_owned(),
             ));
         }
+        if let Some(limit) = order.intent.limit_price {
+            let violates_limit = match order.intent.side {
+                Side::Buy => price > limit,
+                Side::Sell => price < limit,
+            };
+            if violates_limit {
+                return Ok(None);
+            }
+        }
         Ok(Some(Fill {
-            execution_id: format!("exec-{}", order.intent.intent_id),
+            execution_id,
             order_id: order.order_id.clone(),
             instrument_id: order.intent.instrument_id.clone(),
             side: order.intent.side,
-            quantity: order.intent.quantity,
+            quantity,
             price,
             fee: self.flat_fee,
             executed_at: replay_time.to_owned(),
@@ -1270,6 +1367,15 @@ pub struct ReplayResult {
     pub pnl: Option<PnlSnapshot>,
 }
 
+#[derive(Clone, Debug)]
+struct SimulatedWorkingOrder {
+    order: OmsOrder,
+    remaining_quantity: Decimal,
+    eligible_on_bar: u64,
+    fill_sequence: u32,
+    causation_id: String,
+}
+
 /// Orchestrates a single deterministic historical-bar workflow.
 pub struct ReplayEngine {
     /// Logical replay time.
@@ -1279,9 +1385,11 @@ pub struct ReplayEngine {
     /// Immutable configuration version included in every event.
     pub configuration_version: String,
     sequence: u64,
+    bar_sequence: u64,
     policy: RiskPolicy,
     fill_model: DeterministicFillModel,
     portfolios: BTreeMap<(String, String), Portfolio>,
+    working_orders: BTreeMap<String, SimulatedWorkingOrder>,
 }
 
 impl ReplayEngine {
@@ -1307,9 +1415,11 @@ impl ReplayEngine {
             software_version,
             configuration_version,
             sequence: 0,
+            bar_sequence: 0,
             policy,
             fill_model,
             portfolios: BTreeMap::new(),
+            working_orders: BTreeMap::new(),
         })
     }
 
@@ -1324,7 +1434,13 @@ impl ReplayEngine {
     ) -> Result<ReplayResult, EngineError> {
         bar.validate()?;
         self.clock.advance_to(event_time)?;
+        self.bar_sequence = self
+            .bar_sequence
+            .checked_add(1)
+            .ok_or_else(|| EngineError("replay bar sequence overflow".to_owned()))?;
         let mut events = Vec::new();
+        let mut latest_position = None;
+        let mut latest_pnl = None;
         let market_correlation = format!("corr-market-{:012}", self.sequence + 1);
         let market_event = self.emit(
             sink,
@@ -1341,11 +1457,37 @@ impl ReplayEngine {
         let market_event_id = market_event.event_id.clone();
         events.push(market_event);
 
+        let eligible_order_ids: Vec<_> = self
+            .working_orders
+            .iter()
+            .filter(|(_, working)| {
+                working.order.intent.account_id == account_id
+                    && working.order.intent.instrument_id == bar.instrument_id
+                    && working.eligible_on_bar <= self.bar_sequence
+            })
+            .map(|(order_id, _)| order_id.clone())
+            .collect();
+        for order_id in eligible_order_ids {
+            let mut working = self
+                .working_orders
+                .remove(&order_id)
+                .expect("eligible order came from working-order index");
+            if let Some((position, pnl)) =
+                self.attempt_simulated_fill(sink, &mut events, account_id, &bar, &mut working)?
+            {
+                latest_position = Some(position);
+                latest_pnl = Some(pnl);
+            }
+            if working.remaining_quantity > Decimal::ZERO {
+                self.working_orders.insert(order_id, working);
+            }
+        }
+
         let Some(intent) = strategy.on_bar(&bar, self.clock.now())? else {
             return Ok(ReplayResult {
                 events,
-                position: None,
-                pnl: None,
+                position: latest_position,
+                pnl: latest_pnl,
             });
         };
         intent.validate()?;
@@ -1354,6 +1496,14 @@ impl ReplayEngine {
         {
             return Err(EngineError(
                 "strategy intent does not match replay account or configuration".to_owned(),
+            ));
+        }
+        if self
+            .working_orders
+            .contains_key(&format!("order-{}", intent.intent_id))
+        {
+            return Err(EngineError(
+                "simulator rejected a duplicate working-order identity".to_owned(),
             ));
         }
 
@@ -1401,8 +1551,8 @@ impl ReplayEngine {
             events.push(audit);
             return Ok(ReplayResult {
                 events,
-                position: None,
-                pnl: None,
+                position: latest_position,
+                pnl: latest_pnl,
             });
         }
 
@@ -1429,32 +1579,127 @@ impl ReplayEngine {
             let change = order.transition(state, reason)?;
             self.emit_order_change(sink, &mut events, &intent, &decision_event_id, change)?;
         }
-
-        let Some(fill) = self.fill_model.fill(&order, &bar, self.clock.now())? else {
+        let eligible_on_bar = self
+            .bar_sequence
+            .checked_add(u64::from(self.fill_model.latency_bars))
+            .ok_or_else(|| EngineError("simulated order latency overflow".to_owned()))?;
+        let mut working = SimulatedWorkingOrder {
+            remaining_quantity: intent.quantity,
+            eligible_on_bar,
+            fill_sequence: 0,
+            causation_id: events
+                .last()
+                .expect("acknowledgement event was emitted")
+                .event_id
+                .clone(),
+            order,
+        };
+        if eligible_on_bar <= self.bar_sequence {
+            if let Some((position, pnl)) =
+                self.attempt_simulated_fill(sink, &mut events, account_id, &bar, &mut working)?
+            {
+                latest_position = Some(position);
+                latest_pnl = Some(pnl);
+            }
+        } else {
             let audit = self.audit_event(
                 sink,
                 &intent,
-                &decision_event_id,
+                &working.causation_id,
                 events.iter().map(|event| event.event_id.clone()).collect(),
-                "approved limit order remains acknowledged without a simulated fill",
+                "approved order remains acknowledged until its deterministic latency elapses",
             )?;
+            working.causation_id = audit.event_id.clone();
             events.push(audit);
-            return Ok(ReplayResult {
-                events,
-                position: None,
-                pnl: None,
+        }
+        if working.remaining_quantity > Decimal::ZERO {
+            self.working_orders
+                .insert(working.order.order_id.clone(), working);
+        }
+        Ok(ReplayResult {
+            events,
+            position: latest_position,
+            pnl: latest_pnl,
+        })
+    }
+
+    fn attempt_simulated_fill(
+        &mut self,
+        sink: &mut impl EventSink,
+        events: &mut Vec<EventEnvelope>,
+        account_id: &str,
+        bar: &Bar,
+        working: &mut SimulatedWorkingOrder,
+    ) -> Result<Option<(PositionSnapshot, PnlSnapshot)>, EngineError> {
+        let intent = working.order.intent.clone();
+        let quantity = self
+            .fill_model
+            .max_fill_quantity
+            .map_or(working.remaining_quantity, |limit| {
+                std::cmp::min(working.remaining_quantity, limit)
             });
+        let next_fill_sequence = working
+            .fill_sequence
+            .checked_add(1)
+            .ok_or_else(|| EngineError("simulated fill sequence overflow".to_owned()))?;
+        let is_single_full_fill = working.fill_sequence == 0
+            && quantity == working.order.intent.quantity
+            && quantity == working.remaining_quantity;
+        let execution_id = if is_single_full_fill {
+            format!("exec-{}", intent.intent_id)
+        } else {
+            format!("exec-{}-{next_fill_sequence:06}", intent.intent_id)
         };
-        let fill_change =
-            order.transition(OrderState::Filled, "deterministic simulator filled order")?;
-        self.emit_order_change(sink, &mut events, &intent, &decision_event_id, fill_change)?;
+        let Some(fill) = self.fill_model.fill_quantity(
+            &working.order,
+            bar,
+            self.clock.now(),
+            quantity,
+            execution_id,
+        )?
+        else {
+            let audit = self.audit_event(
+                sink,
+                &intent,
+                &working.causation_id,
+                events.iter().map(|event| event.event_id.clone()).collect(),
+                "eligible working limit order remained unfilled on the current bar",
+            )?;
+            working.causation_id = audit.event_id.clone();
+            events.push(audit);
+            return Ok(None);
+        };
+
+        let remaining_after_fill = working.remaining_quantity.checked_sub(fill.quantity)?;
+        let target_state = if remaining_after_fill == Decimal::ZERO {
+            Some(OrderState::Filled)
+        } else if working.order.state == OrderState::Acknowledged {
+            Some(OrderState::PartiallyFilled)
+        } else {
+            None
+        };
+        if let Some(state) = target_state {
+            let reason = if state == OrderState::Filled {
+                "deterministic simulator cumulatively filled order"
+            } else {
+                "deterministic simulator partially filled order"
+            };
+            let change = working.order.transition(state, reason)?;
+            self.emit_order_change(sink, events, &intent, &working.causation_id, change)?;
+            working.causation_id = events
+                .last()
+                .expect("order state event was emitted")
+                .event_id
+                .clone();
+        }
+
         let current_time = self.clock.now().to_owned();
         let fill_event = self.emit(
             sink,
             EventPayload::Fill(fill.clone()),
             &current_time,
             &intent.correlation_id,
-            events.last().map(|event| event.event_id.as_str()),
+            Some(&working.causation_id),
             "simulator",
             "simulator",
             Some(account_id),
@@ -1463,6 +1708,8 @@ impl ReplayEngine {
         )?;
         let fill_event_id = fill_event.event_id.clone();
         events.push(fill_event);
+        working.remaining_quantity = remaining_after_fill;
+        working.fill_sequence = next_fill_sequence;
 
         let (position, pnl) = {
             let portfolio = self
@@ -1505,19 +1752,21 @@ impl ReplayEngine {
         )?;
         let pnl_event_id = pnl_event.event_id.clone();
         events.push(pnl_event);
+        let note = if remaining_after_fill == Decimal::ZERO {
+            "source bar through cumulative simulated fill and exact portfolio update"
+        } else {
+            "source bar through partial simulated fill and exact portfolio update"
+        };
         let audit = self.audit_event(
             sink,
             &intent,
             &pnl_event_id,
             events.iter().map(|event| event.event_id.clone()).collect(),
-            "source bar through simulated fill and exact portfolio update",
+            note,
         )?;
+        working.causation_id = audit.event_id.clone();
         events.push(audit);
-        Ok(ReplayResult {
-            events,
-            position: Some(position),
-            pnl: Some(pnl),
-        })
+        Ok(Some((position, pnl)))
     }
 
     /// Processes a bar only after its reference data and trading session resolve.
@@ -1629,7 +1878,8 @@ mod tests {
     use std::str::FromStr;
 
     use follon_instrument::{
-        AssetClass, Instrument, InstrumentVersion, StaticTradingCalendar, TradingSession,
+        AssetClass, Instrument, InstrumentVersion, StaticTradingCalendar, TradingHalt,
+        TradingSession,
     };
 
     use super::*;
@@ -1659,11 +1909,42 @@ mod tests {
                 max_notional: Decimal::from_integer(10_000).unwrap(),
             },
             DeterministicFillModel {
+                spread_bps: Decimal::ZERO,
                 slippage_bps: Decimal::from_str("0").unwrap(),
                 flat_fee: Decimal::from_str("0.10").unwrap(),
+                latency_bars: 0,
+                max_fill_quantity: None,
             },
         )
         .unwrap()
+    }
+
+    fn simulated_order(
+        side: Side,
+        order_type: OrderType,
+        limit_price: Option<Decimal>,
+    ) -> OmsOrder {
+        OmsOrder {
+            order_id: "order-intent-fill-model-001".to_owned(),
+            intent: OrderIntent {
+                intent_id: "intent-fill-model-001".to_owned(),
+                account_id: "acct-paper-001".to_owned(),
+                strategy_id: "strategy-fill-model-001".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                correlation_id: "corr-fill-model-001".to_owned(),
+                side,
+                quantity: Decimal::from_integer(1).unwrap(),
+                order_type,
+                limit_price,
+                time_in_force: TimeInForce::Day,
+                rationale: "deterministic execution-model test".to_owned(),
+                created_at: "2026-01-02T14:31:00Z".to_owned(),
+                strategy_version: "strategy-fill-model-v1".to_owned(),
+                configuration_version: "cfg-fill-model-v1".to_owned(),
+                environment: "SIMULATION".to_owned(),
+            },
+            state: OrderState::Acknowledged,
+        }
     }
 
     fn strategy() -> BuyOnceStrategy {
@@ -1795,6 +2076,56 @@ mod tests {
     }
 
     #[test]
+    fn market_preconditions_block_halted_bars_before_strategy_evaluation() {
+        let (instruments, _) = market_dependencies();
+        let calendar = StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![TradingSession {
+                exchange_date: "2026-01-02".to_owned(),
+                opens_at: "2026-01-02T14:30:00Z".to_owned(),
+                closes_at: "2026-01-02T21:00:00Z".to_owned(),
+            }],
+            vec![TradingHalt {
+                halt_id: "halt.spy.001".to_owned(),
+                instrument_id: Some("inst.us_equity.spy".to_owned()),
+                starts_at: "2026-01-02T14:31:00Z".to_owned(),
+                ends_at: "2026-01-02T14:32:00Z".to_owned(),
+                reason: "test suspension".to_owned(),
+            }],
+        )
+        .unwrap();
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let mut example_strategy = strategy();
+
+        assert!(replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut example_strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+                &market,
+            )
+            .is_err());
+        let resumed = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut example_strategy,
+                "acct-paper-001",
+                "2026-01-02T14:32:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap();
+        assert!(resumed.position.is_some());
+    }
+
+    #[test]
     fn identical_inputs_produce_identical_canonical_events() {
         let mut first_engine = engine();
         let mut first_store = InMemoryEventStore::default();
@@ -1865,6 +2196,236 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == "audit.trail.v1"));
+    }
+
+    #[test]
+    fn deterministic_fill_model_applies_half_spread_and_slippage_unfavourably() {
+        let model = DeterministicFillModel {
+            spread_bps: Decimal::from_str("20").unwrap(),
+            slippage_bps: Decimal::from_str("5").unwrap(),
+            flat_fee: Decimal::from_str("0.10").unwrap(),
+            latency_bars: 0,
+            max_fill_quantity: None,
+        };
+        model.validate().unwrap();
+
+        let buy = model
+            .fill(
+                &simulated_order(Side::Buy, OrderType::Market, None),
+                &bar(),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap()
+            .unwrap();
+        let sell = model
+            .fill(
+                &simulated_order(Side::Sell, OrderType::Market, None),
+                &bar(),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(buy.price, Decimal::from_str("100.15").unwrap());
+        assert_eq!(sell.price, Decimal::from_str("99.85").unwrap());
+    }
+
+    #[test]
+    fn deterministic_fill_model_never_executes_beyond_a_limit() {
+        let model = DeterministicFillModel {
+            spread_bps: Decimal::from_str("20").unwrap(),
+            slippage_bps: Decimal::from_str("5").unwrap(),
+            flat_fee: Decimal::ZERO,
+            latency_bars: 0,
+            max_fill_quantity: None,
+        };
+
+        let blocked = model
+            .fill(
+                &simulated_order(
+                    Side::Buy,
+                    OrderType::Limit,
+                    Some(Decimal::from_integer(100).unwrap()),
+                ),
+                &bar(),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        let marketable = model
+            .fill(
+                &simulated_order(
+                    Side::Buy,
+                    OrderType::Limit,
+                    Some(Decimal::from_str("100.20").unwrap()),
+                ),
+                &bar(),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(blocked.is_none());
+        assert_eq!(marketable.price, Decimal::from_str("100.15").unwrap());
+    }
+
+    #[test]
+    fn deterministic_fill_model_rejects_invalid_execution_costs() {
+        let negative_spread = DeterministicFillModel {
+            spread_bps: Decimal::from_str("-0.01").unwrap(),
+            slippage_bps: Decimal::ZERO,
+            flat_fee: Decimal::ZERO,
+            latency_bars: 0,
+            max_fill_quantity: None,
+        };
+        let excessive_combined_cost = DeterministicFillModel {
+            spread_bps: Decimal::from_integer(4).unwrap(),
+            slippage_bps: Decimal::from_integer(9_999).unwrap(),
+            flat_fee: Decimal::ZERO,
+            latency_bars: 0,
+            max_fill_quantity: None,
+        };
+        let zero_fill_cap = DeterministicFillModel {
+            spread_bps: Decimal::ZERO,
+            slippage_bps: Decimal::ZERO,
+            flat_fee: Decimal::ZERO,
+            latency_bars: 0,
+            max_fill_quantity: Some(Decimal::ZERO),
+        };
+
+        assert!(negative_spread.validate().is_err());
+        assert!(excessive_combined_cost.validate().is_err());
+        assert!(zero_fill_cap.validate().is_err());
+    }
+
+    #[test]
+    fn replay_engine_persists_latency_and_partial_fills_across_bars() {
+        struct BuyThreeOnce {
+            submitted: bool,
+        }
+
+        impl Strategy for BuyThreeOnce {
+            fn on_bar(
+                &mut self,
+                bar: &Bar,
+                replay_time: &str,
+            ) -> Result<Option<OrderIntent>, EngineError> {
+                if self.submitted {
+                    return Ok(None);
+                }
+                self.submitted = true;
+                Ok(Some(OrderIntent {
+                    intent_id: "intent-partial-001".to_owned(),
+                    account_id: "acct-paper-001".to_owned(),
+                    strategy_id: "strategy-partial-001".to_owned(),
+                    instrument_id: bar.instrument_id.clone(),
+                    correlation_id: "corr-partial-001".to_owned(),
+                    side: Side::Buy,
+                    quantity: Decimal::from_integer(3)?,
+                    order_type: OrderType::Market,
+                    limit_price: None,
+                    time_in_force: TimeInForce::Day,
+                    rationale: "latency and partial-fill regression".to_owned(),
+                    created_at: replay_time.to_owned(),
+                    strategy_version: "strategy-partial-v1".to_owned(),
+                    configuration_version: "cfg-example-1".to_owned(),
+                    environment: "SIMULATION".to_owned(),
+                }))
+            }
+        }
+
+        let mut replay = engine();
+        replay.fill_model.latency_bars = 1;
+        replay.fill_model.max_fill_quantity = Some(Decimal::from_integer(1).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = BuyThreeOnce { submitted: false };
+
+        let submitted = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert!(submitted.position.is_none());
+        assert!(!submitted
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::Fill(_))));
+
+        let first_partial = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:32:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert_eq!(
+            first_partial.position.as_ref().unwrap().quantity,
+            Decimal::from_integer(1).unwrap()
+        );
+        assert!(first_partial.events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::OrderState(change)
+                if change.new_state == OrderState::PartiallyFilled
+        )));
+
+        let second_partial = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:33:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert_eq!(
+            second_partial.position.as_ref().unwrap().quantity,
+            Decimal::from_integer(2).unwrap()
+        );
+        assert!(!second_partial.events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::OrderState(change) if change.new_state == OrderState::Filled
+        )));
+
+        let completed = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:34:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert_eq!(
+            completed.position.as_ref().unwrap().quantity,
+            Decimal::from_integer(3).unwrap()
+        );
+        assert!(completed.events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::OrderState(change) if change.new_state == OrderState::Filled
+        )));
+        assert!(replay.working_orders.is_empty());
+
+        let execution_ids: Vec<_> = store
+            .events()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::Fill(fill) => Some(fill.execution_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            execution_ids,
+            vec![
+                "exec-intent-partial-001-000001",
+                "exec-intent-partial-001-000002",
+                "exec-intent-partial-001-000003"
+            ]
+        );
     }
 
     #[test]

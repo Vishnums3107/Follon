@@ -19,7 +19,7 @@ use follon_control_plane::{
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
 use follon_instrument::{
     AssetClass, Instrument, InstrumentRegistry, InstrumentVersion, StaticTradingCalendar,
-    TradingSession,
+    TradingHalt, TradingSession,
 };
 use follon_market_data::import_corporate_actions;
 use serde::Deserialize;
@@ -135,8 +135,14 @@ struct RiskDocument {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionDocument {
+    #[serde(default = "zero_decimal_string")]
+    spread_bps: String,
     slippage_bps: String,
     flat_fee: String,
+    #[serde(default)]
+    latency_bars: u32,
+    #[serde(default)]
+    max_fill_quantity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +150,8 @@ struct ExecutionDocument {
 struct CalendarDocument {
     calendar_id: String,
     sessions: Vec<SessionDocument>,
+    #[serde(default)]
+    halts: Vec<HaltDocument>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +160,16 @@ struct SessionDocument {
     exchange_date: String,
     opens_at: String,
     closes_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HaltDocument {
+    halt_id: String,
+    instrument_id: Option<String>,
+    starts_at: String,
+    ends_at: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -443,6 +461,10 @@ fn decimal(value: &str) -> Result<Decimal, follon_domain::DecimalError> {
     Decimal::from_str(value)
 }
 
+fn zero_decimal_string() -> String {
+    "0".to_owned()
+}
+
 fn load_runtime_configuration(
     path: &Path,
 ) -> Result<RuntimeConfiguration, Box<dyn std::error::Error>> {
@@ -494,8 +516,16 @@ fn load_runtime_configuration(
     };
     risk_policy.validate()?;
     let fill_model = DeterministicFillModel {
+        spread_bps: decimal(&document.execution.spread_bps)?,
         slippage_bps: decimal(&document.execution.slippage_bps)?,
         flat_fee: decimal(&document.execution.flat_fee)?,
+        latency_bars: document.execution.latency_bars,
+        max_fill_quantity: document
+            .execution
+            .max_fill_quantity
+            .as_deref()
+            .map(decimal)
+            .transpose()?,
     };
     fill_model.validate()?;
     let sessions = document
@@ -508,7 +538,23 @@ fn load_runtime_configuration(
             closes_at: session.closes_at.clone(),
         })
         .collect();
-    let calendar = StaticTradingCalendar::new(document.calendar.calendar_id.clone(), sessions)?;
+    let halts = document
+        .calendar
+        .halts
+        .iter()
+        .map(|halt| TradingHalt {
+            halt_id: halt.halt_id.clone(),
+            instrument_id: halt.instrument_id.clone(),
+            starts_at: halt.starts_at.clone(),
+            ends_at: halt.ends_at.clone(),
+            reason: halt.reason.clone(),
+        })
+        .collect();
+    let calendar = StaticTradingCalendar::new_with_halts(
+        document.calendar.calendar_id.clone(),
+        sessions,
+        halts,
+    )?;
     if document.instruments.is_empty() {
         return Err("configuration must define at least one instrument version".into());
     }
@@ -616,5 +662,36 @@ mod tests {
         std::fs::write(&invalid_path, invalid).unwrap();
         assert!(load_runtime_configuration(&invalid_path).is_err());
         std::fs::remove_file(invalid_path).unwrap();
+    }
+
+    #[test]
+    fn runtime_configuration_preserves_v1_execution_defaults() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/backtest-v1.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        let execution = legacy
+            .get_mut("execution")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        execution.remove("spread_bps");
+        execution.remove("latency_bars");
+        execution.remove("max_fill_quantity");
+        let calendar = legacy
+            .get_mut("calendar")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        calendar.remove("halts");
+        let legacy_path = std::env::temp_dir().join(format!(
+            "follon-legacy-config-{}-defaults.json",
+            std::process::id()
+        ));
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = load_runtime_configuration(&legacy_path).unwrap();
+        assert_eq!(loaded.fill_model.spread_bps, Decimal::ZERO);
+        assert_eq!(loaded.fill_model.latency_bars, 0);
+        assert_eq!(loaded.fill_model.max_fill_quantity, None);
+        std::fs::remove_file(legacy_path).unwrap();
     }
 }

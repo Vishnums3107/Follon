@@ -1,0 +1,32 @@
+name: follon-selfhost
+
+# Restricted local operator profile. Verify the release independently with
+# `follon-admin self-host-readiness` before invoking Compose. This service has
+# no network and validates configuration only; it is not a trading runtime.
+services:
+  admin:
+    image: ${FOLLON_ADMIN_IMAGE:?Set to a verified image pinned by @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    read_only: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    volumes:
+      - type: bind
+        source: ${FOLLON_SELF_HOST_ROOT:?Set to the encrypted host data root}
+        target: /var/lib/follon
+        read_only: false
+      - type: bind
+        source: ${FOLLON_RELEASE_ROOT:?Set to verified release artifacts}
+        target: /opt/follon/release
+        read_only: true
+      - type: bind
+        source: ${FOLLON_CONFIG_ROOT:?Set to the read-only self-host configuration directory}
+        target: /etc/follon
+        read_only: true
+    command: ["self-host-validate", "/etc/follon/self-host.json"]

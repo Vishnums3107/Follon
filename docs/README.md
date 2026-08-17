@@ -13,6 +13,7 @@ Use the [source map](00-source-map.md) to locate every section of the original p
 | [04-experience](04-experience/) | UX safety rules and primary screens |
 | [05-quality-security](05-quality-security/) | Reliability, testing, security, market-data, and compliance requirements |
 | [06-delivery](06-delivery/) | Build sequence, first vertical slice, and solo-founder working cadence |
+| [07-issues](07-issues/) | External review findings and their resolution status |
 | [operations](operations/) | Operational controls and implementation-era records |
 
 ## Reading order for the first implementation
@@ -33,6 +34,20 @@ Use the [source map](00-source-map.md) to locate every section of the original p
 12. [Months 9–11 status](06-delivery/08-months-9-11-status.md)
 
 13. [Controlled-live runbook](operations/02-controlled-live-runbook.md)
+
+14. [Months 12–14 status](06-delivery/09-months-12-14-status.md)
+
+15. [Operator workbench runbook](operations/03-operator-workbench-runbook.md)
+
+16. [Months 15–17 status](06-delivery/10-months-15-17-status.md)
+
+17. [Months 18–20 status](06-delivery/11-months-18-20-status.md)
+
+18. [Commercial and self-hosting runbook](operations/04-commercial-self-hosting-runbook.md)
+
+19. [Privacy and retention runbook](operations/05-privacy-retention-runbook.md)
+
+20. [Step-by-step implementation matrix](06-delivery/13-step-by-step-implementation-matrix.md)
 
 ## Document conventions
 

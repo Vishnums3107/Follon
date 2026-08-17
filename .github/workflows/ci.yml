@@ -70,11 +70,16 @@ jobs:
         env:
           PYTHONPATH: python/ibkr-gateway/src
         run: python -m unittest discover -s python/ibkr-gateway/tests -v
+      - name: Install storage adapter
+        run: python -m pip install python/storage-adapter
+      - name: Run storage adapter tests
+        run: python -m unittest discover -s python/storage-adapter/tests -v
 
   desktop:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
           node-version: "22.20.0"
@@ -83,4 +88,6 @@ jobs:
       - run: npm ci
         working-directory: apps/desktop
       - run: npm run typecheck
+        working-directory: apps/desktop
+      - run: npm run test:evidence
         working-directory: apps/desktop
