@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/trusted-release-key.schema.json",
+  "title": "Follon Trusted Ed25519 Release Key v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["key_id", "public_key_hex"],
+  "properties": {
+    "key_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "public_key_hex": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

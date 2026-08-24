@@ -1,0 +1,15 @@
+# Secure operator-dashboard overlay. Keep the base profile's loopback binding
+# and put an operator-managed TLS reverse proxy in front of port 8080.
+services:
+  dashboard:
+    environment:
+      FOLLON_DASHBOARD_MODE: production
+      FOLLON_DASHBOARD_USERNAME: ${FOLLON_DASHBOARD_USERNAME:?Set the dashboard operator username}
+      FOLLON_DASHBOARD_PASSWORD: ""
+      FOLLON_DASHBOARD_PASSWORD_FILE: /run/secrets/dashboard_password
+    secrets:
+      - dashboard_password
+
+secrets:
+  dashboard_password:
+    file: ${FOLLON_DASHBOARD_PASSWORD_FILE:?Set an absolute path to the protected dashboard password file}

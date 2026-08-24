@@ -3,20 +3,20 @@
 //! Reference data and calendars are selected by replay time; this crate never
 //! queries a machine clock or treats a display ticker as a durable identity.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, DomainError};
 
-/// Asset classes accepted in the first release while retaining extension names.
+/// Asset classes accepted by canonical reference-data contracts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetClass {
     /// Common stock.
     Equity,
     /// Exchange-traded fund.
     Etf,
-    /// Reserved extension point; no option-chain behavior exists yet.
+    /// Listed option contract; versioned option-chain behavior is owned by `follon-options`.
     Option,
-    /// Reserved extension point; no futures behavior exists yet.
+    /// Listed future with complete contract/settlement economics.
     Future,
 }
 
@@ -53,14 +53,14 @@ pub struct Instrument {
     pub tick_size: Decimal,
     /// Exact minimum trade quantity.
     pub lot_size: Decimal,
-    /// Exact contract multiplier (one for first-slice equities/ETFs).
+    /// Exact contract multiplier.
     pub multiplier: Decimal,
     /// Explicit calendar configuration selected by the instrument.
     pub trading_calendar_id: String,
 }
 
 impl Instrument {
-    /// Validates first-slice reference data without accepting options/futures behavior.
+    /// Validates common reference data shared by every supported asset class.
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_canonical_id("instrument_id", &self.instrument_id)?;
         validate_canonical_id("venue", &self.venue)?;
@@ -86,6 +86,145 @@ impl Instrument {
             }
         }
         Ok(())
+    }
+}
+
+/// Contract settlement method retained in canonical reference data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettlementMethod {
+    /// Cash amount is posted in the instrument currency.
+    Cash,
+    /// The underlying instrument is delivered or received.
+    Physical,
+}
+
+/// Listed-option exercise style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExerciseStyle {
+    /// Exercise only at expiration.
+    European,
+    /// Exercise on any permitted date through expiration.
+    American,
+}
+
+/// Canonical option right for reference-data validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceOptionRight {
+    /// Call option.
+    Call,
+    /// Put option.
+    Put,
+}
+
+/// Economic and settlement terms that vary by asset class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InstrumentEconomics {
+    /// Cash security settlement.
+    CashSecurity {
+        /// Contractual settlement lag in business days.
+        settlement_business_days: u8,
+    },
+    /// Complete listed-option reference terms.
+    ListedOption {
+        /// Canonical underlying instrument identity.
+        underlying_instrument_id: String,
+        /// Canonical UTC expiration/last exercise instant.
+        expires_at: String,
+        /// Exact positive strike.
+        strike: Decimal,
+        /// Call or put.
+        right: ReferenceOptionRight,
+        /// American or European exercise convention.
+        exercise_style: ExerciseStyle,
+        /// Cash or physical settlement.
+        settlement: SettlementMethod,
+        /// Business-day settlement lag after exercise/assignment.
+        settlement_business_days: u8,
+    },
+    /// Complete listed-future reference terms.
+    ListedFuture {
+        /// Stable root/product identity.
+        contract_root_id: String,
+        /// Contract expiration instant.
+        expires_at: String,
+        /// Final permissible trading instant.
+        last_trade_at: String,
+        /// Cash or physical final settlement.
+        settlement: SettlementMethod,
+        /// Canonical margin class selected by the clearing configuration.
+        margin_class: String,
+    },
+}
+
+impl InstrumentEconomics {
+    /// Validates terms against their canonical instrument class.
+    pub fn validate_for(&self, instrument: &Instrument) -> Result<(), DomainError> {
+        match (instrument.asset_class, self) {
+            (
+                AssetClass::Equity | AssetClass::Etf,
+                Self::CashSecurity {
+                    settlement_business_days,
+                },
+            ) if *settlement_business_days <= 5 => Ok(()),
+            (
+                AssetClass::Option,
+                Self::ListedOption {
+                    underlying_instrument_id,
+                    expires_at,
+                    strike,
+                    settlement_business_days,
+                    ..
+                },
+            ) => {
+                validate_canonical_id("option underlying_instrument_id", underlying_instrument_id)?;
+                validate_utc_timestamp("option expires_at", expires_at)?;
+                if *strike <= Decimal::ZERO || *settlement_business_days > 5 {
+                    return Err(DomainError("invalid listed-option economics".to_owned()));
+                }
+                Ok(())
+            }
+            (
+                AssetClass::Future,
+                Self::ListedFuture {
+                    contract_root_id,
+                    expires_at,
+                    last_trade_at,
+                    margin_class,
+                    ..
+                },
+            ) => {
+                validate_canonical_id("future contract_root_id", contract_root_id)?;
+                validate_canonical_id("future margin_class", margin_class)?;
+                validate_utc_timestamp("future expires_at", expires_at)?;
+                validate_utc_timestamp("future last_trade_at", last_trade_at)?;
+                if last_trade_at > expires_at {
+                    return Err(DomainError(
+                        "future last trade cannot follow expiration".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(DomainError(
+                "instrument economics do not match asset class".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Complete effective-dated reference record including settlement economics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteInstrumentVersion {
+    /// Core symbology, venue, currency, multiplier, and calendar record.
+    pub reference: InstrumentVersion,
+    /// Asset-class-specific economic terms.
+    pub economics: InstrumentEconomics,
+}
+
+impl CompleteInstrumentVersion {
+    /// Validates both version identity and asset-class economics.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.reference.validate()?;
+        self.economics.validate_for(&self.reference.instrument)
     }
 }
 
@@ -206,16 +345,64 @@ impl TradingSession {
     }
 }
 
+/// Explicit point-in-time trading suspension used by deterministic replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradingHalt {
+    /// Stable identity retained in the version-controlled configuration.
+    pub halt_id: String,
+    /// Optional instrument scope. `None` represents a venue-wide halt.
+    pub instrument_id: Option<String>,
+    /// UTC inclusive start of the halt.
+    pub starts_at: String,
+    /// UTC exclusive end of the halt.
+    pub ends_at: String,
+    /// Human-readable source or reason for the suspension.
+    pub reason: String,
+}
+
+impl TradingHalt {
+    /// Validates identity, scope, time range, and explanation.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_canonical_id("halt_id", &self.halt_id)?;
+        if let Some(instrument_id) = &self.instrument_id {
+            validate_canonical_id("halt instrument_id", instrument_id)?;
+        }
+        validate_utc_timestamp("halt starts_at", &self.starts_at)?;
+        validate_utc_timestamp("halt ends_at", &self.ends_at)?;
+        if self.starts_at >= self.ends_at || self.reason.trim().is_empty() {
+            return Err(DomainError("trading halt is invalid".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Whether this halt suspends the instrument at the supplied UTC instant.
+    pub fn contains(&self, instrument_id: &str, utc_time: &str) -> bool {
+        self.instrument_id
+            .as_deref()
+            .is_none_or(|scope| scope == instrument_id)
+            && self.starts_at.as_str() <= utc_time
+            && utc_time < self.ends_at.as_str()
+    }
+}
+
 /// Explicit session source used by market-data and risk checks.
 pub trait TradingCalendar: Send + Sync {
     /// Stable calendar identity.
     fn calendar_id(&self) -> &str;
     /// Looks up the session that contains a supplied UTC instant.
     fn session_at(&self, utc_time: &str) -> Option<&TradingSession>;
+    /// Resolves the configured exchange session for an exact exchange-local date.
+    fn session_for_exchange_date(&self, exchange_date: &str) -> Option<&TradingSession>;
 
     /// States whether an order is permitted to enter the regular session.
     fn is_open_at(&self, utc_time: &str) -> bool {
         self.session_at(utc_time).is_some()
+    }
+
+    /// States whether an instrument can trade, including explicit halt windows.
+    fn is_instrument_open_at(&self, instrument_id: &str, utc_time: &str) -> bool {
+        let _ = instrument_id;
+        self.is_open_at(utc_time)
     }
 }
 
@@ -223,13 +410,23 @@ pub trait TradingCalendar: Send + Sync {
 pub struct StaticTradingCalendar {
     calendar_id: String,
     sessions: Vec<TradingSession>,
+    halts: Vec<TradingHalt>,
 }
 
 impl StaticTradingCalendar {
     /// Creates an explicit calendar after rejecting overlapping or malformed sessions.
     pub fn new(
         calendar_id: impl Into<String>,
+        sessions: Vec<TradingSession>,
+    ) -> Result<Self, DomainError> {
+        Self::new_with_halts(calendar_id, sessions, Vec::new())
+    }
+
+    /// Creates an explicit calendar with version-controlled trading suspensions.
+    pub fn new_with_halts(
+        calendar_id: impl Into<String>,
         mut sessions: Vec<TradingSession>,
+        mut halts: Vec<TradingHalt>,
     ) -> Result<Self, DomainError> {
         let calendar_id = calendar_id.into();
         validate_canonical_id("calendar_id", &calendar_id)?;
@@ -248,9 +445,40 @@ impl StaticTradingCalendar {
         {
             return Err(DomainError("trading calendar sessions overlap".to_owned()));
         }
+        let mut halt_ids = HashSet::new();
+        for halt in &halts {
+            halt.validate()?;
+            if !halt_ids.insert(halt.halt_id.as_str()) {
+                return Err(DomainError("trading halt IDs must be unique".to_owned()));
+            }
+            if !sessions.iter().any(|session| {
+                session.opens_at <= halt.starts_at && halt.ends_at <= session.closes_at
+            }) {
+                return Err(DomainError(
+                    "trading halt must be contained by an explicit session".to_owned(),
+                ));
+            }
+        }
+        if halts.iter().enumerate().any(|(index, left)| {
+            halts.iter().skip(index + 1).any(|right| {
+                left.instrument_id == right.instrument_id
+                    && left.starts_at < right.ends_at
+                    && right.starts_at < left.ends_at
+            })
+        }) {
+            return Err(DomainError(
+                "trading halt windows with the same scope overlap".to_owned(),
+            ));
+        }
+        halts.sort_by(|left, right| {
+            left.starts_at
+                .cmp(&right.starts_at)
+                .then_with(|| left.halt_id.cmp(&right.halt_id))
+        });
         Ok(Self {
             calendar_id,
             sessions,
+            halts,
         })
     }
 }
@@ -264,6 +492,20 @@ impl TradingCalendar for StaticTradingCalendar {
         self.sessions
             .iter()
             .find(|session| session.contains(utc_time))
+    }
+
+    fn session_for_exchange_date(&self, exchange_date: &str) -> Option<&TradingSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.exchange_date == exchange_date)
+    }
+
+    fn is_instrument_open_at(&self, instrument_id: &str, utc_time: &str) -> bool {
+        self.is_open_at(utc_time)
+            && !self
+                .halts
+                .iter()
+                .any(|halt| halt.contains(instrument_id, utc_time))
     }
 }
 
@@ -322,6 +564,25 @@ mod tests {
     }
 
     #[test]
+    fn registry_fails_closed_after_an_instrument_effective_end() {
+        let mut registry = InstrumentRegistry::default();
+        registry
+            .register(version(
+                "2026-01-01T00:00:00Z",
+                Some("2026-02-01T00:00:00Z"),
+                "SPY",
+            ))
+            .unwrap();
+
+        assert!(registry
+            .resolve("inst.us_equity.spy", "2026-01-31T23:59:59Z")
+            .is_some());
+        assert!(registry
+            .resolve("inst.us_equity.spy", "2026-02-01T00:00:00Z")
+            .is_none());
+    }
+
+    #[test]
     fn calendar_requires_explicit_regular_session() {
         assert!(StaticTradingCalendar::new("cal.us_equities.nyse", Vec::new()).is_err());
         let calendar = StaticTradingCalendar::new(
@@ -335,5 +596,127 @@ mod tests {
         .unwrap();
         assert!(calendar.is_open_at("2026-01-02T14:31:00Z"));
         assert!(!calendar.is_open_at("2026-01-02T21:00:00Z"));
+    }
+
+    #[test]
+    fn calendar_applies_venue_and_instrument_halts_at_exact_boundaries() {
+        let calendar = StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![TradingSession {
+                exchange_date: "2026-01-02".to_owned(),
+                opens_at: "2026-01-02T14:30:00Z".to_owned(),
+                closes_at: "2026-01-02T21:00:00Z".to_owned(),
+            }],
+            vec![
+                TradingHalt {
+                    halt_id: "halt.venue.001".to_owned(),
+                    instrument_id: None,
+                    starts_at: "2026-01-02T15:00:00Z".to_owned(),
+                    ends_at: "2026-01-02T15:05:00Z".to_owned(),
+                    reason: "venue volatility pause".to_owned(),
+                },
+                TradingHalt {
+                    halt_id: "halt.spy.001".to_owned(),
+                    instrument_id: Some("inst.us_equity.spy".to_owned()),
+                    starts_at: "2026-01-02T16:00:00Z".to_owned(),
+                    ends_at: "2026-01-02T16:10:00Z".to_owned(),
+                    reason: "instrument news pending".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(!calendar.is_instrument_open_at("inst.us_equity.spy", "2026-01-02T15:00:00Z"));
+        assert!(!calendar.is_instrument_open_at("inst.us_equity.qqq", "2026-01-02T15:04:59Z"));
+        assert!(!calendar.is_instrument_open_at("inst.us_equity.spy", "2026-01-02T16:09:59Z"));
+        assert!(calendar.is_instrument_open_at("inst.us_equity.qqq", "2026-01-02T16:09:59Z"));
+        assert!(calendar.is_instrument_open_at("inst.us_equity.spy", "2026-01-02T16:10:00Z"));
+    }
+
+    #[test]
+    fn calendar_rejects_malformed_or_ambiguous_halts() {
+        let session = TradingSession {
+            exchange_date: "2026-01-02".to_owned(),
+            opens_at: "2026-01-02T14:30:00Z".to_owned(),
+            closes_at: "2026-01-02T21:00:00Z".to_owned(),
+        };
+        let halt = TradingHalt {
+            halt_id: "halt.spy.001".to_owned(),
+            instrument_id: Some("inst.us_equity.spy".to_owned()),
+            starts_at: "2026-01-02T15:00:00Z".to_owned(),
+            ends_at: "2026-01-02T15:10:00Z".to_owned(),
+            reason: "news pending".to_owned(),
+        };
+        let mut overlapping = halt.clone();
+        overlapping.halt_id = "halt.spy.002".to_owned();
+        overlapping.starts_at = "2026-01-02T15:05:00Z".to_owned();
+        overlapping.ends_at = "2026-01-02T15:15:00Z".to_owned();
+        assert!(StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![session.clone()],
+            vec![halt, overlapping],
+        )
+        .is_err());
+
+        let outside_session = TradingHalt {
+            halt_id: "halt.venue.after-hours".to_owned(),
+            instrument_id: None,
+            starts_at: "2026-01-02T21:00:00Z".to_owned(),
+            ends_at: "2026-01-02T21:05:00Z".to_owned(),
+            reason: "invalid after-hours halt".to_owned(),
+        };
+        assert!(StaticTradingCalendar::new_with_halts(
+            "cal.us_equities.nyse",
+            vec![session],
+            vec![outside_session],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn complete_reference_data_validates_options_futures_and_settlement() {
+        let mut option = version("2026-01-01T00:00:00Z", None, "SPY260320C00500000").instrument;
+        option.instrument_id = "instrument.spy-option".to_owned();
+        option.asset_class = AssetClass::Option;
+        option.multiplier = Decimal::from_integer(100).unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: option,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: Some("2026-03-21T00:00:00Z".to_owned()),
+                reference_version: "reference.option.1".to_owned(),
+            },
+            economics: InstrumentEconomics::ListedOption {
+                underlying_instrument_id: "instrument.spy".to_owned(),
+                expires_at: "2026-03-20T20:00:00Z".to_owned(),
+                strike: Decimal::from_integer(500).unwrap(),
+                right: ReferenceOptionRight::Call,
+                exercise_style: ExerciseStyle::American,
+                settlement: SettlementMethod::Physical,
+                settlement_business_days: 1,
+            },
+        };
+        complete.validate().expect("complete option reference");
+
+        let mut future = version("2026-01-01T00:00:00Z", None, "ESM6").instrument;
+        future.instrument_id = "instrument.es-202606".to_owned();
+        future.asset_class = AssetClass::Future;
+        future.multiplier = Decimal::from_integer(50).unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: future,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference.future.1".to_owned(),
+            },
+            economics: InstrumentEconomics::ListedFuture {
+                contract_root_id: "future.es".to_owned(),
+                expires_at: "2026-06-19T20:00:00Z".to_owned(),
+                last_trade_at: "2026-06-19T15:30:00Z".to_owned(),
+                settlement: SettlementMethod::Cash,
+                margin_class: "margin.index-future".to_owned(),
+            },
+        };
+        complete.validate().expect("complete future reference");
     }
 }

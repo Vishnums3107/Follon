@@ -1,3 +1,9 @@
-# Python strategy environment
+# Python components
 
-This directory will contain the supported strategy SDK, research utilities, and examples. Strategies interact through the approved event/intent APIs only and never receive broker credentials or direct adapter access.
+The supported strategy SDK and IBKR PAPER bridge preserve the approved
+event/intent and broker boundaries. Strategies never receive broker credentials
+or direct adapter access.
+
+The [storage adapter](storage-adapter/README.md) provides deterministic Parquet
+publication, a durable DuckDB dataset catalog, and immutable S3-compatible
+artifact publication/recovery for trusted operator workflows.

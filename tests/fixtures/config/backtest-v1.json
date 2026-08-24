@@ -26,11 +26,15 @@
     "policy_version": "risk-example-1",
     "global_kill_switch": false,
     "max_quantity": "10",
-    "max_notional": "10000"
+    "max_notional": "10000",
+    "max_price_deviation_bps": "100"
   },
   "execution": {
+    "spread_bps": "0",
     "slippage_bps": "0",
-    "flat_fee": "0.10"
+    "flat_fee": "0.10",
+    "latency_bars": 0,
+    "max_fill_quantity": null
   },
   "calendar": {
     "calendar_id": "cal.us-equities.nyse",

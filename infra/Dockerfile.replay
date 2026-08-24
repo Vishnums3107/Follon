@@ -4,6 +4,7 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY apps apps
 COPY core core
+COPY adapters adapters
 RUN cargo build --release -p follon-cli
 
 FROM debian:bookworm-slim

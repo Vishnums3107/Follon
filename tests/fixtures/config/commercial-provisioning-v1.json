@@ -1,0 +1,9 @@
+{
+  "commercial_provisioning_schema_version": 1,
+  "tenant_id": "tenant.acme",
+  "workspace_id": "workspace.acme",
+  "plan": "PROFESSIONAL",
+  "retention_policy_id": "retention.standard.1",
+  "self_hosted": false,
+  "provisioned_at": "2026-08-12T09:00:00Z"
+}

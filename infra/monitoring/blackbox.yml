@@ -1,0 +1,22 @@
+modules:
+  dashboard_mtls:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      fail_if_not_ssl: true
+      tls_config:
+        ca_file: /run/secrets/dashboard_tls_client_ca
+        cert_file: /run/secrets/monitoring_client_certificate
+        key_file: /run/secrets/monitoring_client_private_key
+  grpc_mtls:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+      tls: true
+      tls_config:
+        ca_file: /run/secrets/grpc_tls_client_ca
+        cert_file: /run/secrets/monitoring_client_certificate
+        key_file: /run/secrets/monitoring_client_private_key

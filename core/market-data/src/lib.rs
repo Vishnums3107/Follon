@@ -455,6 +455,176 @@ fn parse_utc(value: &str) -> Result<OffsetDateTime, MarketDataError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|error| MarketDataError(error.to_string()))
 }
 
+/// Normalized top-of-book quote with both source and local receive time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Quote {
+    /// Provider event time in canonical UTC.
+    pub event_time: String,
+    /// Local adapter receive time in canonical UTC.
+    pub received_at: String,
+    /// Canonical resolved instrument identifier.
+    pub instrument_id: String,
+    /// Immutable provider quote identity.
+    pub quote_id: String,
+    /// Monotonic provider sequence for the instrument/channel.
+    pub source_sequence: u64,
+    /// Positive best bid.
+    pub bid_price: Decimal,
+    /// Non-negative displayed bid quantity.
+    pub bid_quantity: Decimal,
+    /// Positive best ask.
+    pub ask_price: Decimal,
+    /// Non-negative displayed ask quantity.
+    pub ask_quantity: Decimal,
+}
+
+impl Quote {
+    /// Rejects crossed, unsequenced, non-canonical, or time-traveling quotes.
+    pub fn validate(&self) -> Result<(), MarketDataError> {
+        validate_canonical_id("quote instrument_id", &self.instrument_id)?;
+        validate_canonical_id("quote_id", &self.quote_id)?;
+        let event_time = parse_utc(&self.event_time)?;
+        let received_at = parse_utc(&self.received_at)?;
+        if received_at < event_time
+            || self.source_sequence == 0
+            || self.bid_price <= Decimal::ZERO
+            || self.ask_price <= Decimal::ZERO
+            || self.bid_price > self.ask_price
+            || self.bid_quantity < Decimal::ZERO
+            || self.ask_quantity < Decimal::ZERO
+        {
+            return Err(MarketDataError("invalid normalized quote".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+/// Feed-quality condition for one explicit observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedStatus {
+    /// Sequence and timing are inside policy.
+    Healthy,
+    /// Source-to-receive latency exceeded policy.
+    Delayed,
+    /// The quote is too old for the supplied decision time.
+    Stale,
+    /// One or more provider sequences are missing.
+    SequenceGap,
+    /// A lower sequence arrived after a newer quote.
+    OutOfOrder,
+    /// An immutable provider quote was observed again.
+    Duplicate,
+}
+
+/// Explicit quality thresholds; no wall clock is consulted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedQualityPolicy {
+    /// Maximum source-to-adapter delay.
+    pub maximum_transport_delay_milliseconds: i128,
+    /// Maximum source age at a risk/strategy decision.
+    pub maximum_staleness_seconds: i64,
+}
+
+/// Auditable result from one feed-quality observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedQualitySnapshot {
+    /// Instrument observed.
+    pub instrument_id: String,
+    /// Quote identity.
+    pub quote_id: String,
+    /// Provider sequence.
+    pub source_sequence: u64,
+    /// Derived quality state.
+    pub status: FeedStatus,
+    /// Exact transport delay.
+    pub transport_delay_milliseconds: i128,
+    /// Exact age at the supplied decision instant.
+    pub staleness_seconds: i64,
+    /// First missing sequence, when a gap is found.
+    pub missing_sequence_from: Option<u64>,
+    /// Last missing sequence, when a gap is found.
+    pub missing_sequence_to: Option<u64>,
+}
+
+/// Deterministic per-instrument feed sequence and freshness monitor.
+#[derive(Default)]
+pub struct FeedQualityMonitor {
+    last_sequence: BTreeMap<String, u64>,
+    quote_ids: BTreeSet<String>,
+}
+
+impl FeedQualityMonitor {
+    /// Observes one normalized quote at an explicit decision time.
+    pub fn observe(
+        &mut self,
+        quote: &Quote,
+        as_of: &str,
+        policy: &FeedQualityPolicy,
+    ) -> Result<FeedQualitySnapshot, MarketDataError> {
+        quote.validate()?;
+        if policy.maximum_transport_delay_milliseconds < 0
+            || policy.maximum_staleness_seconds < 0
+            || self.quote_ids.len() > 10_000_000
+        {
+            return Err(MarketDataError(
+                "invalid feed-quality policy or state".to_owned(),
+            ));
+        }
+        let event_time = parse_utc(&quote.event_time)?;
+        let received_at = parse_utc(&quote.received_at)?;
+        let as_of = parse_utc(as_of)?;
+        if as_of < received_at {
+            return Err(MarketDataError(
+                "feed decision time precedes adapter receipt".to_owned(),
+            ));
+        }
+        let transport_delay_milliseconds = (received_at - event_time).whole_milliseconds();
+        let staleness_seconds = (as_of - event_time).whole_seconds();
+        let duplicate = self.quote_ids.contains(&quote.quote_id);
+        let prior = self.last_sequence.get(&quote.instrument_id).copied();
+        let out_of_order = prior.is_some_and(|sequence| quote.source_sequence < sequence);
+        let gap = prior.and_then(|sequence| {
+            sequence
+                .checked_add(1)
+                .filter(|expected| quote.source_sequence > *expected)
+                .map(|expected| (expected, quote.source_sequence - 1))
+        });
+        let status = if duplicate {
+            FeedStatus::Duplicate
+        } else if out_of_order || prior == Some(quote.source_sequence) {
+            FeedStatus::OutOfOrder
+        } else if gap.is_some() {
+            FeedStatus::SequenceGap
+        } else if staleness_seconds > policy.maximum_staleness_seconds {
+            FeedStatus::Stale
+        } else if transport_delay_milliseconds > policy.maximum_transport_delay_milliseconds {
+            FeedStatus::Delayed
+        } else {
+            FeedStatus::Healthy
+        };
+        if !duplicate {
+            self.quote_ids.insert(quote.quote_id.clone());
+        }
+        if matches!(
+            status,
+            FeedStatus::Healthy | FeedStatus::Delayed | FeedStatus::Stale | FeedStatus::SequenceGap
+        ) {
+            self.last_sequence
+                .insert(quote.instrument_id.clone(), quote.source_sequence);
+        }
+        Ok(FeedQualitySnapshot {
+            instrument_id: quote.instrument_id.clone(),
+            quote_id: quote.quote_id.clone(),
+            source_sequence: quote.source_sequence,
+            status,
+            transport_delay_milliseconds,
+            staleness_seconds,
+            missing_sequence_from: gap.map(|value| value.0),
+            missing_sequence_to: gap.map(|value| value.1),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +750,104 @@ mod tests {
         assert!(builder
             .build([trade("2026-01-02T14:30:00Z", 1, "100", "1"), second])
             .is_err());
+    }
+
+    #[test]
+    fn quote_monitor_detects_delay_staleness_gaps_duplicates_and_reordering() {
+        let policy = FeedQualityPolicy {
+            maximum_transport_delay_milliseconds: 100,
+            maximum_staleness_seconds: 2,
+        };
+        let quote = |id: &str, sequence: u64, event: &str, received: &str| Quote {
+            event_time: event.to_owned(),
+            received_at: received.to_owned(),
+            instrument_id: "instrument.spy".to_owned(),
+            quote_id: id.to_owned(),
+            source_sequence: sequence,
+            bid_price: Decimal::from_str("100").unwrap(),
+            bid_quantity: Decimal::from_str("10").unwrap(),
+            ask_price: Decimal::from_str("100.01").unwrap(),
+            ask_quantity: Decimal::from_str("12").unwrap(),
+        };
+        let mut monitor = FeedQualityMonitor::default();
+        let first = quote(
+            "quote.one",
+            10,
+            "2026-01-02T14:30:00Z",
+            "2026-01-02T14:30:00Z",
+        );
+        assert_eq!(
+            monitor
+                .observe(&first, "2026-01-02T14:30:01Z", &policy)
+                .unwrap()
+                .status,
+            FeedStatus::Healthy
+        );
+        let gap = monitor
+            .observe(
+                &quote(
+                    "quote.gap",
+                    13,
+                    "2026-01-02T14:30:01Z",
+                    "2026-01-02T14:30:02Z",
+                ),
+                "2026-01-02T14:30:04Z",
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(gap.status, FeedStatus::SequenceGap);
+        assert_eq!(gap.missing_sequence_from, Some(11));
+        assert_eq!(gap.missing_sequence_to, Some(12));
+        assert_eq!(
+            monitor
+                .observe(&first, "2026-01-02T14:30:04Z", &policy)
+                .unwrap()
+                .status,
+            FeedStatus::Duplicate
+        );
+        assert_eq!(
+            monitor
+                .observe(
+                    &quote(
+                        "quote.old",
+                        12,
+                        "2026-01-02T14:30:02Z",
+                        "2026-01-02T14:30:02Z",
+                    ),
+                    "2026-01-02T14:30:03Z",
+                    &policy,
+                )
+                .unwrap()
+                .status,
+            FeedStatus::OutOfOrder
+        );
+
+        let delayed = FeedQualityMonitor::default()
+            .observe(
+                &quote(
+                    "quote.delayed",
+                    1,
+                    "2026-01-02T14:30:00Z",
+                    "2026-01-02T14:30:01Z",
+                ),
+                "2026-01-02T14:30:01Z",
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(delayed.status, FeedStatus::Delayed);
+
+        let stale = FeedQualityMonitor::default()
+            .observe(
+                &quote(
+                    "quote.stale",
+                    1,
+                    "2026-01-02T14:30:00Z",
+                    "2026-01-02T14:30:00Z",
+                ),
+                "2026-01-02T14:30:03Z",
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(stale.status, FeedStatus::Stale);
     }
 }

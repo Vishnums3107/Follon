@@ -14,6 +14,13 @@ The Python SDK may:
 
 It may not access a broker adapter or credentials.
 
+`StrategyServices` provides the implemented bounded objects: frozen
+point-in-time historical bars, deterministic SMA/EMA helpers, immutable
+portfolio/cash snapshots, a 64 KiB canonical JSON state store with SHA-256
+fingerprint, and a bounded structured-metrics sink. The objects expose no
+broker, credential, socket, filesystem path, wall clock, or mutable platform
+portfolio.
+
 ## Local worker transport
 
 The supported Months 3â€“5 worker is a versioned, line-delimited JSON process
@@ -24,6 +31,15 @@ the declared strategy tree. The control plane
 checks that identity against the backtest specification before it sends the
 first normalized bar. Each callback receives only immutable strategy context
 and a normalized bar, and returns either one validated intent or `null`.
+
+The v1 stdio protocol remains backward compatible with the minimal bar/context
+frame and also accepts an optional strict `services` snapshot containing
+point-in-time history, portfolio/cash, and host-owned state. When present, the
+worker returns the updated canonical state/fingerprint and emitted structured
+metrics beside the nullable intent. The Rust replay host currently uses the
+minimal frame; a future gRPC host can inject the richer snapshot without a
+protocol redesign. Fill/risk-decision callback delivery and a deployed remote
+worker remain separate integration work.
 
 The worker process runs with a cleared environment. An operator may explicitly
 provide the non-secret `FOLLON_STRATEGY_SDK_PATH` source location, which the

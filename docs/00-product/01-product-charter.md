@@ -4,6 +4,11 @@
 
 Build a trustworthy trading operating system that unifies market data, research, strategy development, backtesting, paper trading, controlled live execution, portfolio risk, monitoring, journaling, and reporting.
 
+This charter is a reference architecture for the complete product, not a
+promise that one founder will ship every capability on a fixed calendar. The
+committed product is always the smallest slice admitted by the current
+evidence gate in the [roadmap](../06-delivery/03-roadmap-and-gates.md).
+
 ## Product promise
 
 Users can develop, validate, deploy, and supervise systematic or discretionary workflows from one auditable platform. The same strategy API and event models are used in research, replay, simulation, paper, and live modes.
@@ -28,3 +33,4 @@ The system is successful when a user can explain any trading decision from sourc
 3. Replay before live trading.
 4. One excellent workflow before many partial workflows.
 5. Strategy code cannot bypass the trading kernel.
+6. Customer and operational evidence before scope expansion.

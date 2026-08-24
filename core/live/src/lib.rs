@@ -14,10 +14,10 @@ use std::str::FromStr;
 
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
-    validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent, OrderState,
-    RiskDecision, Side,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
+    OrderState, RiskDecision, Side,
 };
-use follon_instrument::TradingSession;
+use follon_instrument::{TradingCalendar, TradingSession};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,8 @@ pub struct LiveRiskPolicy {
     pub max_order_quantity: Decimal,
     /// Maximum one-order estimated notional.
     pub max_order_notional: Decimal,
+    /// Maximum absolute limit-price distance from the fresh mark in basis points.
+    pub max_price_deviation_bps: Decimal,
     /// Maximum one-order canary notional; this must not exceed `max_order_notional`.
     pub canary_max_order_notional: Decimal,
     /// Maximum number of live canary submissions since activation.
@@ -133,9 +135,12 @@ impl LiveRiskPolicy {
     /// Validates all non-negotiable live limits.
     pub fn validate(&self) -> Result<(), LiveError> {
         validate_canonical_id("live trading_calendar_id", &self.trading_calendar_id)?;
+        let ten_thousand = Decimal::from_integer(10_000)?;
         if self.version.is_empty()
             || self.max_order_quantity <= Decimal::ZERO
             || self.max_order_notional <= Decimal::ZERO
+            || self.max_price_deviation_bps < Decimal::ZERO
+            || self.max_price_deviation_bps >= ten_thousand
             || self.canary_max_order_notional <= Decimal::ZERO
             || self.canary_max_order_notional > self.max_order_notional
             || self.canary_max_orders == 0
@@ -374,6 +379,33 @@ impl LiveBrokerOrderRequest {
     }
 }
 
+/// A price-only, risk-reducing modification of a working live limit order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveBrokerReplaceRequest {
+    /// Immutable OMS client identity.
+    pub client_order_id: String,
+    /// Current broker-native order identity being superseded.
+    pub previous_broker_order_id: String,
+    /// New positive limit price.
+    pub limit_price: Decimal,
+}
+
+impl LiveBrokerReplaceRequest {
+    fn validate(&self) -> Result<(), LiveError> {
+        validate_canonical_id("live replace client_order_id", &self.client_order_id)?;
+        validate_canonical_id(
+            "live replace previous_broker_order_id",
+            &self.previous_broker_order_id,
+        )?;
+        if self.limit_price <= Decimal::ZERO {
+            return Err(LiveError(
+                "live replacement limit price must be positive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Broker result for one idempotent live submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveBrokerSubmitResult {
@@ -426,6 +458,43 @@ pub enum LiveBrokerEvent {
         /// OMS client idempotency key.
         client_order_id: String,
         /// Stable cancellation reason.
+        reason: String,
+    },
+    /// Broker rejected a requested cancellation; the order remains working.
+    CancelRejected {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Stable broker reason.
+        reason: String,
+    },
+    /// Broker observed time-in-force expiry.
+    Expired {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Stable broker reason.
+        reason: String,
+    },
+    /// Broker observed a modification request before its result is known.
+    ReplaceRequested {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Current broker order identity being replaced.
+        previous_broker_order_id: String,
+    },
+    /// Broker accepted a modification and assigned a new native order identity.
+    Replaced {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Previous broker order identity.
+        previous_broker_order_id: String,
+        /// Replacement broker order identity.
+        broker_order_id: String,
+    },
+    /// Broker rejected a modification; the prior broker version remains working.
+    ReplaceRejected {
+        /// OMS client idempotency identity.
+        client_order_id: String,
+        /// Stable broker reason.
         reason: String,
     },
     /// Broker rejection confirmation.
@@ -481,6 +550,13 @@ pub trait LiveBrokerAdapter {
     ) -> Result<LiveBrokerSubmitResult, LiveError>;
     /// Requests cancellation by client idempotency identity.
     fn cancel(&mut self, client_order_id: &str) -> Result<(), LiveError>;
+    /// Requests a price-only replacement. The result arrives through [`LiveBrokerEvent`].
+    fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
+        request.validate()?;
+        Err(LiveError(
+            "live broker adapter does not support order replacement".to_owned(),
+        ))
+    }
     /// Drains normalized asynchronous broker evidence.
     fn poll(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError>;
     /// Gets independent broker state for reconciliation.
@@ -602,6 +678,10 @@ pub struct LiveOrder {
     pub decision: LiveRiskDecision,
     /// Broker identity after it becomes known.
     pub broker_order_id: Option<String>,
+    /// Every broker-native order identity issued for this immutable OMS order.
+    pub broker_order_versions: Vec<String>,
+    /// State to restore after a replacement acceptance or rejection.
+    replace_return_state: Option<OrderState>,
     /// Exact independently-accounted fill quantity.
     pub filled_quantity: Decimal,
 }
@@ -655,6 +735,8 @@ pub struct LiveRiskDecision {
     pub decided_at: String,
     /// Exact market observation fingerprint.
     pub market_fingerprint: String,
+    /// Exact evaluated inputs and thresholds retained for explanations and audit.
+    pub evaluated_limits: String,
 }
 
 /// Result of a shadow recording or controlled-live canary submission.
@@ -781,6 +863,8 @@ pub struct LiveMonitoringDashboard {
     pub required_live_days: u32,
     /// Whether the next gate is eligible.
     pub promotion_eligible: bool,
+    /// Whether every retained live-state transition is covered by the durable audit chain.
+    pub complete_auditability: bool,
     /// Exact internal cash.
     pub internal_cash: String,
     /// Current position rows, deterministic by instrument.
@@ -856,6 +940,10 @@ struct PersistentLiveOrder {
     market: PersistentMarketData,
     decision: PersistentRiskDecision,
     broker_order_id: Option<String>,
+    #[serde(default)]
+    broker_order_versions: Vec<String>,
+    #[serde(default)]
+    replace_return_state: Option<String>,
     filled_quantity: String,
 }
 
@@ -867,6 +955,7 @@ struct PersistentRiskDecision {
     policy_version: String,
     decided_at: String,
     market_fingerprint: String,
+    evaluated_limits: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1517,18 +1606,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             decided_at: decided_at.to_owned(),
             correlation_id: intent.correlation_id.clone(),
             actor: "live_risk_engine".to_owned(),
-            evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},mark_price={}",
-                self.policy.max_order_quantity,
-                self.policy.max_order_notional,
-                self.policy.canary_max_order_notional,
-                self.policy.canary_max_orders,
-                self.policy.max_open_orders,
-                self.policy.max_position_quantity,
-                self.policy.max_realized_loss,
-                self.policy.max_market_data_age_seconds,
-                market.mark_price,
-            ),
+            evaluated_limits: decision.evaluated_limits.clone(),
         };
         let mut oms = OmsOrder::from_approved_intent(intent, &core_decision)?;
         oms.transition(OrderState::Approved, "LIVE_RISK_APPROVED")?;
@@ -1547,6 +1625,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 market,
                 decision: decision.clone(),
                 broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                replace_return_state: None,
                 filled_quantity: Decimal::ZERO,
             },
         );
@@ -1577,7 +1657,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 order
                     .oms
                     .transition(OrderState::Acknowledged, "LIVE_BROKER_ACKNOWLEDGED")?;
-                order.broker_order_id = Some(broker_order_id);
+                order.broker_order_id = Some(broker_order_id.clone());
+                order.broker_order_versions.push(broker_order_id);
                 let state = order.oms.state;
                 self.persist(
                     "live.order.acknowledged.v1",
@@ -1668,6 +1749,84 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         self.persist("live.order.cancel_sent.v1", actor, occurred_at, order_id)
     }
 
+    /// Requests a price-only replacement that cannot increase the approved limit risk.
+    ///
+    /// Replacement preserves the exact approved intent's quantity, side, and
+    /// identity. It is therefore limited to a more conservative limit price and
+    /// remains subject to the active canary window and durable audit trail.
+    pub fn replace_order(
+        &mut self,
+        order_id: &str,
+        replacement_limit_price: Decimal,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<(), LiveError> {
+        self.ensure_audit_healthy()?;
+        self.require_canary_active(occurred_at)?;
+        validate_canonical_id("live replacement actor", actor)?;
+        if !self.broker_connected {
+            return Err(LiveError(
+                "live canary broker session is not connected; reconcile before replacement"
+                    .to_owned(),
+            ));
+        }
+        let request = {
+            let order = self.order_mut(order_id)?;
+            if !matches!(
+                order.oms.state,
+                OrderState::Acknowledged | OrderState::PartiallyFilled
+            ) {
+                return Err(LiveError(
+                    "only acknowledged or partially filled live orders may be replaced".to_owned(),
+                ));
+            }
+            let prior_limit = order.oms.intent.limit_price.ok_or_else(|| {
+                LiveError("only live limit orders support price replacement".to_owned())
+            })?;
+            if replacement_limit_price <= Decimal::ZERO
+                || (order.oms.intent.side == Side::Buy && replacement_limit_price > prior_limit)
+                || (order.oms.intent.side == Side::Sell && replacement_limit_price < prior_limit)
+            {
+                return Err(LiveError(
+                    "live replacement may only reduce the originally approved limit risk"
+                        .to_owned(),
+                ));
+            }
+            let previous_broker_order_id = order.broker_order_id.clone().ok_or_else(|| {
+                LiveError("live replacement requires an acknowledged broker order ID".to_owned())
+            })?;
+            order.replace_return_state = Some(order.oms.state);
+            order
+                .oms
+                .transition(OrderState::PendingReplace, "LIVE_REPLACE_REQUESTED")?;
+            LiveBrokerReplaceRequest {
+                client_order_id: order.oms.order_id.clone(),
+                previous_broker_order_id,
+                limit_price: replacement_limit_price,
+            }
+        };
+        self.persist(
+            "live.order.pending_replace.v1",
+            actor,
+            occurred_at,
+            order_id,
+        )?;
+        if let Err(error) = self.broker.replace(&request) {
+            self.order_mut(order_id)?
+                .oms
+                .transition(OrderState::Unknown, "LIVE_REPLACE_OUTCOME_UNKNOWN")?;
+            self.broker_connected = false;
+            self.persist(
+                "live.order.replace_unknown.v1",
+                actor,
+                occurred_at,
+                order_id,
+            )?;
+            return Err(error);
+        }
+        self.persist("live.order.replace_sent.v1", actor, occurred_at, order_id)
+    }
+
     /// Drains broker evidence and applies each unique execution exactly once.
     pub fn synchronize(&mut self, actor: &str, occurred_at: &str) -> Result<usize, LiveError> {
         self.ensure_audit_healthy()?;
@@ -1694,13 +1853,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         let count = events.len();
         for event in events {
             self.apply_broker_event(event)?;
+            self.persist(
+                "live.broker.event_applied.v1",
+                actor,
+                occurred_at,
+                "broker-event",
+            )?;
         }
-        self.persist(
-            "live.broker.events_synchronized.v1",
-            actor,
-            occurred_at,
-            "broker-events",
-        )?;
         Ok(count)
     }
 
@@ -1735,11 +1894,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         let reconciliation_id = format!("reconciliation-{:08}", self.next_reconciliation);
         self.next_reconciliation += 1;
         let mut raw_issues = Vec::new();
-        let broker_orders: BTreeMap<_, _> = snapshot
-            .orders
-            .iter()
-            .map(|order| (order.client_order_id.as_str(), order))
-            .collect();
+        let mut broker_orders: BTreeMap<&str, Vec<&LiveBrokerOrderSnapshot>> = BTreeMap::new();
+        for broker_order in &snapshot.orders {
+            broker_orders
+                .entry(broker_order.client_order_id.as_str())
+                .or_default()
+                .push(broker_order);
+        }
         for (order_id, internal) in &self.orders {
             match broker_orders.get(order_id.as_str()) {
                 None if internal.working() => raw_issues.push((
@@ -1747,38 +1908,68 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     order_id.clone(),
                     "internal working order is absent from broker snapshot".to_owned(),
                 )),
-                Some(broker) => {
-                    if internal.broker_order_id.as_deref() != Some(broker.broker_order_id.as_str())
-                    {
+                Some(brokers) => {
+                    let broker = internal.broker_order_id.as_ref().and_then(|current| {
+                        brokers
+                            .iter()
+                            .copied()
+                            .find(|candidate| candidate.broker_order_id == *current)
+                    });
+                    if broker.is_none() {
                         raw_issues.push((
                             "BROKER_ORDER_ID_MISMATCH",
                             order_id.clone(),
                             format!(
-                                "internal={:?},broker={}",
-                                internal.broker_order_id, broker.broker_order_id
+                                "internal_current={:?},broker_versions={}",
+                                internal.broker_order_id,
+                                brokers
+                                    .iter()
+                                    .map(|candidate| candidate.broker_order_id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
                             ),
                         ));
                     }
-                    if internal.filled_quantity != broker.filled_quantity {
+                    if brokers.iter().any(|candidate| {
+                        !internal
+                            .broker_order_versions
+                            .contains(&candidate.broker_order_id)
+                    }) {
+                        raw_issues.push((
+                            "BROKER_ORDER_VERSION_MISMATCH",
+                            order_id.clone(),
+                            "broker snapshot includes an unrecognized broker order version"
+                                .to_owned(),
+                        ));
+                    }
+                    let broker_filled =
+                        brokers.iter().try_fold(Decimal::ZERO, |total, candidate| {
+                            total
+                                .checked_add(candidate.filled_quantity)
+                                .map_err(LiveError::from)
+                        })?;
+                    if internal.filled_quantity != broker_filled {
                         raw_issues.push((
                             "FILLED_QUANTITY_MISMATCH",
                             order_id.clone(),
                             format!(
-                                "internal={},broker={}",
-                                internal.filled_quantity, broker.filled_quantity
+                                "internal={},broker={broker_filled}",
+                                internal.filled_quantity,
                             ),
                         ));
                     }
-                    if internal.oms.state != broker.state {
-                        raw_issues.push((
-                            "ORDER_STATE_MISMATCH",
-                            order_id.clone(),
-                            format!(
-                                "internal={},broker={}",
-                                internal.oms.state.as_str(),
-                                broker.state.as_str()
-                            ),
-                        ));
+                    if let Some(broker) = broker {
+                        if internal.oms.state != broker.state {
+                            raw_issues.push((
+                                "ORDER_STATE_MISMATCH",
+                                order_id.clone(),
+                                format!(
+                                    "internal={},broker={}",
+                                    internal.oms.state.as_str(),
+                                    broker.state.as_str()
+                                ),
+                            ));
+                        }
                     }
                 }
                 None => {}
@@ -1917,12 +2108,20 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         session: &TradingSession,
         report: &LiveReconciliationReport,
         actor: &str,
+        calendar: &dyn TradingCalendar,
     ) -> Result<(), LiveError> {
         self.ensure_audit_healthy()?;
         self.require_canary_active(&report.reconciled_at)?;
         validate_canonical_id("live day actor", actor)?;
         session.validate()?;
         validate_exchange_date(&session.exchange_date)?;
+        if calendar.calendar_id() != self.policy.trading_calendar_id
+            || calendar.session_for_exchange_date(&session.exchange_date) != Some(session)
+        {
+            return Err(LiveError(
+                "live-day gate requires the exact session from the configured calendar".to_owned(),
+            ));
+        }
         if self.activation.mode != LiveRunMode::Canary
             || !report.is_clean()
             || self.latest_reconciliation.as_ref() != Some(report)
@@ -1998,7 +2197,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             })
             .collect();
         LiveMonitoringDashboard {
-            dashboard_schema_version: 1,
+            dashboard_schema_version: 2,
             environment: self.account.environment.clone(),
             mode: self.activation.mode.as_str().to_owned(),
             account_id: self.account.account_id.clone(),
@@ -2020,6 +2219,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             clean_live_days: promotion.clean_live_days,
             required_live_days: promotion.required_live_days,
             promotion_eligible: promotion.eligible_for_next_gate,
+            complete_auditability: promotion.complete_auditability,
             internal_cash: self.cash.to_string(),
             positions,
         }
@@ -2105,6 +2305,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             })?;
         let available_cash = self.cash.checked_sub(reserved_cash)?;
         let estimated_notional = intent.quantity.checked_mul(market.mark_price)?;
+        let requested_price_deviation_bps = intent
+            .limit_price
+            .map(|price| price_deviation_bps(market.mark_price, price))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
         let projected_position = match intent.side {
             Side::Buy => current_position.checked_add(intent.quantity)?,
             Side::Sell => current_position.checked_sub(intent.quantity)?,
@@ -2115,6 +2320,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
         if estimated_notional > self.policy.max_order_notional {
             reasons.push("MAX_ORDER_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if requested_price_deviation_bps > self.policy.max_price_deviation_bps {
+            reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
         if !shadow && estimated_notional > self.policy.canary_max_order_notional {
             reasons.push("CANARY_NOTIONAL_EXCEEDED".to_owned());
@@ -2171,6 +2379,26 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if approved {
             reasons.push("APPROVED".to_owned());
         }
+        let evaluated_limits = format!(
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
+            self.policy.max_order_quantity,
+            self.policy.max_order_notional,
+            self.policy.max_price_deviation_bps,
+            self.policy.canary_max_order_notional,
+            self.policy.canary_max_orders,
+            self.policy.max_open_orders,
+            self.policy.max_position_quantity,
+            self.policy.max_realized_loss,
+            self.policy.max_market_data_age_seconds,
+            market.instrument_id,
+            market.mark_price,
+            market.observed_at,
+            intent.limit_price.map_or_else(|| "MARKET".to_owned(), |price| price.to_string()),
+            requested_price_deviation_bps,
+            estimated_notional,
+            projected_position,
+            available_cash,
+        );
         Ok(LiveRiskDecision {
             decision_id: format!("live-risk-{}", intent.intent_id),
             approved,
@@ -2178,6 +2406,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             policy_version: self.policy.version.clone(),
             decided_at: decided_at.to_owned(),
             market_fingerprint: market_fingerprint(market),
+            evaluated_limits,
         })
     }
 
@@ -2192,12 +2421,24 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 let order = self.order_mut(&client_order_id)?;
                 if let Some(existing) = &order.broker_order_id {
                     if existing != &broker_order_id {
+                        if order.broker_order_versions.contains(&broker_order_id) {
+                            return Ok(());
+                        }
                         return Err(LiveError(
-                            "broker reused a live client ID with different broker ID".to_owned(),
+                            "broker reused a live client ID with an unrecognized broker ID"
+                                .to_owned(),
                         ));
                     }
                 }
-                order.broker_order_id = Some(broker_order_id);
+                if order.broker_order_id.is_none() {
+                    order.broker_order_id = Some(broker_order_id.clone());
+                }
+                if !order.broker_order_versions.contains(&broker_order_id) {
+                    order.broker_order_versions.push(broker_order_id);
+                }
+                if !order.working() {
+                    return Ok(());
+                }
                 transition_to_acknowledged(order, "LIVE_BROKER_ACKNOWLEDGEMENT")?;
             }
             LiveBrokerEvent::Execution {
@@ -2216,19 +2457,34 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 if quantity <= Decimal::ZERO || price <= Decimal::ZERO || fee < Decimal::ZERO {
                     return Err(LiveError("live execution values are invalid".to_owned()));
                 }
-                if !self.execution_ids.insert(execution_id.clone()) {
+                if self.execution_ids.contains(&execution_id) {
                     return Ok(());
                 }
                 let (instrument_id, side, order_id) = {
                     let order = self.order_mut(&client_order_id)?;
                     if let Some(existing) = &order.broker_order_id {
-                        if existing != &broker_order_id {
+                        if existing != &broker_order_id
+                            && !order.broker_order_versions.contains(&broker_order_id)
+                        {
                             return Err(LiveError(
-                                "live execution broker ID does not match order".to_owned(),
+                                "live execution has an unrecognized broker order version"
+                                    .to_owned(),
                             ));
                         }
                     } else {
-                        order.broker_order_id = Some(broker_order_id);
+                        order.broker_order_id = Some(broker_order_id.clone());
+                    }
+                    if !order.broker_order_versions.contains(&broker_order_id) {
+                        order.broker_order_versions.push(broker_order_id.clone());
+                    }
+                    if matches!(
+                        order.oms.state,
+                        OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+                    ) {
+                        order.oms.transition(
+                            OrderState::Unknown,
+                            "LATE_LIVE_BROKER_EXECUTION_AFTER_TERMINAL",
+                        )?;
                     }
                     transition_to_acknowledged(order, "LIVE_EXECUTION_CONFIRMED_ORDER")?;
                     let total = order.filled_quantity.checked_add(quantity)?;
@@ -2255,6 +2511,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         order.oms.order_id.clone(),
                     )
                 };
+                self.execution_ids.insert(execution_id.clone());
                 let fill = Fill {
                     execution_id,
                     order_id,
@@ -2288,21 +2545,138 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             } => {
                 validate_canonical_id("live cancellation client_order_id", &client_order_id)?;
                 validate_reason("live cancellation reason", &reason)?;
+                transition_to_terminal(
+                    self.order_mut(&client_order_id)?,
+                    OrderState::Cancelled,
+                    &reason,
+                )?;
+            }
+            LiveBrokerEvent::CancelRejected {
+                client_order_id,
+                reason,
+            } => {
+                validate_canonical_id("live cancellation client_order_id", &client_order_id)?;
+                validate_reason("live cancel rejection reason", &reason)?;
                 let order = self.order_mut(&client_order_id)?;
                 match order.oms.state {
-                    OrderState::Acknowledged | OrderState::PartiallyFilled => {
-                        order
-                            .oms
-                            .transition(OrderState::PendingCancel, "LIVE_BROKER_CANCEL_OBSERVED")?;
-                        order.oms.transition(OrderState::Cancelled, reason)?;
-                    }
                     OrderState::PendingCancel | OrderState::Unknown => {
-                        order.oms.transition(OrderState::Cancelled, reason)?;
+                        restore_working_state(order, "LIVE_BROKER_CANCEL_REJECTED")?;
                     }
-                    OrderState::Cancelled => {}
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
                     _ => {
                         return Err(LiveError(
-                            "live cancellation is incompatible with OMS state".to_owned(),
+                            "live cancel rejection is incompatible with OMS state".to_owned(),
+                        ))
+                    }
+                }
+            }
+            LiveBrokerEvent::Expired {
+                client_order_id,
+                reason,
+            } => {
+                validate_canonical_id("live expiry client_order_id", &client_order_id)?;
+                validate_reason("live expiry reason", &reason)?;
+                transition_to_terminal(
+                    self.order_mut(&client_order_id)?,
+                    OrderState::Expired,
+                    &reason,
+                )?;
+            }
+            LiveBrokerEvent::ReplaceRequested {
+                client_order_id,
+                previous_broker_order_id,
+            } => {
+                validate_canonical_id("live replacement client_order_id", &client_order_id)?;
+                validate_canonical_id(
+                    "live replacement previous_order_id",
+                    &previous_broker_order_id,
+                )?;
+                let order = self.order_mut(&client_order_id)?;
+                if order.broker_order_id.as_deref() != Some(previous_broker_order_id.as_str()) {
+                    return Err(LiveError(
+                        "live replacement does not match active broker order".to_owned(),
+                    ));
+                }
+                match order.oms.state {
+                    OrderState::Acknowledged | OrderState::PartiallyFilled => {
+                        order.replace_return_state = Some(order.oms.state);
+                        order.oms.transition(
+                            OrderState::PendingReplace,
+                            "LIVE_BROKER_REPLACE_REQUESTED",
+                        )?;
+                    }
+                    OrderState::PendingReplace => {}
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
+                    _ => {
+                        return Err(LiveError(
+                            "live replacement is incompatible with OMS state".to_owned(),
+                        ))
+                    }
+                }
+            }
+            LiveBrokerEvent::Replaced {
+                client_order_id,
+                previous_broker_order_id,
+                broker_order_id,
+            } => {
+                validate_canonical_id("live replacement client_order_id", &client_order_id)?;
+                validate_canonical_id(
+                    "live replacement previous_order_id",
+                    &previous_broker_order_id,
+                )?;
+                validate_canonical_id("live replacement_order_id", &broker_order_id)?;
+                let order = self.order_mut(&client_order_id)?;
+                if order.broker_order_id.as_deref() != Some(previous_broker_order_id.as_str()) {
+                    if order.broker_order_versions.contains(&broker_order_id) {
+                        return Ok(());
+                    }
+                    return Err(LiveError(
+                        "live replacement does not match active broker order".to_owned(),
+                    ));
+                }
+                match order.oms.state {
+                    OrderState::PendingReplace | OrderState::Unknown => {
+                        if !order.broker_order_versions.contains(&broker_order_id) {
+                            order.broker_order_versions.push(broker_order_id.clone());
+                        }
+                        order.broker_order_id = Some(broker_order_id);
+                        restore_replacement_state(order, "LIVE_BROKER_REPLACED")?;
+                    }
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
+                    _ => {
+                        return Err(LiveError(
+                            "live replacement is incompatible with OMS state".to_owned(),
+                        ))
+                    }
+                }
+            }
+            LiveBrokerEvent::ReplaceRejected {
+                client_order_id,
+                reason,
+            } => {
+                validate_canonical_id("live replacement client_order_id", &client_order_id)?;
+                validate_reason("live replacement rejection reason", &reason)?;
+                let order = self.order_mut(&client_order_id)?;
+                match order.oms.state {
+                    OrderState::PendingReplace | OrderState::Unknown => {
+                        restore_replacement_state(order, "LIVE_BROKER_REPLACE_REJECTED")?;
+                    }
+                    OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Rejected
+                    | OrderState::Expired => {}
+                    _ => {
+                        return Err(LiveError(
+                            "live replacement rejection is incompatible with OMS state".to_owned(),
                         ))
                     }
                 }
@@ -2313,24 +2687,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             } => {
                 validate_canonical_id("live rejection client_order_id", &client_order_id)?;
                 validate_reason("live rejection reason", &reason)?;
-                let order = self.order_mut(&client_order_id)?;
-                match order.oms.state {
-                    OrderState::PendingSubmit => {
-                        order
-                            .oms
-                            .transition(OrderState::Submitted, "LIVE_BROKER_REJECTION_OBSERVED")?;
-                        order.oms.transition(OrderState::Rejected, reason)?;
-                    }
-                    OrderState::Submitted | OrderState::Unknown => {
-                        order.oms.transition(OrderState::Rejected, reason)?;
-                    }
-                    OrderState::Rejected => {}
-                    _ => {
-                        return Err(LiveError(
-                            "live rejection is incompatible with OMS state".to_owned(),
-                        ))
-                    }
-                }
+                transition_to_terminal(
+                    self.order_mut(&client_order_id)?,
+                    OrderState::Rejected,
+                    &reason,
+                )?;
             }
         }
         Ok(())
@@ -2406,6 +2767,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             market: PersistentMarketData::from(&order.market),
                             decision: PersistentRiskDecision::from(&order.decision),
                             broker_order_id: order.broker_order_id.clone(),
+                            broker_order_versions: order.broker_order_versions.clone(),
+                            replace_return_state: order
+                                .replace_return_state
+                                .map(OrderState::as_str)
+                                .map(str::to_owned),
                             filled_quantity: order.filled_quantity.to_string(),
                         },
                     )
@@ -2532,6 +2898,28 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             if let Some(broker_order_id) = &persisted.broker_order_id {
                 validate_canonical_id("persisted live broker_order_id", broker_order_id)?;
             }
+            let mut broker_order_versions = persisted.broker_order_versions;
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                if broker_order_versions.is_empty() {
+                    broker_order_versions.push(broker_order_id.clone());
+                }
+            }
+            let mut unique_versions = BTreeSet::new();
+            for broker_order_id in &broker_order_versions {
+                validate_canonical_id("persisted live broker_order_version", broker_order_id)?;
+                if !unique_versions.insert(broker_order_id) {
+                    return Err(LiveError(
+                        "persisted live broker order versions are duplicated".to_owned(),
+                    ));
+                }
+            }
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                if !unique_versions.contains(broker_order_id) {
+                    return Err(LiveError(
+                        "persisted active live broker ID is absent from versions".to_owned(),
+                    ));
+                }
+            }
             let filled_quantity =
                 decimal("persisted live filled quantity", &persisted.filled_quantity)?;
             if filled_quantity < Decimal::ZERO || filled_quantity > intent.quantity {
@@ -2544,6 +2932,16 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 intent,
                 parse_order_state(&persisted.state)?,
             )?;
+            let replace_return_state = persisted
+                .replace_return_state
+                .as_deref()
+                .map(parse_order_state)
+                .transpose()?;
+            if oms.state == OrderState::PendingReplace && replace_return_state.is_none() {
+                return Err(LiveError(
+                    "persisted pending live replacement has no return state".to_owned(),
+                ));
+            }
             orders.insert(
                 order_id,
                 LiveOrder {
@@ -2552,6 +2950,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     market,
                     decision,
                     broker_order_id: persisted.broker_order_id,
+                    broker_order_versions,
+                    replace_return_state,
                     filled_quantity,
                 },
             );
@@ -2720,6 +3120,7 @@ fn configuration_fingerprint(
     let max_deployed_capital = account.max_deployed_capital.to_string();
     let max_order_quantity = policy.max_order_quantity.to_string();
     let max_order_notional = policy.max_order_notional.to_string();
+    let max_price_deviation_bps = policy.max_price_deviation_bps.to_string();
     let canary_max_order_notional = policy.canary_max_order_notional.to_string();
     let canary_max_orders = policy.canary_max_orders.to_string();
     let max_open_orders = policy.max_open_orders.to_string();
@@ -2727,7 +3128,7 @@ fn configuration_fingerprint(
     let max_realized_loss = policy.max_realized_loss.to_string();
     let max_market_data_age_seconds = policy.max_market_data_age_seconds.to_string();
     hash_fingerprint_parts(&[
-        "live-configuration-v1",
+        "live-configuration-v2",
         &account.account_id,
         &account.currency,
         &initial_cash,
@@ -2738,6 +3139,7 @@ fn configuration_fingerprint(
         &policy.trading_calendar_id,
         &max_order_quantity,
         &max_order_notional,
+        &max_price_deviation_bps,
         &canary_max_order_notional,
         &canary_max_orders,
         &max_open_orders,
@@ -2804,12 +3206,82 @@ fn transition_to_acknowledged(order: &mut LiveOrder, reason: &str) -> Result<(),
         OrderState::Submitted | OrderState::Unknown => {
             order.oms.transition(OrderState::Acknowledged, reason)?;
         }
-        OrderState::Acknowledged | OrderState::PartiallyFilled | OrderState::Filled => {}
+        OrderState::Acknowledged
+        | OrderState::PartiallyFilled
+        | OrderState::Filled
+        | OrderState::PendingCancel
+        | OrderState::PendingReplace => {}
         _ => {
             return Err(LiveError(
                 "broker acknowledgement is incompatible with live OMS state".to_owned(),
             ))
         }
+    }
+    Ok(())
+}
+
+fn restore_working_state(order: &mut LiveOrder, reason: &str) -> Result<(), LiveError> {
+    let state = if order.filled_quantity == Decimal::ZERO {
+        OrderState::Acknowledged
+    } else {
+        OrderState::PartiallyFilled
+    };
+    order.oms.transition(state, reason)?;
+    Ok(())
+}
+
+fn restore_replacement_state(order: &mut LiveOrder, reason: &str) -> Result<(), LiveError> {
+    let state = order.replace_return_state.take().unwrap_or_else(|| {
+        if order.filled_quantity == Decimal::ZERO {
+            OrderState::Acknowledged
+        } else {
+            OrderState::PartiallyFilled
+        }
+    });
+    order.oms.transition(state, reason)?;
+    Ok(())
+}
+
+fn transition_to_terminal(
+    order: &mut LiveOrder,
+    terminal: OrderState,
+    reason: &str,
+) -> Result<(), LiveError> {
+    debug_assert!(matches!(
+        terminal,
+        OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+    ));
+    match order.oms.state {
+        OrderState::PendingSubmit => {
+            order.oms.transition(OrderState::Submitted, reason)?;
+            order.oms.transition(terminal, reason)?;
+        }
+        OrderState::Submitted
+        | OrderState::Acknowledged
+        | OrderState::PartiallyFilled
+        | OrderState::PendingCancel
+        | OrderState::PendingReplace
+        | OrderState::Unknown => {
+            order.oms.transition(terminal, reason)?;
+        }
+        state if state == terminal => {}
+        OrderState::Filled | OrderState::Cancelled | OrderState::Rejected | OrderState::Expired => {
+        }
+        _ => {
+            return Err(LiveError(
+                "live broker terminal event is incompatible with OMS state".to_owned(),
+            ))
+        }
+    }
+    if matches!(
+        order.oms.state,
+        OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+    ) && order.filled_quantity >= order.oms.intent.quantity
+    {
+        return Err(LiveError(
+            "non-filled live terminal state cannot have cumulative quantity equal to requested quantity"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2824,17 +3296,20 @@ fn validate_reason(name: &str, value: &str) -> Result<(), LiveError> {
 }
 
 fn validate_broker_snapshot(snapshot: &LiveBrokerAccountSnapshot) -> Result<(), LiveError> {
-    let mut client_order_ids = BTreeSet::new();
+    let mut order_versions = BTreeSet::new();
     let mut broker_order_ids = BTreeSet::new();
     for order in &snapshot.orders {
         validate_canonical_id("live snapshot client_order_id", &order.client_order_id)?;
         validate_canonical_id("live snapshot broker_order_id", &order.broker_order_id)?;
         if order.filled_quantity < Decimal::ZERO
-            || !client_order_ids.insert(order.client_order_id.as_str())
+            || !order_versions.insert((
+                order.client_order_id.as_str(),
+                order.broker_order_id.as_str(),
+            ))
             || !broker_order_ids.insert(order.broker_order_id.as_str())
         {
             return Err(LiveError(
-                "live snapshot has duplicate order IDs or negative fills".to_owned(),
+                "live snapshot has duplicate broker order versions or negative fills".to_owned(),
             ));
         }
     }
@@ -2879,6 +3354,7 @@ fn parse_order_state(value: &str) -> Result<OrderState, LiveError> {
         "PARTIALLY_FILLED" => Ok(OrderState::PartiallyFilled),
         "FILLED" => Ok(OrderState::Filled),
         "PENDING_CANCEL" => Ok(OrderState::PendingCancel),
+        "PENDING_REPLACE" => Ok(OrderState::PendingReplace),
         "CANCELLED" => Ok(OrderState::Cancelled),
         "REJECTED" => Ok(OrderState::Rejected),
         "EXPIRED" => Ok(OrderState::Expired),
@@ -3021,6 +3497,7 @@ impl From<&LiveRiskDecision> for PersistentRiskDecision {
             policy_version: decision.policy_version.clone(),
             decided_at: decision.decided_at.clone(),
             market_fingerprint: decision.market_fingerprint.clone(),
+            evaluated_limits: decision.evaluated_limits.clone(),
         }
     }
 }
@@ -3033,6 +3510,7 @@ impl TryFrom<PersistentRiskDecision> for LiveRiskDecision {
         validate_utc_timestamp("persisted live risk decision time", &value.decided_at)?;
         if value.reason_codes.is_empty()
             || value.policy_version.is_empty()
+            || value.evaluated_limits.is_empty()
             || value.market_fingerprint.len() != 64
             || !value
                 .market_fingerprint
@@ -3059,6 +3537,7 @@ impl TryFrom<PersistentRiskDecision> for LiveRiskDecision {
             policy_version: value.policy_version,
             decided_at: value.decided_at,
             market_fingerprint: value.market_fingerprint,
+            evaluated_limits: value.evaluated_limits,
         })
     }
 }
@@ -3157,6 +3636,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use follon_domain::{OrderType, TimeInForce};
+    use follon_instrument::StaticTradingCalendar;
 
     use super::*;
 
@@ -3277,6 +3757,7 @@ mod tests {
             trading_calendar_id: "calendar.nyse.v1".to_owned(),
             max_order_quantity: amount("10"),
             max_order_notional: amount("100"),
+            max_price_deviation_bps: amount("100"),
             canary_max_order_notional: amount("50"),
             canary_max_orders: 2,
             max_open_orders: 2,
@@ -3346,6 +3827,24 @@ mod tests {
             mark_price: amount("10"),
             observed_at: "2026-01-02T14:30:00Z".to_owned(),
         }
+    }
+
+    fn live_session(exchange_date: &str) -> TradingSession {
+        let (opens_at, closes_at) = if exchange_date >= "2026-03-09" {
+            ("13:30:00Z", "20:00:00Z")
+        } else {
+            ("14:30:00Z", "21:00:00Z")
+        };
+        TradingSession {
+            exchange_date: exchange_date.to_owned(),
+            opens_at: format!("{exchange_date}T{opens_at}"),
+            closes_at: format!("{exchange_date}T{closes_at}"),
+        }
+    }
+
+    fn live_calendar(sessions: &[TradingSession]) -> StaticTradingCalendar {
+        StaticTradingCalendar::new("calendar.nyse.v1", sessions.to_vec())
+            .expect("test live calendar")
     }
 
     fn approval_for(
@@ -3439,16 +3938,10 @@ mod tests {
             .reconcile("operator.approver.001", "2026-01-02T21:01:00Z")
             .expect("independent reconciliation");
         assert!(report.is_clean());
+        let session = live_session("2026-01-02");
+        let calendar = live_calendar(std::slice::from_ref(&session));
         service
-            .record_live_session(
-                &TradingSession {
-                    exchange_date: "2026-01-02".to_owned(),
-                    opens_at: "2026-01-02T14:30:00Z".to_owned(),
-                    closes_at: "2026-01-02T21:00:00Z".to_owned(),
-                },
-                &report,
-                "operator.approver.001",
-            )
+            .record_live_session(&session, &report, "operator.approver.001", &calendar)
             .expect("post-close clean evidence");
         let dashboard = service.monitoring_dashboard();
         assert_eq!(dashboard.clean_live_days, 1);
@@ -3459,6 +3952,109 @@ mod tests {
         let recovered = test_service(LiveRunMode::Canary, &path);
         assert!(!recovered.monitoring_dashboard().broker_connected);
         assert_eq!(recovered.monitoring_dashboard().clean_live_days, 1);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn sixty_configured_clean_sessions_are_required_and_recoverable() {
+        let path = journal_path("sixty-day-gate");
+        let dates = [
+            "2026-01-02",
+            "2026-01-05",
+            "2026-01-06",
+            "2026-01-07",
+            "2026-01-08",
+            "2026-01-09",
+            "2026-01-12",
+            "2026-01-13",
+            "2026-01-14",
+            "2026-01-15",
+            "2026-01-16",
+            "2026-01-20",
+            "2026-01-21",
+            "2026-01-22",
+            "2026-01-23",
+            "2026-01-26",
+            "2026-01-27",
+            "2026-01-28",
+            "2026-01-29",
+            "2026-01-30",
+            "2026-02-02",
+            "2026-02-03",
+            "2026-02-04",
+            "2026-02-05",
+            "2026-02-06",
+            "2026-02-09",
+            "2026-02-10",
+            "2026-02-11",
+            "2026-02-12",
+            "2026-02-13",
+            "2026-02-17",
+            "2026-02-18",
+            "2026-02-19",
+            "2026-02-20",
+            "2026-02-23",
+            "2026-02-24",
+            "2026-02-25",
+            "2026-02-26",
+            "2026-02-27",
+            "2026-03-02",
+            "2026-03-03",
+            "2026-03-04",
+            "2026-03-05",
+            "2026-03-06",
+            "2026-03-09",
+            "2026-03-10",
+            "2026-03-11",
+            "2026-03-12",
+            "2026-03-13",
+            "2026-03-16",
+            "2026-03-17",
+            "2026-03-18",
+            "2026-03-19",
+            "2026-03-20",
+            "2026-03-23",
+            "2026-03-24",
+            "2026-03-25",
+            "2026-03-26",
+            "2026-03-27",
+            "2026-03-30",
+        ];
+        assert_eq!(dates.len(), 60);
+        let sessions: Vec<_> = dates.iter().map(|date| live_session(date)).collect();
+        let calendar = live_calendar(&sessions);
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:01:00Z",
+            )
+            .expect("managed-secret connection");
+
+        for (index, session) in sessions.iter().enumerate() {
+            let report = service
+                .reconcile("operator.approver.001", &session.closes_at)
+                .expect("clean independent reconciliation");
+            assert!(report.is_clean());
+            service
+                .record_live_session(session, &report, "operator.approver.001", &calendar)
+                .expect("calendar-backed session evidence");
+            assert_eq!(service.promotion_status().clean_live_days, index as u32 + 1);
+            assert_eq!(
+                service.promotion_status().eligible_for_next_gate,
+                index == 59
+            );
+        }
+        drop(service);
+
+        let recovered = test_service(LiveRunMode::Canary, &path);
+        let promotion = recovered.promotion_status();
+        assert_eq!(promotion.clean_live_days, 60);
+        assert!(promotion.complete_auditability);
+        assert!(promotion.eligible_for_next_gate);
+        assert!(!recovered.monitoring_dashboard().broker_connected);
+        drop(recovered);
         std::fs::remove_file(path).expect("remove test journal");
     }
 
@@ -3476,6 +4072,36 @@ mod tests {
             .expect("shadow decision");
         assert!(matches!(outcome, LiveSubmitOutcome::ShadowRecorded { .. }));
         assert!(!service.monitoring_dashboard().broker_connected);
+        assert_eq!(service.broker_mut().submitted, 0);
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn controlled_live_price_collar_rejection_retains_exact_limits() {
+        let path = journal_path("price-collar");
+        let mut service = test_service(LiveRunMode::Shadow, &path);
+        let mut far_limit = intent("SHADOW", "intent.shadow.price-collar.001");
+        far_limit.order_type = OrderType::Limit;
+        far_limit.limit_price = Some(amount("11"));
+        let outcome = service
+            .record_shadow_intent(
+                far_limit,
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow rejection evidence");
+        let LiveSubmitOutcome::ShadowRecorded { decision } = outcome else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"PRICE_COLLAR_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("requested_price_deviation_bps=1000.00000000"));
         assert_eq!(service.broker_mut().submitted, 0);
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");

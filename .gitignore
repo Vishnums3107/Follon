@@ -19,8 +19,12 @@ target/
 node_modules/
 dist/
 build/
+/apps/desktop/web-dist/
+/apps/desktop/vite.config.js
+/apps/desktop/src-tauri/gen/schemas/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

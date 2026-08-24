@@ -88,6 +88,31 @@ impl Decimal {
     }
 }
 
+/// Returns the absolute distance between a requested price and a positive
+/// reference price in exact basis points.
+///
+/// This shared calculation keeps simulation, PAPER, and controlled-LIVE price
+/// collars identical. A non-positive input fails closed instead of producing a
+/// misleading risk result.
+pub fn price_deviation_bps(
+    reference_price: Decimal,
+    requested_price: Decimal,
+) -> Result<Decimal, DecimalError> {
+    if reference_price <= Decimal::ZERO || requested_price <= Decimal::ZERO {
+        return Err(DecimalError(
+            "price-collar inputs must both be positive".to_owned(),
+        ));
+    }
+    let distance = if requested_price >= reference_price {
+        requested_price.checked_sub(reference_price)?
+    } else {
+        reference_price.checked_sub(requested_price)?
+    };
+    distance
+        .checked_mul(Decimal::from_integer(10_000)?)?
+        .checked_div(reference_price)
+}
+
 impl FromStr for Decimal {
     type Err = DecimalError;
 
@@ -420,6 +445,8 @@ pub enum OrderState {
     Filled,
     /// Cancellation is in progress.
     PendingCancel,
+    /// A risk-preserving broker modification is in progress.
+    PendingReplace,
     /// Cancellation completed.
     Cancelled,
     /// External system rejected the order.
@@ -444,6 +471,7 @@ impl OrderState {
             Self::PartiallyFilled => "PARTIALLY_FILLED",
             Self::Filled => "FILLED",
             Self::PendingCancel => "PENDING_CANCEL",
+            Self::PendingReplace => "PENDING_REPLACE",
             Self::Cancelled => "CANCELLED",
             Self::Rejected => "REJECTED",
             Self::Expired => "EXPIRED",
@@ -741,6 +769,20 @@ mod tests {
                 .to_string(),
             "25.00000000"
         );
+    }
+
+    #[test]
+    fn price_deviation_is_exact_and_rejects_invalid_inputs() {
+        let reference = Decimal::from_str("100").unwrap();
+        assert_eq!(
+            price_deviation_bps(reference, Decimal::from_str("101.25").unwrap()).unwrap(),
+            Decimal::from_str("125").unwrap()
+        );
+        assert_eq!(
+            price_deviation_bps(reference, Decimal::from_str("99.25").unwrap()).unwrap(),
+            Decimal::from_str("75").unwrap()
+        );
+        assert!(price_deviation_bps(Decimal::ZERO, reference).is_err());
     }
 
     #[test]

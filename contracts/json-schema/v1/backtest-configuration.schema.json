@@ -54,6 +54,10 @@
       "type": "string",
       "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$"
     },
+    "basisPoints": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,3})(?:\\.[0-9]{1,8})?$"
+    },
     "utc": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
@@ -92,12 +96,13 @@
     "risk": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["policy_version", "global_kill_switch", "max_quantity", "max_notional"],
+      "required": ["policy_version", "global_kill_switch", "max_quantity", "max_notional", "max_price_deviation_bps"],
       "properties": {
         "policy_version": { "type": "string", "minLength": 1 },
         "global_kill_switch": { "type": "boolean" },
         "max_quantity": { "$ref": "#/$defs/positiveDecimal" },
-        "max_notional": { "$ref": "#/$defs/positiveDecimal" }
+        "max_notional": { "$ref": "#/$defs/positiveDecimal" },
+        "max_price_deviation_bps": { "$ref": "#/$defs/basisPoints" }
       }
     },
     "execution": {
@@ -105,8 +110,16 @@
       "additionalProperties": false,
       "required": ["slippage_bps", "flat_fee"],
       "properties": {
+        "spread_bps": { "$ref": "#/$defs/decimal" },
         "slippage_bps": { "$ref": "#/$defs/decimal" },
-        "flat_fee": { "$ref": "#/$defs/decimal" }
+        "flat_fee": { "$ref": "#/$defs/decimal" },
+        "latency_bars": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "max_fill_quantity": {
+          "oneOf": [
+            { "$ref": "#/$defs/positiveDecimal" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "calendar": {
@@ -126,6 +139,26 @@
               "exchange_date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
               "opens_at": { "$ref": "#/$defs/utc" },
               "closes_at": { "$ref": "#/$defs/utc" }
+            }
+          }
+        },
+        "halts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["halt_id", "instrument_id", "starts_at", "ends_at", "reason"],
+            "properties": {
+              "halt_id": { "$ref": "#/$defs/canonicalId" },
+              "instrument_id": {
+                "oneOf": [
+                  { "$ref": "#/$defs/canonicalId" },
+                  { "type": "null" }
+                ]
+              },
+              "starts_at": { "$ref": "#/$defs/utc" },
+              "ends_at": { "$ref": "#/$defs/utc" },
+              "reason": { "type": "string", "minLength": 1 }
             }
           }
         }

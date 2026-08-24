@@ -11,6 +11,9 @@ permissions:
 jobs:
   security:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,12 +21,13 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # The initial repository commit contains only LICENSE, so GitHub cannot
-      # build a dependency graph for this bootstrap PR. Future PRs use the
-      # native review once the first application commit is on main.
+      # Private repositories without GitHub Advanced Security cannot run the
+      # native dependency-review action. Opt in with this repository variable
+      # only after GitHub reports the feature as supported; lockfile audits
+      # below remain mandatory in either case.
       - name: Review dependency changes
         uses: actions/dependency-review-action@v4
-        if: github.event_name == 'pull_request' && github.event.pull_request.base.sha != 'af73c9e9b24219d2c9b32bb17701dc5cafc5d918'
+        if: github.event_name == 'pull_request' && vars.DEPENDENCY_REVIEW_ENABLED == 'true'
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Rust advisory auditor
         run: cargo install cargo-audit --locked
@@ -37,6 +41,19 @@ jobs:
       - name: Audit Node dependencies
         run: npm audit --package-lock-only --audit-level=high
         working-directory: apps/desktop
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify deterministic SBOM generation
+        run: python -m unittest discover -s tests/security -v
+      - name: Generate release SBOM
+        run: python tools/generate_sbom.py --source-revision "$GITHUB_SHA" --output build/follon-sbom.cdx.json
+      - name: Retain release SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: follon-sbom
+          path: build/follon-sbom.cdx.json
+          if-no-files-found: error
 
   rust:
     runs-on: ubuntu-24.04
@@ -48,6 +65,30 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  postgres-integration:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_DB: follon_test
+          POSTGRES_USER: follon
+          POSTGRES_PASSWORD: integration-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U follon -d follon_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run transactional PostgreSQL integration test
+        env:
+          FOLLON_TEST_DATABASE_URL: postgresql://follon:integration-only-password@127.0.0.1:5432/follon_test
+        run: cargo test -p follon-postgres -- --ignored
 
   python-and-contracts:
     runs-on: ubuntu-24.04
@@ -62,11 +103,20 @@ jobs:
         env:
           PYTHONPATH: python/strategy-sdk/src
         run: python -m unittest discover -s python/strategy-sdk/tests -v
+      - name: Run IBKR bridge protocol tests
+        env:
+          PYTHONPATH: python/ibkr-gateway/src
+        run: python -m unittest discover -s python/ibkr-gateway/tests -v
+      - name: Install storage adapter
+        run: python -m pip install python/storage-adapter
+      - name: Run storage adapter tests
+        run: python -m unittest discover -s python/storage-adapter/tests -v
 
   desktop:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
           node-version: "22.20.0"
@@ -75,4 +125,6 @@ jobs:
       - run: npm ci
         working-directory: apps/desktop
       - run: npm run typecheck
+        working-directory: apps/desktop
+      - run: npm run test:evidence
         working-directory: apps/desktop

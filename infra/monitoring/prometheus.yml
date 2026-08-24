@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/follon-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  - job_name: follon-dashboard-mtls
+    metrics_path: /probe
+    params:
+      module: [dashboard_mtls]
+    static_configs:
+      - targets: ["https://dashboard-tls:8443/api/v1/health"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  - job_name: follon-trading-api-mtls
+    metrics_path: /probe
+    params:
+      module: [grpc_mtls]
+    static_configs:
+      - targets: ["trading-api:50051"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

@@ -1,0 +1,8 @@
+{
+  "privacy_request_schema_version": 1,
+  "request_id": "privacy.request.acme.001",
+  "tenant_id": "tenant.acme",
+  "subject_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "kind": "ERASURE",
+  "requested_at": "2026-08-12T09:00:00Z"
+}

@@ -2,22 +2,22 @@
 
 **Status:** controlled-live safety kernel and monitoring contracts implemented.
 This is not evidence of a connected broker account or of the 60-live-day gate.
-No credential provider, authenticated approval API, or broker wire-protocol
-client is checked in.
+No authenticated approval API or live broker wire-protocol client is checked
+in, and no credential or external vault is configured.
 
 ## Implemented safety controls
 
 | Requirement | Implementation | Status |
 | --- | --- | --- |
 | Explicit LIVE boundary | `LiveAccount` accepts only literal `LIVE`, an opaque managed credential reference, an opening cash value, and a lower independent deployed-capital ceiling | Implemented and tested |
-| Secret containment | Secret bytes are represented by non-debuggable, zeroizing `SecretMaterial`; only the `LiveBrokerAdapter` connection boundary can receive them. Configuration, journal, dashboard, and error contracts accept only `SecretReference`. | Implemented; managed-vault/keychain implementation remains deployment work |
+| Secret containment | Secret bytes are non-debuggable, zeroizing `SecretMaterial`; only the `LiveBrokerAdapter` connection boundary can receive them. `ManagedCommandSecretProvider` calls one canonical fixed executable without a shell, closes stdin, bounds stdout/time, discards stderr, sanitizes failures, and appends only the opaque `SecretReference`. | Provider boundary implemented and tested; vault policy, helper, identity, rotation, and access audit remain deployment controls |
 | Four-eyes activation and approvals | A `LiveActivation` binds a shadow or canary window to the exact account, risk policy, and kill-switch revision. Every canary order requires an unexpired, single-use approval for the exact intent hash, recorded by its distinct approving operator. | Implemented and tested |
 | Shadow / canary separation | Shadow accepts only `SHADOW` intents and cannot reach an adapter. Canary accepts only matching `LIVE` intents after activation, managed-secret connection, pre-trade checks, and exact approval. | Implemented and tested |
 | Canary limits and kill switches | Canary-specific notional/count limits supplement quantity, notional, open-order, long-only position, realized-loss, fresh-market, available-cash, reserved-cash, and deployed-capital limits. Global/account/strategy/instrument kill switches reject new work. | Implemented and tested |
 | Irreversible-action audit | An exclusive, fsynced NDJSON journal forms a SHA-256 chain. A pending submission is durable before the broker call; ambiguous results are `UNKNOWN`; bad chain/state/configuration recovery fails closed. Restart records a new audit event and never inherits a broker session. | Implemented and tested |
 | Reconciliation, incident, DR | Independent broker orders, fills, positions, and cash are compared without overwrite. Differences become durable incidents; only accountable explanations clear the unresolved count. Reconnect requires evidence drain and reconciliation. | Implemented and tested |
-| Promotion evidence | A day counts only when an explicit closed session has the latest clean post-close reconciliation, no unresolved incident, and durable audit evidence. Days are immutable by exchange date. | Gate mechanism implemented; observed evidence is **0/60** |
-| Monitoring | Strict `live-monitoring-dashboard` schema, immutable `follon-live-status` snapshots, and the desktop read-only display expose audit head, session state, reconciliation, incidents, positions, and 60-day gate state. | Implemented and typechecked |
+| Promotion evidence | A day counts only when the exact session resolves from the configured versioned calendar and has the latest clean post-close reconciliation, no unresolved incident, and durable audit evidence. Days are immutable by exchange date. | Gate mechanism and 60-session recovery test implemented; observed evidence is **0/60** |
+| Monitoring | Strict v2 `live-monitoring-dashboard` schema, immutable `follon-live-status` snapshots, and the desktop read-only display expose audit head, complete-auditability state, broker session, reconciliation, incidents, positions, and 60-day gate state. | Implemented and typechecked |
 
 ## Deliberate deployment boundary
 
@@ -28,8 +28,9 @@ audit-backed monitoring evidence but cannot access credentials or a broker.
 Before a small-capital live canary, an independently reviewed deployment must
 provide all of the following:
 
-1. A managed vault or OS-keychain `SecretProvider`, scoped to one deployment
-   identity, with rotation, access logs, and no plaintext fallback.
+1. A reviewed vault or OS-keychain helper wired through the fixed-command
+   `SecretProvider`, scoped to one deployment identity, with rotation, access
+   logs, no descendant processes, and no plaintext fallback.
 2. A pinned, independently tested `LiveBrokerAdapter` for the approved broker
    endpoint. It must preserve OMS client IDs, normalize broker messages, and
    make no automatic retry after an ambiguous submit or cancel.

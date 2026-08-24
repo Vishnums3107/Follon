@@ -1,0 +1,21 @@
+[package]
+name = "follon-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+argon2 = { version = "0.5.3", features = ["std"] }
+follon-domain = { path = "../domain" }
+hmac = "0.12.1"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

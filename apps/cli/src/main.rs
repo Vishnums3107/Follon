@@ -50,10 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             global_kill_switch: false,
             max_quantity: decimal("10")?,
             max_notional: decimal("10000")?,
+            max_price_deviation_bps: decimal("500")?,
         },
         DeterministicFillModel {
+            spread_bps: decimal("0")?,
             slippage_bps: decimal("0")?,
             flat_fee: decimal("0.10")?,
+            latency_bars: 0,
+            max_fill_quantity: None,
         },
     )?;
     let mut strategy = BuyOnceStrategy::new(

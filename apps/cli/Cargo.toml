@@ -9,10 +9,13 @@ authors.workspace = true
 [dependencies]
 follon-backtest = { path = "../../core/backtest" }
 follon-control-plane = { path = "../../core/control-plane" }
+follon-commercial = { path = "../../core/commercial" }
 follon-domain = { path = "../../core/domain" }
 follon-instrument = { path = "../../core/instrument" }
 follon-live = { path = "../../core/live" }
 follon-market-data = { path = "../../core/market-data" }
+follon-operations = { path = "../../core/operations" }
+follon-options = { path = "../../core/options" }
 follon-paper = { path = "../../core/paper" }
 follon-secrets = { path = "../../core/secrets" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -38,6 +41,18 @@ path = "src/paper.rs"
 [[bin]]
 name = "follon-live-status"
 path = "src/live.rs"
+
+[[bin]]
+name = "follon-operations"
+path = "src/operations.rs"
+
+[[bin]]
+name = "follon-options"
+path = "src/options.rs"
+
+[[bin]]
+name = "follon-admin"
+path = "src/admin.rs"
 
 [lints]
 workspace = true

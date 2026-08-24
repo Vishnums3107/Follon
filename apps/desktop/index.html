@@ -3,19 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Follon — Evidence and Paper Operations</title>
+    <title>Follon | Trading Operations Dashboard</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main id="app" aria-live="polite">
-      <h1>Follon evidence and operations monitoring</h1>
-      <p>Read-only evidence. This client cannot submit, approve, cancel, or transmit an order.</p>
-      <label>
-        Load canonical NDJSON event log, PAPER dashboard, or controlled-live monitoring JSON
-        <input id="event-log-file" type="file" accept=".ndjson,application/x-ndjson,application/json,.json" />
-      </label>
-      <p id="load-status">Choose a local event log or connect a server-owned evidence stream.</p>
-      <section id="evidence" aria-live="polite"></section>
-    </main>
-    <script type="module" src="./dist/main.js"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/react-main.tsx"></script>
   </body>
 </html>

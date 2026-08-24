@@ -1,0 +1,21 @@
+[package]
+name = "follon-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+follon-domain = { path = "../../../core/domain" }
+native-tls = "0.2.14"
+postgres = { version = "0.19.14", features = ["with-serde_json-1"] }
+postgres-native-tls = "0.5.1"
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

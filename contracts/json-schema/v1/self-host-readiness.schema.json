@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/self-host-readiness.schema.json",
+  "title": "Follon Verified Self-Host Readiness Evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["self_host_readiness_schema_version", "state", "configuration_fingerprint", "entitlement_ledger_head_hash", "self_hosting_allowed", "instance_id", "tenant_id", "release_id"],
+  "properties": {
+    "self_host_readiness_schema_version": { "const": 1 },
+    "state": { "const": "READY" },
+    "configuration_fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "entitlement_ledger_head_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "self_hosting_allowed": { "const": true },
+    "instance_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "tenant_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "release_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 }
+  }
+}

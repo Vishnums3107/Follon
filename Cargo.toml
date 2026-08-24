@@ -1,15 +1,24 @@
 [workspace]
 members = [
     "core/domain",
+    "core/execution",
+    "core/risk",
+    "core/accounting",
+    "core/identity",
     "core/instrument",
     "core/market-data",
     "core/backtest",
+    "core/commercial",
+    "core/operations",
+    "core/options",
     "core/paper",
     "core/live",
     "core/secrets",
     "core/control-plane",
     "apps/cli",
     "adapters/brokers/ibkr",
+    "adapters/persistence/postgres",
+    "services/trading-api",
 ]
 resolver = "2"
 

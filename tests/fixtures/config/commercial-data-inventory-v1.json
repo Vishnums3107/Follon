@@ -1,0 +1,36 @@
+{
+  "data_inventory_schema_version": 1,
+  "tenant_id": "tenant.acme",
+  "assets": [
+    {
+      "asset_id": "asset.expired.customer",
+      "tenant_id": "tenant.acme",
+      "relative_path": "expired-customer.txt",
+      "classification": "CUSTOMER_CONTENT",
+      "created_at": "2026-01-01T00:00:00Z",
+      "retain_until": "2026-08-01T00:00:00Z",
+      "subject_hashes": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      "legal_hold": false
+    },
+    {
+      "asset_id": "asset.audit.hold",
+      "tenant_id": "tenant.acme",
+      "relative_path": "audit-hold.txt",
+      "classification": "AUDIT_EVIDENCE",
+      "created_at": "2026-01-01T00:00:00Z",
+      "retain_until": "2026-08-01T00:00:00Z",
+      "subject_hashes": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+      "legal_hold": true
+    },
+    {
+      "asset_id": "asset.privacy.customer",
+      "tenant_id": "tenant.acme",
+      "relative_path": "privacy-customer.txt",
+      "classification": "CUSTOMER_CONTENT",
+      "created_at": "2026-01-01T00:00:00Z",
+      "retain_until": "2027-08-01T00:00:00Z",
+      "subject_hashes": ["cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+      "legal_hold": false
+    }
+  ]
+}

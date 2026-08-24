@@ -16,7 +16,7 @@ paper gateway or any hosted deployment. It does not approve live trading.
 | Boundary | Threat | Baseline control |
 | --- | --- | --- |
 | Strategy worker ? trading core | Malicious or malformed intent | Versioned protobuf/JSON contracts, ingress validation, deterministic risk decision before OMS creation |
-| Trading core ? paper broker adapter | Credential theft, endpoint escalation, or unaudited transmission | `PAPER` is required at the type/configuration boundary; IBKR gateway configuration permits loopback paper ports only; strategy code never receives adapter access |
+| Trading core ? paper broker adapter | Credential theft, endpoint escalation, or unaudited transmission | `PAPER` is required at the type/configuration boundary; the fixed-process IBKR bridge permits loopback paper ports only, uses bounded private pipes, and accepts no broker credential; strategy code never receives adapter access |
 | Client ? control plane | Forged state transition or misleading environment | Client is projection-only; dashboard declares `PAPER`, validates a strict server-owned schema, and offers no state-changing control |
 | Event store ? replay | Event deletion, mutation, or duplicate processing | Append-only canonical events, event-ID idempotency, causal links, deterministic replay comparison |
 | Local developer machine | Secrets in code, fixtures, or logs | `.gitignore`, no credentials in the SDK, fixture review, and secret scanning required before broker work |
@@ -54,8 +54,9 @@ paper gateway or any hosted deployment. It does not approve live trading.
 
 - Review this model with the intended deployment model and legal/compliance
   boundary.
-- Add managed/OS-keychain secret providers with rotation and access audit; do
-  not place credentials in the paper configuration or journal.
+- Configure and independently review the fixed managed vault/OS-keychain helper
+  with least privilege, rotation, access audit, no child processes, and no
+  plaintext fallback; do not place credentials in configuration or journals.
 - Add authenticated identity, role checks, rate limiting, and request
   idempotency at the public boundary.
 - Add signed releases, SBOM generation, dependency and secret scanning, and an

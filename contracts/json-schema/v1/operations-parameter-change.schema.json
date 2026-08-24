@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/operations-parameter-change.schema.json",
+  "title": "Follon Operations Parameter Revision Change v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["change_schema_version", "changes", "previous", "target"],
+  "properties": {
+    "change_schema_version": { "const": 1 },
+    "changes": { "type": "array", "items": { "$ref": "#/$defs/change" } },
+    "previous": { "$ref": "#/$defs/revision" },
+    "target": { "$ref": "#/$defs/revision" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "approval": { "type": "object", "additionalProperties": false, "required": ["approval_evidence_hash", "approval_id", "approval_subject_hash", "approved_at", "approved_by", "authorization_policy_hash", "requested_by"], "properties": { "approval_evidence_hash": { "$ref": "#/$defs/hash" }, "approval_id": { "$ref": "#/$defs/id" }, "approval_subject_hash": { "$ref": "#/$defs/hash" }, "approved_at": { "$ref": "#/$defs/utc" }, "approved_by": { "$ref": "#/$defs/id" }, "authorization_policy_hash": { "$ref": "#/$defs/hash" }, "requested_by": { "$ref": "#/$defs/id" } } },
+    "parameter": { "type": "object", "additionalProperties": false, "required": ["approval", "control", "maximum", "minimum", "parameter_id", "value"], "properties": { "approval": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/approval" }] }, "control": { "enum": ["STANDARD", "TWO_PERSON"] }, "maximum": { "$ref": "#/$defs/decimal" }, "minimum": { "$ref": "#/$defs/decimal" }, "parameter_id": { "$ref": "#/$defs/id" }, "value": { "$ref": "#/$defs/decimal" } } },
+    "change": { "type": "object", "additionalProperties": false, "required": ["after", "before", "change_kind", "parameter_id"], "properties": { "after": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/parameter" }] }, "before": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/parameter" }] }, "change_kind": { "enum": ["ADDED", "REMOVED", "MODIFIED"] }, "parameter_id": { "$ref": "#/$defs/id" } } },
+    "revision": { "type": "object", "additionalProperties": false, "required": ["configuration_content_hash", "configuration_id", "configuration_version", "parameter_set_fingerprint", "parameter_set_id", "previous_parameter_set_fingerprint", "previous_revision", "revision"], "properties": { "configuration_content_hash": { "$ref": "#/$defs/hash" }, "configuration_id": { "$ref": "#/$defs/id" }, "configuration_version": { "type": "string", "minLength": 1 }, "parameter_set_fingerprint": { "$ref": "#/$defs/hash" }, "parameter_set_id": { "$ref": "#/$defs/id" }, "previous_parameter_set_fingerprint": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hash" }] }, "previous_revision": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/id" }] }, "revision": { "$ref": "#/$defs/id" } } }
+  }
+}

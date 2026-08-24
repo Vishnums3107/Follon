@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/self-host-configuration.schema.json",
+  "title": "Follon Hardened Self-Host Configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["self_host_config_schema_version", "instance_id", "tenant_id", "storage_relative_path", "ledger_relative_path", "retention_policy_id", "release_manifest_hash", "release_signature_hash", "trusted_release_key_id", "secret_provider_kind", "bind_address"],
+  "properties": {
+    "self_host_config_schema_version": { "const": 1 },
+    "instance_id": { "$ref": "#/$defs/id" },
+    "tenant_id": { "$ref": "#/$defs/id" },
+    "storage_relative_path": { "$ref": "#/$defs/relativePath" },
+    "ledger_relative_path": { "$ref": "#/$defs/relativePath" },
+    "retention_policy_id": { "$ref": "#/$defs/id" },
+    "release_manifest_hash": { "$ref": "#/$defs/hash" },
+    "release_signature_hash": { "$ref": "#/$defs/hash" },
+    "trusted_release_key_id": { "$ref": "#/$defs/id" },
+    "secret_provider_kind": { "const": "managed_command" },
+    "bind_address": { "enum": ["127.0.0.1", "::1"] }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "relativePath": { "type": "string", "pattern": "^(?!.*(?:^|[\\/])\\.{1,2}(?:[\\/]|$))(?![\\/])[A-Za-z0-9._/-]+$", "minLength": 1, "maxLength": 4096 }
+  }
+}

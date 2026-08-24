@@ -10,6 +10,10 @@
 - Market, limit, stop, and bracket orders.
 - End-of-day and intraday strategies.
 
+Listed-options analytics and other later-release primitives may exist as
+research artifacts, but they are not part of the active product scope and do
+not make their release gate complete.
+
 ## Sequenced expansion
 
 | Release | Additions |
@@ -18,9 +22,11 @@
 | 3 | Second broker, multiple accounts, allocation/rebalancing, FIX, team permissions, and approvals |
 | 4 | India-specific broker support, selected SEBI-aligned workflow, and India-specific contract, expiry, margin, and session rules |
 
-Only one expansion choice is permitted in months 21–24: second broker, India integration, FIX, multi-account allocation, or team approvals.
+After every preceding operational and commercial gate has passed, permit only
+one expansion choice: second broker, India integration, FIX, multi-account
+allocation, or team approvals.
 
-## Hard non-goals for the first two years
+## Hard non-goals for the initial gated release cycle
 
 - HFT, latency arbitrage, exchange membership, direct market access, or custody.
 - Pooled money, personalized investment advice, copy trading, or a public strategy marketplace.
@@ -31,3 +37,13 @@ Only one expansion choice is permitted in months 21–24: second broker, India i
 ## Compliance boundary
 
 Customers retain their own brokerage accounts and approve their strategies and limits. The product provides infrastructure, execution workflow, analytics, and records; it must not promise profitability.
+
+As of 2026-08-13, SEBI's retail algorithmic-trading framework, implementation
+standards, and exchange operational modalities are applicable to all Indian
+stock brokers from 2026-04-01. India-facing API algo distribution is therefore
+a current compliance perimeter, not a future rule to revisit only during
+Release 4. Release 1 remains US-only: do not onboard an India-facing broker,
+algo vendor, or customer workflow until Indian counsel and the selected broker
+have reviewed registration, exchange, API, strategy-tagging, audit, and
+operational obligations for the exact model. See the
+[compliance posture](../05-quality-security/03-market-data-and-compliance.md).

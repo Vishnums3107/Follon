@@ -9,7 +9,10 @@
     "environment",
     "account_id",
     "configuration_fingerprint",
+    "broker_connected",
     "persistence_healthy",
+    "audit_sequence",
+    "audit_head_hash",
     "internal_cash",
     "working_orders",
     "unknown_orders",
@@ -20,14 +23,18 @@
     "clean_paper_days",
     "required_paper_days",
     "promotion_eligible",
+    "complete_auditability",
     "positions"
   ],
   "properties": {
-    "dashboard_schema_version": { "const": 1 },
+    "dashboard_schema_version": { "const": 2 },
     "environment": { "const": "PAPER" },
     "account_id": { "$ref": "#/$defs/canonicalId" },
     "configuration_fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "broker_connected": { "type": "boolean" },
     "persistence_healthy": { "type": "boolean" },
+    "audit_sequence": { "type": "integer", "minimum": 0 },
+    "audit_head_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "internal_cash": { "$ref": "#/$defs/decimal" },
     "working_orders": { "type": "integer", "minimum": 0 },
     "unknown_orders": { "type": "integer", "minimum": 0 },
@@ -47,6 +54,7 @@
     "clean_paper_days": { "type": "integer", "minimum": 0 },
     "required_paper_days": { "const": 30 },
     "promotion_eligible": { "type": "boolean" },
+    "complete_auditability": { "type": "boolean" },
     "positions": {
       "type": "array",
       "items": { "$ref": "#/$defs/position" }
