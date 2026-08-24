@@ -19,3 +19,7 @@ The original `Solo Trading Operating System Master Plan.pdf` remains the source 
 | 18. Engineering doctrine | [Product charter](00-product/01-product-charter.md), [contributing guide](../CONTRIBUTING.md), and all invariant documents |
 
 Future revisions should update the smallest owning document instead of extending the master plan. Material architecture changes require an ADR.
+
+The requirement-by-requirement implementation verdict, including deviations
+and external gates, is maintained in the
+[master-plan conformance audit](06-delivery/14-master-plan-conformance-audit.md).

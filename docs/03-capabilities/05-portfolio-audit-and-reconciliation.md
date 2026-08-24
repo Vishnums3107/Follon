@@ -7,6 +7,10 @@ Track independently of the broker:
 - Cash by currency, buying power, and margin estimates.
 - Positions and average cost.
 - Realized/unrealized P&L, fees, commissions, dividends, corporate actions, and FX translation.
+- FIFO, LIFO, or highest-cost tax-lot selection with exact allocation evidence;
+  these are accounting outputs, not jurisdiction-specific tax advice.
+- Exact cash-debit and marked short-borrow financing accrual under an explicit
+  annual rate, calendar-day interval, and 360/365 day-count basis.
 - Strategy and account attribution.
 
 Use decimal or fixed-point arithmetic. Binary floating point is not permitted for accounting values.

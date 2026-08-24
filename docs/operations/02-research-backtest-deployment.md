@@ -49,14 +49,18 @@ identical. The exact local commands are documented in
 
 ## Known first-release capability boundaries
 
-Accounting is exact but deliberately limited to a single currency and long
-positions. The runner rejects short positions, cross-currency accounting,
-duplicate executions, duplicate corporate actions, out-of-session bars, and
-input that does not match its declared dataset manifest. Replay now fails
-closed at an instrument's effective end and supports explicit venue/instrument
-halts, full-spread/half-spread pricing, adverse slippage, bar-based latency, and
-per-bar partial fills. Economic delisting settlement is still required for
-strategies that depend on delisting outcomes. Borrow is not modeled because the
-ledger rejects shorts; capital allocation is not modeled because the supported
-boundary is one explicit account. Do not use a result as evidence for a
-strategy that depends on either excluded behavior.
+The default `BacktestRunner` artifact path preserves its v1 single-currency,
+long-only ledger and rejects duplicate executions/actions, out-of-session bars,
+and inputs outside the declared manifest. Replay fails closed at an
+instrument's effective end and supports venue/instrument halts,
+full-spread/half-spread pricing, adverse slippage, bar latency, and per-bar
+partial fills.
+
+The advanced account is separately implemented and tested for point-in-time
+universe membership, long/short crossings, explicit borrow availability and
+recalls, cash-debit/short-borrow financing, attributed commission/exchange/
+regulatory charges, fresh FX, initial-margin capital rejection, and terminal
+delisting settlement. Until a public runner configuration selects that account
+and records its terms in the immutable artifact, a v1 CLI result is not evidence
+that those advanced controls ran. Multi-account allocation and production-size
+performance evidence remain outside the current runner.

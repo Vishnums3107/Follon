@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+follon-accounting = { path = "../accounting" }
 follon-control-plane = { path = "../control-plane" }
 follon-domain = { path = "../domain" }
 follon-market-data = { path = "../market-data" }

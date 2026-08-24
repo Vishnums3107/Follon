@@ -9,6 +9,9 @@ authors.workspace = true
 [dependencies]
 follon-paper = { path = "../../../core/paper" }
 follon-domain = { path = "../../../core/domain" }
+follon-commercial = { path = "../../../core/commercial" }
+follon-live = { path = "../../../core/live" }
+follon-secrets = { path = "../../../core/secrets" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 

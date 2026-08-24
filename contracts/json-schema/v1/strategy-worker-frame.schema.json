@@ -96,7 +96,77 @@
         "bar": { "$ref": "#/$defs/bar" },
         "context": { "$ref": "#/$defs/context" },
         "protocol_version": { "const": 1 },
+        "services": { "$ref": "#/$defs/services" },
         "type": { "const": "market_bar" }
+      }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["history", "portfolio", "state"],
+      "properties": {
+        "history": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["as_of", "records"],
+          "properties": {
+            "as_of": { "$ref": "#/$defs/utc" },
+            "records": {
+              "type": "array",
+              "maxItems": 1000000,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["event_time", "bar"],
+                "properties": {
+                  "event_time": { "$ref": "#/$defs/utc" },
+                  "bar": { "$ref": "#/$defs/bar" }
+                }
+              }
+            }
+          }
+        },
+        "portfolio": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["as_of", "positions", "cash_by_currency"],
+          "properties": {
+            "as_of": { "$ref": "#/$defs/utc" },
+            "positions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["instrument_id", "quantity", "average_cost", "mark_price", "currency"],
+                "properties": {
+                  "instrument_id": { "$ref": "#/$defs/canonicalId" },
+                  "quantity": { "$ref": "#/$defs/decimal" },
+                  "average_cost": { "$ref": "#/$defs/decimal" },
+                  "mark_price": { "$ref": "#/$defs/positiveDecimal" },
+                  "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+                }
+              }
+            },
+            "cash_by_currency": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["currency", "amount"],
+                "properties": {
+                  "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+                  "amount": { "$ref": "#/$defs/decimal" }
+                }
+              }
+            }
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["values"],
+          "properties": { "values": { "type": "object" } }
+        }
       }
     },
     "intent": {
@@ -146,6 +216,10 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["intent", "protocol_version", "type"],
+      "dependentRequired": {
+        "metrics": ["state"],
+        "state": ["metrics"]
+      },
       "properties": {
         "intent": {
           "oneOf": [
@@ -153,7 +227,43 @@
             { "type": "null" }
           ]
         },
+        "metrics": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "observed_at", "tags", "value"],
+            "properties": {
+              "name": { "$ref": "#/$defs/canonicalId" },
+              "observed_at": { "$ref": "#/$defs/utc" },
+              "tags": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["key", "value"],
+                  "properties": {
+                    "key": { "$ref": "#/$defs/canonicalId" },
+                    "value": { "$ref": "#/$defs/canonicalId" }
+                  }
+                }
+              },
+              "value": { "$ref": "#/$defs/decimal" }
+            }
+          }
+        },
         "protocol_version": { "const": 1 },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fingerprint", "values"],
+          "properties": {
+            "fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "values": { "type": "object" }
+          }
+        },
         "type": { "const": "strategy_output" }
       }
     },

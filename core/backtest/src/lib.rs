@@ -9,6 +9,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
+use follon_accounting::{
+    accrue_financing, value_margin_account, AccountingError, Currency, FinancingBalance,
+    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot,
+};
 use follon_control_plane::{
     EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
 };
@@ -475,6 +479,661 @@ pub struct BacktestReport {
     pub total_fees: Decimal,
     /// Total cash dividends recognized by the ledger.
     pub total_dividends: Decimal,
+}
+
+/// Point-in-time universe membership used to prevent survivorship look-ahead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UniverseMembership {
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// Inclusive UTC membership start.
+    pub included_from: String,
+    /// Exclusive UTC membership end; `None` means still included.
+    pub excluded_at: Option<String>,
+}
+
+/// Proves that every replay bar belonged to the selected universe at event time.
+///
+/// Membership periods for an instrument must be non-overlapping. A missing
+/// interval fails the run instead of silently using today's constituents.
+pub fn validate_point_in_time_universe(
+    bars: &[(String, Bar)],
+    memberships: &[UniverseMembership],
+) -> Result<(), BacktestError> {
+    let mut by_instrument: BTreeMap<&str, Vec<&UniverseMembership>> = BTreeMap::new();
+    for membership in memberships {
+        validate_canonical_id("universe instrument_id", &membership.instrument_id)?;
+        validate_utc_timestamp("universe included_from", &membership.included_from)?;
+        if let Some(excluded_at) = &membership.excluded_at {
+            validate_utc_timestamp("universe excluded_at", excluded_at)?;
+            if excluded_at <= &membership.included_from {
+                return Err(BacktestError(
+                    "universe membership must have a positive interval".to_owned(),
+                ));
+            }
+        }
+        by_instrument
+            .entry(&membership.instrument_id)
+            .or_default()
+            .push(membership);
+    }
+    for periods in by_instrument.values_mut() {
+        periods.sort_by(|left, right| left.included_from.cmp(&right.included_from));
+        for adjacent in periods.windows(2) {
+            let Some(left_end) = adjacent[0].excluded_at.as_deref() else {
+                return Err(BacktestError(
+                    "open universe membership cannot precede another interval".to_owned(),
+                ));
+            };
+            if left_end > adjacent[1].included_from.as_str() {
+                return Err(BacktestError(
+                    "universe membership intervals overlap".to_owned(),
+                ));
+            }
+        }
+    }
+    for (event_time, bar) in bars {
+        validate_utc_timestamp("bar event_time", event_time)?;
+        let covered = by_instrument
+            .get(bar.instrument_id.as_str())
+            .is_some_and(|periods| {
+                periods.iter().any(|membership| {
+                    membership.included_from.as_str() <= event_time.as_str()
+                        && membership
+                            .excluded_at
+                            .as_ref()
+                            .is_none_or(|excluded_at| event_time < excluded_at)
+                })
+            });
+        if !covered {
+            return Err(BacktestError(format!(
+                "{} was not in the point-in-time universe at {event_time}",
+                bar.instrument_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Explicit fee attribution for one simulated execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BacktestExecutionCharges {
+    /// Broker commission.
+    pub commission: Decimal,
+    /// Venue or exchange fee.
+    pub exchange: Decimal,
+    /// Regulatory or transaction charge.
+    pub regulatory: Decimal,
+}
+
+impl BacktestExecutionCharges {
+    /// Returns the exact composite charge carried by [`Fill::fee`].
+    pub fn total(self) -> Result<Decimal, BacktestError> {
+        if self.commission < Decimal::ZERO
+            || self.exchange < Decimal::ZERO
+            || self.regulatory < Decimal::ZERO
+        {
+            return Err(BacktestError(
+                "execution charges cannot be negative".to_owned(),
+            ));
+        }
+        Ok(self
+            .commission
+            .checked_add(self.exchange)?
+            .checked_add(self.regulatory)?)
+    }
+}
+
+/// Versioned economic and financing terms for an advanced backtest position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvancedInstrumentTerms {
+    /// Settlement currency.
+    pub currency: Currency,
+    /// Exact margin-policy class.
+    pub asset_class: String,
+    /// Contract multiplier.
+    pub multiplier: Decimal,
+    /// Whether the security is borrowable for a short sale.
+    pub shortable: bool,
+    /// Maximum absolute simulated short quantity available to borrow.
+    pub borrow_available: Decimal,
+    /// Annualized stock-borrow charge in basis points.
+    pub borrow_rate_bps: u32,
+}
+
+impl AdvancedInstrumentTerms {
+    fn validate(&self) -> Result<(), BacktestError> {
+        validate_canonical_id("backtest asset_class", &self.asset_class)?;
+        if self.multiplier <= Decimal::ZERO
+            || self.borrow_available < Decimal::ZERO
+            || self.borrow_rate_bps > 1_000_000
+            || (!self.shortable
+                && (self.borrow_available != Decimal::ZERO || self.borrow_rate_bps != 0))
+        {
+            return Err(BacktestError(
+                "invalid advanced instrument terms".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Signed, multi-currency simulated position with exact realized P&L.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvancedBacktestPosition {
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// Versioned instrument terms used for every applied fill.
+    pub terms: AdvancedInstrumentTerms,
+    /// Signed quantity; a negative value is a short position.
+    pub quantity: Decimal,
+    /// Exact average open price, excluding separately attributed charges.
+    pub average_price: Decimal,
+    /// Exact realized trading P&L in settlement currency, before charges.
+    pub realized_pnl: Decimal,
+}
+
+/// Immutable record of a forced close caused by a delisting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelistingSettlement {
+    /// Idempotent corporate-event identity.
+    pub event_id: String,
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// UTC economic effective time.
+    pub effective_at: String,
+    /// Signed position quantity that was closed.
+    pub closed_quantity: Decimal,
+    /// Exact terminal settlement price, including zero for a worthless security.
+    pub settlement_price: Decimal,
+    /// Exact cash movement in settlement currency.
+    pub cash_delta: Decimal,
+    /// Exact realized trading P&L from the close.
+    pub realized_pnl: Decimal,
+}
+
+/// Fresh valuation inputs required for an atomic simulated capital check.
+pub struct BacktestCapitalCheck<'a> {
+    /// Post-fill marks for every open instrument.
+    pub marks_after_fill: &'a BTreeMap<String, Decimal>,
+    /// Explicit fresh FX rate book.
+    pub fx: &'a FxBook,
+    /// Versioned initial and maintenance margin policy.
+    pub policy: &'a MarginPolicy,
+    /// Explicit replay-clock valuation time as Unix seconds.
+    pub as_of_epoch_seconds: i64,
+}
+
+/// Exact advanced-account report in one explicit base currency.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvancedBacktestReport {
+    /// Portfolio-wide FX and margin valuation.
+    pub margin: MarginSnapshot,
+    /// Realized trading P&L converted to the base currency before charges.
+    pub realized_pnl: Decimal,
+    /// Open-position marked P&L converted to the base currency.
+    pub unrealized_pnl: Decimal,
+    /// Commission, exchange, and regulatory charges converted to base.
+    pub execution_charges: Decimal,
+    /// Cash-debit and short-borrow financing converted to base.
+    pub financing_charges: Decimal,
+    /// Stable position evidence, including closed positions.
+    pub positions: Vec<AdvancedBacktestPosition>,
+    /// Applied delisting evidence in deterministic order.
+    pub delistings: Vec<DelistingSettlement>,
+}
+
+/// Multi-currency, long/short, margin-aware account for professional simulations.
+#[derive(Clone, Debug)]
+pub struct AdvancedBacktestAccount {
+    cash_by_currency: BTreeMap<Currency, Decimal>,
+    positions: BTreeMap<String, AdvancedBacktestPosition>,
+    execution_ids: BTreeSet<String>,
+    lifecycle_event_ids: BTreeSet<String>,
+    charges_by_currency: BTreeMap<Currency, BacktestExecutionCharges>,
+    financing_by_currency: BTreeMap<Currency, Decimal>,
+    delistings: Vec<DelistingSettlement>,
+}
+
+impl AdvancedBacktestAccount {
+    /// Creates an account from explicit balances in one or more currencies.
+    pub fn new(cash_by_currency: BTreeMap<Currency, Decimal>) -> Result<Self, BacktestError> {
+        if cash_by_currency.is_empty() {
+            return Err(BacktestError(
+                "advanced backtest account requires cash balances".to_owned(),
+            ));
+        }
+        Ok(Self {
+            cash_by_currency,
+            positions: BTreeMap::new(),
+            execution_ids: BTreeSet::new(),
+            lifecycle_event_ids: BTreeSet::new(),
+            charges_by_currency: BTreeMap::new(),
+            financing_by_currency: BTreeMap::new(),
+            delistings: Vec::new(),
+        })
+    }
+
+    /// Applies a fill once, including short-sale and borrow-availability rules.
+    ///
+    /// The charge breakdown must exactly equal `fill.fee`, preventing a report
+    /// from dropping exchange or regulatory costs.
+    pub fn apply_fill(
+        &mut self,
+        fill: &Fill,
+        terms: &AdvancedInstrumentTerms,
+        charges: BacktestExecutionCharges,
+    ) -> Result<(), BacktestError> {
+        terms.validate()?;
+        for (name, value) in [
+            ("execution_id", fill.execution_id.as_str()),
+            ("order_id", fill.order_id.as_str()),
+            ("instrument_id", fill.instrument_id.as_str()),
+        ] {
+            validate_canonical_id(name, value)?;
+        }
+        validate_utc_timestamp("fill executed_at", &fill.executed_at)?;
+        if fill.quantity <= Decimal::ZERO
+            || fill.price <= Decimal::ZERO
+            || fill.fee < Decimal::ZERO
+            || charges.total()? != fill.fee
+            || self.execution_ids.contains(&fill.execution_id)
+        {
+            return Err(BacktestError(
+                "invalid, duplicate, or unattributed advanced fill".to_owned(),
+            ));
+        }
+
+        let prior =
+            self.positions
+                .get(&fill.instrument_id)
+                .cloned()
+                .unwrap_or(AdvancedBacktestPosition {
+                    instrument_id: fill.instrument_id.clone(),
+                    terms: terms.clone(),
+                    quantity: Decimal::ZERO,
+                    average_price: Decimal::ZERO,
+                    realized_pnl: Decimal::ZERO,
+                });
+        if prior.terms != *terms {
+            return Err(BacktestError(
+                "instrument terms changed inside an open simulation position".to_owned(),
+            ));
+        }
+        let signed_fill = match fill.side {
+            Side::Buy => fill.quantity,
+            Side::Sell => Decimal::ZERO.checked_sub(fill.quantity)?,
+        };
+        let projected_quantity = prior.quantity.checked_add(signed_fill)?;
+        if projected_quantity < Decimal::ZERO
+            && (!terms.shortable || absolute_decimal(projected_quantity)? > terms.borrow_available)
+        {
+            return Err(BacktestError(
+                "short sale exceeds explicit borrow availability".to_owned(),
+            ));
+        }
+
+        let gross = fill
+            .price
+            .checked_mul(fill.quantity)?
+            .checked_mul(terms.multiplier)?;
+        let cash_delta = match fill.side {
+            Side::Buy => Decimal::ZERO.checked_sub(gross.checked_add(fill.fee)?)?,
+            Side::Sell => gross.checked_sub(fill.fee)?,
+        };
+        let prior_cash = self
+            .cash_by_currency
+            .get(&terms.currency)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+
+        let mut projected = prior;
+        let same_direction = projected.quantity == Decimal::ZERO
+            || (projected.quantity > Decimal::ZERO && signed_fill > Decimal::ZERO)
+            || (projected.quantity < Decimal::ZERO && signed_fill < Decimal::ZERO);
+        if same_direction {
+            let prior_units = absolute_decimal(projected.quantity)?;
+            let projected_units = absolute_decimal(projected_quantity)?;
+            projected.average_price = projected
+                .average_price
+                .checked_mul(prior_units)?
+                .checked_add(fill.price.checked_mul(fill.quantity)?)?
+                .checked_div(projected_units)?;
+        } else {
+            let closing = absolute_decimal(projected.quantity)?.min(fill.quantity);
+            let direction = if projected.quantity > Decimal::ZERO {
+                fill.price.checked_sub(projected.average_price)?
+            } else {
+                projected.average_price.checked_sub(fill.price)?
+            };
+            projected.realized_pnl = projected.realized_pnl.checked_add(
+                direction
+                    .checked_mul(closing)?
+                    .checked_mul(terms.multiplier)?,
+            )?;
+            if projected_quantity == Decimal::ZERO {
+                projected.average_price = Decimal::ZERO;
+            } else if (projected.quantity > Decimal::ZERO && projected_quantity < Decimal::ZERO)
+                || (projected.quantity < Decimal::ZERO && projected_quantity > Decimal::ZERO)
+            {
+                projected.average_price = fill.price;
+            }
+        }
+        projected.quantity = projected_quantity;
+
+        self.cash_by_currency
+            .insert(terms.currency.clone(), prior_cash.checked_add(cash_delta)?);
+        self.positions.insert(fill.instrument_id.clone(), projected);
+        self.execution_ids.insert(fill.execution_id.clone());
+        let totals = self
+            .charges_by_currency
+            .entry(terms.currency.clone())
+            .or_default();
+        totals.commission = totals.commission.checked_add(charges.commission)?;
+        totals.exchange = totals.exchange.checked_add(charges.exchange)?;
+        totals.regulatory = totals.regulatory.checked_add(charges.regulatory)?;
+        Ok(())
+    }
+
+    /// Applies a fill only when the resulting account satisfies initial margin.
+    pub fn apply_fill_with_capital_check(
+        &mut self,
+        fill: &Fill,
+        terms: &AdvancedInstrumentTerms,
+        charges: BacktestExecutionCharges,
+        capital: BacktestCapitalCheck<'_>,
+    ) -> Result<(), BacktestError> {
+        let mut projected = self.clone();
+        projected.apply_fill(fill, terms, charges)?;
+        let snapshot = projected.margin_snapshot(
+            capital.marks_after_fill,
+            capital.fx,
+            capital.policy,
+            capital.as_of_epoch_seconds,
+        )?;
+        if snapshot.excess_liquidity < Decimal::ZERO {
+            return Err(BacktestError(
+                "fill exceeds portfolio-level simulated capital".to_owned(),
+            ));
+        }
+        *self = projected;
+        Ok(())
+    }
+
+    /// Returns the forced cover quantity after a point-in-time borrow recall.
+    pub fn required_cover_after_borrow_recall(
+        &self,
+        instrument_id: &str,
+        remaining_borrow: Decimal,
+    ) -> Result<Decimal, BacktestError> {
+        validate_canonical_id("borrow recall instrument_id", instrument_id)?;
+        if remaining_borrow < Decimal::ZERO {
+            return Err(BacktestError(
+                "remaining borrow cannot be negative".to_owned(),
+            ));
+        }
+        let borrowed = self
+            .positions
+            .get(instrument_id)
+            .filter(|position| position.quantity < Decimal::ZERO)
+            .map(|position| absolute_decimal(position.quantity))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
+        if borrowed > remaining_borrow {
+            Ok(borrowed.checked_sub(remaining_borrow)?)
+        } else {
+            Ok(Decimal::ZERO)
+        }
+    }
+
+    /// Accrues cash-debit and stock-borrow financing exactly once.
+    pub fn accrue_financing(
+        &mut self,
+        accrual_id: &str,
+        days: u32,
+        day_count_basis: u32,
+        marks: &BTreeMap<String, Decimal>,
+        cash_debit_rates_bps: &BTreeMap<Currency, u32>,
+    ) -> Result<BTreeMap<Currency, Decimal>, BacktestError> {
+        validate_canonical_id("financing accrual_id", accrual_id)?;
+        if self.lifecycle_event_ids.contains(accrual_id) {
+            return Err(BacktestError("duplicate financing accrual".to_owned()));
+        }
+        let mut balances = Vec::new();
+        for (currency, cash) in &self.cash_by_currency {
+            if *cash < Decimal::ZERO {
+                let rate = cash_debit_rates_bps.get(currency).ok_or_else(|| {
+                    BacktestError(format!("missing cash-debit rate for {}", currency.as_str()))
+                })?;
+                balances.push(FinancingBalance {
+                    reference_id: format!("cash-debit.{}", currency.as_str().to_lowercase()),
+                    kind: FinancingKind::CashDebit,
+                    currency: currency.clone(),
+                    principal: absolute_decimal(*cash)?,
+                    annual_rate_bps: *rate,
+                });
+            }
+        }
+        for position in self
+            .positions
+            .values()
+            .filter(|position| position.quantity < Decimal::ZERO)
+        {
+            let mark = marks.get(&position.instrument_id).ok_or_else(|| {
+                BacktestError(format!(
+                    "missing financing mark for {}",
+                    position.instrument_id
+                ))
+            })?;
+            if *mark <= Decimal::ZERO {
+                return Err(BacktestError("financing marks must be positive".to_owned()));
+            }
+            balances.push(FinancingBalance {
+                reference_id: format!("short-borrow.{}", position.instrument_id),
+                kind: FinancingKind::ShortBorrow,
+                currency: position.terms.currency.clone(),
+                principal: absolute_decimal(position.quantity)?
+                    .checked_mul(*mark)?
+                    .checked_mul(position.terms.multiplier)?,
+                annual_rate_bps: position.terms.borrow_rate_bps,
+            });
+        }
+        let accrual = accrue_financing(&balances, days, day_count_basis)?;
+        for (currency, charge) in &accrual.charges_by_currency {
+            let current = self
+                .cash_by_currency
+                .get(currency)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            self.cash_by_currency
+                .insert(currency.clone(), current.checked_sub(*charge)?);
+            let prior = self
+                .financing_by_currency
+                .get(currency)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            self.financing_by_currency
+                .insert(currency.clone(), prior.checked_add(*charge)?);
+        }
+        self.lifecycle_event_ids.insert(accrual_id.to_owned());
+        Ok(accrual.charges_by_currency)
+    }
+
+    /// Closes an open position at a versioned delisting settlement price.
+    pub fn settle_delisting(
+        &mut self,
+        event_id: &str,
+        instrument_id: &str,
+        effective_at: &str,
+        settlement_price: Decimal,
+    ) -> Result<DelistingSettlement, BacktestError> {
+        validate_canonical_id("delisting event_id", event_id)?;
+        validate_canonical_id("delisting instrument_id", instrument_id)?;
+        validate_utc_timestamp("delisting effective_at", effective_at)?;
+        if settlement_price < Decimal::ZERO || self.lifecycle_event_ids.contains(event_id) {
+            return Err(BacktestError(
+                "invalid or duplicate delisting settlement".to_owned(),
+            ));
+        }
+        let position = self
+            .positions
+            .get_mut(instrument_id)
+            .ok_or_else(|| BacktestError("delisting has no tracked position".to_owned()))?;
+        if position.quantity == Decimal::ZERO {
+            return Err(BacktestError(
+                "delisting position is already closed".to_owned(),
+            ));
+        }
+        let closed_quantity = position.quantity;
+        let cash_delta = settlement_price
+            .checked_mul(closed_quantity)?
+            .checked_mul(position.terms.multiplier)?;
+        let realized = settlement_price
+            .checked_sub(position.average_price)?
+            .checked_mul(closed_quantity)?
+            .checked_mul(position.terms.multiplier)?;
+        position.realized_pnl = position.realized_pnl.checked_add(realized)?;
+        position.quantity = Decimal::ZERO;
+        position.average_price = Decimal::ZERO;
+        let cash = self
+            .cash_by_currency
+            .get(&position.terms.currency)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        self.cash_by_currency.insert(
+            position.terms.currency.clone(),
+            cash.checked_add(cash_delta)?,
+        );
+        let settlement = DelistingSettlement {
+            event_id: event_id.to_owned(),
+            instrument_id: instrument_id.to_owned(),
+            effective_at: effective_at.to_owned(),
+            closed_quantity,
+            settlement_price,
+            cash_delta,
+            realized_pnl: realized,
+        };
+        self.lifecycle_event_ids.insert(event_id.to_owned());
+        self.delistings.push(settlement.clone());
+        Ok(settlement)
+    }
+
+    /// Values all open positions under fresh FX and explicit margin policy.
+    pub fn margin_snapshot(
+        &self,
+        marks: &BTreeMap<String, Decimal>,
+        fx: &FxBook,
+        policy: &MarginPolicy,
+        as_of_epoch_seconds: i64,
+    ) -> Result<MarginSnapshot, BacktestError> {
+        let positions = self
+            .positions
+            .values()
+            .filter(|position| position.quantity != Decimal::ZERO)
+            .map(|position| {
+                let mark_price = marks.get(&position.instrument_id).copied().ok_or_else(|| {
+                    BacktestError(format!("missing mark for {}", position.instrument_id))
+                })?;
+                Ok(MarginPosition {
+                    instrument_id: position.instrument_id.clone(),
+                    asset_class: position.terms.asset_class.clone(),
+                    currency: position.terms.currency.clone(),
+                    quantity: position.quantity,
+                    mark_price,
+                    multiplier: position.terms.multiplier,
+                })
+            })
+            .collect::<Result<Vec<_>, BacktestError>>()?;
+        Ok(value_margin_account(
+            &self.cash_by_currency,
+            &positions,
+            fx,
+            policy,
+            as_of_epoch_seconds,
+        )?)
+    }
+
+    /// Produces a complete FX-converted P&L, cost, financing, and margin report.
+    pub fn report(
+        &self,
+        marks: &BTreeMap<String, Decimal>,
+        fx: &FxBook,
+        policy: &MarginPolicy,
+        as_of_epoch_seconds: i64,
+    ) -> Result<AdvancedBacktestReport, BacktestError> {
+        let margin = self.margin_snapshot(marks, fx, policy, as_of_epoch_seconds)?;
+        let mut realized_pnl = Decimal::ZERO;
+        let mut unrealized_pnl = Decimal::ZERO;
+        for position in self.positions.values() {
+            realized_pnl = realized_pnl.checked_add(fx.convert(
+                position.realized_pnl,
+                &position.terms.currency,
+                &policy.base_currency,
+                as_of_epoch_seconds,
+                policy.maximum_fx_age_seconds,
+            )?)?;
+            if position.quantity != Decimal::ZERO {
+                let mark = marks.get(&position.instrument_id).ok_or_else(|| {
+                    BacktestError(format!("missing mark for {}", position.instrument_id))
+                })?;
+                let local_unrealized = mark
+                    .checked_sub(position.average_price)?
+                    .checked_mul(position.quantity)?
+                    .checked_mul(position.terms.multiplier)?;
+                unrealized_pnl = unrealized_pnl.checked_add(fx.convert(
+                    local_unrealized,
+                    &position.terms.currency,
+                    &policy.base_currency,
+                    as_of_epoch_seconds,
+                    policy.maximum_fx_age_seconds,
+                )?)?;
+            }
+        }
+        let mut execution_charges = Decimal::ZERO;
+        for (currency, charges) in &self.charges_by_currency {
+            execution_charges = execution_charges.checked_add(fx.convert(
+                charges.total()?,
+                currency,
+                &policy.base_currency,
+                as_of_epoch_seconds,
+                policy.maximum_fx_age_seconds,
+            )?)?;
+        }
+        let mut financing_charges = Decimal::ZERO;
+        for (currency, charges) in &self.financing_by_currency {
+            financing_charges = financing_charges.checked_add(fx.convert(
+                *charges,
+                currency,
+                &policy.base_currency,
+                as_of_epoch_seconds,
+                policy.maximum_fx_age_seconds,
+            )?)?;
+        }
+        Ok(AdvancedBacktestReport {
+            margin,
+            realized_pnl,
+            unrealized_pnl,
+            execution_charges,
+            financing_charges,
+            positions: self.positions.values().cloned().collect(),
+            delistings: self.delistings.clone(),
+        })
+    }
+
+    /// Returns exact balances in canonical currency order.
+    pub fn cash_by_currency(&self) -> &BTreeMap<Currency, Decimal> {
+        &self.cash_by_currency
+    }
+
+    /// Returns positions in canonical instrument order, including closed evidence.
+    pub fn positions(&self) -> &BTreeMap<String, AdvancedBacktestPosition> {
+        &self.positions
+    }
+
+    /// Returns immutable delisting settlements in application order.
+    pub fn delistings(&self) -> &[DelistingSettlement] {
+        &self.delistings
+    }
 }
 
 /// One exact valuation point in a completed backtest equity curve.
@@ -1297,9 +1956,23 @@ impl From<DecimalError> for BacktestError {
     }
 }
 
+impl From<AccountingError> for BacktestError {
+    fn from(error: AccountingError) -> Self {
+        Self(error.0)
+    }
+}
+
 impl From<EngineError> for BacktestError {
     fn from(error: EngineError) -> Self {
         Self(error.0)
+    }
+}
+
+fn absolute_decimal(value: Decimal) -> Result<Decimal, BacktestError> {
+    if value < Decimal::ZERO {
+        Ok(Decimal::ZERO.checked_sub(value)?)
+    } else {
+        Ok(value)
     }
 }
 
@@ -1563,6 +2236,7 @@ mod tests {
                 global_kill_switch: false,
                 max_quantity: Decimal::from_integer(10).unwrap(),
                 max_notional: Decimal::from_integer(10_000).unwrap(),
+                max_price_deviation_bps: Decimal::from_integer(500).unwrap(),
             },
             DeterministicFillModel {
                 spread_bps: Decimal::ZERO,
@@ -1752,5 +2426,190 @@ mod tests {
         assert_eq!(recovered.find_by_tag("regime", "baseline").len(), 1);
         assert_eq!(recovered.export_ndjson(), record.canonical_json());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn point_in_time_universe_rejects_survivorship_lookahead() {
+        let bars = vec![
+            ("2026-01-02T14:30:00Z".to_owned(), bar()),
+            ("2026-01-03T14:30:00Z".to_owned(), bar()),
+        ];
+        let valid = [UniverseMembership {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            included_from: "2026-01-01T00:00:00Z".to_owned(),
+            excluded_at: Some("2026-01-04T00:00:00Z".to_owned()),
+        }];
+        validate_point_in_time_universe(&bars, &valid).unwrap();
+
+        let ended = [UniverseMembership {
+            excluded_at: Some("2026-01-03T00:00:00Z".to_owned()),
+            ..valid[0].clone()
+        }];
+        assert!(validate_point_in_time_universe(&bars, &ended).is_err());
+    }
+
+    #[test]
+    fn advanced_account_models_short_borrow_fx_margin_financing_and_delisting() {
+        use follon_accounting::{FxQuote, MarginRate};
+
+        let usd = Currency::new("USD").unwrap();
+        let eur = Currency::new("EUR").unwrap();
+        let mut account = AdvancedBacktestAccount::new(BTreeMap::from([
+            (usd.clone(), Decimal::from_integer(10_000).unwrap()),
+            (eur.clone(), Decimal::from_integer(1_000).unwrap()),
+        ]))
+        .unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: true,
+            borrow_available: Decimal::from_integer(5).unwrap(),
+            borrow_rate_bps: 100,
+        };
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.short-1".to_owned(),
+                    order_id: "order.short-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: Decimal::from_integer(5).unwrap(),
+                    price: Decimal::from_integer(100).unwrap(),
+                    fee: Decimal::from_integer(1).unwrap(),
+                    executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: Decimal::from_str("0.50").unwrap(),
+                    exchange: Decimal::from_str("0.25").unwrap(),
+                    regulatory: Decimal::from_str("0.25").unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            account
+                .required_cover_after_borrow_recall(
+                    "inst.us_equity.spy",
+                    Decimal::from_integer(2).unwrap()
+                )
+                .unwrap(),
+            Decimal::from_integer(3).unwrap()
+        );
+
+        let marks = BTreeMap::from([(
+            "inst.us_equity.spy".to_owned(),
+            Decimal::from_integer(90).unwrap(),
+        )]);
+        let mut fx = FxBook::default();
+        fx.upsert(FxQuote {
+            base: eur,
+            quote: usd.clone(),
+            quote_rate: Decimal::from_str("1.10").unwrap(),
+            observed_at_epoch_seconds: 1_000,
+        })
+        .unwrap();
+        let policy = MarginPolicy {
+            base_currency: usd.clone(),
+            maximum_fx_age_seconds: 10,
+            rates: BTreeMap::from([(
+                "equity".to_owned(),
+                MarginRate {
+                    initial_bps: 5_000,
+                    maintenance_bps: 2_500,
+                },
+            )]),
+        };
+        let snapshot = account
+            .margin_snapshot(&marks, &fx, &policy, 1_005)
+            .unwrap();
+        assert_eq!(
+            snapshot.net_liquidation_value,
+            Decimal::from_integer(11_149).unwrap()
+        );
+        assert_eq!(snapshot.initial_margin, Decimal::from_integer(225).unwrap());
+
+        let accrued = account
+            .accrue_financing("financing.day-1", 365, 365, &marks, &BTreeMap::new())
+            .unwrap();
+        assert_eq!(accrued[&usd], Decimal::from_str("4.50").unwrap());
+        let settlement = account
+            .settle_delisting(
+                "delisting.spy",
+                "inst.us_equity.spy",
+                "2026-01-05T21:00:00Z",
+                Decimal::from_integer(80).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(settlement.cash_delta, Decimal::from_integer(-400).unwrap());
+        assert_eq!(settlement.realized_pnl, Decimal::from_integer(100).unwrap());
+        assert_eq!(account.delistings(), &[settlement]);
+        let report = account.report(&marks, &fx, &policy, 1_005).unwrap();
+        assert_eq!(report.realized_pnl, Decimal::from_integer(100).unwrap());
+        assert_eq!(report.unrealized_pnl, Decimal::ZERO);
+        assert_eq!(report.execution_charges, Decimal::from_integer(1).unwrap());
+        assert_eq!(report.financing_charges, Decimal::from_str("4.50").unwrap());
+        assert_eq!(
+            report.margin.net_liquidation_value,
+            Decimal::from_str("11194.50").unwrap()
+        );
+    }
+
+    #[test]
+    fn advanced_account_rejects_a_fill_beyond_portfolio_capital() {
+        use follon_accounting::MarginRate;
+
+        let usd = Currency::new("USD").unwrap();
+        let mut account = AdvancedBacktestAccount::new(BTreeMap::from([(
+            usd.clone(),
+            Decimal::from_integer(100).unwrap(),
+        )]))
+        .unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: false,
+            borrow_available: Decimal::ZERO,
+            borrow_rate_bps: 0,
+        };
+        let fill = Fill {
+            execution_id: "execution.over-capital".to_owned(),
+            order_id: "order.over-capital".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(10).unwrap(),
+            price: Decimal::from_integer(100).unwrap(),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:30:00Z".to_owned(),
+        };
+        let policy = MarginPolicy {
+            base_currency: usd,
+            maximum_fx_age_seconds: 0,
+            rates: BTreeMap::from([(
+                "equity".to_owned(),
+                MarginRate {
+                    initial_bps: 5_000,
+                    maintenance_bps: 2_500,
+                },
+            )]),
+        };
+        assert!(account
+            .apply_fill_with_capital_check(
+                &fill,
+                &terms,
+                BacktestExecutionCharges::default(),
+                BacktestCapitalCheck {
+                    marks_after_fill: &BTreeMap::from([(
+                        "inst.us_equity.spy".to_owned(),
+                        Decimal::from_integer(100).unwrap(),
+                    )]),
+                    fx: &FxBook::default(),
+                    policy: &policy,
+                    as_of_epoch_seconds: 1_000,
+                },
+            )
+            .is_err());
+        assert!(account.positions().is_empty());
     }
 }

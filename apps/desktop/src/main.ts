@@ -35,17 +35,28 @@ type WorkspaceDefinition = Readonly<{
   features: readonly string[];
 }>;
 
+const isTauriRuntime = window.location.protocol === "tauri:" ||
+  window.location.hostname === "tauri.localhost";
+const apiOrigin = isTauriRuntime ? "http://127.0.0.1:8080" : window.location.origin;
+
+function apiUrl(path: string): string {
+  if (!path.startsWith("/api/v1/")) {
+    throw new Error("API paths must use the versioned read-only boundary.");
+  }
+  return new URL(path, apiOrigin).toString();
+}
+
 const WORKSPACES: readonly WorkspaceDefinition[] = [
-  { id: "command-center", title: "Command Center", description: "System health, acceptance gates, and evidence from every implemented Follon capability.", features: ["market-data", "replay", "research", "paper", "controlled-live", "operations", "options", "commercial"] },
+  { id: "command-center", title: "Command Center", description: "System health, acceptance gates, and evidence from every implemented Follon capability.", features: ["market-data", "replay", "research", "paper", "controlled-live", "operations", "options", "commercial", "execution-risk", "accounting", "identity", "platform"] },
   { id: "research-lab", title: "Research Lab", description: "Historical datasets, normalized market data, experiment records, reports, and deterministic options analysis.", features: ["market-data", "research", "options"] },
   { id: "strategy-studio", title: "Strategy Studio", description: "Strategy bundle, worker runtime, configuration, replay, and reproducibility identities without browser-side code execution.", features: ["research", "replay"] },
   { id: "backtest-explorer", title: "Backtest Explorer", description: "Completed backtest artifacts, event trails, reports, manifests, trades, and repeatability evidence.", features: ["research", "replay"] },
-  { id: "execution-blotter", title: "Execution Blotter", description: "Intent, risk decision, order lifecycle, fill, rejection, replacement, and reconciliation evidence across simulation, PAPER, and controlled LIVE.", features: ["replay", "paper", "controlled-live"] },
-  { id: "risk-cockpit", title: "Risk Cockpit", description: "Exposure, limits, drawdown, alerts, kill-switch state, unknown orders, and reconciliation health.", features: ["paper", "controlled-live", "operations"] },
-  { id: "portfolio", title: "Portfolio", description: "Positions, exact accounting, attribution, P&L, options scenarios, and cross-environment reconciliation.", features: ["replay", "paper", "operations", "options"] },
+  { id: "execution-blotter", title: "Execution Blotter", description: "Intent, EMS plan, risk decision, order lifecycle, fill, rejection, replacement, and reconciliation evidence across simulation, PAPER, and controlled LIVE.", features: ["replay", "paper", "controlled-live", "execution-risk"] },
+  { id: "risk-cockpit", title: "Risk Cockpit", description: "Portfolio-wide exposure, limits, drawdown, margin, Greeks, alerts, kill-switch state, unknown orders, and reconciliation health.", features: ["paper", "controlled-live", "operations", "execution-risk"] },
+  { id: "portfolio", title: "Portfolio", description: "Positions, multi-currency accounting, margin, attribution, P&L, options scenarios, and cross-environment reconciliation.", features: ["replay", "paper", "operations", "options", "execution-risk", "accounting"] },
   { id: "replay-incidents", title: "Replay & Incidents", description: "Canonical causal events, recovery journals, reconciliation incidents, and deterministic reconstruction evidence.", features: ["replay", "paper", "controlled-live", "operations"] },
-  { id: "journal", title: "Journal", description: "Append-only PAPER, controlled-LIVE, operations, and commercial decisions with audit-chain evidence.", features: ["replay", "paper", "controlled-live", "operations", "commercial"] },
-  { id: "administration", title: "Administration", description: "Provisioning, entitlement, privacy, retention, release-signature, and self-host readiness evidence.", features: ["commercial"] },
+  { id: "journal", title: "Journal", description: "Append-only PAPER, controlled-LIVE, accounting, operations, and commercial decisions with audit-chain evidence.", features: ["replay", "paper", "controlled-live", "operations", "commercial", "accounting", "platform"] },
+  { id: "administration", title: "Administration", description: "Customer IAM, provisioning, entitlement, privacy, retention, release-signature, persistence, and self-host readiness evidence.", features: ["commercial", "identity", "platform"] },
 ];
 
 const root = document.querySelector<HTMLElement>("#evidence");
@@ -170,7 +181,7 @@ async function loadServerEvidence(name: string): Promise<void> {
   }
   setStatus(`Loading ${name}…`);
   try {
-    const response = await fetch(`/api/v1/evidence/${encodeURIComponent(name)}`, { cache: "no-store" });
+    const response = await fetch(apiUrl(`/api/v1/evidence/${encodeURIComponent(name)}`), { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Unable to load ${name} (HTTP ${response.status}).`);
     }
@@ -180,7 +191,7 @@ async function loadServerEvidence(name: string): Promise<void> {
     } else {
       artifactMetaElement.textContent = name;
     }
-    downloadArtifactLink.href = `/api/v1/evidence/${encodeURIComponent(name)}?download=1`;
+    downloadArtifactLink.href = apiUrl(`/api/v1/evidence/${encodeURIComponent(name)}?download=1`);
     downloadArtifactLink.hidden = false;
     if (Array.from(serverEvidenceSelect.options).some((option) => option.value === name)) {
       serverEvidenceSelect.value = name;
@@ -197,7 +208,7 @@ async function refreshServerEvidence(autoLoad: boolean): Promise<void> {
   refreshEvidenceButton.disabled = true;
   setStatus("Checking the local evidence folder…");
   try {
-    const response = await fetch("/api/v1/evidence", { cache: "no-store" });
+    const response = await fetch(apiUrl("/api/v1/evidence"), { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Unable to list local evidence (HTTP ${response.status}).`);
     }
@@ -277,7 +288,7 @@ function formatTimestamp(value: string): string {
 
 async function loadFeatureDefinitions(): Promise<void> {
   try {
-    const response = await fetch("/api/v1/features", { cache: "no-store" });
+    const response = await fetch(apiUrl("/api/v1/features"), { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Unable to load feature catalog (HTTP ${response.status}).`);
     }
@@ -316,7 +327,7 @@ function updateFeatureCatalog(): void {
 async function refreshSystemStatus(): Promise<void> {
   refreshSystemButton.disabled = true;
   try {
-    const response = await fetch("/api/v1/status", { cache: "no-store" });
+    const response = await fetch(apiUrl("/api/v1/status"), { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`Unable to load system health (HTTP ${response.status}).`);
     }
@@ -339,7 +350,7 @@ async function refreshSystemStatus(): Promise<void> {
 }
 
 async function refreshWorkspaceSnapshot(): Promise<void> {
-  const response = await fetch("/api/v1/workspaces", { cache: "no-store" });
+  const response = await fetch(apiUrl("/api/v1/workspaces"), { cache: "no-store" });
   if (!response.ok) {
     throw new Error(`Unable to load integrated workspaces (HTTP ${response.status}).`);
   }
@@ -371,12 +382,20 @@ function renderCurrentWorkspace(): void {
 function workspaceRoute(): string {
   const hashPrefix = "#workspace/";
   if (window.location.hash.startsWith(hashPrefix)) {
-    return decodeURIComponent(window.location.hash.slice(hashPrefix.length));
+    return decodeWorkspaceId(window.location.hash.slice(hashPrefix.length));
   }
   const pathPrefix = "/workspace/";
   return window.location.pathname.startsWith(pathPrefix)
-    ? decodeURIComponent(window.location.pathname.slice(pathPrefix.length))
+    ? decodeWorkspaceId(window.location.pathname.slice(pathPrefix.length))
     : "command-center";
+}
+
+function decodeWorkspaceId(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return "command-center";
+  }
 }
 
 async function openWorkspace(
@@ -508,48 +527,65 @@ for (const button of workspaceButtons) {
 window.addEventListener("popstate", () => {
   void openWorkspace(workspaceRoute(), { scroll: false, history: false });
 });
+window.addEventListener("hashchange", () => {
+  void openWorkspace(workspaceRoute(), { scroll: false, history: false });
+});
 void initializeDashboard();
 
 // A production desktop host supplies an authenticated server-owned stream only
 // when an explicit stream URL is configured. The UI never creates state changes.
 const streamParameter = new URLSearchParams(window.location.search).get("stream");
 if (streamParameter !== null) {
-  const stream = new WebSocket(streamParameter);
-  stream.addEventListener("message", (message) => {
-    try {
-      const payload = String(message.data);
+  let streamUrl: URL | null = null;
+  try {
+    const candidate = new URL(streamParameter, window.location.origin);
+    const expectedProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    if (candidate.origin === window.location.origin && candidate.protocol === expectedProtocol) {
+      streamUrl = candidate;
+    }
+  } catch {
+    // A status message below explains why the optional stream was ignored.
+  }
+  if (streamUrl === null) {
+    setStatus("Ignored an invalid evidence stream URL. Streams must use this dashboard's origin and transport.", "error");
+  } else {
+    const stream = new WebSocket(streamUrl);
+    stream.addEventListener("message", (message) => {
       try {
-        const dashboard = parseOptionsDashboard(payload);
-        events = [];
-        renderOptionsDashboard(evidenceRoot, dashboard);
-      } catch {
+        const payload = String(message.data);
         try {
-          const dashboard = parseOperationsDashboard(payload);
+          const dashboard = parseOptionsDashboard(payload);
           events = [];
-          renderOperationsDashboard(evidenceRoot, dashboard);
+          renderOptionsDashboard(evidenceRoot, dashboard);
         } catch {
           try {
-            const dashboard = parseLiveMonitoringDashboard(payload);
+            const dashboard = parseOperationsDashboard(payload);
             events = [];
-            renderLiveMonitoringDashboard(evidenceRoot, dashboard);
+            renderOperationsDashboard(evidenceRoot, dashboard);
           } catch {
             try {
-              const dashboard = parsePaperDashboard(payload);
+              const dashboard = parseLiveMonitoringDashboard(payload);
               events = [];
-              renderPaperDashboard(evidenceRoot, dashboard);
+              renderLiveMonitoringDashboard(evidenceRoot, dashboard);
             } catch {
-              const next = parseEvidenceLog(`${payload}\n`)[0];
-              events = [...events, next];
-              renderEvidence(evidenceRoot, events);
+              try {
+                const dashboard = parsePaperDashboard(payload);
+                events = [];
+                renderPaperDashboard(evidenceRoot, dashboard);
+              } catch {
+                const next = parseEvidenceLog(`${payload}\n`)[0];
+                events = [...events, next];
+                renderEvidence(evidenceRoot, events);
+              }
             }
           }
         }
+      } catch {
+        setStatus("Received an invalid evidence event from the configured stream.", "error");
       }
-    } catch {
-      setStatus("Received an invalid evidence event from the configured stream.", "error");
-    }
-  });
-  stream.addEventListener("error", () => {
-    setStatus("Configured evidence stream is unavailable; no trading controls are present.", "error");
-  });
+    });
+    stream.addEventListener("error", () => {
+      setStatus("Configured evidence stream is unavailable; no trading controls are present.", "error");
+    });
+  }
 }

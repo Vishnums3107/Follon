@@ -1,12 +1,14 @@
-//! Deterministic European-option contracts, analytics, scenarios, and book reconciliation.
+//! Deterministic option contracts, European valuation, expiration lifecycle,
+//! scenarios, and book reconciliation.
 //!
 //! All economic inputs and outputs are [`Decimal`] values. The Black–Scholes
 //! implementation uses a bounded fixed-point approximation for logarithm,
 //! exponential, normal density, and normal CDF before quantizing every result
 //! to Follon's eight decimal places. It therefore does not consult a platform
 //! math library or wall clock. This v1 model deliberately accepts only
-//! European exercise; an American-style contract must be rejected rather than
-//! silently priced with the wrong model.
+//! European valuation; an American-style contract must be rejected rather than
+//! silently priced with the wrong model. Expiration exercise/assignment and
+//! cash/physical settlement are modeled separately from valuation style.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -781,6 +783,125 @@ pub fn evaluate_expiry_scenarios(
         .into_iter()
         .map(|price| evaluate_expiry_scenario(chain, strategy, price))
         .collect()
+}
+
+/// Settlement method for exercise and assignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionSettlementMethod {
+    /// Intrinsic value is posted as cash with no underlying delivery.
+    Cash,
+    /// Underlying units and strike cash are exchanged.
+    Physical,
+}
+
+/// Final lifecycle outcome for an expiring position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionLifecycleOutcome {
+    /// Position expired below the automatic-exercise threshold.
+    Expired,
+    /// A positive holder position exercised.
+    Exercised,
+    /// A negative writer position was assigned.
+    Assigned,
+}
+
+/// Exact option, underlying, and cash changes at expiration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionLifecycleSettlement {
+    /// Stable event identity supplied by the caller.
+    pub lifecycle_event_id: String,
+    /// Option instrument settled.
+    pub option_id: String,
+    /// Underlying instrument affected by physical settlement.
+    pub underlying_instrument_id: String,
+    /// Exercise, assignment, or worthless expiry.
+    pub outcome: OptionLifecycleOutcome,
+    /// Exact signed option quantity required to close the position.
+    pub option_quantity_delta: Decimal,
+    /// Exact signed underlying-unit delivery.
+    pub underlying_quantity_delta: Decimal,
+    /// Exact settlement-currency cash movement.
+    pub cash_delta: Decimal,
+    /// Intrinsic value per underlying unit.
+    pub intrinsic_value: Decimal,
+    /// Canonical recognition time.
+    pub occurred_at: String,
+}
+
+/// Settles a complete signed option position at or after expiration.
+///
+/// Positive quantities are holder positions; negative quantities are writer
+/// positions. Fractional contracts and pre-expiration settlement are rejected.
+#[allow(clippy::too_many_arguments)]
+pub fn settle_expired_option_position(
+    lifecycle_event_id: &str,
+    contract: &OptionContract,
+    signed_contract_quantity: Decimal,
+    underlying_price: Decimal,
+    automatic_exercise_threshold: Decimal,
+    settlement_method: OptionSettlementMethod,
+    occurred_at: &str,
+) -> Result<OptionLifecycleSettlement, OptionError> {
+    validate_canonical_id("option lifecycle_event_id", lifecycle_event_id)?;
+    contract.validate()?;
+    validate_utc_timestamp("option lifecycle occurred_at", occurred_at)?;
+    if parse_utc(occurred_at)? < parse_utc(&contract.expiration_at)?
+        || signed_contract_quantity == Decimal::ZERO
+        || signed_contract_quantity.scaled() % 100_000_000 != 0
+        || underlying_price < Decimal::ZERO
+        || automatic_exercise_threshold < Decimal::ZERO
+    {
+        return Err(OptionError(
+            "invalid option expiration settlement request".to_owned(),
+        ));
+    }
+    let intrinsic_value = contract.intrinsic_value(underlying_price)?;
+    let option_quantity_delta = Decimal::ZERO.checked_sub(signed_contract_quantity)?;
+    if intrinsic_value < automatic_exercise_threshold || intrinsic_value == Decimal::ZERO {
+        return Ok(OptionLifecycleSettlement {
+            lifecycle_event_id: lifecycle_event_id.to_owned(),
+            option_id: contract.option_id.clone(),
+            underlying_instrument_id: contract.underlying_instrument_id.clone(),
+            outcome: OptionLifecycleOutcome::Expired,
+            option_quantity_delta,
+            underlying_quantity_delta: Decimal::ZERO,
+            cash_delta: Decimal::ZERO,
+            intrinsic_value,
+            occurred_at: occurred_at.to_owned(),
+        });
+    }
+    let outcome = if signed_contract_quantity > Decimal::ZERO {
+        OptionLifecycleOutcome::Exercised
+    } else {
+        OptionLifecycleOutcome::Assigned
+    };
+    let signed_underlying_units = signed_contract_quantity.checked_mul(contract.multiplier)?;
+    let (underlying_quantity_delta, cash_delta) = match settlement_method {
+        OptionSettlementMethod::Cash => (
+            Decimal::ZERO,
+            intrinsic_value.checked_mul(signed_underlying_units)?,
+        ),
+        OptionSettlementMethod::Physical => {
+            let underlying_quantity_delta = match contract.right {
+                OptionRight::Call => signed_underlying_units,
+                OptionRight::Put => Decimal::ZERO.checked_sub(signed_underlying_units)?,
+            };
+            let cash_delta = Decimal::ZERO
+                .checked_sub(underlying_quantity_delta.checked_mul(contract.strike)?)?;
+            (underlying_quantity_delta, cash_delta)
+        }
+    };
+    Ok(OptionLifecycleSettlement {
+        lifecycle_event_id: lifecycle_event_id.to_owned(),
+        option_id: contract.option_id.clone(),
+        underlying_instrument_id: contract.underlying_instrument_id.clone(),
+        outcome,
+        option_quantity_delta,
+        underlying_quantity_delta,
+        cash_delta,
+        intrinsic_value,
+        occurred_at: occurred_at.to_owned(),
+    })
 }
 
 /// Immutable strategy/data/config/model identities that every environment must carry.
@@ -1647,6 +1768,54 @@ mod tests {
         assert_eq!(scenarios[0].underlying_price, decimal("90"));
         assert_eq!(scenarios[0].total_pnl, decimal("-520"));
         assert_eq!(scenarios[2].total_pnl, decimal("480"));
+    }
+
+    #[test]
+    fn expiration_lifecycle_handles_exercise_assignment_and_worthless_expiry() {
+        let chain = chain();
+        let call = &chain.contracts[0];
+        let exercised = settle_expired_option_position(
+            "lifecycle.call.long",
+            call,
+            decimal("2"),
+            decimal("110"),
+            decimal("0.01"),
+            OptionSettlementMethod::Physical,
+            &call.expiration_at,
+        )
+        .expect("exercise");
+        assert_eq!(exercised.outcome, OptionLifecycleOutcome::Exercised);
+        assert_eq!(exercised.option_quantity_delta, decimal("-2"));
+        assert_eq!(exercised.underlying_quantity_delta, decimal("200"));
+        assert_eq!(exercised.cash_delta, decimal("-20000"));
+
+        let put = &chain.contracts[1];
+        let assigned = settle_expired_option_position(
+            "lifecycle.put.short",
+            put,
+            decimal("-1"),
+            decimal("90"),
+            decimal("0.01"),
+            OptionSettlementMethod::Physical,
+            &put.expiration_at,
+        )
+        .expect("assignment");
+        assert_eq!(assigned.outcome, OptionLifecycleOutcome::Assigned);
+        assert_eq!(assigned.underlying_quantity_delta, decimal("100"));
+        assert_eq!(assigned.cash_delta, decimal("-9500"));
+
+        let expired = settle_expired_option_position(
+            "lifecycle.call.expired",
+            call,
+            decimal("1"),
+            decimal("90"),
+            decimal("0.01"),
+            OptionSettlementMethod::Cash,
+            &call.expiration_at,
+        )
+        .expect("expiry");
+        assert_eq!(expired.outcome, OptionLifecycleOutcome::Expired);
+        assert_eq!(expired.cash_delta, Decimal::ZERO);
     }
 
     #[test]

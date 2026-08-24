@@ -41,6 +41,19 @@ jobs:
       - name: Audit Node dependencies
         run: npm audit --package-lock-only --audit-level=high
         working-directory: apps/desktop
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify deterministic SBOM generation
+        run: python -m unittest discover -s tests/security -v
+      - name: Generate release SBOM
+        run: python tools/generate_sbom.py --source-revision "$GITHUB_SHA" --output build/follon-sbom.cdx.json
+      - name: Retain release SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: follon-sbom
+          path: build/follon-sbom.cdx.json
+          if-no-files-found: error
 
   rust:
     runs-on: ubuntu-24.04
@@ -52,6 +65,30 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  postgres-integration:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_DB: follon_test
+          POSTGRES_USER: follon
+          POSTGRES_PASSWORD: integration-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U follon -d follon_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run transactional PostgreSQL integration test
+        env:
+          FOLLON_TEST_DATABASE_URL: postgresql://follon:integration-only-password@127.0.0.1:5432/follon_test
+        run: cargo test -p follon-postgres -- --ignored
 
   python-and-contracts:
     runs-on: ubuntu-24.04

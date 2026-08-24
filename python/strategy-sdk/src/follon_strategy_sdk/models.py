@@ -7,6 +7,10 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .services import StrategyServices
 
 
 _UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -94,6 +98,7 @@ class StrategyContext:
     configuration_version: str
     replay_time: str
     environment: str = "SIMULATION"
+    services: StrategyServices | None = None
 
     def __post_init__(self) -> None:
         _canonical_id("account_id", self.account_id)

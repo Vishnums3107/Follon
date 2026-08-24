@@ -10,9 +10,15 @@
 - Store raw source events separately from normalized events.
 - Deliver historical replay through the same event interface used by live strategies.
 
-## First implementation
+## Implemented repository boundary
 
-Start with historical bar ingestion for US equities/ETFs, a normalized bar event, persistent event storage, and a controllable replay clock. Quote/trade feeds, gap handling, and live market-data subscriptions follow only after deterministic bar replay is proven.
+Historical trade/bar ingestion, deterministic bar construction, persistent
+events, replay clock, effective-dated instrument/reference economics, and a
+normalized quote contract are implemented. Quote monitoring validates spread
+and sizes, retains source/local receive time and source sequence, and classifies
+healthy, delayed, stale, gap, duplicate, and out-of-order observations. A
+licensed live vendor subscription, reconnect/gap-repair operation, and observed
+feed-availability history remain deployment/vendor gates.
 
 ## Invariants
 

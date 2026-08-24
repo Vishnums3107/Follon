@@ -9,13 +9,20 @@
 | Option contract and chains | Strict canonical contract IDs, underlying identity, expiration, strike, right, multiplier, currency, canonical reference version, snapshot timestamp, quotes, and deterministic chain fingerprint | Implemented and tested |
 | Volatility and Greeks | Fixed-point, bounded European Black–Scholes approximation for price, delta, gamma, vega, theta, rho, plus deterministic implied-volatility bisection from the exact bid/ask midpoint | Implemented and tested |
 | Multi-leg / expiry workflow | Validated long/short whole-contract legs, exact entry premiums/multipliers, and deterministic expiry scenarios with per-leg and total P&L | Implemented and tested |
+| Expiration lifecycle | Exact intrinsic/threshold decision, long exercise, short assignment, worthless expiry, option close, and physical or cash settlement economics | Implemented and tested; broker instruction remains external |
 | Cross-environment reconciliation | Explicit-time exact comparison of BACKTEST, PAPER, and LIVE option books, including cash, positions, marks, realized P&L, and each book's separately declared strategy/data/config/replay/chain/model identity; the outer reconciliation configuration has an exact source-byte hash and every declared export is normalized/fingerprinted | Implemented and tested |
 | Options CLI / reports | Immutable analysis dashboard and Markdown report, strict configuration ingress, and content hashes | Implemented and tested |
 | Replay UI | Strict desktop parser and evidence-only display for option analytics, scenarios, provenance, and reconciliation differences | Implemented and typechecked |
 
 ## Model and product boundary
 
-The v1 model intentionally supports **European exercise only**. It fails closed for missing/invalid economics and avoids passing an American-style option through an inapplicable pricing model. It also rejects impossible European no-arbitrage premiums, expired valuation inputs, platform-math calls, and use of the workstation clock.
+The v1 **valuation model** intentionally supports European options only. It
+fails closed for missing/invalid economics and avoids passing an American-style
+option through an inapplicable pricing model. The separate expiration lifecycle
+kernel accepts the contract's recorded expiry economics and does not pretend to
+model American early-exercise valuation. The valuation engine also rejects
+impossible European no-arbitrage premiums, expired valuation inputs,
+platform-math calls, and use of the workstation clock.
 
 The calculations use Follon’s signed eight-decimal fixed-point type with bounded deterministic implementations of logarithm, exponential, square root, normal density, normal CDF, and bisection. The model version is recorded as `follon-european-black-scholes-fixed-v1`; changing its approximation or rounding requires a new model version and regenerated evidence.
 
@@ -37,4 +44,8 @@ Repeat an identical command in place to verify immutable publication is idempote
 
 “Options reconcile and reproduce across backtest, paper, and live” becomes an operational claim only after an independently reviewed option-capable broker adapter exports normalized books for the same account/instant, the exact relevant chain/reference snapshot is retained, and all three books reconcile without unresolved difference. Before enabling real options orders, additionally review OCC/venue contract symbology, exercise/assignment, early exercise and dividend risk, margin, corporate actions, settlement, currency, commissions, tax, halt behavior, stale quotes, market-data licensing, and the broker’s multi-leg order semantics.
 
-No options order endpoint, broker credential, exercise instruction, assignment workflow, or live trading permission is introduced by this repository phase.
+No broker credential, exercise instruction transport, accepted native-combo
+mapping, or live trading permission is introduced by this repository phase.
+Exercise/assignment settlement is a deterministic internal lifecycle
+projection; it becomes operational evidence only after reconciliation against
+the reviewed broker export.

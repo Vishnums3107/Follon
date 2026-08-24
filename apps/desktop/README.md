@@ -12,9 +12,14 @@ kill switches, `UNKNOWN` orders, reconciliation incidents, positions, and
 promotion evidence. It deliberately contains no action that can create,
 approve, cancel, schedule, configure, journal, or transmit an order.
 
-The eventual Tauri host will provide an authenticated WebSocket endpoint at
-`/api/v1/evidence`; this TypeScript shell is kept framework-light until the
-control-plane stream contract is exercised end to end.
+React owns the application shell, Vite emits the deployable web bundle, and the
+Tauri v2 host provides the native desktop boundary without privileged custom
+commands. The existing fail-closed TypeScript evidence controller is loaded
+only after React mounts the complete workspace DOM.
+
+The packaged client reads its versioned API from the loopback evidence service
+at `http://127.0.0.1:8080`. The server grants read-only cross-origin access only
+to the exact Tauri asset origins; it must be running before the native client.
 
 ## Open the local dashboard
 
@@ -38,11 +43,12 @@ Risk Cockpit, Portfolio, Replay and Incidents, Journal, and Administration.
 Each workspace renders domain-specific metrics and tables, links back to exact
 source artifacts, and keeps documented external acceptance gates visible.
 
-Development is loopback-only without authentication. Production mode supports
-fail-closed HTTP Basic authentication for an operator deployment and requires
-a password of at least 16 characters; it must be placed behind TLS. Customer
-identity, entitlement enforcement, and role-based authorization remain external
-gates and are not implied by this local evidence surface.
+Development is loopback-only without authentication. The compatibility server
+supports fail-closed HTTP Basic authentication for an operator deployment and
+requires a password of at least 16 characters. Production Compose places it
+behind client-certificate TLS. The customer IAM/RBAC/MFA kernel and durable
+schema are implemented separately; no customer identity or privileged trading
+mutation is exposed through this read-only server.
 
 The small dashboard API intentionally exposes only safe evidence filenames,
 rejects traversal and symlink escapes, sends a restrictive content-security
@@ -55,4 +61,8 @@ the unbundled ESM graph works on the static server.
 ```powershell
 npm install
 npm run test:evidence
+npm run typecheck
+npm run build:web
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run build:desktop
 ```

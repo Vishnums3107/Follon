@@ -54,19 +54,37 @@ cargo test --workspace
 cargo run -p follon-cli --bin follon-replay -- tests/fixtures/historical-bars/spy-one-minute.csv var/follon-events.ndjson
 ```
 
-Live execution, short selling, and cross-currency accounting remain explicitly
-out of scope. The later PAPER-control implementation is described separately in
-[Months 6–8 status](07-months-6-8-status.md). Passing this gate is deployment
-evidence for the bounded historical-research product, not approval for
-capital-bearing operation.
+The original replay runner remains long-only and single-currency for v1
+artifact compatibility. A separate advanced backtest account now implements
+point-in-time universe controls, long/short crossings, borrow limits/recalls,
+financing, attributed charges, delistings, multi-currency FX, and atomic margin
+capital checks. It does not retroactively relabel legacy artifacts; public CLI
+orchestration of the advanced account remains explicit follow-on integration.
+PAPER controls are described in
+[Months 6–8 status](07-months-6-8-status.md). Passing this gate is evidence for
+the bounded historical-research product, not approval for capital-bearing
+operation.
 
 ## Deployment artifact status
 
 `infra/compose.dev.yml` provisions loopback-only non-production PostgreSQL,
-MinIO, and the dashboard. `infra/Dockerfile.replay` builds the non-live replay
-image, while the opt-in storage tool image publishes Parquet, maintains the
-DuckDB catalog, and verifies immutable MinIO upload/recovery. All development
-containers were built and exercised locally on 2026-08-17.
+MinIO, the React dashboard, and the gRPC trading API. Production Compose adds
+database TLS, gRPC mTLS, client-certificate dashboard TLS, secret-file ingress,
+monitoring and alerts without creating a production database, CA, secret store,
+or broker credential. Both development and production configurations validate.
+Container build/runtime health was not rerun on 2026-08-24 because the local
+Docker Desktop engine was unavailable.
+
+## Platform and advanced-kernel status
+
+Advanced EMS planning, portfolio-wide risk, multi-currency/margin accounting,
+customer IAM/MFA/RBAC, transactional PostgreSQL event/outbox persistence, the
+versioned gRPC topology, React/Vite/Tauri packaging, and a review-bound
+controlled-LIVE adapter are implemented and tested at repository boundaries.
+The adapter has no configured real LIVE transport, credential, signed review
+record, or capital session. See the
+[master-plan conformance audit](14-master-plan-conformance-audit.md) for exact
+coverage and remaining requirements.
 
 ## Months 12–14 operator-workbench status
 

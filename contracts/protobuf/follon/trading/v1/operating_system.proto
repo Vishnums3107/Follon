@@ -1,0 +1,297 @@
+syntax = "proto3";
+
+package follon.trading.v1;
+
+// Deployed read/plan boundary. Capital-bearing submission remains behind the
+// separately reviewed broker adapter and controlled-LIVE activation gate.
+service TradingOperatingSystem {
+  rpc CheckHealth(HealthRequest) returns (HealthResponse);
+  rpc PlanExecution(ExecutionPlanRequest) returns (ExecutionPlanResponse);
+  rpc PlanPassiveRepricing(PassiveRepricingRequest) returns (PassiveRepricingResponse);
+  rpc PlanOptionCombo(OptionComboRequest) returns (OptionComboResponse);
+  rpc EvaluatePortfolioRisk(PortfolioRiskRequest) returns (PortfolioRiskResponse);
+  rpc ValueMarginAccount(MarginAccountRequest) returns (MarginAccountResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  bool database_ready = 2;
+  bool transport_tls = 3;
+  string service_version = 4;
+}
+
+enum ExecutionSide {
+  EXECUTION_SIDE_UNSPECIFIED = 0;
+  EXECUTION_SIDE_BUY = 1;
+  EXECUTION_SIDE_SELL = 2;
+}
+
+enum ExecutionAlgorithmKind {
+  EXECUTION_ALGORITHM_KIND_UNSPECIFIED = 0;
+  EXECUTION_ALGORITHM_KIND_IMMEDIATE = 1;
+  EXECUTION_ALGORITHM_KIND_TWAP = 2;
+  EXECUTION_ALGORITHM_KIND_PARTICIPATION = 3;
+  EXECUTION_ALGORITHM_KIND_VWAP = 4;
+  EXECUTION_ALGORITHM_KIND_ARRIVAL_PRICE = 5;
+}
+
+enum ChildOrderKind {
+  CHILD_ORDER_KIND_UNSPECIFIED = 0;
+  CHILD_ORDER_KIND_MARKET = 1;
+  CHILD_ORDER_KIND_LIMIT = 2;
+  CHILD_ORDER_KIND_STOP = 3;
+  CHILD_ORDER_KIND_STOP_LIMIT = 4;
+}
+
+message ExecutionPlanRequest {
+  string tenant_id = 1;
+  string parent_order_id = 2;
+  string account_id = 3;
+  string strategy_id = 4;
+  string instrument_id = 5;
+  ExecutionSide side = 6;
+  string quantity = 7;
+  optional string limit_price = 8;
+  ExecutionAlgorithmKind algorithm = 9;
+  uint32 slice_count = 10;
+  uint64 interval_seconds = 11;
+  uint32 participation_bps = 12;
+  repeated string observed_market_volumes = 13;
+  repeated string forecast_market_volumes = 14;
+  uint32 urgency_bps = 15;
+}
+
+message ChildInstruction {
+  string child_id = 1;
+  string quantity = 2;
+  uint64 release_after_seconds = 3;
+  optional string limit_price = 4;
+  optional string venue = 5;
+  ChildOrderKind order_kind = 6;
+  optional string stop_price = 7;
+}
+
+message ExecutionPlanResponse {
+  string parent_order_id = 1;
+  repeated ChildInstruction children = 2;
+  string unallocated_quantity = 3;
+}
+
+message PassiveMarketObservation {
+  uint64 observed_after_seconds = 1;
+  string best_bid = 2;
+  string best_ask = 3;
+}
+
+message PassiveRepricingRequest {
+  string tenant_id = 1;
+  string parent_order_id = 2;
+  string account_id = 3;
+  string strategy_id = 4;
+  string instrument_id = 5;
+  ExecutionSide side = 6;
+  string quantity = 7;
+  optional string hard_limit_price = 8;
+  string initial_limit_price = 9;
+  string tick_size = 10;
+  uint32 maximum_chase_bps = 11;
+  uint32 maximum_replacements = 12;
+  uint64 minimum_replace_interval_seconds = 13;
+  repeated PassiveMarketObservation observations = 14;
+}
+
+message CancelReplaceInstruction {
+  string cancel_child_id = 1;
+  ChildInstruction replacement = 2;
+}
+
+message PassiveRepricingResponse {
+  ChildInstruction initial = 1;
+  repeated CancelReplaceInstruction replacements = 2;
+}
+
+enum ComboPriceLimitKind {
+  COMBO_PRICE_LIMIT_KIND_UNSPECIFIED = 0;
+  COMBO_PRICE_LIMIT_KIND_MAXIMUM_DEBIT = 1;
+  COMBO_PRICE_LIMIT_KIND_MINIMUM_CREDIT = 2;
+}
+
+message OptionComboLeg {
+  string instrument_id = 1;
+  ExecutionSide side = 2;
+  uint32 ratio = 3;
+  string limit_price = 4;
+}
+
+message OptionComboRequest {
+  string tenant_id = 1;
+  string combo_id = 2;
+  string account_id = 3;
+  string strategy_id = 4;
+  string combo_quantity = 5;
+  ComboPriceLimitKind price_limit_kind = 6;
+  string price_limit = 7;
+  repeated OptionComboLeg legs = 8;
+}
+
+message ComboLegInstruction {
+  string child_id = 1;
+  string instrument_id = 2;
+  ExecutionSide side = 3;
+  string quantity = 4;
+  string limit_price = 5;
+}
+
+message OptionComboResponse {
+  string combo_id = 1;
+  string combo_quantity = 2;
+  string protected_net_price = 3;
+  repeated ComboLegInstruction legs = 4;
+}
+
+message BucketLimit {
+  string key = 1;
+  string limit = 2;
+}
+
+message PortfolioRiskPolicy {
+  string version = 1;
+  bool global_kill_switch = 2;
+  string max_gross_exposure = 3;
+  string max_abs_net_exposure = 4;
+  string max_leverage_bps = 5;
+  string max_concentration_bps = 6;
+  string max_daily_loss = 7;
+  string max_drawdown_bps = 8;
+  string max_margin_utilization_bps = 9;
+  string max_abs_delta = 10;
+  string max_abs_gamma = 11;
+  uint64 max_open_orders = 12;
+  uint32 max_order_rate = 13;
+  repeated string allowed_instruments = 14;
+  repeated string restricted_instruments = 15;
+  repeated BucketLimit sector_limits = 16;
+  repeated BucketLimit asset_class_limits = 17;
+  repeated BucketLimit currency_limits = 18;
+  repeated BucketLimit strategy_limits = 19;
+}
+
+message PortfolioPosition {
+  string account_id = 1;
+  string strategy_id = 2;
+  string instrument_id = 3;
+  string asset_class = 4;
+  string sector = 5;
+  string currency = 6;
+  string quantity = 7;
+  string mark_price = 8;
+  string multiplier = 9;
+  string delta = 10;
+  string gamma = 11;
+}
+
+message RestingOrder {
+  string order_id = 1;
+  string account_id = 2;
+  string instrument_id = 3;
+  ExecutionSide side = 4;
+}
+
+message CandidateOrder {
+  string account_id = 1;
+  string strategy_id = 2;
+  string instrument_id = 3;
+  string asset_class = 4;
+  string sector = 5;
+  string currency = 6;
+  ExecutionSide side = 7;
+  string quantity = 8;
+  string reference_price = 9;
+  string multiplier = 10;
+  string delta = 11;
+  string gamma = 12;
+  string intent_id = 13;
+}
+
+message PortfolioRiskRequest {
+  string tenant_id = 1;
+  PortfolioRiskPolicy policy = 2;
+  string equity = 3;
+  string peak_equity = 4;
+  string daily_pnl = 5;
+  string margin_used = 6;
+  repeated PortfolioPosition positions = 7;
+  repeated RestingOrder resting_orders = 8;
+  uint32 recent_order_count = 9;
+  optional CandidateOrder candidate = 10;
+}
+
+message RiskMetrics {
+  string gross_exposure = 1;
+  string net_exposure = 2;
+  string leverage_bps = 3;
+  string concentration_bps = 4;
+  string drawdown_bps = 5;
+  string margin_utilization_bps = 6;
+  string total_delta = 7;
+  string total_gamma = 8;
+}
+
+message PortfolioRiskResponse {
+  bool approved = 1;
+  repeated string reason_codes = 2;
+  string policy_version = 3;
+  RiskMetrics metrics = 4;
+}
+
+message CurrencyAmount {
+  string currency = 1;
+  string amount = 2;
+}
+
+message FxRate {
+  string base_currency = 1;
+  string quote_currency = 2;
+  string rate = 3;
+  int64 observed_at_epoch_seconds = 4;
+}
+
+message MarginRate {
+  string asset_class = 1;
+  uint32 initial_bps = 2;
+  uint32 maintenance_bps = 3;
+}
+
+message MarginPosition {
+  string instrument_id = 1;
+  string asset_class = 2;
+  string currency = 3;
+  string quantity = 4;
+  string mark_price = 5;
+  string multiplier = 6;
+}
+
+message MarginAccountRequest {
+  string tenant_id = 1;
+  string base_currency = 2;
+  int64 as_of_epoch_seconds = 3;
+  int64 maximum_fx_age_seconds = 4;
+  repeated CurrencyAmount cash = 5;
+  repeated FxRate fx_rates = 6;
+  repeated MarginRate margin_rates = 7;
+  repeated MarginPosition positions = 8;
+}
+
+message MarginAccountResponse {
+  string base_currency = 1;
+  string cash_value = 2;
+  string position_market_value = 3;
+  string net_liquidation_value = 4;
+  string initial_margin = 5;
+  string maintenance_margin = 6;
+  string excess_liquidity = 7;
+  bool margin_call = 8;
+  repeated CurrencyAmount exposure_by_currency = 9;
+}

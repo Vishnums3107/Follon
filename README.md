@@ -8,18 +8,21 @@ replay-to-paper workflow and customer validation; later-phase code remains
 technical evidence until the operational and commercial gates in the
 [roadmap](docs/06-delivery/03-roadmap-and-gates.md) pass.
 
-This repository is in its **non-connected controlled-live engineering** stage. It contains the
-decomposed product plan, versioned contracts, a deterministic historical replay
-slice, an isolated strategy SDK, a durable PAPER OMS/control boundary, and an
-evidence-only desktop shell. It also contains a controlled-live safety kernel
-for hash-chained audit, four-eyes activation/approvals, shadow/canary limits,
-reconciliation, and monitoring. It has no checked-in live credentials,
-authenticated approval service, or live broker endpoint. A fixed-process
-managed-secret provider is available for an audited vault/keychain helper, but
-no provider or credential is configured by the repository. The checked-in IBKR
-implementation includes a PAPER-only official-API process bridge and a
-deterministic local model; connecting it still requires an operator-managed TWS
-or IB Gateway PAPER session and the documented acceptance gates.
+This repository is in its **non-connected controlled-live engineering** stage.
+It contains the decomposed product plan, versioned contracts, deterministic
+research/replay and PAPER paths, advanced broker-neutral execution planning,
+portfolio-wide risk, multi-currency/margin accounting, customer IAM primitives,
+transactional PostgreSQL persistence, and a versioned gRPC service. The ten
+read-only operating workspaces are packaged with React/Vite and a least-
+privilege Tauri v2 host.
+
+The controlled-LIVE boundary remains fail-closed. The checked-in IBKR wrapper
+requires a signed adapter artifact, two independent reviewers, a managed secret,
+an initial broker snapshot, strict canary limits, price protection, and an
+irreversible instance emergency stop. There is no configured LIVE credential,
+reviewed vendor transport, or retained capital session. See the
+[master-plan conformance audit](docs/06-delivery/14-master-plan-conformance-audit.md)
+for the exact requirement status and open external gates.
 
 ## Start here
 
@@ -36,8 +39,8 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
 - Historical-bar CSV import, explicit replay clock and exchange-session model,
   canonical timestamp/order validation, append-only local NDJSON event storage,
   deterministic risk/OMS/simulator, and cumulative portfolio evidence flow.
-- Content-addressed bar/action datasets, deterministic backtest runner, exact
-  single-currency accounting, content-addressed configuration, portable
+- Content-addressed bar/action datasets, deterministic backtest runner,
+  content-addressed configuration, portable
   self-describing result artifacts, completion manifests, and local experiment
   metadata/export.
 - Python strategy contracts that can submit intents but cannot access adapters
@@ -46,12 +49,23 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   reservation, durable evidence/restart recovery, reconciliation, kill
   switches, reconnect handling, deterministic broker fault injection, and a
   bounded process transport for the official IBKR Python TWS API bridge.
-- A TypeScript desktop evidence projection that cannot alter trading state,
-  including read-only PAPER, controlled-live monitoring, and operations
-  workbench dashboards.
-- A Docker-packaged unified web dashboard for all implemented evidence areas,
-  dependency health, artifact filtering/downloads, and explicit acceptance-gate
-  visibility. The browser surface remains read-only by design.
+- A React/TypeScript desktop evidence projection that cannot alter trading
+  state, including read-only PAPER, controlled-live monitoring, operations,
+  portfolio, identity, platform, and acceptance-gate views. Vite creates the
+  web bundle and Tauri v2 supplies the native package boundary.
+- Broker-neutral EMS algorithms (immediate, TWAP, VWAP, participation,
+  arrival-price, passive cancel/replace, routing, brackets, trailing stops,
+  baskets, and atomic option combinations), portfolio-wide risk, and balanced
+  multi-currency/margin accounting. Scheduled, passive, combination, risk, and
+  margin planning are exposed through the versioned gRPC API.
+- Customer IAM primitives with Argon2id, TOTP MFA, lockout, short opaque
+  sessions, revocation, tenant isolation, and explicit RBAC permissions.
+- Transactional PostgreSQL migrations and adapter behavior for tenant-isolated
+  events/outbox, checkpoints, balanced journals, IAM, risk policies, and broker
+  command receipts.
+- Development and production Compose topology for the dashboard and gRPC API,
+  plus production mTLS, client-certificate dashboard TLS, monitoring/alert
+  rules, backup/restore-drill tooling, and ordered release-promotion gates.
 - A deterministic operator workbench for fixed-point risk cockpit projections,
   attributable accounting movements, stable alerts, explicit-time schedule
   planning with typed due-time completions, predecessor-linked parameter
@@ -60,10 +74,11 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   no broker, credential, wall-clock, background-execution, or order-control
   capability.
 - A deterministic European-options core for versioned chain snapshots,
-  fixed-point implied volatility/Greeks, multi-leg expiry scenarios, and
-  explicit-time BACKTEST/PAPER/LIVE option-book reconciliation with
-  separately fingerprinted declared export provenance. It is evidence-only and does
-  not contain a broker options-order, exercise, assignment, or credential path.
+  fixed-point implied volatility/Greeks, multi-leg expiry scenarios, explicit
+  cash/physical exercise and assignment settlement, and explicit-time
+  BACKTEST/PAPER/LIVE option-book reconciliation with separately fingerprinted
+  declared export provenance. Option-combination planning is broker-neutral;
+  no reviewed capital-bearing broker options transport or credential is included.
 - A controlled-live safety kernel with opaque credential references, zeroizing
   secret-material boundary, a no-shell managed-helper provider, time-bounded
   four-eyes activations and approvals,
@@ -78,11 +93,13 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   verification. These controls neither process payments nor prove customer
   adoption—the paying-customer gate remains external, independently evidenced
   work.
-- JSON Schema, Protobuf, CI, dependency review, secret scanning, and an initial
-  threat model.
+- JSON Schema, Protobuf, CI (including disposable PostgreSQL integration),
+  dependency review, secret scanning, and an initial threat model.
 
-See [implementation status](docs/06-delivery/05-implementation-status.md) for
-the active roadmap gate and local verification status.
+See the [conformance audit](docs/06-delivery/14-master-plan-conformance-audit.md)
+for current implementation evidence and the
+[production operations runbook](docs/operations/09-production-operations-runbook.md)
+for the fail-closed deployment and evidence sequence.
 
 ## Initial release boundary
 

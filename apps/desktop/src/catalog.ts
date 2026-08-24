@@ -81,7 +81,7 @@ export function renderCoverageSummary(
 
 export function renderSystemStatus(root: HTMLElement, status: SystemStatus): void {
   root.replaceChildren();
-  const serviceOrder = ["dashboard", "postgres", "minio"];
+  const serviceOrder = ["dashboard", "trading-api", "postgres", "minio"];
   for (const serviceName of serviceOrder) {
     const service = status.services[serviceName];
     if (service === undefined) {

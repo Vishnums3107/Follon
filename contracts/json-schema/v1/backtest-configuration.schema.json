@@ -54,6 +54,10 @@
       "type": "string",
       "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$"
     },
+    "basisPoints": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,3})(?:\\.[0-9]{1,8})?$"
+    },
     "utc": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
@@ -92,12 +96,13 @@
     "risk": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["policy_version", "global_kill_switch", "max_quantity", "max_notional"],
+      "required": ["policy_version", "global_kill_switch", "max_quantity", "max_notional", "max_price_deviation_bps"],
       "properties": {
         "policy_version": { "type": "string", "minLength": 1 },
         "global_kill_switch": { "type": "boolean" },
         "max_quantity": { "$ref": "#/$defs/positiveDecimal" },
-        "max_notional": { "$ref": "#/$defs/positiveDecimal" }
+        "max_notional": { "$ref": "#/$defs/positiveDecimal" },
+        "max_price_deviation_bps": { "$ref": "#/$defs/basisPoints" }
       }
     },
     "execution": {

@@ -6,19 +6,29 @@
 //! [`IbkrPaperGatewayTransport`] and is continuously exercised by the core's
 //! deterministic in-memory paper model and fault-injection suite.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
+use follon_commercial::{
+    verify_release_artifacts, verify_release_signature, ReleaseManifest, ReleaseSignature,
+    TrustedReleaseKey,
+};
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, OrderState};
+use follon_live::{
+    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest,
+    LiveBrokerReplaceRequest, LiveBrokerSubmitResult, LiveError,
+};
 use follon_paper::{
     BrokerAccountSnapshot, BrokerEvent, BrokerOrderRequest, BrokerOrderSnapshot,
     BrokerPositionSnapshot, BrokerSubmitResult, PaperBrokerAdapter, PaperError,
 };
+use follon_secrets::SecretMaterial;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -695,6 +705,368 @@ impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapte
     }
 }
 
+/// Proof that the exact capital-bearing adapter binary belongs to a signed,
+/// artifact-verified release. It can be constructed only by
+/// [`verify_capital_adapter_release`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCapitalAdapterRelease {
+    release_id: String,
+    manifest_hash: String,
+    adapter_sha256: String,
+}
+
+impl VerifiedCapitalAdapterRelease {
+    /// Signed release identity.
+    pub fn release_id(&self) -> &str {
+        &self.release_id
+    }
+
+    /// SHA-256 of the canonical signed manifest.
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
+    /// SHA-256 of the exact reviewed adapter artifact.
+    pub fn adapter_sha256(&self) -> &str {
+        &self.adapter_sha256
+    }
+}
+
+/// Verifies an Ed25519 release signature and every manifest artifact before
+/// selecting the exact `adapter.ibkr.live` binary for capital-bearing use.
+pub fn verify_capital_adapter_release(
+    manifest_source: &str,
+    signature: &ReleaseSignature,
+    trusted_key: &TrustedReleaseKey,
+    artifact_root: &Path,
+) -> Result<VerifiedCapitalAdapterRelease, LiveError> {
+    let manifest = verify_release_signature(manifest_source, signature, trusted_key)
+        .map_err(|error| LiveError(error.to_string()))?;
+    verify_release_artifacts(&manifest, artifact_root)
+        .map_err(|error| LiveError(error.to_string()))?;
+    verified_capital_artifact(&manifest)
+}
+
+fn verified_capital_artifact(
+    manifest: &ReleaseManifest,
+) -> Result<VerifiedCapitalAdapterRelease, LiveError> {
+    let artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_id == "adapter.ibkr.live")
+        .ok_or_else(|| LiveError("signed release does not contain adapter.ibkr.live".to_owned()))?;
+    Ok(VerifiedCapitalAdapterRelease {
+        release_id: manifest.release_id.clone(),
+        manifest_hash: manifest
+            .fingerprint()
+            .map_err(|error| LiveError(error.to_string()))?,
+        adapter_sha256: artifact.sha256.clone(),
+    })
+}
+
+/// Human review record bound to one already verified adapter artifact.
+///
+/// The two reviewer identities are evidence inputs; a deployment owner must
+/// validate them against its change-management/IAM system before constructing
+/// this adapter. This crate never manufactures an approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapitalAdapterReview {
+    /// Canonical review record ID.
+    pub review_id: String,
+    /// Release identity reviewed.
+    pub release_id: String,
+    /// Exact signed manifest fingerprint.
+    pub manifest_hash: String,
+    /// Exact adapter artifact hash.
+    pub adapter_sha256: String,
+    /// Primary security/code reviewer.
+    pub primary_reviewer: String,
+    /// Independent operational/risk reviewer.
+    pub secondary_reviewer: String,
+    /// Canonical UTC review completion time.
+    pub reviewed_at: String,
+}
+
+impl CapitalAdapterReview {
+    fn validate(&self, release: &VerifiedCapitalAdapterRelease) -> Result<(), LiveError> {
+        for (name, value) in [
+            ("capital adapter review_id", self.review_id.as_str()),
+            (
+                "capital adapter primary reviewer",
+                self.primary_reviewer.as_str(),
+            ),
+            (
+                "capital adapter secondary reviewer",
+                self.secondary_reviewer.as_str(),
+            ),
+        ] {
+            validate_canonical_id(name, value).map_err(|error| LiveError(error.to_string()))?;
+        }
+        validate_utc_timestamp("capital adapter reviewed_at", &self.reviewed_at)
+            .map_err(|error| LiveError(error.to_string()))?;
+        if self.primary_reviewer == self.secondary_reviewer
+            || self.release_id != release.release_id
+            || self.manifest_hash != release.manifest_hash
+            || self.adapter_sha256 != release.adapter_sha256
+        {
+            return Err(LiveError(
+                "capital adapter review is not independent or does not bind the verified release"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Explicit, narrowly bounded IBKR LIVE endpoint and canary envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IbkrLiveGatewayConfiguration {
+    /// Canonical controlled-LIVE account ID.
+    pub account_id: String,
+    /// Only a colocated loopback TWS/Gateway is accepted.
+    pub host: String,
+    /// IBKR LIVE TWS (7496) or Gateway (4001) port.
+    pub port: u16,
+    /// Must be `LIVE`.
+    pub environment: String,
+    /// Maximum exact quantity accepted by this edge adapter.
+    pub maximum_quantity: Decimal,
+    /// Maximum limit-price notional accepted by this edge adapter.
+    pub maximum_notional: Decimal,
+    /// Explicit instrument canary allow-list.
+    pub allowed_instruments: BTreeSet<String>,
+}
+
+impl IbkrLiveGatewayConfiguration {
+    /// Validates the endpoint and a deliberately narrow canary envelope.
+    pub fn validate(&self) -> Result<(), LiveError> {
+        validate_canonical_id("IBKR live account_id", &self.account_id)
+            .map_err(|error| LiveError(error.to_string()))?;
+        if !matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+            || !matches!(self.port, 7496 | 4001)
+            || self.environment != "LIVE"
+            || self.maximum_quantity <= Decimal::ZERO
+            || self.maximum_notional <= Decimal::ZERO
+            || self.allowed_instruments.is_empty()
+        {
+            return Err(LiveError(
+                "IBKR LIVE adapter requires loopback LIVE port and positive canary limits"
+                    .to_owned(),
+            ));
+        }
+        for instrument in &self.allowed_instruments {
+            validate_canonical_id("IBKR live allowed instrument", instrument)
+                .map_err(|error| LiveError(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Vendor transport seam that must be implemented only by the reviewed IBKR
+/// API package. Secret bytes are received for connection and must not be stored,
+/// logged, or returned.
+pub trait IbkrLiveGatewayTransport {
+    /// Establishes the capital-bearing broker connection.
+    fn connect_live(
+        &mut self,
+        configuration: &IbkrLiveGatewayConfiguration,
+        credential: &[u8],
+    ) -> Result<(), LiveError>;
+    /// Sends one already approved normalized request idempotently.
+    fn submit_live(
+        &mut self,
+        request: &LiveBrokerOrderRequest,
+    ) -> Result<LiveBrokerSubmitResult, LiveError>;
+    /// Requests cancellation.
+    fn cancel_live(&mut self, client_order_id: &str) -> Result<(), LiveError>;
+    /// Requests a price-only replacement.
+    fn replace_live(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError>;
+    /// Drains normalized asynchronous events.
+    fn poll_live(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError>;
+    /// Retrieves an independent account snapshot.
+    fn live_account_snapshot(
+        &mut self,
+        account_id: &str,
+    ) -> Result<LiveBrokerAccountSnapshot, LiveError>;
+    /// Best-effort cancellation of every working order for emergency stop.
+    fn cancel_all_live(&mut self, account_id: &str) -> Result<(), LiveError>;
+    /// Closes the live connection and clears transport-held credentials.
+    fn disconnect_live(&mut self);
+}
+
+/// Capital-bearing IBKR adapter that remains inert until signed-release and
+/// four-eyes review evidence are both supplied.
+pub struct IbkrControlledLiveAdapter<T> {
+    configuration: IbkrLiveGatewayConfiguration,
+    release: VerifiedCapitalAdapterRelease,
+    review: CapitalAdapterReview,
+    transport: T,
+    connected: bool,
+    initial_snapshot_observed: bool,
+    emergency_stop: bool,
+}
+
+impl<T: IbkrLiveGatewayTransport> IbkrControlledLiveAdapter<T> {
+    /// Constructs an inert adapter after checking release and review bindings.
+    pub fn new(
+        configuration: IbkrLiveGatewayConfiguration,
+        release: VerifiedCapitalAdapterRelease,
+        review: CapitalAdapterReview,
+        transport: T,
+    ) -> Result<Self, LiveError> {
+        configuration.validate()?;
+        review.validate(&release)?;
+        Ok(Self {
+            configuration,
+            release,
+            review,
+            transport,
+            connected: false,
+            initial_snapshot_observed: false,
+            emergency_stop: false,
+        })
+    }
+
+    /// Returns the bound signed release evidence.
+    pub fn verified_release(&self) -> &VerifiedCapitalAdapterRelease {
+        &self.release
+    }
+
+    /// Returns the externally supplied independent review record.
+    pub fn review(&self) -> &CapitalAdapterReview {
+        &self.review
+    }
+
+    /// Irreversibly stops new submissions for this adapter instance, then
+    /// attempts broker-wide cancellation. The stop remains active even when
+    /// cancellation transport fails.
+    pub fn activate_emergency_stop(&mut self) -> Result<(), LiveError> {
+        self.emergency_stop = true;
+        self.transport
+            .cancel_all_live(&self.configuration.account_id)
+    }
+
+    /// Releases the reviewed transport during controlled shutdown.
+    pub fn into_transport(mut self) -> T {
+        self.transport.disconnect_live();
+        self.transport
+    }
+
+    fn require_submission_ready(&self, request: &LiveBrokerOrderRequest) -> Result<(), LiveError> {
+        if !self.connected || !self.initial_snapshot_observed || self.emergency_stop {
+            return Err(LiveError(
+                "IBKR LIVE adapter is disconnected, unreconciled, or emergency-stopped".to_owned(),
+            ));
+        }
+        if request.account_id != self.configuration.account_id
+            || !self
+                .configuration
+                .allowed_instruments
+                .contains(&request.instrument_id)
+            || request.quantity <= Decimal::ZERO
+            || request.quantity > self.configuration.maximum_quantity
+        {
+            return Err(LiveError(
+                "IBKR LIVE request exceeds the reviewed canary envelope".to_owned(),
+            ));
+        }
+        let limit_price = request.limit_price.ok_or_else(|| {
+            LiveError("IBKR LIVE canary requires a price-protected limit order".to_owned())
+        })?;
+        let notional = request.quantity.checked_mul(limit_price)?;
+        if notional > self.configuration.maximum_notional {
+            return Err(LiveError(
+                "IBKR LIVE request exceeds maximum canary notional".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<T: IbkrLiveGatewayTransport> LiveBrokerAdapter for IbkrControlledLiveAdapter<T> {
+    fn connect(&mut self, account_id: &str, credential: &SecretMaterial) -> Result<(), LiveError> {
+        if account_id != self.configuration.account_id || self.emergency_stop {
+            return Err(LiveError(
+                "IBKR LIVE connection account mismatch or emergency stop".to_owned(),
+            ));
+        }
+        credential.expose_to(|bytes| self.transport.connect_live(&self.configuration, bytes))?;
+        self.connected = true;
+        self.initial_snapshot_observed = false;
+        if self
+            .transport
+            .live_account_snapshot(&self.configuration.account_id)
+            .is_err()
+        {
+            self.connected = false;
+            self.transport.disconnect_live();
+            return Err(LiveError(
+                "IBKR LIVE initial account snapshot failed".to_owned(),
+            ));
+        }
+        self.initial_snapshot_observed = true;
+        Ok(())
+    }
+
+    fn submit(
+        &mut self,
+        request: &LiveBrokerOrderRequest,
+    ) -> Result<LiveBrokerSubmitResult, LiveError> {
+        self.require_submission_ready(request)?;
+        self.transport.submit_live(request)
+    }
+
+    fn cancel(&mut self, client_order_id: &str) -> Result<(), LiveError> {
+        validate_canonical_id("IBKR live cancel client_order_id", client_order_id)
+            .map_err(|error| LiveError(error.to_string()))?;
+        if !self.connected {
+            return Err(LiveError("IBKR LIVE adapter is disconnected".to_owned()));
+        }
+        self.transport.cancel_live(client_order_id)
+    }
+
+    fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
+        if !self.connected || self.emergency_stop {
+            return Err(LiveError("IBKR LIVE replacement is disabled".to_owned()));
+        }
+        self.transport.replace_live(request)
+    }
+
+    fn poll(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError> {
+        if !self.connected {
+            return Err(LiveError("IBKR LIVE adapter is disconnected".to_owned()));
+        }
+        self.transport.poll_live()
+    }
+
+    fn snapshot(&mut self, account_id: &str) -> Result<LiveBrokerAccountSnapshot, LiveError> {
+        if account_id != self.configuration.account_id || !self.connected {
+            return Err(LiveError(
+                "IBKR LIVE snapshot account mismatch or disconnected adapter".to_owned(),
+            ));
+        }
+        let snapshot = self.transport.live_account_snapshot(account_id)?;
+        self.initial_snapshot_observed = true;
+        Ok(snapshot)
+    }
+
+    fn reconnect(
+        &mut self,
+        account_id: &str,
+        credential: &SecretMaterial,
+    ) -> Result<(), LiveError> {
+        self.connected = false;
+        self.initial_snapshot_observed = false;
+        self.transport.disconnect_live();
+        if self.emergency_stop {
+            return Err(LiveError(
+                "IBKR LIVE adapter cannot reconnect after emergency stop".to_owned(),
+            ));
+        }
+        self.connect(account_id, credential)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,5 +1182,181 @@ mod tests {
             .cancel_paper_order("order.1")
             .expect_err("poisoned session must reject later work");
         assert!(error.0.contains("unhealthy"));
+    }
+}
+
+#[cfg(test)]
+mod live_adapter_tests {
+    use super::*;
+    use follon_domain::Side;
+    use follon_live::{LiveBrokerOrderSnapshot, LiveBrokerPositionSnapshot};
+
+    #[derive(Default)]
+    struct FakeLiveTransport {
+        connected: bool,
+        submissions: usize,
+        cancel_all_calls: usize,
+    }
+
+    impl IbkrLiveGatewayTransport for FakeLiveTransport {
+        fn connect_live(
+            &mut self,
+            _configuration: &IbkrLiveGatewayConfiguration,
+            credential: &[u8],
+        ) -> Result<(), LiveError> {
+            if credential != b"managed-secret" {
+                return Err(LiveError("credential rejected".to_owned()));
+            }
+            self.connected = true;
+            Ok(())
+        }
+
+        fn submit_live(
+            &mut self,
+            _request: &LiveBrokerOrderRequest,
+        ) -> Result<LiveBrokerSubmitResult, LiveError> {
+            self.submissions += 1;
+            Ok(LiveBrokerSubmitResult::Acknowledged {
+                broker_order_id: "ibkr.live.1".to_owned(),
+            })
+        }
+
+        fn cancel_live(&mut self, _client_order_id: &str) -> Result<(), LiveError> {
+            Ok(())
+        }
+
+        fn replace_live(&mut self, _request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
+            Ok(())
+        }
+
+        fn poll_live(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError> {
+            Ok(Vec::new())
+        }
+
+        fn live_account_snapshot(
+            &mut self,
+            _account_id: &str,
+        ) -> Result<LiveBrokerAccountSnapshot, LiveError> {
+            if !self.connected {
+                return Err(LiveError("not connected".to_owned()));
+            }
+            Ok(LiveBrokerAccountSnapshot {
+                orders: Vec::<LiveBrokerOrderSnapshot>::new(),
+                positions: Vec::<LiveBrokerPositionSnapshot>::new(),
+                cash: Decimal::from_integer(1_000).unwrap(),
+            })
+        }
+
+        fn cancel_all_live(&mut self, _account_id: &str) -> Result<(), LiveError> {
+            self.cancel_all_calls += 1;
+            Ok(())
+        }
+
+        fn disconnect_live(&mut self) {
+            self.connected = false;
+        }
+    }
+
+    fn release() -> VerifiedCapitalAdapterRelease {
+        VerifiedCapitalAdapterRelease {
+            release_id: "release.canary".to_owned(),
+            manifest_hash: "a".repeat(64),
+            adapter_sha256: "b".repeat(64),
+        }
+    }
+
+    fn review() -> CapitalAdapterReview {
+        CapitalAdapterReview {
+            review_id: "review.ibkr-live".to_owned(),
+            release_id: "release.canary".to_owned(),
+            manifest_hash: "a".repeat(64),
+            adapter_sha256: "b".repeat(64),
+            primary_reviewer: "user.security".to_owned(),
+            secondary_reviewer: "user.risk".to_owned(),
+            reviewed_at: "2026-08-24T10:00:00Z".to_owned(),
+        }
+    }
+
+    fn configuration() -> IbkrLiveGatewayConfiguration {
+        IbkrLiveGatewayConfiguration {
+            account_id: "acct.live.001".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 7496,
+            environment: "LIVE".to_owned(),
+            maximum_quantity: Decimal::from_integer(2).unwrap(),
+            maximum_notional: Decimal::from_integer(250).unwrap(),
+            allowed_instruments: BTreeSet::from(["aapl.xnas".to_owned()]),
+        }
+    }
+
+    fn request(quantity: i64, price: Option<i64>) -> LiveBrokerOrderRequest {
+        LiveBrokerOrderRequest {
+            client_order_id: "order.live.1".to_owned(),
+            account_id: "acct.live.001".to_owned(),
+            instrument_id: "aapl.xnas".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(quantity).unwrap(),
+            limit_price: price.map(|value| Decimal::from_integer(value).unwrap()),
+        }
+    }
+
+    #[test]
+    fn review_requires_two_distinct_people_and_exact_release_binding() {
+        let mut invalid = review();
+        invalid.secondary_reviewer = invalid.primary_reviewer.clone();
+        assert!(IbkrControlledLiveAdapter::new(
+            configuration(),
+            release(),
+            invalid,
+            FakeLiveTransport::default(),
+        )
+        .is_err());
+        let mut invalid = review();
+        invalid.adapter_sha256 = "c".repeat(64);
+        assert!(IbkrControlledLiveAdapter::new(
+            configuration(),
+            release(),
+            invalid,
+            FakeLiveTransport::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn live_adapter_requires_secret_snapshot_limit_price_and_canary_envelope() {
+        let mut adapter = IbkrControlledLiveAdapter::new(
+            configuration(),
+            release(),
+            review(),
+            FakeLiveTransport::default(),
+        )
+        .unwrap();
+        assert!(adapter.submit(&request(1, Some(100))).is_err());
+        let secret = SecretMaterial::new(b"managed-secret".to_vec()).unwrap();
+        adapter.connect("acct.live.001", &secret).unwrap();
+        assert!(adapter.submit(&request(1, None)).is_err());
+        assert!(adapter.submit(&request(3, Some(100))).is_err());
+        assert!(matches!(
+            adapter.submit(&request(2, Some(100))).unwrap(),
+            LiveBrokerSubmitResult::Acknowledged { .. }
+        ));
+        adapter.activate_emergency_stop().unwrap();
+        assert!(adapter.submit(&request(1, Some(100))).is_err());
+        let transport = adapter.into_transport();
+        assert_eq!(transport.submissions, 1);
+        assert_eq!(transport.cancel_all_calls, 1);
+    }
+
+    #[test]
+    fn live_configuration_rejects_paper_port_remote_host_and_empty_allow_list() {
+        let mut invalid = configuration();
+        invalid.port = 7497;
+        assert!(invalid.validate().is_err());
+        invalid = configuration();
+        invalid.host = "api.example.com".to_owned();
+        assert!(invalid.validate().is_err());
+        invalid = configuration();
+        invalid.allowed_instruments.clear();
+        assert!(invalid.validate().is_err());
     }
 }

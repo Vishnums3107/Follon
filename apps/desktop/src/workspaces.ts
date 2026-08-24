@@ -39,6 +39,19 @@ type DatasetSummary = Readonly<{
   content_sha256?: string;
 }>;
 
+type NotebookSummary = Readonly<{
+  artifact: string;
+  modified_at: string;
+  bytes: number;
+  nbformat: number;
+  cell_count: number;
+  code_cells: number;
+  markdown_cells: number;
+  output_count: number;
+  kernel: string;
+  language: string;
+}>;
+
 type BacktestSummary = Readonly<{
   artifact: string;
   modified_at: string;
@@ -63,6 +76,7 @@ export type WorkspaceSnapshot = Readonly<{
   counts: Readonly<Record<string, number>>;
   feature_artifact_counts: Readonly<Record<string, number>>;
   datasets: readonly DatasetSummary[];
+  notebooks: readonly NotebookSummary[];
   backtests: readonly BacktestSummary[];
   experiments: readonly SnapshotRecord[];
   manifests: readonly SnapshotRecord[];
@@ -100,13 +114,20 @@ const OMS_LIFECYCLE_COVERAGE: ReadonlyArray<readonly [string, string, string]> =
 
 export function parseWorkspaceSnapshot(value: unknown): WorkspaceSnapshot {
   if (!isRecord(value) || value.workspace_schema_version !== 1 || value.read_only !== true ||
-      typeof value.generated_at !== "string" || !isNumberRecord(value.counts) ||
-      !isNumberRecord(value.feature_artifact_counts) || !Array.isArray(value.datasets) ||
-      !Array.isArray(value.backtests) || !Array.isArray(value.experiments) ||
+      typeof value.generated_at !== "string" || !isCountRecord(value.counts, [
+        "artifacts", "datasets", "notebooks", "backtests", "experiments", "events", "journals", "commercial_records",
+      ]) || !isCountRecord(value.feature_artifact_counts, [
+        "market-data", "replay", "research", "paper", "controlled-live", "operations", "options", "commercial",
+        "execution-risk", "accounting", "identity", "platform",
+      ]) || !Array.isArray(value.datasets) || !Array.isArray(value.notebooks) || !Array.isArray(value.backtests) || !Array.isArray(value.experiments) ||
       !Array.isArray(value.manifests) || !Array.isArray(value.events) ||
       !Array.isArray(value.journals) || !Array.isArray(value.commercial) ||
       !Array.isArray(value.commercial_artifacts)) {
     throw new Error("The workspace projection does not match the v1 read-only contract.");
+  }
+  if (!value.datasets.every(isDatasetSummary) || !value.notebooks.every(isNotebookSummary) || !value.backtests.every(isBacktestSummary) ||
+      !value.commercial_artifacts.every(isEvidenceArtifact)) {
+    throw new Error("The workspace projection contains invalid typed evidence.");
   }
   for (const item of [...value.experiments, ...value.manifests, ...value.events, ...value.journals, ...value.commercial]) {
     if (!isSnapshotRecord(item)) {
@@ -177,13 +198,15 @@ function renderCommandCenter(
   const operations = operationsDashboard(snapshot);
   const paper = paperDashboard(snapshot);
   const live = liveDashboard(snapshot);
+  const strategyIdentities = strategyIdentityRows(snapshot, operations);
+  const openGateCount = (paper?.promotion_eligible ? 0 : 1) + (live?.promotion_eligible ? 0 : 1) + 3;
   const alertCount = (operations?.alerts.length ?? 0) + (paper?.unexplained_incidents ?? 0) +
     (live?.unresolved_incidents ?? 0) + (paper?.unknown_orders ?? 0) + (live?.unknown_orders ?? 0);
   renderMetrics(summaryRoot, [
-    ["Runtime services", services.length === 0 ? "Unavailable" : `${healthyServices}/${services.length}`, "Dashboard, PostgreSQL, and object storage", healthyServices === services.length ? "good" : "bad"],
+    ["Runtime services", services.length === 0 ? "Unavailable" : `${healthyServices}/${services.length}`, "Dashboard, gRPC kernel, PostgreSQL, and object storage", healthyServices === services.length ? "good" : "bad"],
     ["Indexed evidence", String(snapshot.counts.artifacts ?? 0), "Immutable artifacts across the complete repository"],
     ["Operator attention", String(alertCount), "Alerts, unknown orders, and unresolved discrepancies", alertCount === 0 ? "good" : "bad"],
-    ["External gates", "5 open", "PAPER, LIVE, partner, broker-options, and commercial evidence", "warn"],
+    ["External gates", `${openGateCount} open`, "PAPER, LIVE, partner, broker-options, and commercial evidence", openGateCount === 0 ? "good" : "warn"],
   ]);
 
   const serviceSection = createPanel("Runtime and dependencies", "Live health from the container boundary.");
@@ -192,6 +215,16 @@ function renderCommandCenter(
   ]);
   appendTableOrEmpty(serviceSection, ["Service", "Status", "Detail"], serviceRows, "Runtime health is unavailable.");
   root.append(serviceSection);
+
+  const operatingStatus = createPanel("System, broker, strategy, and risk status", "One evidence-backed operating view; an unavailable source is never treated as healthy.");
+  appendTableOrEmpty(operatingStatus, ["Area", "Status", "Evidence"], [
+    ["System dependencies", services.length === 0 ? "UNAVAILABLE" : healthyServices === services.length ? "HEALTHY" : "DEGRADED", services.length === 0 ? "No runtime status" : `${healthyServices}/${services.length} healthy`],
+    ["Strategy identities", strategyIdentities.length > 0 ? "EVIDENCED" : "UNAVAILABLE", `${strategyIdentities.length} versioned identity record(s)`],
+    ["Risk", operations?.risk.state ?? "UNAVAILABLE", operations === undefined ? "No operations projection" : `${operations.risk.limits.length} evaluated limit(s)`],
+    ["PAPER broker", paper === undefined ? "UNAVAILABLE" : paper.broker_connected ? "CONNECTED" : "DISCONNECTED", paper?.account_id ?? "No PAPER projection"],
+    ["Controlled-LIVE broker", live === undefined ? "UNAVAILABLE" : live.broker_connected ? "CONNECTED" : "DISCONNECTED", live?.account_id ?? "No controlled-LIVE projection"],
+  ], "No operating-status evidence is available.");
+  root.append(operatingStatus);
 
   const environment = createPanel("Environment readiness", "Code capability is separated from observed operating evidence.");
   appendTableOrEmpty(environment, ["Environment / gate", "Observed", "Required", "Decision"], [
@@ -223,9 +256,9 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   const options = optionsDashboard(snapshot);
   renderMetrics(summaryRoot, [
     ["Datasets", String(snapshot.datasets.length), "CSV and immutable Parquet receipts indexed with row and schema metadata"],
+    ["Notebooks", String(snapshot.notebooks.length), "Inert Jupyter metadata; notebook code and outputs are never executed"],
     ["Experiments", String(snapshot.experiments.length), "Immutable experiment catalogue records"],
     ["Backtest artifacts", String(snapshot.backtests.length), "Reproducible completed runs"],
-    ["Option contracts", String(options?.analytics.length ?? 0), "Frozen European-option analytics"],
   ]);
   const datasets = createPanel("Dataset inventory", "Historical inputs currently available to deterministic research workflows, including verified Parquet receipts.");
   appendTableOrEmpty(datasets, ["Dataset", "Version / format", "Rows", "Columns", "Modified"], snapshot.datasets.map((dataset) => [
@@ -234,6 +267,13 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     String(dataset.rows), dataset.columns.join(", "), formatTime(dataset.modified_at),
   ]), "No indexed datasets are available.", (index) => context.onOpenArtifact(snapshot.datasets[index]?.name ?? ""));
   root.append(datasets);
+
+  const notebooks = createPanel("Notebook inventory", "Jupyter notebooks are indexed as inert research evidence. The dashboard never executes cells, JavaScript outputs, or embedded HTML.");
+  appendTableOrEmpty(notebooks, ["Notebook", "Format", "Cells", "Code", "Markdown", "Outputs", "Kernel / language", "Modified"], snapshot.notebooks.map((notebook) => [
+    notebook.artifact, `nbformat ${notebook.nbformat}`, String(notebook.cell_count), String(notebook.code_cells), String(notebook.markdown_cells),
+    String(notebook.output_count), [notebook.kernel, notebook.language].filter(Boolean).join(" / "), formatTime(notebook.modified_at),
+  ]), "No Jupyter notebook evidence is currently indexed.", (index) => context.onOpenArtifact(snapshot.notebooks[index]?.artifact ?? ""));
+  root.append(notebooks);
 
   const experiments = createPanel("Experiment catalogue", "Content-addressed runs and linked output identities.");
   appendTableOrEmpty(experiments, ["Experiment", "Run", "Artifact fingerprint", "Event output", "Source"], snapshot.experiments.map((record) => [
@@ -278,13 +318,19 @@ function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snaps
 }
 
 function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
-  const completed = snapshot.backtests.filter((run) => Object.keys(run.performance).length > 0);
-  const fingerprints = new Set(snapshot.backtests.map((run) => text(run.artifact_fingerprint)).filter(Boolean));
+  const fills = snapshot.events.filter((item) =>
+    field(item.data, "event_type") === "execution.fill.v1" &&
+    (field(item.data, "source") === "simulator" || field(item.data, "actor") === "simulator")
+  );
+  const taggedExperiments = snapshot.experiments.filter((item) => {
+    const tags = record(item.data.tags);
+    return Boolean(field(tags, "regime") || field(tags, "sensitivity") || field(tags, "scenario"));
+  });
   renderMetrics(summaryRoot, [
     ["Completed runs", String(snapshot.backtests.length), "Immutable backtest artifacts"],
-    ["Unique outputs", String(fingerprints.size), "Content-addressed artifact fingerprints"],
+    ["Recorded fills", String(fills.length), "Canonical simulated execution.fill.v1 evidence"],
+    ["Experiment records", String(snapshot.experiments.length), `${taggedExperiments.length} with regime or sensitivity dimensions`],
     ["Completion manifests", String(snapshot.manifests.length), "SHA-256 publication records"],
-    ["Metric-complete", String(completed.length), "Runs with performance and accounting summaries"],
   ]);
   const runs = createPanel("Run comparison", "Compare performance, accounting, and provenance without rerunning or mutating results.");
   appendTableOrEmpty(runs, ["Artifact", "Strategy", "Dataset", "Trades", "Net P&L", "Return bps", "Max drawdown", "Fingerprint"], snapshot.backtests.slice(0, 50).map((run) => {
@@ -295,6 +341,42 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
   }), "No backtest result artifacts are available.", (index) => context.onOpenArtifact(snapshot.backtests[index]?.artifact ?? ""));
   root.append(runs);
 
+  const trades = createPanel("Trade evidence", "Inspect each canonical simulated execution rather than relying only on aggregate trade counts.");
+  appendTableOrEmpty(trades, ["Time", "Execution", "Order", "Instrument", "Side", "Quantity", "Price", "Fee", "Source"], fills.slice(0, 300).map((item) => {
+    const payload = record(item.data.payload);
+    return [
+      field(payload, "executed_at") || field(item.data, "event_time"),
+      field(payload, "execution_id"),
+      field(payload, "order_id"),
+      field(payload, "instrument_id") || field(item.data, "instrument_id"),
+      field(payload, "side"),
+      field(payload, "quantity"),
+      field(payload, "price"),
+      field(payload, "fee"),
+      item.artifact,
+    ];
+  }), "No canonical fill events are available for the indexed backtests.", (index) => context.onOpenArtifact(fills[index]?.artifact ?? ""));
+  root.append(trades);
+
+  const dimensions = createPanel("Regime and sensitivity dimensions", "Experiment tags remain attached to immutable run identities; missing tags are reported explicitly rather than inferred from results.");
+  appendTableOrEmpty(dimensions, ["Experiment", "Run", "Regime", "Sensitivity / scenario", "Other dimensions", "Specification", "Source"], snapshot.experiments.map((item) => {
+    const tags = record(item.data.tags);
+    const otherTags = Object.entries(tags)
+      .filter(([key]) => key !== "regime" && key !== "sensitivity" && key !== "scenario")
+      .map(([key, value]) => `${key}=${text(value)}`)
+      .join(" | ");
+    return [
+      field(item.data, "experiment_id"),
+      field(item.data, "run_id"),
+      field(tags, "regime") || "Not tagged",
+      field(tags, "sensitivity") || field(tags, "scenario") || "Not tagged",
+      otherTags || "None",
+      shortHash(field(item.data, "specification_fingerprint")),
+      item.artifact,
+    ];
+  }), "No experiment records are available; regime and sensitivity comparisons require tagged immutable runs.", (index) => context.onOpenArtifact(snapshot.experiments[index]?.artifact ?? ""));
+  root.append(dimensions);
+
   const executionModel = createPanel("Execution realism model", "Every run binds these deterministic assumptions through its immutable configuration fingerprint.");
   appendDefinition(executionModel, [
     ["Quoted spread", "Buys pay and sells concede half of the configured full spread"],
@@ -303,6 +385,10 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
     ["Latency", "A configured number of complete market bars must pass before fill eligibility"],
     ["Partial fills", "An optional per-bar quantity cap persists remaining quantity as a working order"],
     ["Trading halts", "Version-controlled venue or instrument halt windows block strategy evaluation"],
+    ["Survivorship", "Every replay bar must belong to an effective-dated point-in-time universe interval"],
+    ["Short and borrow", "Explicit shortability, borrow availability/recalls, and daily financing accrue without look-ahead"],
+    ["Delistings", "A versioned terminal settlement closes long or short positions and preserves realized P&L evidence"],
+    ["Capital", "Fresh FX and portfolio-wide initial margin are evaluated before an advanced-account fill is committed"],
   ]);
   root.append(executionModel);
 
@@ -353,10 +439,27 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
   }), "No execution lifecycle events are available.", (index) => context.onOpenArtifact(executionEvents[index]?.artifact ?? ""));
   root.append(blotter);
 
+  const riskDecisions = snapshot.events.filter((item) => field(item.data, "event_type") === "risk.decision.v1");
+  const risk = createPanel("Explainable risk decisions", "Every approval and rejection exposes the exact rule outcomes, evaluated inputs and thresholds, policy version, and decision actor.");
+  appendTableOrEmpty(risk, ["Time", "Decision", "Intent", "Outcome", "Reason codes", "Evaluated inputs and limits", "Policy", "Actor"], riskDecisions.slice(0, 300).map((item) => {
+    const payload = record(item.data.payload);
+    return [
+      field(item.data, "event_time"),
+      field(payload, "decision_id"),
+      field(payload, "intent_id"),
+      payload.approved === true ? "APPROVED" : payload.approved === false ? "REJECTED" : "UNKNOWN",
+      stringList(payload.reason_codes).join(", "),
+      field(payload, "evaluated_limits"),
+      field(payload, "policy_version"),
+      field(payload, "actor"),
+    ];
+  }), "No immutable risk-decision events are available.", (index) => context.onOpenArtifact(riskDecisions[index]?.artifact ?? ""));
+  root.append(risk);
+
   const lifecycle = createPanel("Broker lifecycle condition coverage", "Explicit handling for the out-of-order and modification cases recorded in the system review.");
   appendTableOrEmpty(lifecycle, ["Condition", "Implementation", "Invariant"], OMS_LIFECYCLE_COVERAGE.map((row) => [...row]), "No lifecycle coverage metadata is available.");
   root.append(lifecycle);
-  root.append(renderFeatureEvidence(context, ["replay", "paper", "controlled-live"]));
+  root.append(renderFeatureEvidence(context, ["replay", "paper", "controlled-live", "execution-risk"]));
 }
 
 function renderRiskCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
@@ -396,7 +499,7 @@ function renderRiskCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   alertRows.push(["LIVE", "RECONCILIATION", live?.account_id ?? "No snapshot", reconciliationText(live?.last_reconciliation_clean, live?.last_reconciled_at)]);
   appendTableOrEmpty(alerts, ["Scope", "Code", "Subject", "State"], alertRows, "No alerts or reconciliation records are available.");
   root.append(alerts);
-  root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations"]));
+  root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations", "execution-risk"]));
 }
 
 function renderPortfolio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
@@ -432,7 +535,7 @@ function renderPortfolio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: 
     ]), "No scenario rows are available.");
     root.append(scenario);
   }
-  root.append(renderFeatureEvidence(context, ["replay", "paper", "operations", "options"]));
+  root.append(renderFeatureEvidence(context, ["replay", "paper", "operations", "options", "execution-risk", "accounting"]));
 }
 
 function renderReplayAndIncidents(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
@@ -489,13 +592,20 @@ function renderJournal(summaryRoot: HTMLElement, root: HTMLElement, snapshot: Wo
   ], "No integrity heads are available.");
   root.append(integrity);
 
-  const records = createPanel("Unified append-only journal", "Entries remain separated by source domain and retain their original artifact.");
-  appendTableOrEmpty(records, ["Domain", "Sequence", "Time", "Event type", "Actor", "Record hash", "Artifact"], snapshot.journals.slice(0, 500).map((item) => [
-    (item.category ?? "unknown").toUpperCase(), field(item.data, "sequence"), field(item.data, "occurred_at"), field(item.data, "event_type") || "State snapshot",
-    field(item.data, "actor"), shortHash(field(item.data, "entry_hash") || field(item.data, "record_hash")), item.artifact,
+  const records = createPanel("Unified append-only journal", "Decisions, annotations, and review evidence remain separated by source domain and retain their original artifact.");
+  appendTableOrEmpty(records, ["Domain", "Sequence", "Time", "Event type", "Entry / correlation", "Actor", "Details / annotation", "Record hash", "Artifact"], snapshot.journals.slice(0, 500).map((item) => [
+    (item.category ?? "unknown").toUpperCase(),
+    field(item.data, "sequence"),
+    field(item.data, "occurred_at"),
+    field(item.data, "event_type") || "State snapshot",
+    field(item.data, "entry_id") || field(item.data, "correlation_id"),
+    field(item.data, "actor"),
+    keyValueText(item.data.details),
+    shortHash(field(item.data, "entry_hash") || field(item.data, "record_hash")),
+    item.artifact,
   ]), "No journal records are available.", (index) => context.onOpenArtifact(snapshot.journals[index]?.artifact ?? ""));
   root.append(records);
-  root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations", "commercial"]));
+  root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations", "commercial", "accounting", "platform"]));
 }
 
 function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
@@ -509,7 +619,7 @@ function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snaps
     ["Release evidence", String(releaseArtifacts.length), "Manifest, signature, and trusted-key artifacts", releaseArtifacts.length > 0 ? "good" : "warn"],
     ["Self-host readiness", String(selfHostArtifacts.length), "Verified entitlement and signed release evidence", selfHostArtifacts.length > 0 ? "good" : "warn"],
   ]);
-  const tenants = createPanel("Commercial ledger", "Typed, pseudonymous commercial facts; this dashboard does not process payments or identity.");
+  const tenants = createPanel("Commercial ledger", "Typed, pseudonymous commercial facts; password and MFA secret material is never projected into this dashboard.");
   appendTableOrEmpty(tenants, ["Sequence", "Tenant", "Event", "Actor", "Occurred", "Record hash", "Artifact"], snapshot.commercial.map((item) => [
     field(item.data, "sequence"), field(item.data, "tenant_id"), field(item.data, "event_type"), field(item.data, "actor"),
     field(item.data, "occurred_at"), shortHash(field(item.data, "record_hash")), item.artifact,
@@ -518,23 +628,27 @@ function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snaps
 
   const controls = createPanel("Deployment and administrative controls", "Implemented evidence primitives and their enforced operating boundary.");
   appendTableOrEmpty(controls, ["Capability", "Repository implementation", "Dashboard integration", "Remaining external dependency"], [
-    ["Provisioning", "Typed tenant and workspace record", provisioned > 0 ? "Evidence visible" : "No local evidence", "Customer identity and authorization gateway"],
+    ["Provisioning", "Typed tenant and workspace record", provisioned > 0 ? "Evidence visible" : "No local evidence", "Customer onboarding acceptance"],
     ["Entitlement", "Deterministic PAID / GRACE / denied derivation", subscriptions > 0 ? "Ledger evidence visible" : "No subscription observation", "Payment-provider validation and gateway enforcement"],
     ["Privacy / retention", "Hash-bound plan and confirmed single-file execution", artifactCount(snapshot, /privacy|retention/i) > 0 ? "Artifacts visible" : "No local plan artifact", "Reviewed request, legal hold, and authorized operator"],
     ["Signed release", "Manifest plus detached Ed25519 verification", releaseArtifacts.length > 0 ? "Evidence visible" : "No local signed release evidence", "Offline HSM/KMS signing and independent review"],
-    ["Self-host readiness", "Loopback, managed-secret, signature, entitlement checks", selfHostArtifacts.length > 0 ? "Evidence visible" : "No readiness receipt", "Customer deployment, backups, TLS, and monitoring"],
-    ["Authentication / RBAC", "Basic operator gate for protected deployment", "Runtime auth mode visible", "Customer identity, roles, MFA, and revocation service"],
+    ["Customer IAM / MFA / RBAC", "Argon2id, TOTP, hashed one-time recovery codes, password rotation, opaque sessions, lockout, revocation, tenant isolation, and server-side roles", "Capability and runtime auth mode visible", "Production enrollment, out-of-band delivery, support, and acceptance evidence"],
+    ["Transactional PostgreSQL", "Checksum-bound schema, forced RLS, event-plus-outbox transaction, idempotency, balanced journals, and complete product projections", "gRPC and database health visible", "Backup/restore drill and production secret/TLS custody"],
+    ["React / Tauri", "Vite production bundle and least-privilege Tauri v2 native host", "This interface is React-owned", "Signed installer promotion and OS-specific acceptance"],
+    ["gRPC topology", "Versioned scheduled, cancel-before-replace passive, and atomic options-combination EMS plus portfolio-risk and margin APIs with production mTLS requirement", "Trading API health visible", "Production certificate issuance, ingress, monitoring, and load acceptance"],
+    ["Controlled-LIVE IBKR", "Signed artifact verification, two-reviewer binding, canary envelope, initial snapshot, and emergency stop", "Capability boundary visible", "Reviewed vendor transport, broker credentials, and capital-bearing acceptance"],
+    ["Self-host readiness", "Loopback, managed-secret, signature, entitlement checks", selfHostArtifacts.length > 0 ? "Evidence visible" : "No readiness receipt", "Customer deployment, backups, TLS, monitoring, and on-call"],
   ], "No administrative control mapping is available.");
   root.append(controls);
 
   const boundary = createPanel("Privileged-action boundary", "These operations intentionally stay outside the web process.");
   appendDefinition(boundary, [
-    ["Never accepted by this server", "Broker credentials, payment cards, private signing keys, raw customer identity, or live approval secrets"],
+    ["Never accepted by this server", "Broker credentials, payment cards, private signing keys, password/MFA material, or live approval secrets"],
     ["Operator-only commands", "Provisioning, retention execution, release signing, entitlement checks, kill switches, schedule completion, and journal append"],
     ["Why", "They require stronger identity, confirmation, filesystem, two-person, offline-signing, or broker boundaries than this local read-only dashboard provides"],
   ]);
   root.append(boundary);
-  root.append(renderFeatureEvidence(context, ["commercial"]));
+  root.append(renderFeatureEvidence(context, ["commercial", "identity", "platform"]));
 }
 
 function renderFeatureEvidence(context: WorkspaceContext, featureIds: readonly string[]): HTMLElement {
@@ -741,15 +855,55 @@ function artifactCount(snapshot: WorkspaceSnapshot, pattern: RegExp): number {
 }
 
 function isSnapshotRecord(value: unknown): value is SnapshotRecord {
-  return isRecord(value) && typeof value.artifact === "string" && isRecord(value.data);
+  return isRecord(value) && typeof value.artifact === "string" && isRecord(value.data) &&
+    (value.feature === undefined || typeof value.feature === "string") &&
+    (value.category === undefined || typeof value.category === "string") &&
+    (value.modified_at === undefined || typeof value.modified_at === "string");
 }
 
 function isSnapshotDashboard(value: unknown): value is SnapshotDashboard {
   return isRecord(value) && typeof value.artifact === "string" && typeof value.modified_at === "string" && isRecord(value.data);
 }
 
-function isNumberRecord(value: unknown): value is Record<string, number> {
-  return isRecord(value) && Object.values(value).every((item) => typeof item === "number" && Number.isFinite(item));
+function isDatasetSummary(value: unknown): value is DatasetSummary {
+  return isRecord(value) && typeof value.name === "string" && typeof value.modified_at === "string" &&
+    isCount(value.bytes) && isCount(value.rows) && Array.isArray(value.columns) &&
+    value.columns.every((column) => typeof column === "string") &&
+    (value.dataset_id === undefined || typeof value.dataset_id === "string") &&
+    (value.dataset_version === undefined || typeof value.dataset_version === "string") &&
+    (value.storage_format === undefined || typeof value.storage_format === "string") &&
+    (value.content_sha256 === undefined || typeof value.content_sha256 === "string");
+}
+
+function isNotebookSummary(value: unknown): value is NotebookSummary {
+  return isRecord(value) && typeof value.artifact === "string" && typeof value.modified_at === "string" &&
+    isCount(value.bytes) && isCount(value.nbformat) && value.nbformat > 0 && isCount(value.cell_count) &&
+    isCount(value.code_cells) && isCount(value.markdown_cells) && isCount(value.output_count) &&
+    value.code_cells + value.markdown_cells <= value.cell_count && typeof value.kernel === "string" &&
+    typeof value.language === "string";
+}
+
+function isBacktestSummary(value: unknown): value is BacktestSummary {
+  return isRecord(value) && typeof value.artifact === "string" && typeof value.modified_at === "string" &&
+    typeof value.artifact_fingerprint === "string" && typeof value.event_output_hash === "string" &&
+    typeof value.specification_fingerprint === "string" && isRecord(value.performance) &&
+    isRecord(value.report) && isRecord(value.specification);
+}
+
+function isEvidenceArtifact(value: unknown): value is EvidenceArtifact {
+  return isRecord(value) && typeof value.name === "string" && isCount(value.bytes) &&
+    typeof value.modified_at === "string" && typeof value.feature === "string" &&
+    typeof value.kind === "string" &&
+    (value.format === "ndjson" || value.format === "json" || value.format === "markdown" || value.format === "csv" || value.format === "text");
+}
+
+function isCountRecord(value: unknown, requiredKeys: readonly string[]): value is Record<string, number> {
+  return isRecord(value) && requiredKeys.every((key) => isCount(value[key])) &&
+    Object.values(value).every(isCount);
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -762,6 +916,16 @@ function record(value: unknown): Readonly<Record<string, unknown>> {
 
 function field(value: Readonly<Record<string, unknown>>, name: string): string {
   return text(value[name]);
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
+}
+
+function keyValueText(value: unknown): string {
+  return Object.entries(record(value))
+    .map(([key, item]) => `${displayName(key)}: ${text(item)}`)
+    .join(" | ");
 }
 
 function text(value: unknown): string {

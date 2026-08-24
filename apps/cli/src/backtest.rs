@@ -130,6 +130,7 @@ struct RiskDocument {
     global_kill_switch: bool,
     max_quantity: String,
     max_notional: String,
+    max_price_deviation_bps: String,
 }
 
 #[derive(Deserialize)]
@@ -513,6 +514,7 @@ fn load_runtime_configuration(
         global_kill_switch: document.risk.global_kill_switch,
         max_quantity: decimal(&document.risk.max_quantity)?,
         max_notional: decimal(&document.risk.max_notional)?,
+        max_price_deviation_bps: decimal(&document.risk.max_price_deviation_bps)?,
     };
     risk_policy.validate()?;
     let fill_model = DeterministicFillModel {

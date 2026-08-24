@@ -1,10 +1,10 @@
 # Infrastructure
 
-The foundation supports deterministic **simulation-only** replay. The compose
-file provisions non-production PostgreSQL, S3-compatible object storage, the
-read-only dashboard, and an opt-in storage tool. Local append-only evidence,
-deterministic Parquet/DuckDB datasets, and immutable MinIO artifact operations
-are implemented adapters with separate responsibilities.
+The development topology provisions non-production PostgreSQL, S3-compatible
+object storage, the read-only React dashboard, the gRPC trading API, and an
+opt-in storage tool. Local append-only evidence, transactional event/outbox
+persistence, deterministic Parquet/DuckDB datasets, and immutable MinIO artifact
+operations remain separate adapters.
 
 ## Local dependencies
 
@@ -14,22 +14,39 @@ Copy-Item infra/.env.example infra/.env
 docker compose --env-file infra/.env -f infra/compose.dev.yml up -d
 ```
 
-Open the local read-only evidence dashboard at `http://127.0.0.1:8080`. It
-shows PostgreSQL/MinIO health, the implemented capability and acceptance-gate
-map, and compatible `.ndjson`, `.json`, `.md`, and `.csv` evidence from the
-repository `var/` directory. The dashboard is loopback-only and has no trading
-controls.
+Open the local read-only evidence dashboard at `http://127.0.0.1:8080`. The
+gRPC service listens on `127.0.0.1:50051`. The dashboard shows service health,
+the implemented capability and acceptance-gate map, and compatible `.ndjson`,
+`.json`, `.md`, and `.csv` evidence from the repository `var/` directory. It is
+loopback-only and has no trading controls.
 
-For an authenticated deployment, set `FOLLON_DASHBOARD_MODE=production` plus
-both dashboard credential variables. Production mode fails closed unless the
-password is at least 16 characters. Basic authentication must be placed behind
-operator-managed TLS; it is not a substitute for an application identity,
-authorization, session, or customer-entitlement gateway.
+Development dashboard Basic authentication is an operator-only compatibility
+boundary; it is not the customer IAM service. Do not expose the development
+topology to an untrusted network.
 
 Services bind only to loopback addresses. `infra/.env` is ignored and must
-never contain broker credentials. Before deploying a service, replace local
-passwords with a managed secret provider and configure encrypted backups,
-retention, monitoring, and recovery drills.
+never contain broker credentials. The development API accepts a development
+database URL; the production API refuses direct connection-string injection.
+
+## Production candidate topology
+
+`compose.production.yml` accepts only deployment-supplied digest-pinned images
+and secret files. It requires PostgreSQL TLS, gRPC mutual TLS, dashboard TLS
+with a client certificate, and a protected dashboard password file. It does not
+create a production database, CA, secret store, or broker credential.
+
+Combine monitoring only after the deployment owns a routed Alertmanager
+configuration and monitoring client identity:
+
+```powershell
+docker compose -f infra/compose.production.yml -f infra/compose.monitoring.yml config
+```
+
+The checked-in probes and rules cover endpoint availability, missing scrapes,
+and certificate expiry. They do not prove a named on-call rotation or incident
+response. Follow the
+[production operations and evidence runbook](../docs/operations/09-production-operations-runbook.md)
+before any staging or production promotion.
 
 ## Storage tool
 

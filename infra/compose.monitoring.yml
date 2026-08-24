@@ -1,0 +1,79 @@
+# Combine with compose.production.yml. Alertmanager routing is deployment-owned
+# and must be supplied as an explicit file containing the real on-call receiver.
+services:
+  blackbox:
+    image: ${FOLLON_BLACKBOX_IMAGE:?Set a reviewed blackbox-exporter image pinned by @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    configs:
+      - source: blackbox_configuration
+        target: /etc/blackbox/blackbox.yml
+    secrets:
+      - dashboard_tls_client_ca
+      - grpc_tls_client_ca
+      - monitoring_client_certificate
+      - monitoring_client_private_key
+    read_only: true
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=16m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  prometheus:
+    image: ${FOLLON_PROMETHEUS_IMAGE:?Set a reviewed Prometheus image pinned by @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${FOLLON_METRICS_RETENTION:-30d}
+      - --web.enable-lifecycle=false
+    configs:
+      - source: prometheus_configuration
+        target: /etc/prometheus/prometheus.yml
+      - source: prometheus_alerts
+        target: /etc/prometheus/follon-alerts.yml
+    volumes:
+      - prometheus-data:/prometheus
+    read_only: true
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=16m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  alertmanager:
+    image: ${FOLLON_ALERTMANAGER_IMAGE:?Set a reviewed Alertmanager image pinned by @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    configs:
+      - source: alertmanager_configuration
+        target: /etc/alertmanager/alertmanager.yml
+    volumes:
+      - alertmanager-data:/alertmanager
+    read_only: true
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=16m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+configs:
+  blackbox_configuration:
+    file: ./monitoring/blackbox.yml
+  prometheus_configuration:
+    file: ./monitoring/prometheus.yml
+  prometheus_alerts:
+    file: ./monitoring/follon-alerts.yml
+  alertmanager_configuration:
+    file: ${FOLLON_ALERTMANAGER_CONFIG_FILE:?Set reviewed on-call routing configuration}
+
+secrets:
+  monitoring_client_certificate:
+    file: ${FOLLON_MONITORING_CLIENT_CERTIFICATE_FILE:?Set monitoring client certificate}
+  monitoring_client_private_key:
+    file: ${FOLLON_MONITORING_CLIENT_PRIVATE_KEY_FILE:?Set monitoring client private key}
+
+volumes:
+  prometheus-data:
+  alertmanager-data:

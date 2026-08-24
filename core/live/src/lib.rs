@@ -14,8 +14,8 @@ use std::str::FromStr;
 
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
-    validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent, OrderState,
-    RiskDecision, Side,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
+    OrderState, RiskDecision, Side,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
@@ -115,6 +115,8 @@ pub struct LiveRiskPolicy {
     pub max_order_quantity: Decimal,
     /// Maximum one-order estimated notional.
     pub max_order_notional: Decimal,
+    /// Maximum absolute limit-price distance from the fresh mark in basis points.
+    pub max_price_deviation_bps: Decimal,
     /// Maximum one-order canary notional; this must not exceed `max_order_notional`.
     pub canary_max_order_notional: Decimal,
     /// Maximum number of live canary submissions since activation.
@@ -133,9 +135,12 @@ impl LiveRiskPolicy {
     /// Validates all non-negotiable live limits.
     pub fn validate(&self) -> Result<(), LiveError> {
         validate_canonical_id("live trading_calendar_id", &self.trading_calendar_id)?;
+        let ten_thousand = Decimal::from_integer(10_000)?;
         if self.version.is_empty()
             || self.max_order_quantity <= Decimal::ZERO
             || self.max_order_notional <= Decimal::ZERO
+            || self.max_price_deviation_bps < Decimal::ZERO
+            || self.max_price_deviation_bps >= ten_thousand
             || self.canary_max_order_notional <= Decimal::ZERO
             || self.canary_max_order_notional > self.max_order_notional
             || self.canary_max_orders == 0
@@ -730,6 +735,8 @@ pub struct LiveRiskDecision {
     pub decided_at: String,
     /// Exact market observation fingerprint.
     pub market_fingerprint: String,
+    /// Exact evaluated inputs and thresholds retained for explanations and audit.
+    pub evaluated_limits: String,
 }
 
 /// Result of a shadow recording or controlled-live canary submission.
@@ -948,6 +955,7 @@ struct PersistentRiskDecision {
     policy_version: String,
     decided_at: String,
     market_fingerprint: String,
+    evaluated_limits: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1598,18 +1606,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             decided_at: decided_at.to_owned(),
             correlation_id: intent.correlation_id.clone(),
             actor: "live_risk_engine".to_owned(),
-            evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},mark_price={}",
-                self.policy.max_order_quantity,
-                self.policy.max_order_notional,
-                self.policy.canary_max_order_notional,
-                self.policy.canary_max_orders,
-                self.policy.max_open_orders,
-                self.policy.max_position_quantity,
-                self.policy.max_realized_loss,
-                self.policy.max_market_data_age_seconds,
-                market.mark_price,
-            ),
+            evaluated_limits: decision.evaluated_limits.clone(),
         };
         let mut oms = OmsOrder::from_approved_intent(intent, &core_decision)?;
         oms.transition(OrderState::Approved, "LIVE_RISK_APPROVED")?;
@@ -2308,6 +2305,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             })?;
         let available_cash = self.cash.checked_sub(reserved_cash)?;
         let estimated_notional = intent.quantity.checked_mul(market.mark_price)?;
+        let requested_price_deviation_bps = intent
+            .limit_price
+            .map(|price| price_deviation_bps(market.mark_price, price))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
         let projected_position = match intent.side {
             Side::Buy => current_position.checked_add(intent.quantity)?,
             Side::Sell => current_position.checked_sub(intent.quantity)?,
@@ -2318,6 +2320,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
         if estimated_notional > self.policy.max_order_notional {
             reasons.push("MAX_ORDER_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if requested_price_deviation_bps > self.policy.max_price_deviation_bps {
+            reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
         if !shadow && estimated_notional > self.policy.canary_max_order_notional {
             reasons.push("CANARY_NOTIONAL_EXCEEDED".to_owned());
@@ -2374,6 +2379,26 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if approved {
             reasons.push("APPROVED".to_owned());
         }
+        let evaluated_limits = format!(
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
+            self.policy.max_order_quantity,
+            self.policy.max_order_notional,
+            self.policy.max_price_deviation_bps,
+            self.policy.canary_max_order_notional,
+            self.policy.canary_max_orders,
+            self.policy.max_open_orders,
+            self.policy.max_position_quantity,
+            self.policy.max_realized_loss,
+            self.policy.max_market_data_age_seconds,
+            market.instrument_id,
+            market.mark_price,
+            market.observed_at,
+            intent.limit_price.map_or_else(|| "MARKET".to_owned(), |price| price.to_string()),
+            requested_price_deviation_bps,
+            estimated_notional,
+            projected_position,
+            available_cash,
+        );
         Ok(LiveRiskDecision {
             decision_id: format!("live-risk-{}", intent.intent_id),
             approved,
@@ -2381,6 +2406,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             policy_version: self.policy.version.clone(),
             decided_at: decided_at.to_owned(),
             market_fingerprint: market_fingerprint(market),
+            evaluated_limits,
         })
     }
 
@@ -3094,6 +3120,7 @@ fn configuration_fingerprint(
     let max_deployed_capital = account.max_deployed_capital.to_string();
     let max_order_quantity = policy.max_order_quantity.to_string();
     let max_order_notional = policy.max_order_notional.to_string();
+    let max_price_deviation_bps = policy.max_price_deviation_bps.to_string();
     let canary_max_order_notional = policy.canary_max_order_notional.to_string();
     let canary_max_orders = policy.canary_max_orders.to_string();
     let max_open_orders = policy.max_open_orders.to_string();
@@ -3101,7 +3128,7 @@ fn configuration_fingerprint(
     let max_realized_loss = policy.max_realized_loss.to_string();
     let max_market_data_age_seconds = policy.max_market_data_age_seconds.to_string();
     hash_fingerprint_parts(&[
-        "live-configuration-v1",
+        "live-configuration-v2",
         &account.account_id,
         &account.currency,
         &initial_cash,
@@ -3112,6 +3139,7 @@ fn configuration_fingerprint(
         &policy.trading_calendar_id,
         &max_order_quantity,
         &max_order_notional,
+        &max_price_deviation_bps,
         &canary_max_order_notional,
         &canary_max_orders,
         &max_open_orders,
@@ -3469,6 +3497,7 @@ impl From<&LiveRiskDecision> for PersistentRiskDecision {
             policy_version: decision.policy_version.clone(),
             decided_at: decision.decided_at.clone(),
             market_fingerprint: decision.market_fingerprint.clone(),
+            evaluated_limits: decision.evaluated_limits.clone(),
         }
     }
 }
@@ -3481,6 +3510,7 @@ impl TryFrom<PersistentRiskDecision> for LiveRiskDecision {
         validate_utc_timestamp("persisted live risk decision time", &value.decided_at)?;
         if value.reason_codes.is_empty()
             || value.policy_version.is_empty()
+            || value.evaluated_limits.is_empty()
             || value.market_fingerprint.len() != 64
             || !value
                 .market_fingerprint
@@ -3507,6 +3537,7 @@ impl TryFrom<PersistentRiskDecision> for LiveRiskDecision {
             policy_version: value.policy_version,
             decided_at: value.decided_at,
             market_fingerprint: value.market_fingerprint,
+            evaluated_limits: value.evaluated_limits,
         })
     }
 }
@@ -3726,6 +3757,7 @@ mod tests {
             trading_calendar_id: "calendar.nyse.v1".to_owned(),
             max_order_quantity: amount("10"),
             max_order_notional: amount("100"),
+            max_price_deviation_bps: amount("100"),
             canary_max_order_notional: amount("50"),
             canary_max_orders: 2,
             max_open_orders: 2,
@@ -4040,6 +4072,36 @@ mod tests {
             .expect("shadow decision");
         assert!(matches!(outcome, LiveSubmitOutcome::ShadowRecorded { .. }));
         assert!(!service.monitoring_dashboard().broker_connected);
+        assert_eq!(service.broker_mut().submitted, 0);
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn controlled_live_price_collar_rejection_retains_exact_limits() {
+        let path = journal_path("price-collar");
+        let mut service = test_service(LiveRunMode::Shadow, &path);
+        let mut far_limit = intent("SHADOW", "intent.shadow.price-collar.001");
+        far_limit.order_type = OrderType::Limit;
+        far_limit.limit_price = Some(amount("11"));
+        let outcome = service
+            .record_shadow_intent(
+                far_limit,
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow rejection evidence");
+        let LiveSubmitOutcome::ShadowRecorded { decision } = outcome else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"PRICE_COLLAR_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("requested_price_deviation_bps=1000.00000000"));
         assert_eq!(service.broker_mut().submitted, 0);
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");

@@ -4,7 +4,16 @@ import json
 from pathlib import Path
 import unittest
 
-from follon_strategy_sdk import OrderIntent, OrderType, Side, Strategy, StrategyBundle, TimeInForce, strategy_bundle_hash
+from follon_strategy_sdk import (
+    OrderIntent,
+    OrderType,
+    Side,
+    Strategy,
+    StrategyBundle,
+    StrategyMetric,
+    TimeInForce,
+    strategy_bundle_hash,
+)
 from follon_strategy_sdk.worker import PROTOCOL_VERSION, run_worker
 
 
@@ -71,6 +80,76 @@ class WorkerProtocolTests(unittest.TestCase):
         source_root = Path(__file__).parents[1] / "src" / "follon_strategy_sdk"
         self.assertEqual(strategy_bundle_hash(source_root), strategy_bundle_hash(source_root))
 
+    def test_worker_round_trips_bounded_services_state_and_metrics(self) -> None:
+        market_bar = {
+            "instrument_id": "inst.us_equity.spy",
+            "open": "100",
+            "high": "101",
+            "low": "99",
+            "close": "100",
+            "volume": "10",
+            "interval_seconds": 60,
+            "exchange_timezone": "America/New_York",
+        }
+        frame = {
+            "protocol_version": PROTOCOL_VERSION,
+            "type": "market_bar",
+            "context": {
+                "account_id": "acct-paper-001",
+                "strategy_id": "strategy-worker-001",
+                "strategy_version": "v1",
+                "configuration_version": "cfg-v1",
+                "replay_time": "2026-01-02T14:30:00Z",
+                "environment": "SIMULATION",
+            },
+            "bar": market_bar,
+            "services": {
+                "history": {
+                    "as_of": "2026-01-02T14:30:00Z",
+                    "records": [
+                        {
+                            "event_time": "2026-01-02T14:29:00Z",
+                            "bar": market_bar,
+                        }
+                    ],
+                },
+                "portfolio": {
+                    "as_of": "2026-01-02T14:30:00Z",
+                    "positions": [
+                        {
+                            "instrument_id": "inst.us_equity.spy",
+                            "quantity": "1",
+                            "average_cost": "99",
+                            "mark_price": "100",
+                            "currency": "USD",
+                        }
+                    ],
+                    "cash_by_currency": [{"currency": "USD", "amount": "1000"}],
+                },
+                "state": {"values": {"callback.count": 1}},
+            },
+        }
+        destination = StringIO()
+        bundle = StrategyBundle(
+            strategy_id="strategy-worker-001",
+            strategy_version="v1",
+            bundle_hash="a" * 64,
+        )
+        self.assertEqual(
+            run_worker(
+                ServiceAwareStrategy(),
+                bundle,
+                StringIO(json.dumps(frame) + "\n"),
+                destination,
+            ),
+            0,
+        )
+        _, output = [json.loads(line) for line in destination.getvalue().splitlines()]
+        self.assertIsNone(output["intent"])
+        self.assertEqual(output["state"]["values"], {"callback.count": 2})
+        self.assertEqual(len(output["state"]["fingerprint"]), 64)
+        self.assertEqual(output["metrics"][0]["value"], "2")
+
     def test_worker_rejects_unknown_protocol_fields(self) -> None:
         frame = {
             "protocol_version": PROTOCOL_VERSION,
@@ -102,6 +181,30 @@ class WorkerProtocolTests(unittest.TestCase):
             strategy_version="v1",
             bundle_hash="a" * 64,
         )
+
+
+class ServiceAwareStrategy(Strategy):
+    def on_bar(self, context, bar):
+        services = context.services
+        if services is None:
+            raise ValueError("bounded services are required")
+        history = services.history.bars(
+            bar.instrument_id,
+            starts_at="2026-01-02T14:29:00Z",
+            ends_at=context.replay_time,
+        )
+        if len(history) != 1 or services.portfolio.position(bar.instrument_id) is None:
+            raise ValueError("service snapshot is incomplete")
+        count = services.state.get("callback.count", 0)
+        services.state.set("callback.count", count + 1)
+        services.metrics.emit(
+            StrategyMetric(
+                name="callback.count",
+                value=Decimal(str(count + 1)),
+                observed_at=context.replay_time,
+            )
+        )
+        return None
 
         self.assertEqual(run_worker(EmitOneIntent(), bundle, source, destination), 2)
         frames = [json.loads(line) for line in destination.getvalue().splitlines()]

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, DomainError};
 
-/// Asset classes accepted in the first release while retaining extension names.
+/// Asset classes accepted by canonical reference-data contracts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetClass {
     /// Common stock.
@@ -16,7 +16,7 @@ pub enum AssetClass {
     Etf,
     /// Listed option contract; versioned option-chain behavior is owned by `follon-options`.
     Option,
-    /// Reserved extension point; no futures behavior exists yet.
+    /// Listed future with complete contract/settlement economics.
     Future,
 }
 
@@ -53,14 +53,14 @@ pub struct Instrument {
     pub tick_size: Decimal,
     /// Exact minimum trade quantity.
     pub lot_size: Decimal,
-    /// Exact contract multiplier (one for first-slice equities/ETFs).
+    /// Exact contract multiplier.
     pub multiplier: Decimal,
     /// Explicit calendar configuration selected by the instrument.
     pub trading_calendar_id: String,
 }
 
 impl Instrument {
-    /// Validates first-slice reference data without accepting options/futures behavior.
+    /// Validates common reference data shared by every supported asset class.
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_canonical_id("instrument_id", &self.instrument_id)?;
         validate_canonical_id("venue", &self.venue)?;
@@ -86,6 +86,145 @@ impl Instrument {
             }
         }
         Ok(())
+    }
+}
+
+/// Contract settlement method retained in canonical reference data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettlementMethod {
+    /// Cash amount is posted in the instrument currency.
+    Cash,
+    /// The underlying instrument is delivered or received.
+    Physical,
+}
+
+/// Listed-option exercise style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExerciseStyle {
+    /// Exercise only at expiration.
+    European,
+    /// Exercise on any permitted date through expiration.
+    American,
+}
+
+/// Canonical option right for reference-data validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceOptionRight {
+    /// Call option.
+    Call,
+    /// Put option.
+    Put,
+}
+
+/// Economic and settlement terms that vary by asset class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InstrumentEconomics {
+    /// Cash security settlement.
+    CashSecurity {
+        /// Contractual settlement lag in business days.
+        settlement_business_days: u8,
+    },
+    /// Complete listed-option reference terms.
+    ListedOption {
+        /// Canonical underlying instrument identity.
+        underlying_instrument_id: String,
+        /// Canonical UTC expiration/last exercise instant.
+        expires_at: String,
+        /// Exact positive strike.
+        strike: Decimal,
+        /// Call or put.
+        right: ReferenceOptionRight,
+        /// American or European exercise convention.
+        exercise_style: ExerciseStyle,
+        /// Cash or physical settlement.
+        settlement: SettlementMethod,
+        /// Business-day settlement lag after exercise/assignment.
+        settlement_business_days: u8,
+    },
+    /// Complete listed-future reference terms.
+    ListedFuture {
+        /// Stable root/product identity.
+        contract_root_id: String,
+        /// Contract expiration instant.
+        expires_at: String,
+        /// Final permissible trading instant.
+        last_trade_at: String,
+        /// Cash or physical final settlement.
+        settlement: SettlementMethod,
+        /// Canonical margin class selected by the clearing configuration.
+        margin_class: String,
+    },
+}
+
+impl InstrumentEconomics {
+    /// Validates terms against their canonical instrument class.
+    pub fn validate_for(&self, instrument: &Instrument) -> Result<(), DomainError> {
+        match (instrument.asset_class, self) {
+            (
+                AssetClass::Equity | AssetClass::Etf,
+                Self::CashSecurity {
+                    settlement_business_days,
+                },
+            ) if *settlement_business_days <= 5 => Ok(()),
+            (
+                AssetClass::Option,
+                Self::ListedOption {
+                    underlying_instrument_id,
+                    expires_at,
+                    strike,
+                    settlement_business_days,
+                    ..
+                },
+            ) => {
+                validate_canonical_id("option underlying_instrument_id", underlying_instrument_id)?;
+                validate_utc_timestamp("option expires_at", expires_at)?;
+                if *strike <= Decimal::ZERO || *settlement_business_days > 5 {
+                    return Err(DomainError("invalid listed-option economics".to_owned()));
+                }
+                Ok(())
+            }
+            (
+                AssetClass::Future,
+                Self::ListedFuture {
+                    contract_root_id,
+                    expires_at,
+                    last_trade_at,
+                    margin_class,
+                    ..
+                },
+            ) => {
+                validate_canonical_id("future contract_root_id", contract_root_id)?;
+                validate_canonical_id("future margin_class", margin_class)?;
+                validate_utc_timestamp("future expires_at", expires_at)?;
+                validate_utc_timestamp("future last_trade_at", last_trade_at)?;
+                if last_trade_at > expires_at {
+                    return Err(DomainError(
+                        "future last trade cannot follow expiration".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(DomainError(
+                "instrument economics do not match asset class".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Complete effective-dated reference record including settlement economics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteInstrumentVersion {
+    /// Core symbology, venue, currency, multiplier, and calendar record.
+    pub reference: InstrumentVersion,
+    /// Asset-class-specific economic terms.
+    pub economics: InstrumentEconomics,
+}
+
+impl CompleteInstrumentVersion {
+    /// Validates both version identity and asset-class economics.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.reference.validate()?;
+        self.economics.validate_for(&self.reference.instrument)
     }
 }
 
@@ -532,5 +671,52 @@ mod tests {
             vec![outside_session],
         )
         .is_err());
+    }
+
+    #[test]
+    fn complete_reference_data_validates_options_futures_and_settlement() {
+        let mut option = version("2026-01-01T00:00:00Z", None, "SPY260320C00500000").instrument;
+        option.instrument_id = "instrument.spy-option".to_owned();
+        option.asset_class = AssetClass::Option;
+        option.multiplier = Decimal::from_integer(100).unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: option,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: Some("2026-03-21T00:00:00Z".to_owned()),
+                reference_version: "reference.option.1".to_owned(),
+            },
+            economics: InstrumentEconomics::ListedOption {
+                underlying_instrument_id: "instrument.spy".to_owned(),
+                expires_at: "2026-03-20T20:00:00Z".to_owned(),
+                strike: Decimal::from_integer(500).unwrap(),
+                right: ReferenceOptionRight::Call,
+                exercise_style: ExerciseStyle::American,
+                settlement: SettlementMethod::Physical,
+                settlement_business_days: 1,
+            },
+        };
+        complete.validate().expect("complete option reference");
+
+        let mut future = version("2026-01-01T00:00:00Z", None, "ESM6").instrument;
+        future.instrument_id = "instrument.es-202606".to_owned();
+        future.asset_class = AssetClass::Future;
+        future.multiplier = Decimal::from_integer(50).unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: future,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference.future.1".to_owned(),
+            },
+            economics: InstrumentEconomics::ListedFuture {
+                contract_root_id: "future.es".to_owned(),
+                expires_at: "2026-06-19T20:00:00Z".to_owned(),
+                last_trade_at: "2026-06-19T15:30:00Z".to_owned(),
+                settlement: SettlementMethod::Cash,
+                margin_class: "margin.index-future".to_owned(),
+            },
+        };
+        complete.validate().expect("complete future reference");
     }
 }

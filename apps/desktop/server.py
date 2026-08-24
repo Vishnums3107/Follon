@@ -7,15 +7,19 @@ import base64
 import binascii
 import csv
 import hmac
+import math
 import mimetypes
 import os
 import re
 import socket
+from collections import deque
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from pathlib import PurePosixPath
+from threading import Lock
+from time import monotonic
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import urlopen
 
@@ -30,12 +34,14 @@ AUTH_PASSWORD_FILE = os.environ.get("FOLLON_DASHBOARD_PASSWORD_FILE", "")
 POSTGRES_HOST = os.environ.get("FOLLON_POSTGRES_HOST", "postgres")
 POSTGRES_PORT = int(os.environ.get("FOLLON_POSTGRES_INTERNAL_PORT", "5432"))
 MINIO_HEALTH_URL = os.environ.get("FOLLON_MINIO_HEALTH_URL", "http://minio:9000/minio/health/live")
+TRADING_API_HOST = os.environ.get("FOLLON_TRADING_API_HOST", "trading-api")
+TRADING_API_PORT = int(os.environ.get("FOLLON_TRADING_API_PORT", "50051"))
 MAX_EVIDENCE_BYTES = 10 * 1024 * 1024
 EVIDENCE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 STATIC_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 CANONICAL_STORAGE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
-EVIDENCE_SUFFIXES = {".ndjson", ".json", ".md", ".csv"}
+EVIDENCE_SUFFIXES = {".ndjson", ".json", ".md", ".csv", ".ipynb"}
 IGNORED_EVIDENCE_DIRECTORIES = {
     ".git",
     ".mypy_cache",
@@ -49,6 +55,11 @@ IGNORED_EVIDENCE_DIRECTORIES = {
 MAX_INDEXED_EVIDENCE = 2_000
 MAX_WORKSPACE_RECORDS = 1_000
 MAX_RECORDS_PER_ARTIFACT = 250
+AUTH_FAILURE_LIMIT = 5
+AUTH_FAILURE_WINDOW_SECONDS = 60.0
+MAX_TRACKED_AUTH_CLIENTS = 10_000
+_AUTH_FAILURES: dict[str, deque[float]] = {}
+_AUTH_FAILURES_LOCK = Lock()
 
 
 def load_auth_password() -> str:
@@ -72,14 +83,60 @@ if (AUTH_USERNAME == "") != (AUTH_PASSWORD == ""):
 if MODE == "production" and (not AUTH_USERNAME or len(AUTH_PASSWORD) < 16):
     raise RuntimeError("production dashboard mode requires a username and a password of at least 16 characters")
 
+
+def _prune_auth_failures(failures: deque[float], now: float) -> None:
+    cutoff = now - AUTH_FAILURE_WINDOW_SECONDS
+    while failures and failures[0] <= cutoff:
+        failures.popleft()
+
+
+def authentication_retry_after(client: str, *, now: float | None = None) -> int:
+    """Return a bounded Retry-After value for one direct peer, or zero when allowed."""
+    current = monotonic() if now is None else now
+    with _AUTH_FAILURES_LOCK:
+        failures = _AUTH_FAILURES.get(client)
+        if failures is None:
+            return 0
+        _prune_auth_failures(failures, current)
+        if not failures:
+            _AUTH_FAILURES.pop(client, None)
+            return 0
+        if len(failures) < AUTH_FAILURE_LIMIT:
+            return 0
+        return max(1, math.ceil(AUTH_FAILURE_WINDOW_SECONDS - (current - failures[0])))
+
+
+def record_authentication_failure(client: str, *, now: float | None = None) -> None:
+    """Record a failed dashboard login without trusting proxy-supplied identity headers."""
+    current = monotonic() if now is None else now
+    with _AUTH_FAILURES_LOCK:
+        failures = _AUTH_FAILURES.get(client)
+        if failures is None:
+            if len(_AUTH_FAILURES) >= MAX_TRACKED_AUTH_CLIENTS:
+                oldest_client = min(
+                    _AUTH_FAILURES,
+                    key=lambda tracked: _AUTH_FAILURES[tracked][-1],
+                )
+                _AUTH_FAILURES.pop(oldest_client, None)
+            failures = deque()
+            _AUTH_FAILURES[client] = failures
+        _prune_auth_failures(failures, current)
+        failures.append(current)
+
+
+def clear_authentication_failures(client: str) -> None:
+    with _AUTH_FAILURES_LOCK:
+        _AUTH_FAILURES.pop(client, None)
+
+
 FEATURES: tuple[dict[str, object], ...] = (
     {
         "id": "market-data",
         "title": "Market data",
         "state": "implemented",
-        "summary": "Strict trade ingestion, normalized bars, instruments, and exchange sessions.",
-        "capabilities": ["Normalized trade importer", "Deterministic OHLCV bar builder", "Canonical ordering", "Duplicate and sequence rejection", "Instrument registry", "Trading calendar with explicit venue and instrument halts", "Corporate-action inputs", "Immutable Parquet datasets"],
-        "boundary": "Historical inputs only; no licensed market-data redistribution or live feed is configured.",
+        "summary": "Strict trade/quote ingestion, feed quality, complete instrument economics, and exchange sessions.",
+        "capabilities": ["Normalized trades and source/receive-time quotes", "Deterministic OHLCV bar builder", "Canonical ordering", "Duplicate, out-of-order, gap, delay, and stale-feed detection", "Effective-dated instrument registry", "Option/future/settlement economics", "Trading calendar with explicit venue and instrument halts", "Corporate-action inputs", "Immutable Parquet datasets"],
+        "boundary": "The normalized feed contract is implemented; no licensed production market-data redistribution or vendor connection is configured.",
         "gate": "Foundation verification passed locally.",
         "screens": ["Command Center", "Research Lab"],
         "source": "core/market-data + core/instrument + follon-build-bars",
@@ -101,9 +158,9 @@ FEATURES: tuple[dict[str, object], ...] = (
         "id": "research",
         "title": "Research & backtests",
         "state": "implemented",
-        "summary": "Reproducible backtests, Python strategy isolation, manifests, and experiment evidence.",
-        "capabilities": ["Event-driven backtester", "Explicit spread, slippage, bar latency, and per-bar fill caps", "Python worker identity handshake", "Strategy bundle hashing", "Configuration and dataset fingerprinting", "Corporate actions", "Exact accounting", "Performance and equity metrics", "Immutable JSON and Markdown reports", "Completion manifests", "Experiment catalog", "DuckDB dataset catalog", "Versioned S3-compatible artifact storage"],
-        "boundary": "Single-currency historical research; strategy workers cannot access adapters or credentials.",
+        "summary": "Reproducible point-in-time backtests, bounded strategy services, manifests, and experiment evidence.",
+        "capabilities": ["Event-driven backtester", "Explicit spread, slippage, bar latency, and per-bar fill caps", "Point-in-time universe and historical-data controls", "Long/short positions with borrow limits and recalls", "Borrow and cash-debit financing", "Multi-currency FX and portfolio-margin capital checks", "Delisting settlements and corporate actions", "Python history, indicators, portfolio, state, and metrics services", "Python worker identity handshake and bundle hashing", "Configuration and dataset fingerprinting", "Exact accounting", "Performance and equity metrics", "Immutable reports and completion manifests", "Experiment catalog", "DuckDB dataset catalog", "Versioned S3-compatible artifact storage"],
+        "boundary": "The advanced account kernel is broker-neutral; strategy workers cannot access adapters or credentials, and production-scale performance evidence remains external.",
         "gate": "Research engineering gate passed locally.",
         "screens": ["Research Lab", "Strategy Studio", "Backtest Explorer"],
         "source": "core/backtest + python/strategy-sdk + python/storage-adapter + follon-backtest",
@@ -149,9 +206,9 @@ FEATURES: tuple[dict[str, object], ...] = (
         "id": "options",
         "title": "Options evidence",
         "state": "gated",
-        "summary": "European-options analytics, Greeks, expiry scenarios, and cross-environment reconciliation.",
-        "capabilities": ["Frozen option chains", "Fixed-point European pricing", "Implied-volatility bisection", "Delta/Gamma/Vega/Theta/Rho", "Multi-leg expiry scenarios", "BACKTEST/PAPER/LIVE book reconciliation", "Source-export and run-identity verification", "Immutable analytics reports"],
-        "boundary": "Evidence only; no broker order, exercise, assignment, or American-option path.",
+        "summary": "European-options analytics, expiry lifecycle, scenarios, and cross-environment reconciliation.",
+        "capabilities": ["Frozen option chains", "Fixed-point European pricing", "Implied-volatility bisection", "Delta/Gamma/Vega/Theta/Rho", "Multi-leg expiry scenarios", "Long exercise and short assignment settlement", "Physical and cash option settlement", "BACKTEST/PAPER/LIVE book reconciliation", "Source-export and run-identity verification", "Immutable analytics reports"],
+        "boundary": "The lifecycle kernel is broker-neutral; no broker exercise instruction, American-option valuation, or accepted capital session is configured.",
         "gate": "Independent broker-backed reconciliation evidence: 0 sessions.",
         "screens": ["Research Lab", "Backtest Explorer", "Portfolio"],
         "source": "core/options + follon-options",
@@ -168,6 +225,54 @@ FEATURES: tuple[dict[str, object], ...] = (
         "screens": ["Administration", "Journal"],
         "source": "core/commercial + follon-admin + self-host compose",
         "documentation": "docs/06-delivery/11-months-18-20-status.md",
+    },
+    {
+        "id": "execution-risk",
+        "title": "Execution & portfolio risk",
+        "state": "implemented",
+        "summary": "Deterministic EMS planning and portfolio-wide pre-trade risk exposed through the versioned gRPC boundary.",
+        "capabilities": ["Immediate, exact TWAP, forecast VWAP, POV, and arrival-price scheduling over gRPC", "Strict cancel-before-replace passive plans over gRPC with post-only chase collars", "Fee/latency/price-aware smart venue routing", "Bracket, trailing-stop, and basket planning", "Atomic ratio-bound, net-price-protected option-combination plans over gRPC", "Gross, net, leverage, concentration, drawdown, and margin limits", "Sector, asset-class, currency, strategy, and instrument limits", "Greeks, self-trade, open-order, and order-rate controls"],
+        "boundary": "Planning and risk decisions are broker-neutral; every capital-bearing submission still requires controlled-LIVE approval and its reviewed adapter.",
+        "gate": "Focused Rust and gRPC contract tests pass locally; broker-backed acceptance remains external.",
+        "screens": ["Execution Blotter", "Risk Cockpit", "Portfolio"],
+        "source": "core/execution + core/risk + follon-trading-api",
+        "documentation": "docs/06-delivery/14-master-plan-conformance-audit.md",
+    },
+    {
+        "id": "accounting",
+        "title": "Multi-currency accounting",
+        "state": "implemented",
+        "summary": "Exact balanced journals, tax lots, financing, FX conversion, and portfolio margin valuation.",
+        "capabilities": ["Per-currency double-entry balancing", "Idempotent journal projection", "FIFO, LIFO, and highest-cost tax-lot disposal", "Cash-debit and short-borrow financing accrual", "Fresh direct and inverse FX rates", "Multi-currency cash and long/short position valuation", "Initial and maintenance margin", "Margin-call and excess-liquidity projection"],
+        "boundary": "Missing or stale FX and absent asset-class margin policy fail closed; independent broker statement ingestion remains deployment evidence.",
+        "gate": "Exact accounting and margin tests pass locally.",
+        "screens": ["Portfolio", "Journal"],
+        "source": "core/accounting + PostgreSQL journal schema + follon-trading-api",
+        "documentation": "docs/06-delivery/14-master-plan-conformance-audit.md",
+    },
+    {
+        "id": "identity",
+        "title": "Customer IAM",
+        "state": "implemented",
+        "summary": "Tenant-isolated passwords, TOTP/recovery MFA, opaque sessions, revocation, and server-side RBAC.",
+        "capabilities": ["Argon2id password hashing and authenticated password rotation", "TOTP MFA with bounded challenges", "Hashed one-time recovery codes", "Opaque hashed short-lived sessions", "Lockout and immediate security-version revocation", "Tenant-isolated authorization", "Organization admin, risk, trader, read-only, and auditor roles"],
+        "boundary": "Production enrollment, out-of-band delivery, support operations, and external identity-provider acceptance require deployment ownership.",
+        "gate": "IAM unit tests and PostgreSQL identity schema checks pass locally.",
+        "screens": ["Administration"],
+        "source": "core/identity + PostgreSQL RLS identity schema",
+        "documentation": "docs/05-quality-security/02-security-architecture.md",
+    },
+    {
+        "id": "platform",
+        "title": "Deployable application platform",
+        "state": "gated",
+        "summary": "Transactional PostgreSQL, gRPC topology, React production bundle, and least-privilege Tauri desktop packaging.",
+        "capabilities": ["Checksum-bound versioned PostgreSQL migrations", "Forced row-level tenant security", "Atomic event plus outbox commit", "Order, execution, position, broker, strategy, configuration, risk, audit, identity, billing, and journal projections", "Concurrent skip-locked delivery", "mTLS-capable gRPC service", "React and Vite browser client", "Tauri v2 native host without privileged web commands"],
+        "boundary": "Production certificates, secret custody, deployment promotion, monitoring, backup drills, and installer signing are operator-controlled.",
+        "gate": "Local compilation passes; container and signed-installer runtime acceptance must be recorded on deployment infrastructure.",
+        "screens": ["Command Center", "Administration"],
+        "source": "adapters/persistence/postgres + services/trading-api + apps/desktop",
+        "documentation": "docs/operations/08-dashboard-deployment-runbook.md",
     },
 )
 
@@ -210,6 +315,8 @@ def classify_artifact(path: Path) -> tuple[str, str]:
             sample = handle.read(32_768).lower()
     except OSError:
         sample = ""
+    if path.suffix.lower() == ".ipynb":
+        return "research", "Research notebook"
     if "option_dashboard_schema_version" in sample or "option" in name:
         return "options", "Options analytics"
     if '"environment":"live"' in sample or "live" in name:
@@ -235,6 +342,7 @@ def artifact_format(path: Path) -> str:
         ".json": "json",
         ".md": "markdown",
         ".csv": "csv",
+        ".ipynb": "json",
     }.get(path.suffix.lower(), "text")
 
 
@@ -359,6 +467,53 @@ def summarize_csv(path: Path, metadata: dict[str, object]) -> dict[str, object] 
     }
 
 
+def summarize_notebook(metadata: dict[str, object], payload: dict[str, object]) -> dict[str, object] | None:
+    """Return inert notebook metadata without executing cells or returning outputs."""
+    nbformat = payload.get("nbformat")
+    cells = payload.get("cells")
+    if (
+        not isinstance(nbformat, int)
+        or isinstance(nbformat, bool)
+        or nbformat < 1
+        or not isinstance(cells, list)
+        or len(cells) > MAX_WORKSPACE_RECORDS
+    ):
+        return None
+    code_cells = 0
+    markdown_cells = 0
+    output_count = 0
+    for cell in cells:
+        if not isinstance(cell, dict):
+            return None
+        cell_type = cell.get("cell_type")
+        if cell_type == "code":
+            code_cells += 1
+            outputs = cell.get("outputs", [])
+            if not isinstance(outputs, list):
+                return None
+            output_count += len(outputs)
+        elif cell_type == "markdown":
+            markdown_cells += 1
+    notebook_metadata = payload.get("metadata")
+    metadata_record = notebook_metadata if isinstance(notebook_metadata, dict) else {}
+    kernelspec = metadata_record.get("kernelspec")
+    kernel_record = kernelspec if isinstance(kernelspec, dict) else {}
+    language_info = metadata_record.get("language_info")
+    language_record = language_info if isinstance(language_info, dict) else {}
+    return {
+        "artifact": metadata["name"],
+        "modified_at": metadata["modified_at"],
+        "bytes": metadata["bytes"],
+        "nbformat": nbformat,
+        "cell_count": len(cells),
+        "code_cells": code_cells,
+        "markdown_cells": markdown_cells,
+        "output_count": output_count,
+        "kernel": kernel_record.get("display_name") if isinstance(kernel_record.get("display_name"), str) else "",
+        "language": language_record.get("name") if isinstance(language_record.get("name"), str) else "",
+    }
+
+
 def dashboard_candidate(
     candidates: list[tuple[str, str, dict[str, object]]],
     metadata: dict[str, object],
@@ -378,6 +533,7 @@ def workspace_snapshot() -> dict[str, object]:
     """Build the bounded, read-only projection consumed by all operator workspaces."""
     artifacts, evidence_paths = scan_evidence()
     datasets: list[dict[str, object]] = []
+    notebooks: list[dict[str, object]] = []
     backtests: list[dict[str, object]] = []
     experiments: list[dict[str, object]] = []
     manifests: list[dict[str, object]] = []
@@ -402,6 +558,11 @@ def workspace_snapshot() -> dict[str, object]:
         if metadata["format"] == "json":
             payload = read_json_artifact(path)
             if payload is None:
+                continue
+            if path.suffix.lower() == ".ipynb":
+                notebook = summarize_notebook(metadata, payload)
+                if notebook is not None:
+                    notebooks.append(notebook)
                 continue
             environment = payload.get("environment")
             if payload.get("dashboard_schema_version") == 2 and environment == "PAPER":
@@ -481,6 +642,7 @@ def workspace_snapshot() -> dict[str, object]:
         "counts": {
             "artifacts": len(artifacts),
             "datasets": len(datasets),
+            "notebooks": len(notebooks),
             "backtests": len(backtests),
             "experiments": len(experiments),
             "events": len(events),
@@ -489,6 +651,7 @@ def workspace_snapshot() -> dict[str, object]:
         },
         "feature_artifact_counts": feature_counts,
         "datasets": datasets[:MAX_WORKSPACE_RECORDS],
+        "notebooks": notebooks[:MAX_WORKSPACE_RECORDS],
         "backtests": backtests[:MAX_WORKSPACE_RECORDS],
         "experiments": experiments[:MAX_WORKSPACE_RECORDS],
         "manifests": manifests[:MAX_WORKSPACE_RECORDS],
@@ -533,6 +696,7 @@ def system_status() -> dict[str, object]:
             "dashboard": {"status": "healthy", "detail": "Read-only API available"},
             "postgres": probe_tcp(POSTGRES_HOST, POSTGRES_PORT),
             "minio": probe_http(MINIO_HEALTH_URL),
+            "trading-api": probe_tcp(TRADING_API_HOST, TRADING_API_PORT),
         },
         "artifacts": {
             "count": len(artifacts),
@@ -544,12 +708,34 @@ def system_status() -> dict[str, object]:
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "FollonEvidenceDashboard/2.0"
 
+    TAURI_READ_ONLY_ORIGINS = frozenset({
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+    })
+
     def end_headers(self) -> None:
+        request_origin = getattr(self, "headers", {}).get("Origin")
+        tauri_origin = (
+            request_origin
+            if request_origin in self.TAURI_READ_ONLY_ORIGINS
+            else None
+        )
+        if tauri_origin is not None:
+            self.send_header("Access-Control-Allow-Origin", tauri_origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:")
+        self.send_header("X-Robots-Tag", "noindex, noarchive")
+        self.send_header(
+            "Cross-Origin-Resource-Policy",
+            "cross-origin" if tauri_origin is not None else "same-origin",
+        )
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()")
+        self.send_header("Content-Security-Policy", "default-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:")
         super().end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
@@ -558,9 +744,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/health":
             self.write_json(HTTPStatus.OK, {"status": "ok"})
             return
+        client = self.client_address[0]
+        retry_after = authentication_retry_after(client)
+        if retry_after:
+            self.request_rate_limited(retry_after)
+            return
         if not self.is_authorized():
+            record_authentication_failure(client)
             self.request_authentication()
             return
+        clear_authentication_failures(client)
         if path == "/api/v1/status":
             self.write_json(HTTPStatus.OK, system_status())
             return
@@ -605,7 +798,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.write_body(body)
+
+    def request_rate_limited(self, retry_after: int) -> None:
+        body = b"Too many authentication attempts."
+        self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+        self.send_header("Retry-After", str(retry_after))
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.write_body(body)
 
     def write_json(self, status: HTTPStatus, payload: object) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -613,7 +815,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.write_body(body)
 
     def write_evidence(self, name: str, *, download: bool = False) -> None:
         evidence = evidence_file(name)
@@ -650,7 +852,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.write_body(body)
+
+    def write_body(self, body: bytes) -> None:
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # A browser or desktop webview may close while a bounded response is
+            # in flight. The request has no mutation to roll back, so suppress
+            # the expected transport noise without hiding application errors.
+            self.close_connection = True
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")

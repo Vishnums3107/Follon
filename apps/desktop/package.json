@@ -3,13 +3,27 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Evidence-only desktop shell for the Follon first vertical slice",
+  "description": "React and Tauri operations desktop for the Follon trading operating system",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
+    "build:web": "vite build",
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "tauri": "tauri",
+    "build:desktop": "tauri build",
     "test:evidence": "npm run build && node test/evidence-contract.mjs && node test/browser-module-contract.mjs"
   },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
   "devDependencies": {
-    "typescript": "5.8.3"
+    "@tauri-apps/cli": "2.11.4",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.0",
+    "typescript": "5.8.3",
+    "vite": "8.2.2"
   }
 }

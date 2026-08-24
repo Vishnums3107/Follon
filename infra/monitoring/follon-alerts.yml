@@ -1,0 +1,35 @@
+groups:
+  - name: follon-runtime
+    rules:
+      - alert: FollonEndpointUnavailable
+        expr: probe_success{job=~"follon-.+-mtls"} == 0
+        for: 2m
+        labels:
+          severity: page
+          service: follon
+        annotations:
+          summary: "Follon endpoint is unavailable"
+          description: "Mutually authenticated probe for {{ $labels.instance }} has failed for two minutes."
+          runbook: "docs/operations/09-production-operations-runbook.md#endpoint-unavailable"
+
+      - alert: FollonMonitoringTargetMissing
+        expr: up{job=~"follon-.+-mtls"} == 0
+        for: 5m
+        labels:
+          severity: page
+          service: follon-monitoring
+        annotations:
+          summary: "Follon probe target is not being scraped"
+          description: "Prometheus cannot scrape {{ $labels.job }}."
+          runbook: "docs/operations/09-production-operations-runbook.md#monitoring-target-missing"
+
+      - alert: FollonCertificateExpiresSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) < 14 * 24 * 60 * 60
+        for: 15m
+        labels:
+          severity: ticket
+          service: follon-tls
+        annotations:
+          summary: "Follon TLS certificate expires within 14 days"
+          description: "Rotate the certificate for {{ $labels.instance }} through controlled promotion."
+          runbook: "docs/operations/09-production-operations-runbook.md#certificate-expiry"

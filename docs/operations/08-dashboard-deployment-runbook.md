@@ -6,9 +6,10 @@ paying-customer acceptance gates.
 
 ## What is deployed
 
-The dashboard unifies the implemented market-data, replay, research, PAPER,
-controlled-live, operations, options, and commercial evidence views. It reads
-immutable artifacts and probes PostgreSQL and MinIO reachability. It does not
+The React dashboard unifies the implemented market-data, replay, research,
+PAPER, controlled-live, operations, options, EMS/risk, multi-currency
+accounting, IAM, platform, and commercial evidence views. It reads immutable
+artifacts and probes the gRPC kernel, PostgreSQL, and object-store reachability. It does not
 submit an order, operate a kill switch, approve a live action, receive a
 credential, charge a customer, erase private data, sign a release, or append an
 operator ledger.
@@ -26,7 +27,18 @@ docker compose --env-file infra/.env -f infra/compose.dev.yml up -d --build
 docker compose --env-file infra/.env -f infra/compose.dev.yml ps
 Invoke-WebRequest http://127.0.0.1:8080/api/v1/health -UseBasicParsing
 Invoke-RestMethod http://127.0.0.1:8080/api/v1/workspaces
+npm --prefix apps/desktop run typecheck
+npm --prefix apps/desktop run build:web
+cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+npm --prefix apps/desktop run build:desktop
 ```
+
+The native build must produce both an MSI and an NSIS installer. In the Tauri
+runtime, versioned read-only API requests are sent explicitly to
+`http://127.0.0.1:8080`; the loopback server allows only the exact Tauri asset
+origins and otherwise retains same-origin resource policy. Start the loopback
+evidence service before the native client. Do not broaden the allowlist or bind
+the server to a non-loopback address.
 
 Every service must report healthy. Open `http://127.0.0.1:8080` and confirm the
 dependency cards and all ten tailored primary workspaces: health/gates,
@@ -50,9 +62,38 @@ all dashboard assets use root-relative URLs so direct navigation works.
   browser extension, not by Follon. Verify in an extension-free private window
   or disable that extension for `127.0.0.1`. Do not add `unsafe-inline` to the
   dashboard Content Security Policy to accommodate extension injection.
-- `/favicon.ico`, `/favicon.svg`, `/styles.css`, `/dist/main.js`, `/evidence`,
+- `/favicon.ico`, the Vite-generated `/assets/*` files, `/evidence`,
   `/workspaces`, and `/workspace/<workspace-id>` must return HTTP 200. Unknown
   paths such as `/invalid/` intentionally return HTTP 404.
+
+## Signed production topology
+
+`infra/compose.production.yml` runs only pre-built images supplied by digest.
+It refuses direct database credentials, reads the PostgreSQL URL from a secret
+file, requires `sslmode=require`, configures gRPC server identity plus client
+CA, and puts the dashboard behind a client-certificate TLS proxy. The compose
+file deliberately does not create a certificate authority, managed database,
+object store, signer, or credential.
+
+Validate interpolation without starting services:
+
+```powershell
+docker compose -f infra/compose.production.yml config --no-interpolate --quiet
+docker compose -f infra/compose.production.yml -f infra/compose.monitoring.yml config --no-interpolate --quiet
+```
+
+After deployment-owned secret paths and image digests are set, start production
+and monitoring together:
+
+```powershell
+docker compose -f infra/compose.production.yml -f infra/compose.monitoring.yml up -d
+```
+
+The monitoring overlay requires a reviewed Alertmanager configuration with the
+real on-call receiver. Checked-in Prometheus rules page on unavailable mTLS
+endpoints and ticket certificates within fourteen days of expiry. A successful
+container start is not a penetration test, legal approval, restore drill, or
+on-call acceptance receipt.
 
 ## Authenticated operator deployment
 
@@ -73,9 +114,18 @@ docker compose --env-file infra/.env -f infra/compose.dev.yml -f infra/compose.d
 ```
 
 Production mode fails closed when either credential is missing or the password
-is shorter than 16 characters. HTTP Basic authentication is only an operator
-gate for this bounded deployment. It is not customer identity, role-based
-authorization, or entitlement enforcement.
+is shorter than 16 characters. HTTP Basic authentication is only a compatibility
+operator gate for this bounded deployment. Customer Argon2id/TOTP/session/RBAC
+logic belongs to `core/identity` and its PostgreSQL schema; production
+enrollment/recovery and a privileged customer API are not exposed by this
+read-only server.
+
+The server also applies a bounded sliding-window authentication limit to the
+direct peer address. After five failed credentials within sixty seconds,
+subsequent protected requests receive HTTP `429` with `Retry-After` until the
+window clears. Successful authentication clears that peer's failure budget.
+The deployment must not trust this local control as a replacement for reverse-
+proxy rate limits, MFA, centralized identity, alerts, or source-IP controls.
 
 ## Security properties to verify
 
@@ -89,9 +139,15 @@ authorization, or entitlement enforcement.
   escapes are rejected; artifacts over 10 MiB are not indexed or rendered.
 - Content is emitted with `nosniff`, no-store caching, frame denial, no referrer,
   and a restrictive Content Security Policy. Markdown is rendered as inert text.
-- The Node and Python build/runtime base images are pinned by digest. A release
-  candidate still requires SBOM generation, vulnerability review, signature,
-  and `follon-admin self-host-readiness` evidence.
+- The Node and Python build/runtime base images are pinned by digest. Generate
+  the deterministic CycloneDX Cargo/npm/Python SBOM with:
+
+  ```powershell
+  python tools/generate_sbom.py --source-revision <immutable-revision> --output build/follon-sbom.cdx.json
+  ```
+
+  A release candidate still requires SBOM review, vulnerability disposition,
+  signature, and `follon-admin self-host-readiness` evidence.
 
 ## Operational checks
 

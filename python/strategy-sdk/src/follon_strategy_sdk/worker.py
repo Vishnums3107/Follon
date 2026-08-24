@@ -1,8 +1,9 @@
 """Versioned stdio worker protocol for isolated strategy execution.
 
-The Rust control plane owns all market-data, risk, OMS, and accounting logic.
-This worker receives one normalized bar at a time and may return at most one
-validated declarative intent. It never receives adapter credentials.
+The control plane owns market-data, risk, OMS, and accounting authority. This
+worker receives one normalized bar at a time plus an optional bounded snapshot
+of point-in-time research services, and may return at most one validated
+declarative intent. It never receives adapter credentials.
 """
 
 from __future__ import annotations
@@ -17,6 +18,16 @@ from typing import Any, TextIO
 
 from .bundle import StrategyBundle, strategy_bundle_hash
 from .models import Bar, OrderIntent, StrategyContext
+from .services import (
+    HistoricalDataService,
+    MetricsSink,
+    PortfolioSnapshot,
+    PositionSnapshot,
+    StrategyMetric,
+    StrategyServices,
+    StrategyStateStore,
+    TimedBar,
+)
 from .strategy import Strategy
 
 PROTOCOL_VERSION = 1
@@ -47,7 +58,9 @@ def _decimal(value: Any, name: str) -> Decimal:
         raise WorkerProtocolError(f"{name} must be a valid decimal") from error
 
 
-def _context(payload: dict[str, Any]) -> StrategyContext:
+def _context(
+    payload: dict[str, Any], services: StrategyServices | None = None
+) -> StrategyContext:
     _require_exact_fields(
         payload,
         {
@@ -67,6 +80,7 @@ def _context(payload: dict[str, Any]) -> StrategyContext:
         configuration_version=_required_string(payload, "configuration_version"),
         replay_time=_required_string(payload, "replay_time"),
         environment=_required_string(payload, "environment"),
+        services=services,
     )
 
 
@@ -100,14 +114,101 @@ def _bar(payload: dict[str, Any]) -> Bar:
     )
 
 
-def _read_frame(line: str) -> tuple[StrategyContext, Bar]:
+def _services(payload: dict[str, Any], replay_time: str) -> StrategyServices:
+    _require_exact_fields(payload, {"history", "portfolio", "state"}, "strategy services")
+    history = payload.get("history")
+    portfolio = payload.get("portfolio")
+    state = payload.get("state")
+    if not isinstance(history, dict) or not isinstance(portfolio, dict) or not isinstance(state, dict):
+        raise WorkerProtocolError("strategy services require object snapshots")
+
+    _require_exact_fields(history, {"as_of", "records"}, "historical service")
+    history_as_of = _required_string(history, "as_of")
+    history_records = history.get("records")
+    if history_as_of != replay_time or not isinstance(history_records, list):
+        raise WorkerProtocolError("historical service must match replay time and contain records")
+    parsed_history: list[TimedBar] = []
+    for record in history_records:
+        if not isinstance(record, dict):
+            raise WorkerProtocolError("historical records must be objects")
+        _require_exact_fields(record, {"event_time", "bar"}, "historical record")
+        record_bar = record.get("bar")
+        if not isinstance(record_bar, dict):
+            raise WorkerProtocolError("historical record bar must be an object")
+        parsed_history.append(
+            TimedBar(
+                event_time=_required_string(record, "event_time"),
+                bar=_bar(record_bar),
+            )
+        )
+
+    _require_exact_fields(
+        portfolio,
+        {"as_of", "positions", "cash_by_currency"},
+        "portfolio service",
+    )
+    portfolio_as_of = _required_string(portfolio, "as_of")
+    positions = portfolio.get("positions")
+    cash = portfolio.get("cash_by_currency")
+    if portfolio_as_of != replay_time or not isinstance(positions, list) or not isinstance(cash, list):
+        raise WorkerProtocolError("portfolio service must match replay time and contain arrays")
+    parsed_positions: list[PositionSnapshot] = []
+    for position in positions:
+        if not isinstance(position, dict):
+            raise WorkerProtocolError("portfolio positions must be objects")
+        _require_exact_fields(
+            position,
+            {"instrument_id", "quantity", "average_cost", "mark_price", "currency"},
+            "portfolio position",
+        )
+        parsed_positions.append(
+            PositionSnapshot(
+                instrument_id=_required_string(position, "instrument_id"),
+                quantity=_decimal(position.get("quantity"), "position quantity"),
+                average_cost=_decimal(position.get("average_cost"), "position average_cost"),
+                mark_price=_decimal(position.get("mark_price"), "position mark_price"),
+                currency=_required_string(position, "currency"),
+            )
+        )
+    parsed_cash: list[tuple[str, Decimal]] = []
+    for balance in cash:
+        if not isinstance(balance, dict):
+            raise WorkerProtocolError("portfolio cash balances must be objects")
+        _require_exact_fields(balance, {"currency", "amount"}, "portfolio cash balance")
+        parsed_cash.append(
+            (
+                _required_string(balance, "currency"),
+                _decimal(balance.get("amount"), "portfolio cash amount"),
+            )
+        )
+
+    _require_exact_fields(state, {"values"}, "strategy state")
+    state_values = state.get("values")
+    if not isinstance(state_values, dict):
+        raise WorkerProtocolError("strategy state values must be an object")
+    return StrategyServices(
+        history=HistoricalDataService(parsed_history, as_of=history_as_of),
+        portfolio=PortfolioSnapshot(
+            as_of=portfolio_as_of,
+            positions=tuple(parsed_positions),
+            cash_by_currency=tuple(parsed_cash),
+        ),
+        state=StrategyStateStore(state_values),
+        metrics=MetricsSink(),
+    )
+
+
+def _read_frame(line: str) -> tuple[StrategyContext, Bar, bool]:
     try:
         frame = json.loads(line)
     except json.JSONDecodeError as error:
         raise WorkerProtocolError("frame is not valid JSON") from error
     if not isinstance(frame, dict):
         raise WorkerProtocolError("frame must be a JSON object")
-    _require_exact_fields(frame, {"protocol_version", "type", "context", "bar"}, "frame")
+    expected = {"protocol_version", "type", "context", "bar"}
+    fields = set(frame)
+    if fields not in (expected, expected | {"services"}):
+        raise WorkerProtocolError("frame has missing or unknown fields")
     if frame.get("protocol_version") != PROTOCOL_VERSION:
         raise WorkerProtocolError("unsupported worker protocol version")
     if frame.get("type") != "market_bar":
@@ -116,7 +217,23 @@ def _read_frame(line: str) -> tuple[StrategyContext, Bar]:
     bar = frame.get("bar")
     if not isinstance(context, dict) or not isinstance(bar, dict):
         raise WorkerProtocolError("market_bar requires object context and bar")
-    return _context(context), _bar(bar)
+    base_context = _context(context)
+    service_payload = frame.get("services")
+    if service_payload is None:
+        return base_context, _bar(bar), False
+    if not isinstance(service_payload, dict):
+        raise WorkerProtocolError("services must be an object")
+    services = _services(service_payload, base_context.replay_time)
+    return _context(context, services), _bar(bar), True
+
+
+def _metric_payload(metric: StrategyMetric) -> dict[str, object]:
+    return {
+        "name": metric.name,
+        "observed_at": metric.observed_at,
+        "tags": [{"key": key, "value": value} for key, value in metric.tags],
+        "value": str(metric.value),
+    }
 
 
 def _write_frame(stream: TextIO, frame: dict[str, Any]) -> None:
@@ -150,7 +267,7 @@ def run_worker(
             )
             return 2
         try:
-            context, bar = _read_frame(line)
+            context, bar, service_frame = _read_frame(line)
             if (
                 context.strategy_id != bundle.strategy_id
                 or context.strategy_version != bundle.strategy_version
@@ -159,14 +276,23 @@ def run_worker(
             intent = strategy.on_bar(context, bar)
             if intent is not None and not isinstance(intent, OrderIntent):
                 raise WorkerProtocolError("strategy must return an OrderIntent or None")
-            _write_frame(
-                destination,
-                {
-                    "intent": intent.as_payload() if intent is not None else None,
-                    "protocol_version": PROTOCOL_VERSION,
-                    "type": "strategy_output",
-                },
-            )
+            output: dict[str, Any] = {
+                "intent": intent.as_payload() if intent is not None else None,
+                "protocol_version": PROTOCOL_VERSION,
+                "type": "strategy_output",
+            }
+            if service_frame:
+                services = context.services
+                if services is None:
+                    raise WorkerProtocolError("service frame lost its bounded services")
+                output["metrics"] = [
+                    _metric_payload(metric) for metric in services.metrics.snapshot()
+                ]
+                output["state"] = {
+                    "fingerprint": services.state.fingerprint(),
+                    "values": services.state.snapshot(),
+                }
+            _write_frame(destination, output)
         except (ValueError, WorkerProtocolError) as error:
             _write_frame(
                 destination,

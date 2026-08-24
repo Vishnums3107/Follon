@@ -1,6 +1,10 @@
 [workspace]
 members = [
     "core/domain",
+    "core/execution",
+    "core/risk",
+    "core/accounting",
+    "core/identity",
     "core/instrument",
     "core/market-data",
     "core/backtest",
@@ -13,6 +17,8 @@ members = [
     "core/control-plane",
     "apps/cli",
     "adapters/brokers/ibkr",
+    "adapters/persistence/postgres",
+    "services/trading-api",
 ]
 resolver = "2"
 

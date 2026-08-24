@@ -1,6 +1,6 @@
 # Dashboard feature integration and remaining-work status
 
-**Implementation snapshot: 2026-08-17.** The Docker dashboard now provides ten
+**Implementation snapshot: 2026-08-22.** The Docker dashboard now provides ten
 functional, workspace-specific read-only views over every capability that has
 an implemented repository evidence contract. It no longer treats a list of
 artifact links as a workspace implementation.
@@ -18,6 +18,9 @@ This record distinguishes three different claims:
 
 - `/api/v1/workspaces` creates a bounded, read-only projection from allowlisted
   immutable evidence beneath `var/`.
+- The browser validates every workspace count, artifact, dataset, backtest, and
+  typed dashboard record before it renders it. Invalid projection data fails
+  closed instead of being interpreted as operational state.
 - JSON dashboard contracts, canonical NDJSON events, journals, experiment
   records, manifests, CSV dataset structure, and portable immutable-Parquet
   receipts are integrated without allowing artifact content to execute as
@@ -29,33 +32,60 @@ This record distinguishes three different claims:
   interpretation, and direct links to its source artifacts.
 - The generic evidence inspector remains available for complete source review
   and download. It is supporting functionality, not the workspace itself.
+- The authenticated loopback deployment applies constant-time credential
+  checks and a bounded per-direct-peer sliding-window rate limit with `429` and
+  `Retry-After`. This remains an operator gate, not customer IAM or RBAC.
 
 ## Primary workspace coverage
 
 | Workspace | Implemented integrated functions |
 | --- | --- |
-| Command Center | Container/dependency health, environment readiness, external gate progress, operator attention queue, recent evidence |
-| Research Lab | Dataset schema/row inventory, experiment catalogue, completed backtests, frozen option-chain analytics |
+| Command Center | Container/dependency health, consolidated system/broker/strategy/risk status, environment readiness, derived external gate progress, operator attention queue, recent evidence |
+| Research Lab | Dataset schema/row inventory, inert Jupyter notebook inventory, experiment catalogue, completed backtests, frozen option-chain analytics |
 | Strategy Studio | Strategy/version/bundle identities, exact configuration and dataset binding, engine/source identity, isolated Python-worker contract |
-| Backtest Explorer | Run comparison, trade/P&L/return/drawdown metrics, completion manifests, reproducibility hashes, options expiry scenarios |
+| Backtest Explorer | Run comparison, canonical fill-level trade evidence, P&L/return/drawdown metrics, tagged regime/sensitivity dimensions, completion manifests, reproducibility hashes, options expiry scenarios |
 | Execution Blotter | SIMULATION/PAPER/LIVE separation, intent/risk/order/fill timeline, correlation/causation, UNKNOWN counts, all reviewed out-of-order/cancel/replace lifecycle conditions |
 | Risk Cockpit | Equity, exposure, drawdown, limits, breaches, kill switches, deterministic alerts, PAPER/LIVE reconciliation state |
 | Portfolio | Operations/PAPER/LIVE internal positions, exact P&L attribution, options scenarios, cross-environment option-book reconciliation |
 | Replay and Incidents | Event-type distribution, causal replay timeline, journal coverage, UNKNOWN and reconciliation incident state |
-| Journal | PAPER, controlled-LIVE, operations, and commercial chain cursors, health, sequence, head hashes, and unified append-only records |
+| Journal | PAPER, controlled-LIVE, operations, and commercial chain cursors, health, sequence, head hashes, decision/annotation fields, entry/correlation identities, and unified append-only records |
 | Administration | Provisioning/subscription ledger, entitlement boundary, privacy/retention artifacts, signed-release artifacts, self-host readiness, auth/deployment boundary |
+
+The Execution Blotter also renders every retained `risk.decision.v1` event with
+the decision/intent identity, approval outcome, machine-readable reason codes,
+exact evaluated inputs and limits, policy version, and actor. This keeps a
+rejection explainable from the primary operating screen without adding any
+browser-side order or policy mutation.
+
+Jupyter `.ipynb` files are allowlisted as research evidence and summarized by
+format, cell type, output count, kernel, and language. They are opened only in
+the inert JSON evidence inspector; the server and browser never execute cells
+or trust notebook HTML/JavaScript output.
+
+Backtest Explorer renders each retained simulator-sourced canonical
+`execution.fill.v1` record
+with execution/order identity, instrument, side, quantity, price, and fee. It
+also renders experiment `tags` as regime, sensitivity/scenario, and additional
+dimensions bound to the run and specification fingerprint. The current local
+experiment records are untagged, so the interface states `Not tagged` instead
+of manufacturing regime or sensitivity classifications from performance.
+
+Journal renders the operations journal's validated, non-secret `details` map as
+decision or annotation evidence together with entry/correlation identity,
+actor, hash, and source artifact. Journal append remains an operator-only CLI
+action so the read-only dashboard cannot rewrite audit history.
 
 ## Implemented feature-domain coverage
 
 | Domain | Dashboard integration | Current local evidence |
 | --- | --- | --- |
-| Market data and instruments | Imports/datasets, canonical columns and row counts, immutable Parquet receipts, bars, reference/calendar/corporate-action capability map | Integrated when CSV or storage-receipt artifacts exist |
+| Market data and instruments | Imports/datasets, canonical columns and row counts, immutable Parquet receipts, bars, quote/feed-quality and complete settlement/reference/calendar/corporate-action capability map | Integrated when CSV or storage-receipt artifacts exist |
 | Replay and simulation | Canonical causal events, strategy-to-intent-to-risk-to-OMS-to-fill-to-portfolio trail | Integrated |
-| Research and backtests | Run specifications, Python-worker identities, metrics, accounting, reports, manifests, experiments | Integrated |
+| Research and backtests | Run specifications, Python-worker identities and bounded service API, metrics, accounting, reports, manifests, experiments, and explicit advanced-account assumptions | Integrated; legacy artifacts remain visibly bounded |
 | PAPER operations | Status, audit head, working/UNKNOWN orders, kill switches, positions, reconciliation, 30-session gate | Integrated; observed gate remains 0/30 |
 | Controlled LIVE | SHADOW/CANARY monitoring, audit, incidents, positions, reconciliation, 60-session gate | Monitoring integrated; no connected live adapter/control plane |
 | Operations workbench | Risk, attribution, alerts, schedule, journal, configuration and reproducibility identities | Integrated |
-| Options | Frozen chain, fixed-point European analytics/Greeks, expiry scenarios, declared-book reconciliation | Integrated; external broker-backed acceptance remains absent |
+| Options | Frozen chain, fixed-point European analytics/Greeks, expiry scenarios, expiration exercise/assignment settlement capability, declared-book reconciliation | Integrated; external broker-backed acceptance remains absent |
 | Commercial and deployment | Ledger, provisioning/subscription facts, artifact inventory, release/readiness status and boundaries | Ledger integrated; release/readiness evidence is absent locally |
 
 At the snapshot above the live API reports 76 artifacts, 4 datasets, 11
@@ -94,9 +124,11 @@ or live readiness:
   instrument halts, bar latency, persistent working orders, and partial-fill
   caps are implemented and represented in Backtest Explorer. Effective-dated
   instruments fail closed after their configured end.
-- Economic delisting settlement remains required for strategies that depend on
-  delisting outcomes. Borrow and portfolio allocation remain deliberately
-  excluded by the long-only, single-account boundary rather than approximated.
+- The advanced backtest account implements economic delisting settlement,
+  short/borrow/recall/financing behavior, fresh FX, and portfolio initial-margin
+  checks. The existing CLI runner still emits legacy long-only/single-currency
+  artifacts; the dashboard states that boundary instead of implying the
+  advanced account was selected. Multi-account allocation remains excluded.
 - Deterministic Parquet publication, DuckDB hash/row-validated registration,
   immutable versioned S3-compatible publication, read-after-write validation,
   and verified recovery are implemented. The dashboard indexes portable JSON
@@ -171,9 +203,11 @@ Manual visual acceptance is still required in an extension-free browser:
    workspace navigation and clickable evidence rows.
 
 This manual visual step is recorded because the connected browser-testing
-surface was unavailable during the 2026-08-17 implementation session. Source,
+surface was unavailable during the 2026-08-22 conformance session. Source,
 contract, API, and container verification do not replace that final human
 visual acceptance.
 
 The documentation-wide continuation order is in the
 [step-by-step implementation matrix](13-step-by-step-implementation-matrix.md).
+The complete PDF requirement verdict is in the
+[master-plan conformance audit](14-master-plan-conformance-audit.md).

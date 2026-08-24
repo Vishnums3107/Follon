@@ -11,9 +11,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 
 use follon_domain::{
-    validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar, Decimal, DecimalError,
-    DomainError, EventEnvelope, EventPayload, Fill, OrderIntent, OrderState, OrderStateChange,
-    OrderType, PnlSnapshot, PositionSnapshot, RiskDecision, Side, TimeInForce,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar, Decimal,
+    DecimalError, DomainError, EventEnvelope, EventPayload, Fill, OrderIntent, OrderState,
+    OrderStateChange, OrderType, PnlSnapshot, PositionSnapshot, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{InstrumentRegistry, TradingCalendar};
 
@@ -899,14 +899,19 @@ pub struct RiskPolicy {
     pub max_quantity: Decimal,
     /// Maximum allowed estimated notional at the current bar close.
     pub max_notional: Decimal,
+    /// Maximum absolute limit-price distance from the current mark in basis points.
+    pub max_price_deviation_bps: Decimal,
 }
 
 impl RiskPolicy {
     /// Validates policy identity and positive deterministic limits at engine construction.
     pub fn validate(&self) -> Result<(), EngineError> {
+        let ten_thousand = Decimal::from_integer(10_000)?;
         if self.version.is_empty()
             || self.max_quantity <= Decimal::ZERO
             || self.max_notional <= Decimal::ZERO
+            || self.max_price_deviation_bps < Decimal::ZERO
+            || self.max_price_deviation_bps >= ten_thousand
         {
             return Err(EngineError("invalid deterministic risk policy".to_owned()));
         }
@@ -922,6 +927,11 @@ impl RiskPolicy {
     ) -> Result<RiskDecision, EngineError> {
         intent.validate()?;
         let estimated_notional = intent.quantity.checked_mul(bar.close)?;
+        let requested_price_deviation_bps = intent
+            .limit_price
+            .map(|price| price_deviation_bps(bar.close, price))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
         let mut reason_codes = Vec::new();
         if self.global_kill_switch {
             reason_codes.push("KILL_SWITCH_ACTIVE".to_owned());
@@ -931,6 +941,9 @@ impl RiskPolicy {
         }
         if estimated_notional > self.max_notional {
             reason_codes.push("MAX_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if requested_price_deviation_bps > self.max_price_deviation_bps {
+            reason_codes.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
         if bar.close <= Decimal::ZERO {
             reason_codes.push("INVALID_MARK_PRICE".to_owned());
@@ -949,8 +962,14 @@ impl RiskPolicy {
             correlation_id: intent.correlation_id.clone(),
             actor: "risk_engine".to_owned(),
             evaluated_limits: format!(
-                "max_quantity={},max_notional={},estimated_notional={}",
-                self.max_quantity, self.max_notional, estimated_notional
+                "max_quantity={},max_notional={},max_price_deviation_bps={},reference_price={},requested_price={},requested_price_deviation_bps={},estimated_notional={}",
+                self.max_quantity,
+                self.max_notional,
+                self.max_price_deviation_bps,
+                bar.close,
+                intent.limit_price.map_or_else(|| "MARKET".to_owned(), |price| price.to_string()),
+                requested_price_deviation_bps,
+                estimated_notional,
             ),
         })
     }
@@ -1907,6 +1926,7 @@ mod tests {
                 global_kill_switch: false,
                 max_quantity: Decimal::from_integer(10).unwrap(),
                 max_notional: Decimal::from_integer(10_000).unwrap(),
+                max_price_deviation_bps: Decimal::from_integer(500).unwrap(),
             },
             DeterministicFillModel {
                 spread_bps: Decimal::ZERO,
@@ -2196,6 +2216,32 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == "audit.trail.v1"));
+    }
+
+    #[test]
+    fn risk_price_collar_rejects_a_limit_far_from_the_reference_mark() {
+        let policy = RiskPolicy {
+            version: "risk-price-collar-v1".to_owned(),
+            global_kill_switch: false,
+            max_quantity: Decimal::from_integer(10).unwrap(),
+            max_notional: Decimal::from_integer(10_000).unwrap(),
+            max_price_deviation_bps: Decimal::from_integer(100).unwrap(),
+        };
+        let order = simulated_order(
+            Side::Buy,
+            OrderType::Limit,
+            Some(Decimal::from_integer(105).unwrap()),
+        );
+        let decision = policy
+            .evaluate(&order.intent, &bar(), "2026-01-02T14:31:00Z")
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"PRICE_COLLAR_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("requested_price_deviation_bps=500.00000000"));
     }
 
     #[test]

@@ -20,16 +20,25 @@ The order-management system owns client IDs, broker IDs, the lifecycle state mac
   exchanges bounded correlated protocol messages over private pipes, and marks
   the session unhealthy after timeout, broken output, or protocol mismatch.
 
-## Planned execution methods
+## Implemented broker-neutral execution planning
 
-- Immediate market and limit order submission.
-- Passive limit order.
-- Bracket orders.
-- Time-weighted and participation-limited execution.
-- Bounded cancel-and-replace and price chasing.
-- Basket submission only after portfolio checks.
+- Immediate market or price-protected limit children.
+- Exact fixed-point TWAP, forecast-volume VWAP, POV/participation, and
+  urgency-weighted arrival-price schedules with quantity conservation.
+- Passive limit execution with monotonic post-only cancel/replace, minimum
+  intervals, maximum replacements, hard parent limits, and adverse chase caps.
+- Fee/latency/price-aware multi-venue routing.
+- Bracket/stop-limit children, monotonic trailing stops, and portfolio-sized
+  baskets.
+- Ratio-bound, net-debit/net-credit-protected option combinations. An adapter
+  must support a native atomic combination or reject before transmitting any
+  leg; the planner never authorizes legging risk.
 
-VWAP/POV, arrival-price logic, multi-venue routing, and options-combination execution are later capabilities.
+These are deterministic planning contracts, not broker acceptance evidence.
+The versioned gRPC API exposes scheduled execution algorithms through arrival
+price, the full cancel-before-replace passive sequence, and synchronized
+net-price-protected option-combination plans. An adapter must still map a combo
+to a native atomic broker order or reject it before transmitting any leg.
 
 ## Safety requirements
 

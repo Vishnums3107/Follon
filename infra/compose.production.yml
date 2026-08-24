@@ -1,0 +1,118 @@
+name: follon-production
+
+# Production topology consumes pre-built, signed images pinned by digest and
+# deployment-owned secret files. It intentionally does not provision a local
+# database, certificate authority, object store, or broker credential.
+services:
+  dashboard:
+    image: ${FOLLON_DASHBOARD_IMAGE:?Set a verified dashboard image pinned by @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    environment:
+      FOLLON_DASHBOARD_HOST: 0.0.0.0
+      FOLLON_DASHBOARD_PORT: 8080
+      FOLLON_DASHBOARD_MODE: production
+      FOLLON_DASHBOARD_USERNAME: ${FOLLON_DASHBOARD_USERNAME:?Set the operator username}
+      FOLLON_DASHBOARD_PASSWORD_FILE: /run/secrets/dashboard_password
+      FOLLON_POSTGRES_HOST: ${FOLLON_POSTGRES_HEALTH_HOST:?Set the managed PostgreSQL health host}
+      FOLLON_POSTGRES_INTERNAL_PORT: ${FOLLON_POSTGRES_HEALTH_PORT:-5432}
+      FOLLON_MINIO_HEALTH_URL: ${FOLLON_OBJECT_STORE_HEALTH_URL:?Set the managed object-store health URL}
+      FOLLON_TRADING_API_HOST: trading-api
+      FOLLON_TRADING_API_PORT: 50051
+    secrets:
+      - dashboard_password
+    volumes:
+      - type: bind
+        source: ${FOLLON_EVIDENCE_ROOT:?Set the immutable evidence root}
+        target: /var/follon
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  trading-api:
+    image: ${FOLLON_TRADING_API_IMAGE:?Set a verified trading API image pinned by @sha256}
+    pull_policy: never
+    user: "10001:10001"
+    environment:
+      FOLLON_DEPLOYMENT_MODE: production
+      FOLLON_GRPC_BIND: 0.0.0.0:50051
+      FOLLON_DATABASE_URL_FILE: /run/secrets/database_url
+      FOLLON_DATABASE_CA: /run/secrets/database_ca
+      FOLLON_GRPC_TLS_CERTIFICATE: /run/secrets/grpc_tls_certificate
+      FOLLON_GRPC_TLS_PRIVATE_KEY: /run/secrets/grpc_tls_private_key
+      FOLLON_GRPC_TLS_CLIENT_CA: /run/secrets/grpc_tls_client_ca
+    secrets:
+      - database_url
+      - database_ca
+      - grpc_tls_certificate
+      - grpc_tls_private_key
+      - grpc_tls_client_ca
+    ports:
+      - "${FOLLON_GRPC_LISTEN_ADDRESS:-127.0.0.1}:${FOLLON_GRPC_PORT:-50051}:50051"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/follon-trading-api", "--healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  dashboard-tls:
+    image: ${FOLLON_TLS_PROXY_IMAGE:?Set a reviewed nginx image pinned by @sha256}
+    pull_policy: never
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    ports:
+      - "${FOLLON_DASHBOARD_LISTEN_ADDRESS:-127.0.0.1}:${FOLLON_DASHBOARD_TLS_PORT:-8443}:8443"
+    secrets:
+      - dashboard_tls_certificate
+      - dashboard_tls_private_key
+      - dashboard_tls_client_ca
+    configs:
+      - source: dashboard_proxy
+        target: /etc/nginx/nginx.conf
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+      - /var/cache/nginx:rw,nosuid,nodev,noexec,size=16m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+configs:
+  dashboard_proxy:
+    file: ./nginx.dashboard.conf
+
+secrets:
+  dashboard_password:
+    file: ${FOLLON_DASHBOARD_PASSWORD_FILE:?Set protected dashboard password file}
+  database_url:
+    file: ${FOLLON_DATABASE_URL_FILE:?Set protected PostgreSQL URL file with sslmode=require}
+  database_ca:
+    file: ${FOLLON_DATABASE_CA_FILE:?Set PostgreSQL CA certificate}
+  grpc_tls_certificate:
+    file: ${FOLLON_GRPC_TLS_CERTIFICATE_FILE:?Set gRPC server certificate}
+  grpc_tls_private_key:
+    file: ${FOLLON_GRPC_TLS_PRIVATE_KEY_FILE:?Set gRPC server private key}
+  grpc_tls_client_ca:
+    file: ${FOLLON_GRPC_TLS_CLIENT_CA_FILE:?Set gRPC client CA}
+  dashboard_tls_certificate:
+    file: ${FOLLON_DASHBOARD_TLS_CERTIFICATE_FILE:?Set dashboard TLS certificate}
+  dashboard_tls_private_key:
+    file: ${FOLLON_DASHBOARD_TLS_PRIVATE_KEY_FILE:?Set dashboard TLS private key}
+  dashboard_tls_client_ca:
+    file: ${FOLLON_DASHBOARD_TLS_CLIENT_CA_FILE:?Set dashboard client CA}

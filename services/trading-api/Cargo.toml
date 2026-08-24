@@ -1,0 +1,29 @@
+[package]
+name = "follon-trading-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+follon-accounting = { path = "../../core/accounting" }
+follon-domain = { path = "../../core/domain" }
+follon-execution = { path = "../../core/execution" }
+follon-postgres = { path = "../../adapters/persistence/postgres" }
+follon-risk = { path = "../../core/risk" }
+prost = "0.14.1"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tonic = { version = "0.14.2", features = ["transport", "tls-ring"] }
+tonic-prost = "0.14.2"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.2"
+
+[[bin]]
+name = "follon-trading-api"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -14,8 +14,8 @@ use std::str::FromStr;
 
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
-    validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent, OrderState,
-    OrderType, RiskDecision, Side, TimeInForce,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
+    OrderState, OrderType, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 use fs2::FileExt;
@@ -796,6 +796,8 @@ pub struct PaperRiskPolicy {
     pub max_order_quantity: Decimal,
     /// Maximum one-order estimated notional.
     pub max_order_notional: Decimal,
+    /// Maximum absolute limit-price distance from the fresh mark in basis points.
+    pub max_price_deviation_bps: Decimal,
     /// Maximum number of non-terminal OMS orders.
     pub max_open_orders: usize,
     /// Maximum absolute position quantity per instrument.
@@ -809,11 +811,14 @@ pub struct PaperRiskPolicy {
 impl PaperRiskPolicy {
     /// Validates immutable paper-risk limits.
     pub fn validate(&self) -> Result<(), PaperError> {
+        let ten_thousand = Decimal::from_integer(10_000)?;
         if self.version.is_empty()
             || validate_canonical_id("paper trading_calendar_id", &self.trading_calendar_id)
                 .is_err()
             || self.max_order_quantity <= Decimal::ZERO
             || self.max_order_notional <= Decimal::ZERO
+            || self.max_price_deviation_bps < Decimal::ZERO
+            || self.max_price_deviation_bps >= ten_thousand
             || self.max_open_orders == 0
             || self.max_position_quantity <= Decimal::ZERO
             || self.max_realized_loss < Decimal::ZERO
@@ -2217,6 +2222,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             realized_pnl,
         };
         let estimated_notional = intent.quantity.checked_mul(market.mark_price)?;
+        let requested_price_deviation_bps = intent
+            .limit_price
+            .map(|price| price_deviation_bps(market.mark_price, price))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
         let projected_position = match intent.side {
             Side::Buy => context.position_quantity.checked_add(intent.quantity)?,
             Side::Sell => context.position_quantity.checked_sub(intent.quantity)?,
@@ -2227,6 +2237,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         }
         if estimated_notional > self.risk_policy.max_order_notional {
             reasons.push("MAX_ORDER_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if requested_price_deviation_bps > self.risk_policy.max_price_deviation_bps {
+            reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
         if self
             .orders
@@ -2271,9 +2284,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},market_instrument_id={},market_mark_price={},market_observed_at={},estimated_notional={},projected_position={},available_cash={}",
+                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
                 self.risk_policy.max_order_quantity,
                 self.risk_policy.max_order_notional,
+                self.risk_policy.max_price_deviation_bps,
                 self.risk_policy.max_open_orders,
                 self.risk_policy.max_position_quantity,
                 self.risk_policy.max_realized_loss,
@@ -2281,6 +2295,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 market.instrument_id,
                 market.mark_price,
                 market.observed_at,
+                intent.limit_price.map_or_else(|| "MARKET".to_owned(), |price| price.to_string()),
+                requested_price_deviation_bps,
                 estimated_notional,
                 projected_position,
                 context.available_cash,
@@ -2916,12 +2932,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         let initial_cash = self.account.initial_cash.to_string();
         let max_order_quantity = self.risk_policy.max_order_quantity.to_string();
         let max_order_notional = self.risk_policy.max_order_notional.to_string();
+        let max_price_deviation_bps = self.risk_policy.max_price_deviation_bps.to_string();
         let max_open_orders = self.risk_policy.max_open_orders.to_string();
         let max_position_quantity = self.risk_policy.max_position_quantity.to_string();
         let max_realized_loss = self.risk_policy.max_realized_loss.to_string();
         let max_market_data_age_seconds = self.risk_policy.max_market_data_age_seconds.to_string();
         hash_fingerprint_parts(&[
-            "paper-configuration-v1",
+            "paper-configuration-v2",
             &self.account.account_id,
             &self.account.currency,
             &initial_cash,
@@ -2930,6 +2947,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             &self.risk_policy.trading_calendar_id,
             &max_order_quantity,
             &max_order_notional,
+            &max_price_deviation_bps,
             &max_open_orders,
             &max_position_quantity,
             &max_realized_loss,
@@ -3380,6 +3398,7 @@ mod tests {
             trading_calendar_id: "cal.us_equities.nyse.v1".to_owned(),
             max_order_quantity: decimal("quantity", "100").unwrap(),
             max_order_notional: decimal("notional", "50000").unwrap(),
+            max_price_deviation_bps: decimal("price collar", "100").unwrap(),
             max_open_orders: 10,
             max_position_quantity: decimal("position", "1000").unwrap(),
             max_realized_loss: decimal("loss", "10000").unwrap(),
@@ -3807,6 +3826,31 @@ mod tests {
                 "2026-01-02T14:31:10Z",
             )
             .is_err());
+    }
+
+    #[test]
+    fn paper_price_collar_rejection_is_explainable_and_creates_no_order() {
+        let mut service = service();
+        let mut far_limit = intent("intent-paper-price-collar", "2026-01-02T14:31:00Z");
+        far_limit.order_type = OrderType::Limit;
+        far_limit.limit_price = Some(decimal("limit", "105").unwrap());
+        let result = service
+            .submit_intent(
+                far_limit,
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        assert!(!result.decision.approved);
+        assert!(result.order_id.is_none());
+        assert!(result
+            .decision
+            .reason_codes
+            .contains(&"PRICE_COLLAR_EXCEEDED".to_owned()));
+        assert!(result
+            .decision
+            .evaluated_limits
+            .contains("requested_price_deviation_bps=500.00000000"));
     }
 
     #[test]
