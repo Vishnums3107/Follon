@@ -26,7 +26,7 @@ jobs:
       # only after GitHub reports the feature as supported; lockfile audits
       # below remain mandatory in either case.
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         if: github.event_name == 'pull_request' && vars.DEPENDENCY_REVIEW_ENABLED == 'true'
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Rust advisory auditor
