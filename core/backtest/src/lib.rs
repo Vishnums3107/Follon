@@ -959,6 +959,55 @@ impl AdvancedBacktestAccount {
         Ok(accrual.charges_by_currency)
     }
 
+    /// Applies a split or cash-dividend action to the advanced account exactly once.
+    ///
+    /// The action must be part of the immutable selected dataset. A split
+    /// changes units and unit cost without inventing cash; a cash dividend is
+    /// applied to the signed held quantity, so a short correctly owes the
+    /// dividend. No action can be applied twice.
+    pub fn apply_corporate_action(
+        &mut self,
+        action: &CorporateAction,
+    ) -> Result<(), BacktestError> {
+        action.validate()?;
+        if self.lifecycle_event_ids.contains(action.action_id()) {
+            return Err(BacktestError(
+                "duplicate advanced corporate action".to_owned(),
+            ));
+        }
+        let Some(position) = self.positions.get_mut(action.instrument_id()) else {
+            self.lifecycle_event_ids
+                .insert(action.action_id().to_owned());
+            return Ok(());
+        };
+        match action {
+            CorporateAction::Split { ratio, .. } => {
+                position.quantity = position.quantity.checked_mul(*ratio)?;
+                if position.quantity != Decimal::ZERO {
+                    position.average_price = position.average_price.checked_div(*ratio)?;
+                }
+            }
+            CorporateAction::CashDividend { amount, .. } => {
+                let cash_delta = position
+                    .quantity
+                    .checked_mul(*amount)?
+                    .checked_mul(position.terms.multiplier)?;
+                let cash = self
+                    .cash_by_currency
+                    .get(&position.terms.currency)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                self.cash_by_currency.insert(
+                    position.terms.currency.clone(),
+                    cash.checked_add(cash_delta)?,
+                );
+            }
+        }
+        self.lifecycle_event_ids
+            .insert(action.action_id().to_owned());
+        Ok(())
+    }
+
     /// Closes an open position at a versioned delisting settlement price.
     pub fn settle_delisting(
         &mut self,
@@ -1133,6 +1182,79 @@ impl AdvancedBacktestAccount {
     /// Returns immutable delisting settlements in application order.
     pub fn delistings(&self) -> &[DelistingSettlement] {
         &self.delistings
+    }
+}
+
+impl AdvancedBacktestReport {
+    /// Stable JSON report with strings for every exact numeric value.
+    pub fn canonical_json(&self) -> String {
+        let positions = self
+            .positions
+            .iter()
+            .map(|position| {
+                format!(
+                    "{{\"asset_class\":{},\"average_price\":\"{}\",\"currency\":{},\"instrument_id\":{},\"quantity\":\"{}\",\"realized_pnl\":\"{}\"}}",
+                    json_string(&position.terms.asset_class),
+                    position.average_price,
+                    json_string(position.terms.currency.as_str()),
+                    json_string(&position.instrument_id),
+                    position.quantity,
+                    position.realized_pnl,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let delistings = self
+            .delistings
+            .iter()
+            .map(|settlement| {
+                format!(
+                    "{{\"cash_delta\":\"{}\",\"closed_quantity\":\"{}\",\"effective_at\":{},\"event_id\":{},\"instrument_id\":{},\"realized_pnl\":\"{}\",\"settlement_price\":\"{}\"}}",
+                    settlement.cash_delta,
+                    settlement.closed_quantity,
+                    json_string(&settlement.effective_at),
+                    json_string(&settlement.event_id),
+                    json_string(&settlement.instrument_id),
+                    settlement.realized_pnl,
+                    settlement.settlement_price,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"advanced_report_schema_version\":1,\"delistings\":[{}],\"execution_charges\":\"{}\",\"financing_charges\":\"{}\",\"margin\":{{\"base_currency\":{},\"cash_value\":\"{}\",\"excess_liquidity\":\"{}\",\"initial_margin\":\"{}\",\"maintenance_margin\":\"{}\",\"margin_call\":{},\"net_liquidation_value\":\"{}\",\"position_market_value\":\"{}\"}},\"positions\":[{}],\"realized_pnl\":\"{}\",\"unrealized_pnl\":\"{}\"}}",
+            delistings,
+            self.execution_charges,
+            self.financing_charges,
+            json_string(self.margin.base_currency.as_str()),
+            self.margin.cash_value,
+            self.margin.excess_liquidity,
+            self.margin.initial_margin,
+            self.margin.maintenance_margin,
+            self.margin.margin_call,
+            self.margin.net_liquidation_value,
+            self.margin.position_market_value,
+            positions,
+            self.realized_pnl,
+            self.unrealized_pnl,
+        )
+    }
+
+    /// Renders the advanced-account margin and economics evidence for review.
+    pub fn markdown_report(&self) -> String {
+        format!(
+            "# Follon Advanced Backtest Report\n\n| Metric | Exact value |\n| --- | ---: |\n| Base currency | {} |\n| Net liquidation value | {} |\n| Initial margin | {} |\n| Maintenance margin | {} |\n| Excess liquidity | {} |\n| Margin call | {} |\n| Realized P&L | {} |\n| Unrealized P&L | {} |\n| Execution charges | {} |\n| Financing charges | {} |\n\n",
+            self.margin.base_currency.as_str(),
+            self.margin.net_liquidation_value,
+            self.margin.initial_margin,
+            self.margin.maintenance_margin,
+            self.margin.excess_liquidity,
+            self.margin.margin_call,
+            self.realized_pnl,
+            self.unrealized_pnl,
+            self.execution_charges,
+            self.financing_charges,
+        )
     }
 }
 
@@ -2553,6 +2675,98 @@ mod tests {
             report.margin.net_liquidation_value,
             Decimal::from_str("11194.50").unwrap()
         );
+    }
+
+    #[test]
+    fn advanced_account_applies_corporate_actions_once_and_serializes_evidence() {
+        use follon_accounting::MarginRate;
+
+        let usd = Currency::new("USD").unwrap();
+        let mut account = AdvancedBacktestAccount::new(BTreeMap::from([(
+            usd.clone(),
+            Decimal::from_integer(1_000).unwrap(),
+        )]))
+        .unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: false,
+            borrow_available: Decimal::ZERO,
+            borrow_rate_bps: 0,
+        };
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.buy-1".to_owned(),
+                    order_id: "order.buy-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Buy,
+                    quantity: Decimal::from_integer(2).unwrap(),
+                    price: Decimal::from_integer(100).unwrap(),
+                    fee: Decimal::ZERO,
+                    executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges::default(),
+            )
+            .unwrap();
+        let split = CorporateAction::Split {
+            action_id: "action.spy-split".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            effective_at: "2026-01-03T00:00:00Z".to_owned(),
+            ratio: Decimal::from_integer(2).unwrap(),
+        };
+        account.apply_corporate_action(&split).unwrap();
+        assert!(account.apply_corporate_action(&split).is_err());
+        account
+            .apply_corporate_action(&CorporateAction::CashDividend {
+                action_id: "action.spy-dividend".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                effective_at: "2026-01-04T00:00:00Z".to_owned(),
+                amount: Decimal::from_integer(5).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(
+            account.positions()["inst.us_equity.spy"].quantity,
+            Decimal::from_integer(4).unwrap()
+        );
+        assert_eq!(
+            account.positions()["inst.us_equity.spy"].average_price,
+            Decimal::from_integer(50).unwrap()
+        );
+        assert_eq!(
+            account.cash_by_currency()[&usd],
+            Decimal::from_integer(820).unwrap()
+        );
+
+        let policy = MarginPolicy {
+            base_currency: usd,
+            maximum_fx_age_seconds: 0,
+            rates: BTreeMap::from([(
+                "equity".to_owned(),
+                MarginRate {
+                    initial_bps: 10_000,
+                    maintenance_bps: 10_000,
+                },
+            )]),
+        };
+        let report = account
+            .report(
+                &BTreeMap::from([(
+                    "inst.us_equity.spy".to_owned(),
+                    Decimal::from_integer(60).unwrap(),
+                )]),
+                &FxBook::default(),
+                &policy,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(report.unrealized_pnl, Decimal::from_integer(40).unwrap());
+        assert!(report
+            .canonical_json()
+            .contains("advanced_report_schema_version"));
+        assert!(report.markdown_report().contains("Initial margin"));
     }
 
     #[test]

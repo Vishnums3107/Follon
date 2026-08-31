@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "configuration_id": "config.spy-advanced",
+  "configuration_version": "v1",
+  "engine_version": "core-0.1.0",
+  "seed": 7,
+  "starts_at": "2026-01-02T14:31:00Z",
+  "ends_at": "2026-01-02T14:31:00Z",
+  "account": {
+    "account_id": "acct.paper.001",
+    "currency": "USD",
+    "initial_cash": "100000"
+  },
+  "advanced_account": {
+    "base_currency": "USD",
+    "initial_cash_by_currency": [
+      { "currency": "USD", "amount": "100000" }
+    ],
+    "maximum_fx_age_seconds": 0,
+    "fx_rates": [],
+    "margin_rates": [
+      { "asset_class": "etf", "initial_bps": 5000, "maintenance_bps": 2500 }
+    ],
+    "instrument_terms": [
+      {
+        "instrument_id": "inst.us_equity.spy",
+        "asset_class": "etf",
+        "currency": "USD",
+        "multiplier": "1",
+        "shortable": false,
+        "borrow_available": "0",
+        "borrow_rate_bps": 0
+      }
+    ],
+    "cash_debit_rates_bps": {},
+    "financing_accruals": [],
+    "delistings": []
+  },
+  "dataset": {
+    "dataset_id": "dataset.spy",
+    "dataset_version": "v1",
+    "reference_data_version": "reference-example-1",
+    "universe_id": "universe.spy"
+  },
+  "strategy": {
+    "strategy_id": "strategy-example-001",
+    "strategy_version": "strategy-example-v1",
+    "builtin_entry_threshold": "100"
+  },
+  "risk": {
+    "policy_version": "risk-example-1",
+    "global_kill_switch": false,
+    "max_quantity": "10",
+    "max_notional": "10000",
+    "max_price_deviation_bps": "100"
+  },
+  "execution": {
+    "spread_bps": "0",
+    "slippage_bps": "0",
+    "flat_fee": "0.10",
+    "latency_bars": 0,
+    "max_fill_quantity": null
+  },
+  "calendar": {
+    "calendar_id": "cal.us-equities.nyse",
+    "sessions": [
+      {
+        "exchange_date": "2026-01-02",
+        "opens_at": "2026-01-02T14:30:00Z",
+        "closes_at": "2026-01-02T21:00:00Z"
+      }
+    ]
+  },
+  "instruments": [
+    {
+      "instrument_id": "inst.us_equity.spy",
+      "symbol": "SPY",
+      "exchange_symbol": "SPY",
+      "asset_class": "ETF",
+      "venue": "venue.nyse_arca",
+      "currency": "USD",
+      "broker_ids": {},
+      "tick_size": "0.01",
+      "lot_size": "1",
+      "multiplier": "1",
+      "trading_calendar_id": "cal.us-equities.nyse",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "reference_version": "reference-example-1"
+    }
+  ]
+}

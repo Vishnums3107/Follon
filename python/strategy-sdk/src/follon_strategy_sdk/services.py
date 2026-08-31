@@ -257,6 +257,8 @@ class StrategyServices:
 
 def _canonical_state(values: dict[str, object]) -> str:
     try:
-        return json.dumps(values, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return json.dumps(
+            values, sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=False
+        )
     except (TypeError, ValueError) as error:
         raise ValueError("strategy state must contain JSON-safe finite values") from error

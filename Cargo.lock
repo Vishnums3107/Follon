@@ -364,6 +364,7 @@ dependencies = [
 name = "follon-cli"
 version = "0.1.0"
 dependencies = [
+ "follon-accounting",
  "follon-backtest",
  "follon-commercial",
  "follon-control-plane",
@@ -378,6 +379,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "time",
 ]
 
 [[package]]
@@ -400,6 +402,7 @@ dependencies = [
  "follon-domain",
  "follon-instrument",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

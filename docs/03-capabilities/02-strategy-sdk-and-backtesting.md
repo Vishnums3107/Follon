@@ -33,13 +33,14 @@ first normalized bar. Each callback receives only immutable strategy context
 and a normalized bar, and returns either one validated intent or `null`.
 
 The v1 stdio protocol remains backward compatible with the minimal bar/context
-frame and also accepts an optional strict `services` snapshot containing
-point-in-time history, portfolio/cash, and host-owned state. When present, the
-worker returns the updated canonical state/fingerprint and emitted structured
-metrics beside the nullable intent. The Rust replay host currently uses the
-minimal frame; a future gRPC host can inject the richer snapshot without a
-protocol redesign. Fill/risk-decision callback delivery and a deployed remote
-worker remain separate integration work.
+frame and also accepts a strict `services` snapshot containing point-in-time
+history, portfolio/cash, and host-owned state. The Rust replay host selects
+that richer frame for every Python backtest worker, advances its bounded
+history and portfolio projection on replayed fills, and rejects tampered state
+fingerprints, future-dated metrics, malformed metrics, or protocol drift.
+Workers return the updated canonical state/fingerprint and structured metrics
+beside the nullable intent. Fill/risk-decision callbacks directly into Python
+and a deployed remote gRPC worker remain separate integration work.
 
 The worker process runs with a cleared environment. An operator may explicitly
 provide the non-secret `FOLLON_STRATEGY_SDK_PATH` source location, which the
@@ -60,6 +61,15 @@ engine version, time range, instrument universe definition, and generated
 artifacts. The portable artifact embeds this complete specification, and a
 completion manifest binds each output file by SHA-256. A result without this
 record is exploratory output, not a reproducible decision artifact.
+
+Every CLI replay additionally produces a hashed advanced-account JSON and
+Markdown sidecar. Explicit `advanced_account` configuration supplies FX,
+margin, borrow, financing, and terminal-lifecycle economics. Older v1
+configuration files receive a deterministic, fully-paid cash-account profile
+from their own immutable account and instrument data: 100% margin, no inferred
+FX or borrow, and no fabricated financing or lifecycle events. The CLI refuses
+to publish a completed result if that advanced projection fails a capital or
+lifecycle validation.
 
 ## Exit condition
 

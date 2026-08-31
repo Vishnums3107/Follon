@@ -29,6 +29,7 @@
     "starts_at": { "$ref": "#/$defs/utc" },
     "ends_at": { "$ref": "#/$defs/utc" },
     "account": { "$ref": "#/$defs/account" },
+    "advanced_account": { "$ref": "#/$defs/advancedAccount" },
     "dataset": { "$ref": "#/$defs/dataset" },
     "strategy": { "$ref": "#/$defs/strategy" },
     "risk": { "$ref": "#/$defs/risk" },
@@ -70,6 +71,104 @@
         "account_id": { "$ref": "#/$defs/canonicalId" },
         "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
         "initial_cash": { "$ref": "#/$defs/decimal" }
+      }
+    },
+    "currencyBalance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["currency", "amount"],
+      "properties": {
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "amount": { "$ref": "#/$defs/decimal" }
+      }
+    },
+    "fxRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_currency", "quote_currency", "rate", "observed_at"],
+      "properties": {
+        "base_currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "quote_currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "rate": { "$ref": "#/$defs/positiveDecimal" },
+        "observed_at": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "marginRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_class", "initial_bps", "maintenance_bps"],
+      "properties": {
+        "asset_class": { "$ref": "#/$defs/canonicalId" },
+        "initial_bps": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "maintenance_bps": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      }
+    },
+    "advancedInstrumentTerms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instrument_id", "asset_class", "currency", "multiplier", "shortable", "borrow_available", "borrow_rate_bps"],
+      "properties": {
+        "instrument_id": { "$ref": "#/$defs/canonicalId" },
+        "asset_class": { "$ref": "#/$defs/canonicalId" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "multiplier": { "$ref": "#/$defs/positiveDecimal" },
+        "shortable": { "type": "boolean" },
+        "borrow_available": { "$ref": "#/$defs/decimal" },
+        "borrow_rate_bps": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      }
+    },
+    "financingAccrual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accrual_id", "effective_at", "days", "day_count_basis"],
+      "properties": {
+        "accrual_id": { "$ref": "#/$defs/canonicalId" },
+        "effective_at": { "$ref": "#/$defs/utc" },
+        "days": { "type": "integer", "minimum": 1, "maximum": 366 },
+        "day_count_basis": { "type": "integer", "minimum": 1, "maximum": 366 }
+      }
+    },
+    "delisting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "instrument_id", "effective_at", "settlement_price"],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/canonicalId" },
+        "instrument_id": { "$ref": "#/$defs/canonicalId" },
+        "effective_at": { "$ref": "#/$defs/utc" },
+        "settlement_price": { "$ref": "#/$defs/decimal" }
+      }
+    },
+    "advancedAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_currency", "initial_cash_by_currency", "maximum_fx_age_seconds", "fx_rates", "margin_rates", "instrument_terms"],
+      "properties": {
+        "base_currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "initial_cash_by_currency": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/currencyBalance" }
+        },
+        "maximum_fx_age_seconds": { "type": "integer", "minimum": 0 },
+        "fx_rates": { "type": "array", "items": { "$ref": "#/$defs/fxRate" } },
+        "margin_rates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/marginRate" }
+        },
+        "instrument_terms": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/advancedInstrumentTerms" }
+        },
+        "cash_debit_rates_bps": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Z]{3}$" },
+          "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+        },
+        "financing_accruals": { "type": "array", "items": { "$ref": "#/$defs/financingAccrual" } },
+        "delistings": { "type": "array", "items": { "$ref": "#/$defs/delisting" } }
       }
     },
     "dataset": {

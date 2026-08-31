@@ -10,6 +10,7 @@ authors.workspace = true
 follon-domain = { path = "../domain" }
 follon-instrument = { path = "../instrument" }
 serde_json = "1.0.145"
+sha2 = "0.10.9"
 
 [lib]
 path = "src/lib.rs"
