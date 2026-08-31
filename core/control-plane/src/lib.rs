@@ -16,6 +16,7 @@ use follon_domain::{
     OrderStateChange, OrderType, PnlSnapshot, PositionSnapshot, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{InstrumentRegistry, TradingCalendar};
+use sha2::{Digest, Sha256};
 
 /// Error returned by the deterministic trading kernel.
 #[derive(Debug)]
@@ -466,6 +467,19 @@ impl EventSink for FileEventStore {
 pub trait Strategy {
     /// Handles one normalized bar and may emit exactly one declarative intent.
     fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError>;
+
+    /// Receives an execution after the replay portfolio has applied it.
+    ///
+    /// The default deliberately does nothing. Isolated workers use this hook to
+    /// construct their next immutable portfolio snapshot; it never permits a
+    /// strategy to alter a fill, broker state, or risk decision.
+    fn on_execution(
+        &mut self,
+        _fill: &Fill,
+        _position: &PositionSnapshot,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// Immutable identity expected from an isolated strategy worker process.
@@ -504,6 +518,265 @@ impl StrategyWorkerIdentity {
     }
 }
 
+/// Explicit single-currency starting balance for bounded worker services.
+///
+/// It is intentionally limited to the deterministic replay account. A worker
+/// receives a snapshot only; it cannot mutate cash, positions, adapters, or
+/// credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyWorkerServicesConfig {
+    /// ISO currency used by the replay account and every current position.
+    pub currency: String,
+    /// Exact opening cash supplied by the immutable backtest input.
+    pub initial_cash: Decimal,
+}
+
+impl StrategyWorkerServicesConfig {
+    fn validate(&self) -> Result<(), EngineError> {
+        if self.currency.len() != 3
+            || !self.currency.bytes().all(|byte| byte.is_ascii_uppercase())
+            || self.initial_cash < Decimal::ZERO
+        {
+            return Err(EngineError(
+                "invalid strategy worker service account snapshot".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One exact custom metric returned by a bounded isolated strategy callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyWorkerMetric {
+    /// Canonical metric name.
+    pub name: String,
+    /// Exact reported value.
+    pub value: Decimal,
+    /// Replay-clock time at which the strategy measured the value.
+    pub observed_at: String,
+    /// Stable canonical tag key/value pairs.
+    pub tags: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerPortfolioPosition {
+    quantity: Decimal,
+    average_cost: Decimal,
+    mark_price: Decimal,
+}
+
+#[derive(Clone, Debug)]
+struct WorkerRuntimeServices {
+    currency: String,
+    cash: Decimal,
+    positions: BTreeMap<String, WorkerPortfolioPosition>,
+    history: Vec<(String, Bar)>,
+    state: serde_json::Map<String, serde_json::Value>,
+    state_fingerprint: String,
+    latest_metrics: Vec<StrategyWorkerMetric>,
+}
+
+impl WorkerRuntimeServices {
+    const MAX_HISTORY_RECORDS: usize = 1_000_000;
+    const MAX_STATE_BYTES: usize = 65_536;
+    const MAX_METRICS: usize = 10_000;
+
+    fn new(config: StrategyWorkerServicesConfig) -> Result<Self, EngineError> {
+        config.validate()?;
+        let state = serde_json::Map::new();
+        Ok(Self {
+            currency: config.currency,
+            cash: config.initial_cash,
+            positions: BTreeMap::new(),
+            history: Vec::new(),
+            state_fingerprint: json_fingerprint(&state)?,
+            state,
+            latest_metrics: Vec::new(),
+        })
+    }
+
+    fn observe_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<(), EngineError> {
+        validate_utc_timestamp("worker replay_time", replay_time)?;
+        if self.history.len() >= Self::MAX_HISTORY_RECORDS {
+            return Err(EngineError(
+                "strategy worker history exceeds its bounded service contract".to_owned(),
+            ));
+        }
+        if let Some(position) = self.positions.get_mut(&bar.instrument_id) {
+            position.mark_price = bar.close;
+        }
+        self.history.push((replay_time.to_owned(), bar.clone()));
+        Ok(())
+    }
+
+    fn apply_execution(
+        &mut self,
+        fill: &Fill,
+        position: &PositionSnapshot,
+    ) -> Result<(), EngineError> {
+        if fill.instrument_id != position.instrument_id
+            || fill.quantity <= Decimal::ZERO
+            || fill.price <= Decimal::ZERO
+            || fill.fee < Decimal::ZERO
+        {
+            return Err(EngineError(
+                "worker service snapshot received an invalid execution".to_owned(),
+            ));
+        }
+        let gross = fill.price.checked_mul(fill.quantity)?;
+        self.cash = match fill.side {
+            Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
+            Side::Sell => self.cash.checked_add(gross.checked_sub(fill.fee)?)?,
+        };
+        self.positions.insert(
+            position.instrument_id.clone(),
+            WorkerPortfolioPosition {
+                quantity: position.quantity,
+                average_cost: position.average_cost,
+                mark_price: fill.price,
+            },
+        );
+        Ok(())
+    }
+
+    fn service_payload(&self, replay_time: &str) -> serde_json::Value {
+        let history = self
+            .history
+            .iter()
+            .map(|(event_time, bar)| {
+                serde_json::json!({
+                    "event_time": event_time,
+                    "bar": worker_bar_payload(bar),
+                })
+            })
+            .collect::<Vec<_>>();
+        let positions = self
+            .positions
+            .iter()
+            .map(|(instrument_id, position)| {
+                serde_json::json!({
+                    "instrument_id": instrument_id,
+                    "quantity": position.quantity.to_string(),
+                    "average_cost": position.average_cost.to_string(),
+                    "mark_price": position.mark_price.to_string(),
+                    "currency": self.currency,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "history": { "as_of": replay_time, "records": history },
+            "portfolio": {
+                "as_of": replay_time,
+                "positions": positions,
+                "cash_by_currency": [{ "currency": self.currency, "amount": self.cash.to_string() }],
+            },
+            "state": { "values": self.state },
+        })
+    }
+
+    fn store_output(
+        &mut self,
+        state: &serde_json::Value,
+        metrics: &serde_json::Value,
+        replay_time: &str,
+    ) -> Result<(), EngineError> {
+        let state = state.as_object().ok_or_else(|| {
+            EngineError("strategy worker service state is not an object".to_owned())
+        })?;
+        require_exact_json_fields(
+            state,
+            &["fingerprint", "values"],
+            "strategy worker service state",
+        )?;
+        let fingerprint = json_value_string(state, "fingerprint")?;
+        if !is_sha256(fingerprint) {
+            return Err(EngineError(
+                "strategy worker service state has an invalid fingerprint".to_owned(),
+            ));
+        }
+        let values = state
+            .get("values")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                EngineError("strategy worker service state values are not an object".to_owned())
+            })?;
+        let computed = json_fingerprint(values)?;
+        if computed != fingerprint {
+            return Err(EngineError(
+                "strategy worker service state fingerprint does not bind its values".to_owned(),
+            ));
+        }
+        let metrics = metrics
+            .as_array()
+            .ok_or_else(|| EngineError("strategy worker metrics are not an array".to_owned()))?;
+        if metrics.len() > Self::MAX_METRICS {
+            return Err(EngineError(
+                "strategy worker metrics exceed the bounded service contract".to_owned(),
+            ));
+        }
+        let mut parsed_metrics = Vec::with_capacity(metrics.len());
+        for metric in metrics {
+            let metric = metric
+                .as_object()
+                .ok_or_else(|| EngineError("strategy worker metric is not an object".to_owned()))?;
+            require_exact_json_fields(
+                metric,
+                &["name", "observed_at", "tags", "value"],
+                "strategy worker metric",
+            )?;
+            let name = json_value_string(metric, "name")?.to_owned();
+            validate_canonical_id("strategy worker metric name", &name)?;
+            let observed_at = json_value_string(metric, "observed_at")?.to_owned();
+            validate_utc_timestamp("strategy worker metric observed_at", &observed_at)?;
+            if observed_at.as_str() > replay_time {
+                return Err(EngineError(
+                    "strategy worker metric contains look-ahead time".to_owned(),
+                ));
+            }
+            let value = Decimal::from_str(json_value_string(metric, "value")?)?;
+            let tags = metric
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    EngineError("strategy worker metric tags are not an array".to_owned())
+                })?;
+            if tags.len() > 32 {
+                return Err(EngineError(
+                    "strategy worker metric has too many tags".to_owned(),
+                ));
+            }
+            let mut keys = BTreeSet::new();
+            let mut parsed_tags = Vec::with_capacity(tags.len());
+            for tag in tags {
+                let tag = tag.as_object().ok_or_else(|| {
+                    EngineError("strategy worker metric tag is not an object".to_owned())
+                })?;
+                require_exact_json_fields(tag, &["key", "value"], "strategy worker metric tag")?;
+                let key = json_value_string(tag, "key")?.to_owned();
+                let value = json_value_string(tag, "value")?.to_owned();
+                validate_canonical_id("strategy worker metric tag key", &key)?;
+                validate_canonical_id("strategy worker metric tag value", &value)?;
+                if !keys.insert(key.clone()) {
+                    return Err(EngineError(
+                        "strategy worker metric has duplicate tag keys".to_owned(),
+                    ));
+                }
+                parsed_tags.push((key, value));
+            }
+            parsed_metrics.push(StrategyWorkerMetric {
+                name,
+                value,
+                observed_at,
+                tags: parsed_tags,
+            });
+        }
+        self.state = values.clone();
+        self.state_fingerprint = fingerprint.to_owned();
+        self.latest_metrics = parsed_metrics;
+        Ok(())
+    }
+}
+
 /// Stdio adapter for the versioned isolated strategy-worker protocol.
 ///
 /// The child receives only normalized market bars and immutable strategy
@@ -511,6 +784,7 @@ impl StrategyWorkerIdentity {
 /// engine sees it; a worker never receives adapters or credentials.
 pub struct ProcessStrategyWorker {
     identity: StrategyWorkerIdentity,
+    services: Option<WorkerRuntimeServices>,
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
@@ -522,6 +796,31 @@ impl ProcessStrategyWorker {
         program: impl AsRef<OsStr>,
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
+    ) -> Result<Self, EngineError> {
+        Self::spawn_inner(program, arguments, identity, None)
+    }
+
+    /// Starts a worker with bounded point-in-time data, portfolio, state, and
+    /// metrics services enabled for every callback.
+    pub fn spawn_with_services(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+        services: StrategyWorkerServicesConfig,
+    ) -> Result<Self, EngineError> {
+        Self::spawn_inner(
+            program,
+            arguments,
+            identity,
+            Some(WorkerRuntimeServices::new(services)?),
+        )
+    }
+
+    fn spawn_inner(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+        services: Option<WorkerRuntimeServices>,
     ) -> Result<Self, EngineError> {
         identity.validate()?;
         let mut command = Command::new(program);
@@ -547,6 +846,7 @@ impl ProcessStrategyWorker {
         })?;
         let mut worker = Self {
             identity,
+            services,
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
@@ -601,7 +901,7 @@ impl ProcessStrategyWorker {
         bar: &Bar,
         replay_time: &str,
     ) -> Result<Option<OrderIntent>, EngineError> {
-        let frame = serde_json::json!({
+        let mut frame = serde_json::json!({
             "protocol_version": 1,
             "type": "market_bar",
             "context": {
@@ -612,17 +912,15 @@ impl ProcessStrategyWorker {
                 "replay_time": replay_time,
                 "environment": self.identity.environment,
             },
-            "bar": {
-                "instrument_id": bar.instrument_id,
-                "open": bar.open.to_string(),
-                "high": bar.high.to_string(),
-                "low": bar.low.to_string(),
-                "close": bar.close.to_string(),
-                "volume": bar.volume.to_string(),
-                "interval_seconds": bar.interval_seconds,
-                "exchange_timezone": bar.exchange_timezone,
-            },
+            "bar": worker_bar_payload(bar),
         });
+        if let Some(services) = self.services.as_mut() {
+            services.observe_bar(bar, replay_time)?;
+            frame
+                .as_object_mut()
+                .expect("worker request frame remains an object")
+                .insert("services".to_owned(), services.service_payload(replay_time));
+        }
         let serialized =
             serde_json::to_string(&frame).expect("serializing a JSON worker frame cannot fail");
         let stdin = self
@@ -644,11 +942,26 @@ impl ProcessStrategyWorker {
         }
         match json_value_string(object, "type")? {
             "strategy_output" => {
-                require_exact_json_fields(
-                    object,
-                    &["intent", "protocol_version", "type"],
-                    "strategy worker output frame",
-                )?;
+                if let Some(services) = self.services.as_mut() {
+                    require_exact_json_fields(
+                        object,
+                        &["intent", "metrics", "protocol_version", "state", "type"],
+                        "strategy worker enriched output frame",
+                    )?;
+                    services.store_output(
+                        object.get("state").expect("required output state exists"),
+                        object
+                            .get("metrics")
+                            .expect("required output metrics exist"),
+                        replay_time,
+                    )?;
+                } else {
+                    require_exact_json_fields(
+                        object,
+                        &["intent", "protocol_version", "type"],
+                        "strategy worker output frame",
+                    )?;
+                }
                 match object.get("intent") {
                     Some(serde_json::Value::Null) => Ok(None),
                     Some(serde_json::Value::Object(intent)) => {
@@ -696,11 +1009,36 @@ impl ProcessStrategyWorker {
             )),
         }
     }
+
+    /// Returns the fingerprint of state retained after the latest enriched callback.
+    pub fn state_fingerprint(&self) -> Option<&str> {
+        self.services
+            .as_ref()
+            .map(|services| services.state_fingerprint.as_str())
+    }
+
+    /// Returns validated custom metrics from the latest enriched callback.
+    pub fn latest_metrics(&self) -> Option<&[StrategyWorkerMetric]> {
+        self.services
+            .as_ref()
+            .map(|services| services.latest_metrics.as_slice())
+    }
 }
 
 impl Strategy for ProcessStrategyWorker {
     fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError> {
         self.request_intent(bar, replay_time)
+    }
+
+    fn on_execution(
+        &mut self,
+        fill: &Fill,
+        position: &PositionSnapshot,
+    ) -> Result<(), EngineError> {
+        if let Some(services) = self.services.as_mut() {
+            services.apply_execution(fill, position)?;
+        }
+        Ok(())
     }
 }
 
@@ -830,6 +1168,32 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn worker_bar_payload(bar: &Bar) -> serde_json::Value {
+    serde_json::json!({
+        "instrument_id": bar.instrument_id,
+        "open": bar.open.to_string(),
+        "high": bar.high.to_string(),
+        "low": bar.low.to_string(),
+        "close": bar.close.to_string(),
+        "volume": bar.volume.to_string(),
+        "interval_seconds": bar.interval_seconds,
+        "exchange_timezone": bar.exchange_timezone,
+    })
+}
+
+fn json_fingerprint(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, EngineError> {
+    let canonical = serde_json::to_string(values)
+        .map_err(|error| EngineError(format!("cannot serialize strategy worker state: {error}")))?;
+    if canonical.len() > WorkerRuntimeServices::MAX_STATE_BYTES {
+        return Err(EngineError(
+            "strategy worker state exceeds the bounded service contract".to_owned(),
+        ));
+    }
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
 }
 
 /// A deterministic example strategy used by the first replay test.
@@ -1491,9 +1855,14 @@ impl ReplayEngine {
                 .working_orders
                 .remove(&order_id)
                 .expect("eligible order came from working-order index");
-            if let Some((position, pnl)) =
-                self.attempt_simulated_fill(sink, &mut events, account_id, &bar, &mut working)?
-            {
+            if let Some((position, pnl)) = self.attempt_simulated_fill(
+                sink,
+                &mut events,
+                strategy,
+                account_id,
+                &bar,
+                &mut working,
+            )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
             }
@@ -1614,9 +1983,14 @@ impl ReplayEngine {
             order,
         };
         if eligible_on_bar <= self.bar_sequence {
-            if let Some((position, pnl)) =
-                self.attempt_simulated_fill(sink, &mut events, account_id, &bar, &mut working)?
-            {
+            if let Some((position, pnl)) = self.attempt_simulated_fill(
+                sink,
+                &mut events,
+                strategy,
+                account_id,
+                &bar,
+                &mut working,
+            )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
             }
@@ -1646,6 +2020,7 @@ impl ReplayEngine {
         &mut self,
         sink: &mut impl EventSink,
         events: &mut Vec<EventEnvelope>,
+        strategy: &mut impl Strategy,
         account_id: &str,
         bar: &Bar,
         working: &mut SimulatedWorkingOrder,
@@ -1741,6 +2116,7 @@ impl ReplayEngine {
                 portfolio.pnl_snapshot(bar.close)?,
             )
         };
+        strategy.on_execution(&fill, &position)?;
         let current_time = self.clock.now().to_owned();
         let position_event = self.emit(
             sink,
@@ -2543,6 +2919,96 @@ mod tests {
             environment: "SIMULATION".to_owned(),
         };
         assert!(identity.validate().is_err());
+    }
+
+    #[test]
+    fn enriched_worker_services_are_point_in_time_bound_and_state_fingerprinted() {
+        let replay_time = "2026-01-02T14:31:00Z";
+        let mut services = WorkerRuntimeServices::new(StrategyWorkerServicesConfig {
+            currency: "USD".to_owned(),
+            initial_cash: Decimal::from_integer(1_000).unwrap(),
+        })
+        .unwrap();
+        services.observe_bar(&bar(), replay_time).unwrap();
+
+        let values = serde_json::json!({"phase": 1}).as_object().unwrap().clone();
+        let fingerprint = json_fingerprint(&values).unwrap();
+        services
+            .store_output(
+                &serde_json::json!({"fingerprint": fingerprint, "values": values}),
+                &serde_json::json!([{
+                    "name": "strategy.signal",
+                    "value": "1.25",
+                    "observed_at": replay_time,
+                    "tags": [{"key": "regime", "value": "baseline"}],
+                }]),
+                replay_time,
+            )
+            .unwrap();
+
+        let fill = Fill {
+            execution_id: "exec.worker.001".to_owned(),
+            order_id: "order.worker.001".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(1).unwrap(),
+            price: Decimal::from_integer(100).unwrap(),
+            fee: Decimal::from_str("0.10").unwrap(),
+            executed_at: replay_time.to_owned(),
+        };
+        let position = PositionSnapshot {
+            account_id: "acct.paper.001".to_owned(),
+            instrument_id: fill.instrument_id.clone(),
+            quantity: Decimal::from_integer(1).unwrap(),
+            average_cost: Decimal::from_str("100.10").unwrap(),
+            realized_pnl: Decimal::ZERO,
+        };
+        services.apply_execution(&fill, &position).unwrap();
+
+        let payload = services.service_payload(replay_time);
+        assert_eq!(payload["history"]["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["portfolio"]["cash_by_currency"][0]["amount"],
+            "899.90000000"
+        );
+        assert_eq!(
+            payload["portfolio"]["positions"][0]["average_cost"],
+            "100.10000000"
+        );
+        assert_eq!(services.state_fingerprint, fingerprint);
+        assert_eq!(services.latest_metrics[0].name, "strategy.signal");
+    }
+
+    #[test]
+    fn enriched_worker_services_reject_tampered_state_and_lookahead_metrics() {
+        let replay_time = "2026-01-02T14:31:00Z";
+        let mut services = WorkerRuntimeServices::new(StrategyWorkerServicesConfig {
+            currency: "USD".to_owned(),
+            initial_cash: Decimal::from_integer(1).unwrap(),
+        })
+        .unwrap();
+        let values = serde_json::json!({"phase": 1}).as_object().unwrap().clone();
+        assert!(services
+            .store_output(
+                &serde_json::json!({"fingerprint": "0".repeat(64), "values": values}),
+                &serde_json::json!([]),
+                replay_time,
+            )
+            .is_err());
+        let values = serde_json::Map::new();
+        let fingerprint = json_fingerprint(&values).unwrap();
+        assert!(services
+            .store_output(
+                &serde_json::json!({"fingerprint": fingerprint, "values": values}),
+                &serde_json::json!([{
+                    "name": "strategy.signal",
+                    "value": "1",
+                    "observed_at": "2026-01-02T14:31:01Z",
+                    "tags": [],
+                }]),
+                replay_time,
+            )
+            .is_err());
     }
 
     #[test]

@@ -88,27 +88,28 @@ fn parameter_change_and_journal_backed_schedule_workflow_is_reproducible() {
         .as_str()
         .expect("validation must print a parameter-set fingerprint")
         .to_owned();
-    let previous_document: serde_json::Value = serde_json::from_str(&previous_source).unwrap();
-    let previous_subject_hash = previous_document["parameters"]["values"][1]["approval"]
-        ["approval_subject_hash"]
-        .as_str()
-        .unwrap();
-    let target_source = previous_source
-        .replace(
-            "\"configuration_version\": \"2026.08.10.1\"",
-            "\"configuration_version\": \"2026.08.10.2\"",
-        )
-        .replace(
-            "\"revision\": \"7\",\n    \"previous_revision\": null,\n    \"previous_parameter_set_fingerprint\": null",
-            &format!(
-                "\"revision\": \"8\",\n    \"previous_revision\": \"7\",\n    \"previous_parameter_set_fingerprint\": \"{previous_parameter_set_fingerprint}\""
-            ),
-        )
-        .replace("\"value\": \"2.0\"", "\"value\": \"2.25\"")
-        .replace(
-            previous_subject_hash,
-            &target_approval_subject_hash(previous_parameter_set_fingerprint),
-        );
+    let target_subject_hash =
+        target_approval_subject_hash(previous_parameter_set_fingerprint.clone());
+    let mut target_document: serde_json::Value = serde_json::from_str(&previous_source).unwrap();
+    target_document["configuration"]["configuration_version"] =
+        serde_json::Value::String("2026.08.10.2".to_owned());
+    target_document["parameters"]["revision"] = serde_json::Value::String("8".to_owned());
+    target_document["parameters"]["previous_revision"] = serde_json::Value::String("7".to_owned());
+    target_document["parameters"]["previous_parameter_set_fingerprint"] =
+        serde_json::Value::String(previous_parameter_set_fingerprint);
+    let values = target_document["parameters"]["values"]
+        .as_array_mut()
+        .expect("operations fixture must include parameter values");
+    values[0]["value"] = serde_json::Value::String("2.25".to_owned());
+    for value in values {
+        if let Some(approval) = value["approval"].as_object_mut() {
+            approval.insert(
+                "approval_subject_hash".to_owned(),
+                serde_json::Value::String(target_subject_hash.clone()),
+            );
+        }
+    }
+    let target_source = serde_json::to_string_pretty(&target_document).unwrap();
     fs::write(&target, target_source).unwrap();
 
     let change_path = workspace.join("parameter-changes.json");

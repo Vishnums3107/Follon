@@ -1052,32 +1052,34 @@ mod tests {
             Some(previous.parameters.fingerprint().unwrap());
         target_parameters.values[0].value = decimal("2.25").unwrap();
         let target_subject_hash = target_parameters.approval_subject_fingerprint().unwrap();
-        let previous_subject_hash = previous.parameters.values[1]
-            .approval
-            .as_ref()
-            .unwrap()
-            .approval_subject_hash
-            .clone();
         for value in &mut target_parameters.values {
             if let Some(approval) = &mut value.approval {
                 approval.approval_subject_hash = target_subject_hash.clone();
             }
         }
         let previous_source = fs::read_to_string(&fixture).unwrap();
-        let target_source = previous_source
-            .replace(
-                "\"configuration_version\": \"2026.08.10.1\"",
-                "\"configuration_version\": \"2026.08.10.2\"",
-            )
-            .replace(
-                "\"revision\": \"7\",\n    \"previous_revision\": null,\n    \"previous_parameter_set_fingerprint\": null",
-                &format!(
-                    "\"revision\": \"8\",\n    \"previous_revision\": \"7\",\n    \"previous_parameter_set_fingerprint\": \"{}\"",
-                    previous.parameters.fingerprint().unwrap()
-                ),
-            )
-            .replace("\"value\": \"2.0\"", "\"value\": \"2.25\"")
-            .replace(&previous_subject_hash, &target_subject_hash);
+        let mut target_document: serde_json::Value =
+            serde_json::from_str(&previous_source).unwrap();
+        target_document["configuration"]["configuration_version"] =
+            serde_json::Value::String("2026.08.10.2".to_owned());
+        target_document["parameters"]["revision"] = serde_json::Value::String("8".to_owned());
+        target_document["parameters"]["previous_revision"] =
+            serde_json::Value::String("7".to_owned());
+        target_document["parameters"]["previous_parameter_set_fingerprint"] =
+            serde_json::Value::String(previous.parameters.fingerprint().unwrap());
+        let values = target_document["parameters"]["values"]
+            .as_array_mut()
+            .expect("parameter-change fixture must include values");
+        values[0]["value"] = serde_json::Value::String("2.25".to_owned());
+        for value in values {
+            if let Some(approval) = value["approval"].as_object_mut() {
+                approval.insert(
+                    "approval_subject_hash".to_owned(),
+                    serde_json::Value::String(target_subject_hash.clone()),
+                );
+            }
+        }
+        let target_source = serde_json::to_string_pretty(&target_document).unwrap();
         let path = std::env::temp_dir().join(format!(
             "follon-operations-parameter-change-{}-{}.json",
             std::process::id(),

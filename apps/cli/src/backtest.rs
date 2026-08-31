@@ -7,16 +7,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use follon_accounting::{Currency, FxBook, FxQuote, MarginPolicy, MarginRate};
 use follon_backtest::{
-    BacktestInput, BacktestRunner, BacktestSpec, DatasetManifest, ExperimentRecord,
-    FileExperimentStore,
+    AdvancedBacktestAccount, AdvancedBacktestReport, AdvancedInstrumentTerms, BacktestCapitalCheck,
+    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec, DatasetManifest,
+    ExperimentRecord, FileExperimentStore,
 };
 use follon_cli::{sha256_text, write_immutable};
 use follon_control_plane::{
     import_historical_bars, BuyOnceStrategy, DeterministicFillModel, MarketPreconditions,
     ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity,
+    StrategyWorkerServicesConfig,
 };
-use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
+use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, Fill, Side};
 use follon_instrument::{
     AssetClass, Instrument, InstrumentRegistry, InstrumentVersion, StaticTradingCalendar,
     TradingHalt, TradingSession,
@@ -24,6 +27,8 @@ use follon_instrument::{
 use follon_market_data::import_corporate_actions;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 const BUILTIN_STRATEGY_SOURCE: &str = include_str!("../../../core/control-plane/src/lib.rs");
 
@@ -96,6 +101,8 @@ struct BacktestConfigurationDocument {
     execution: ExecutionDocument,
     calendar: CalendarDocument,
     instruments: Vec<InstrumentDocument>,
+    #[serde(default)]
+    advanced_account: Option<AdvancedAccountDocument>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +111,77 @@ struct AccountDocument {
     account_id: String,
     currency: String,
     initial_cash: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrencyBalanceDocument {
+    currency: String,
+    amount: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FxRateDocument {
+    base_currency: String,
+    quote_currency: String,
+    rate: String,
+    observed_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarginRateDocument {
+    asset_class: String,
+    initial_bps: u32,
+    maintenance_bps: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvancedInstrumentTermsDocument {
+    instrument_id: String,
+    asset_class: String,
+    currency: String,
+    multiplier: String,
+    shortable: bool,
+    borrow_available: String,
+    borrow_rate_bps: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinancingAccrualDocument {
+    accrual_id: String,
+    effective_at: String,
+    days: u32,
+    day_count_basis: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelistingDocument {
+    event_id: String,
+    instrument_id: String,
+    effective_at: String,
+    settlement_price: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvancedAccountDocument {
+    base_currency: String,
+    initial_cash_by_currency: Vec<CurrencyBalanceDocument>,
+    maximum_fx_age_seconds: i64,
+    fx_rates: Vec<FxRateDocument>,
+    margin_rates: Vec<MarginRateDocument>,
+    instrument_terms: Vec<AdvancedInstrumentTermsDocument>,
+    #[serde(default)]
+    cash_debit_rates_bps: BTreeMap<String, u32>,
+    #[serde(default)]
+    financing_accruals: Vec<FinancingAccrualDocument>,
+    #[serde(default)]
+    delistings: Vec<DelistingDocument>,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +280,34 @@ struct RuntimeConfiguration {
     fill_model: DeterministicFillModel,
     instruments: InstrumentRegistry,
     calendar: StaticTradingCalendar,
+    /// Every replay is projected through the advanced account. Configurations
+    /// without explicit economics receive a conservative cash-account profile
+    /// derived only from their already-versioned reference data.
+    advanced_account: AdvancedAccountRuntime,
+}
+
+struct AdvancedAccountRuntime {
+    cash_by_currency: BTreeMap<Currency, Decimal>,
+    terms_by_instrument: BTreeMap<String, AdvancedInstrumentTerms>,
+    fx: FxBook,
+    margin_policy: MarginPolicy,
+    cash_debit_rates_bps: BTreeMap<Currency, u32>,
+    financing_accruals: Vec<FinancingAccrualRuntime>,
+    delistings: Vec<DelistingRuntime>,
+}
+
+struct FinancingAccrualRuntime {
+    accrual_id: String,
+    effective_at: String,
+    days: u32,
+    day_count_basis: u32,
+}
+
+struct DelistingRuntime {
+    event_id: String,
+    instrument_id: String,
+    effective_at: String,
+    settlement_price: Decimal,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -302,14 +408,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 strategy_bundle_hash,
                 environment: "SIMULATION".to_owned(),
             };
-            let mut strategy = ProcessStrategyWorker::spawn(
+            let mut strategy = ProcessStrategyWorker::spawn_with_services(
                 &worker.program,
                 worker.protocol_arguments(),
                 identity,
+                StrategyWorkerServicesConfig {
+                    currency: document.account.currency.clone(),
+                    initial_cash: configuration.initial_cash,
+                },
             )?;
             runner.run(&mut strategy, &input, &market)?
         }
     };
+    let advanced_report = advanced_account_projection(
+        &completed.canonical_events,
+        &input.corporate_actions,
+        &configuration.advanced_account,
+    )?;
     let event_path = arguments.artifact_path.with_extension("events.ndjson");
     let report_path = arguments.artifact_path.with_extension("report.md");
     let manifest_path = arguments.artifact_path.with_extension("manifest.json");
@@ -319,8 +434,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_immutable(&arguments.artifact_path, &artifact_json)?;
     write_immutable(&event_path, &event_stream)?;
     write_immutable(&report_path, &report)?;
+    let advanced_artifact = advanced_report.canonical_json();
+    let advanced_report_text = advanced_report.markdown_report();
+    let advanced_artifact_path = arguments
+        .artifact_path
+        .with_extension("advanced-account.json");
+    let advanced_report_path = arguments.artifact_path.with_extension("advanced-report.md");
+    write_immutable(&advanced_artifact_path, &advanced_artifact)?;
+    write_immutable(&advanced_report_path, &advanced_report_text)?;
+    let advanced_manifest = format!(
+        "{{\"artifact_sha256\":\"{}\",\"report_sha256\":\"{}\"}}",
+        sha256_text(&advanced_artifact),
+        sha256_text(&advanced_report_text),
+    );
     let completion_manifest = format!(
-        "{{\"artifact_fingerprint\":\"{}\",\"artifact_sha256\":\"{}\",\"configuration_hash\":\"{}\",\"event_output_hash\":\"{}\",\"events_sha256\":\"{}\",\"manifest_schema_version\":1,\"report_sha256\":\"{}\",\"specification_fingerprint\":\"{}\"}}",
+        "{{\"advanced_account\":{},\"artifact_fingerprint\":\"{}\",\"artifact_sha256\":\"{}\",\"configuration_hash\":\"{}\",\"event_output_hash\":\"{}\",\"events_sha256\":\"{}\",\"manifest_schema_version\":2,\"report_sha256\":\"{}\",\"specification_fingerprint\":\"{}\"}}",
+        advanced_manifest,
         completed.artifact.fingerprint(),
         sha256_text(&artifact_json),
         configuration.content_hash,
@@ -344,6 +473,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("event stream: {}", event_path.display());
     eprintln!("report: {}", report_path.display());
     eprintln!("completion manifest: {}", manifest_path.display());
+    eprintln!(
+        "advanced account artifact: {}",
+        advanced_artifact_path.display()
+    );
+    eprintln!(
+        "advanced account report: {}",
+        advanced_report_path.display()
+    );
     eprintln!("artifact fingerprint: {}", completed.artifact.fingerprint());
     eprintln!("configuration hash: {}", configuration.content_hash);
     Ok(())
@@ -600,6 +737,10 @@ fn load_runtime_configuration(
             reference_version: instrument.reference_version.clone(),
         })?;
     }
+    let advanced_account = match document.advanced_account.as_ref() {
+        Some(advanced) => advanced_account_runtime(advanced, &document.instruments)?,
+        None => conservative_advanced_account_runtime(&document.account, &document.instruments)?,
+    };
     Ok(RuntimeConfiguration {
         document,
         content_hash,
@@ -609,7 +750,381 @@ fn load_runtime_configuration(
         fill_model,
         instruments,
         calendar,
+        advanced_account,
     })
+}
+
+/// Builds the deterministic default for legacy v1 configurations.
+///
+/// This is deliberately a fully paid cash account: every open position carries
+/// 100% initial and maintenance margin, shorting is disabled, and there is no
+/// inferred FX, borrow, financing, or lifecycle data. It replaces the former
+/// simple-account projection without inventing economics that the immutable
+/// configuration did not supply.
+fn conservative_advanced_account_runtime(
+    account: &AccountDocument,
+    instruments: &[InstrumentDocument],
+) -> Result<AdvancedAccountRuntime, Box<dyn std::error::Error>> {
+    let base_currency = Currency::new(account.currency.clone())?;
+    let mut rates = BTreeMap::new();
+    let mut terms_by_instrument = BTreeMap::new();
+    for instrument in instruments {
+        let asset_class = instrument.asset_class.to_ascii_lowercase();
+        validate_canonical_id("default advanced margin asset_class", &asset_class)?;
+        rates.entry(asset_class.clone()).or_insert(MarginRate {
+            initial_bps: 10_000,
+            maintenance_bps: 10_000,
+        });
+        let terms = AdvancedInstrumentTerms {
+            currency: Currency::new(instrument.currency.clone())?,
+            asset_class,
+            multiplier: decimal(&instrument.multiplier)?,
+            shortable: false,
+            borrow_available: Decimal::ZERO,
+            borrow_rate_bps: 0,
+        };
+        if terms_by_instrument
+            .insert(instrument.instrument_id.clone(), terms)
+            .is_some()
+        {
+            return Err("default advanced account has duplicate instrument terms".into());
+        }
+    }
+    Ok(AdvancedAccountRuntime {
+        cash_by_currency: BTreeMap::from([(
+            base_currency.clone(),
+            decimal(&account.initial_cash)?,
+        )]),
+        terms_by_instrument,
+        fx: FxBook::default(),
+        margin_policy: MarginPolicy {
+            base_currency,
+            maximum_fx_age_seconds: 0,
+            rates,
+        },
+        cash_debit_rates_bps: BTreeMap::new(),
+        financing_accruals: Vec::new(),
+        delistings: Vec::new(),
+    })
+}
+
+fn advanced_account_runtime(
+    document: &AdvancedAccountDocument,
+    instruments: &[InstrumentDocument],
+) -> Result<AdvancedAccountRuntime, Box<dyn std::error::Error>> {
+    let base_currency = Currency::new(document.base_currency.clone())?;
+    if document.maximum_fx_age_seconds < 0 || document.initial_cash_by_currency.is_empty() {
+        return Err("advanced account requires non-negative FX age and opening cash".into());
+    }
+    let configured_instruments: BTreeMap<_, _> = instruments
+        .iter()
+        .map(|instrument| {
+            (
+                instrument.instrument_id.as_str(),
+                (
+                    instrument.currency.as_str(),
+                    instrument.multiplier.as_str(),
+                    instrument.asset_class.to_ascii_lowercase(),
+                ),
+            )
+        })
+        .collect();
+    let mut cash_by_currency = BTreeMap::new();
+    for balance in &document.initial_cash_by_currency {
+        let currency = Currency::new(balance.currency.clone())?;
+        if cash_by_currency
+            .insert(currency, decimal(&balance.amount)?)
+            .is_some()
+        {
+            return Err("advanced account has duplicate opening cash currency".into());
+        }
+    }
+    let mut fx = FxBook::default();
+    for rate in &document.fx_rates {
+        fx.upsert(FxQuote {
+            base: Currency::new(rate.base_currency.clone())?,
+            quote: Currency::new(rate.quote_currency.clone())?,
+            quote_rate: decimal(&rate.rate)?,
+            observed_at_epoch_seconds: epoch_seconds(&rate.observed_at)?,
+        })?;
+    }
+    let mut rates = BTreeMap::new();
+    for rate in &document.margin_rates {
+        validate_canonical_id("advanced margin asset_class", &rate.asset_class)?;
+        if rate.initial_bps == 0
+            || rate.initial_bps > 10_000
+            || rate.maintenance_bps == 0
+            || rate.maintenance_bps > rate.initial_bps
+        {
+            return Err("advanced account has invalid initial or maintenance margin rate".into());
+        }
+        if rates
+            .insert(
+                rate.asset_class.clone(),
+                MarginRate {
+                    initial_bps: rate.initial_bps,
+                    maintenance_bps: rate.maintenance_bps,
+                },
+            )
+            .is_some()
+        {
+            return Err("advanced account has duplicate margin asset class".into());
+        }
+    }
+    let margin_policy = MarginPolicy {
+        base_currency,
+        maximum_fx_age_seconds: document.maximum_fx_age_seconds,
+        rates,
+    };
+    let mut terms_by_instrument = BTreeMap::new();
+    for terms in &document.instrument_terms {
+        validate_canonical_id("advanced instrument_id", &terms.instrument_id)?;
+        let Some((currency, multiplier, asset_class)) =
+            configured_instruments.get(terms.instrument_id.as_str())
+        else {
+            return Err("advanced account terms reference an unconfigured instrument".into());
+        };
+        if terms.currency != *currency
+            || terms.multiplier != *multiplier
+            || terms.asset_class != *asset_class
+        {
+            return Err(
+                "advanced instrument terms must match immutable configured reference data".into(),
+            );
+        }
+        let parsed = AdvancedInstrumentTerms {
+            currency: Currency::new(terms.currency.clone())?,
+            asset_class: terms.asset_class.clone(),
+            multiplier: decimal(&terms.multiplier)?,
+            shortable: terms.shortable,
+            borrow_available: decimal(&terms.borrow_available)?,
+            borrow_rate_bps: terms.borrow_rate_bps,
+        };
+        if terms_by_instrument
+            .insert(terms.instrument_id.clone(), parsed)
+            .is_some()
+        {
+            return Err("advanced account has duplicate instrument terms".into());
+        }
+    }
+    if terms_by_instrument.len() != configured_instruments.len()
+        || !configured_instruments
+            .keys()
+            .all(|instrument_id| terms_by_instrument.contains_key(*instrument_id))
+    {
+        return Err("advanced account must declare terms for every configured instrument".into());
+    }
+    let mut cash_debit_rates_bps = BTreeMap::new();
+    for (currency, rate) in &document.cash_debit_rates_bps {
+        if cash_debit_rates_bps
+            .insert(Currency::new(currency.clone())?, *rate)
+            .is_some()
+        {
+            return Err("advanced account has duplicate cash-debit currency".into());
+        }
+    }
+    let mut financing_ids = BTreeMap::new();
+    let mut financing_accruals = Vec::with_capacity(document.financing_accruals.len());
+    for accrual in &document.financing_accruals {
+        validate_canonical_id("advanced financing accrual_id", &accrual.accrual_id)?;
+        validate_utc_timestamp("advanced financing effective_at", &accrual.effective_at)?;
+        if accrual.days == 0 || accrual.day_count_basis == 0 || accrual.day_count_basis > 366 {
+            return Err("advanced financing days and day-count basis must be positive".into());
+        }
+        if financing_ids
+            .insert(accrual.accrual_id.as_str(), ())
+            .is_some()
+        {
+            return Err("advanced account has duplicate financing accrual".into());
+        }
+        financing_accruals.push(FinancingAccrualRuntime {
+            accrual_id: accrual.accrual_id.clone(),
+            effective_at: accrual.effective_at.clone(),
+            days: accrual.days,
+            day_count_basis: accrual.day_count_basis,
+        });
+    }
+    financing_accruals.sort_by(|left, right| left.effective_at.cmp(&right.effective_at));
+    let mut delisting_ids = BTreeMap::new();
+    let mut delistings = Vec::with_capacity(document.delistings.len());
+    for delisting in &document.delistings {
+        validate_canonical_id("advanced delisting event_id", &delisting.event_id)?;
+        validate_canonical_id("advanced delisting instrument_id", &delisting.instrument_id)?;
+        validate_utc_timestamp("advanced delisting effective_at", &delisting.effective_at)?;
+        if !terms_by_instrument.contains_key(&delisting.instrument_id) {
+            return Err("advanced delisting references an unconfigured instrument".into());
+        }
+        if delisting_ids
+            .insert(delisting.event_id.as_str(), ())
+            .is_some()
+        {
+            return Err("advanced account has duplicate delisting event".into());
+        }
+        delistings.push(DelistingRuntime {
+            event_id: delisting.event_id.clone(),
+            instrument_id: delisting.instrument_id.clone(),
+            effective_at: delisting.effective_at.clone(),
+            settlement_price: decimal(&delisting.settlement_price)?,
+        });
+    }
+    delistings.sort_by(|left, right| left.effective_at.cmp(&right.effective_at));
+    Ok(AdvancedAccountRuntime {
+        cash_by_currency,
+        terms_by_instrument,
+        fx,
+        margin_policy,
+        cash_debit_rates_bps,
+        financing_accruals,
+        delistings,
+    })
+}
+
+fn epoch_seconds(value: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    validate_utc_timestamp("advanced timestamp", value)?;
+    Ok(OffsetDateTime::parse(value, &Rfc3339)?.unix_timestamp())
+}
+
+fn advanced_account_projection(
+    canonical_events: &[String],
+    corporate_actions: &[follon_market_data::CorporateAction],
+    runtime: &AdvancedAccountRuntime,
+) -> Result<AdvancedBacktestReport, Box<dyn std::error::Error>> {
+    let mut account = AdvancedBacktestAccount::new(runtime.cash_by_currency.clone())?;
+    let mut marks = BTreeMap::new();
+    let mut actions: Vec<_> = corporate_actions.iter().collect();
+    actions.sort_by(|left, right| {
+        left.effective_at()
+            .cmp(right.effective_at())
+            .then_with(|| left.action_id().cmp(right.action_id()))
+    });
+    let mut next_action = 0;
+    let mut next_financing = 0;
+    let mut next_delisting = 0;
+    let mut final_time = None;
+
+    for line in canonical_events {
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        let object = event
+            .as_object()
+            .ok_or("canonical backtest event must be an object")?;
+        let event_type = required_json_string(object, "event_type")?;
+        let event_time = required_json_string(object, "event_time")?;
+        if event_type != "market.bar.v1" {
+            if event_type == "execution.fill.v1" {
+                let payload = object
+                    .get("payload")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or("fill event payload must be an object")?;
+                let side = match required_json_string(payload, "side")? {
+                    "BUY" => Side::Buy,
+                    "SELL" => Side::Sell,
+                    _ => return Err("fill event has invalid side".into()),
+                };
+                let fill = Fill {
+                    execution_id: required_json_string(payload, "execution_id")?.to_owned(),
+                    order_id: required_json_string(payload, "order_id")?.to_owned(),
+                    instrument_id: required_json_string(payload, "instrument_id")?.to_owned(),
+                    side,
+                    quantity: decimal(required_json_string(payload, "quantity")?)?,
+                    price: decimal(required_json_string(payload, "price")?)?,
+                    fee: decimal(required_json_string(payload, "fee")?)?,
+                    executed_at: required_json_string(payload, "executed_at")?.to_owned(),
+                };
+                let terms = runtime
+                    .terms_by_instrument
+                    .get(&fill.instrument_id)
+                    .ok_or("advanced account has no terms for simulated fill")?;
+                account.apply_fill_with_capital_check(
+                    &fill,
+                    terms,
+                    BacktestExecutionCharges {
+                        commission: fill.fee,
+                        exchange: Decimal::ZERO,
+                        regulatory: Decimal::ZERO,
+                    },
+                    BacktestCapitalCheck {
+                        marks_after_fill: &marks,
+                        fx: &runtime.fx,
+                        policy: &runtime.margin_policy,
+                        as_of_epoch_seconds: epoch_seconds(&fill.executed_at)?,
+                    },
+                )?;
+            }
+            continue;
+        }
+
+        while actions
+            .get(next_action)
+            .is_some_and(|action| action.effective_at() <= event_time)
+        {
+            account.apply_corporate_action(actions[next_action])?;
+            next_action += 1;
+        }
+        while runtime
+            .delistings
+            .get(next_delisting)
+            .is_some_and(|delisting| delisting.effective_at.as_str() <= event_time)
+        {
+            let delisting = &runtime.delistings[next_delisting];
+            account.settle_delisting(
+                &delisting.event_id,
+                &delisting.instrument_id,
+                &delisting.effective_at,
+                delisting.settlement_price,
+            )?;
+            next_delisting += 1;
+        }
+        while runtime
+            .financing_accruals
+            .get(next_financing)
+            .is_some_and(|accrual| accrual.effective_at.as_str() <= event_time)
+        {
+            let accrual = &runtime.financing_accruals[next_financing];
+            account.accrue_financing(
+                &accrual.accrual_id,
+                accrual.days,
+                accrual.day_count_basis,
+                &marks,
+                &runtime.cash_debit_rates_bps,
+            )?;
+            next_financing += 1;
+        }
+        let payload = object
+            .get("payload")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("market event payload must be an object")?;
+        let instrument_id = required_json_string(payload, "instrument_id")?;
+        let close = decimal(required_json_string(payload, "close")?)?;
+        if close <= Decimal::ZERO {
+            return Err("market event close must be positive".into());
+        }
+        marks.insert(instrument_id.to_owned(), close);
+        final_time = Some(event_time.to_owned());
+    }
+
+    let final_time = final_time.ok_or("advanced backtest received no market events")?;
+    if next_financing != runtime.financing_accruals.len()
+        || next_delisting != runtime.delistings.len()
+    {
+        return Err("advanced lifecycle input falls outside the selected backtest range".into());
+    }
+    Ok(account.report(
+        &marks,
+        &runtime.fx,
+        &runtime.margin_policy,
+        epoch_seconds(&final_time)?,
+    )?)
+}
+
+fn required_json_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("canonical backtest event has no {field}").into())
 }
 
 #[cfg(test)]
