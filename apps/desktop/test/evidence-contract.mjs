@@ -62,7 +62,7 @@ try {
     datasets: [{ name: "bars.csv", modified_at: "2026-08-21T00:00:00Z", bytes: 12, columns: ["close"], rows: 1 }],
     notebooks: [{ artifact: "research.ipynb", modified_at: "2026-08-21T00:00:00Z", bytes: 100, nbformat: 4, cell_count: 2, code_cells: 1, markdown_cells: 1, output_count: 0, kernel: "Python 3", language: "python" }],
     backtests: [{ artifact: "run.json", modified_at: "2026-08-21T00:00:00Z", artifact_fingerprint: "a".repeat(64), event_output_hash: "b".repeat(64), performance: {}, report: {}, specification: {}, specification_fingerprint: "c".repeat(64) }],
-    experiments: [], manifests: [], events: [], journals: [], commercial: [], paper: null, live: null, operations: null, options: null,
+    experiments: [], manifests: [], events: [], journals: [], commercial: [], execution_evidence: [], paper: null, live: null, operations: null, options: null,
     commercial_artifacts: [],
   };
   assert.doesNotThrow(() => parseWorkspaceSnapshot(validWorkspace));

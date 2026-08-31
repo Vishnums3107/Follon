@@ -24,6 +24,10 @@ pub const OPERATIONS_JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const OPERATIONS_DASHBOARD_SCHEMA_VERSION: u32 = 1;
 /// Typed journal event used for a configuration-bound schedule completion.
 pub const SCHEDULE_COMPLETION_EVENT_TYPE: &str = "operations.schedule_completed.v2";
+/// Typed immutable model-governance decision record.
+pub const MODEL_RISK_EVENT_TYPE: &str = "operations.model_risk_recorded.v1";
+/// Typed immutable operational game-day result record.
+pub const GAME_DAY_EVENT_TYPE: &str = "operations.game_day_recorded.v1";
 const LEGACY_SCHEDULE_COMPLETION_EVENT_TYPE: &str = "operations.schedule_completed.v1";
 const EMPTY_JOURNAL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
@@ -1673,6 +1677,171 @@ impl JournalRecord {
     }
 }
 
+/// Decision recorded by the accountable owner of a versioned strategy model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelRiskDecision {
+    /// The bounded evidence supports promotion only within the active gate.
+    Promote,
+    /// The strategy version is no longer permitted to advance.
+    Demote,
+    /// The version remains under review with no promotion decision.
+    Hold,
+}
+
+impl ModelRiskDecision {
+    /// Stable evidence representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Promote => "PROMOTE",
+            Self::Demote => "DEMOTE",
+            Self::Hold => "HOLD",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, OperationsError> {
+        match value {
+            "PROMOTE" => Ok(Self::Promote),
+            "DEMOTE" => Ok(Self::Demote),
+            "HOLD" => Ok(Self::Hold),
+            _ => Err(OperationsError(
+                "model-risk decision must be PROMOTE, DEMOTE, or HOLD".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Verified, append-only model-risk record reconstructed from the operations journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelRiskRecord {
+    /// Journal idempotency identity.
+    pub record_id: String,
+    /// UTC decision time retained by the journal.
+    pub occurred_at: String,
+    /// Accountable operator identity retained by the journal.
+    pub actor: String,
+    /// Strategy identity under review.
+    pub strategy_id: String,
+    /// Immutable strategy version under review.
+    pub strategy_version: String,
+    /// SHA-256 of the exact declared strategy bundle.
+    pub strategy_bundle_hash: String,
+    /// SHA-256 of the immutable backtest artifact used as decision evidence.
+    pub backtest_artifact_hash: String,
+    /// Promote, demote, or hold decision.
+    pub decision: ModelRiskDecision,
+    /// Concise, non-secret summary of the model change.
+    pub change_summary: String,
+    /// SHA-256 binding the change summary to the record.
+    pub change_summary_hash: String,
+    /// Concise, non-secret evidence-based reasoning.
+    pub reason: String,
+}
+
+/// Verified, append-only fault-injection game-day record reconstructed from the journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameDayRecord {
+    /// Journal idempotency identity.
+    pub record_id: String,
+    /// UTC completion time retained by the journal.
+    pub occurred_at: String,
+    /// Accountable operator identity retained by the journal.
+    pub actor: String,
+    /// Canonical scenario identity from the approved exercise plan.
+    pub scenario_id: String,
+    /// Whether the declared exercise passed every acceptance assertion.
+    pub passed: bool,
+    /// SHA-256 of the immutable fault plan used for the exercise.
+    pub fault_plan_hash: String,
+    /// SHA-256 of the immutable run/test evidence artifact.
+    pub evidence_hash: String,
+    /// SHA-256 of the reconciliation evidence produced after recovery.
+    pub reconciliation_hash: String,
+    /// Concise, non-secret blameless postmortem or follow-up summary.
+    pub postmortem_summary: String,
+}
+
+/// Projects only verified typed model-risk records from an already verified journal.
+pub fn model_risk_records(
+    records: &[JournalRecord],
+) -> Result<Vec<ModelRiskRecord>, OperationsError> {
+    let mut projected = records
+        .iter()
+        .filter(|record| record.event_type == MODEL_RISK_EVENT_TYPE)
+        .map(model_risk_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    projected.sort_by(|left, right| {
+        left.strategy_id
+            .cmp(&right.strategy_id)
+            .then_with(|| left.strategy_version.cmp(&right.strategy_version))
+            .then_with(|| left.occurred_at.cmp(&right.occurred_at))
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+    Ok(projected)
+}
+
+/// Projects only verified typed game-day records from an already verified journal.
+pub fn game_day_records(records: &[JournalRecord]) -> Result<Vec<GameDayRecord>, OperationsError> {
+    let mut projected = records
+        .iter()
+        .filter(|record| record.event_type == GAME_DAY_EVENT_TYPE)
+        .map(game_day_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    projected.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| left.scenario_id.cmp(&right.scenario_id))
+            .then_with(|| left.record_id.cmp(&right.record_id))
+    });
+    Ok(projected)
+}
+
+fn model_risk_record(record: &JournalRecord) -> Result<ModelRiskRecord, OperationsError> {
+    validate_model_risk_details(&record.details)?;
+    Ok(ModelRiskRecord {
+        record_id: record.entry_id.clone(),
+        occurred_at: record.occurred_at.clone(),
+        actor: record.actor.clone(),
+        strategy_id: required_record_detail(record, "strategy_id")?.to_owned(),
+        strategy_version: required_record_detail(record, "strategy_version")?.to_owned(),
+        strategy_bundle_hash: required_record_detail(record, "strategy_bundle_hash")?.to_owned(),
+        backtest_artifact_hash: required_record_detail(record, "backtest_artifact_hash")?
+            .to_owned(),
+        decision: ModelRiskDecision::parse(required_record_detail(record, "decision")?)?,
+        change_summary: required_record_detail(record, "change_summary")?.to_owned(),
+        change_summary_hash: required_record_detail(record, "change_summary_hash")?.to_owned(),
+        reason: required_record_detail(record, "reason")?.to_owned(),
+    })
+}
+
+fn game_day_record(record: &JournalRecord) -> Result<GameDayRecord, OperationsError> {
+    validate_game_day_details(&record.details)?;
+    Ok(GameDayRecord {
+        record_id: record.entry_id.clone(),
+        occurred_at: record.occurred_at.clone(),
+        actor: record.actor.clone(),
+        scenario_id: required_record_detail(record, "scenario_id")?.to_owned(),
+        passed: required_record_detail(record, "result")? == "PASS",
+        fault_plan_hash: required_record_detail(record, "fault_plan_hash")?.to_owned(),
+        evidence_hash: required_record_detail(record, "evidence_hash")?.to_owned(),
+        reconciliation_hash: required_record_detail(record, "reconciliation_hash")?.to_owned(),
+        postmortem_summary: required_record_detail(record, "postmortem_summary")?.to_owned(),
+    })
+}
+
+fn required_record_detail<'a>(
+    record: &'a JournalRecord,
+    key: &str,
+) -> Result<&'a str, OperationsError> {
+    record
+        .details
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OperationsError(format!("{} lacks required {key} evidence", record.entry_id))
+        })
+}
+
 /// Renders a portable, read-only operations dashboard contract.
 pub fn canonical_dashboard_json(
     snapshot: &OperationsSnapshot,
@@ -2158,6 +2327,12 @@ fn validate_journal_input(input: &JournalEntryInput) -> Result<(), OperationsErr
     if input.event_type == SCHEDULE_COMPLETION_EVENT_TYPE {
         validate_schedule_completion_input(input)?;
     }
+    if input.event_type == MODEL_RISK_EVENT_TYPE {
+        validate_model_risk_details(&input.details)?;
+    }
+    if input.event_type == GAME_DAY_EVENT_TYPE {
+        validate_game_day_details(&input.details)?;
+    }
     Ok(())
 }
 
@@ -2210,6 +2385,121 @@ fn validate_schedule_completion_input(input: &JournalEntryInput) -> Result<(), O
         ));
     }
     Ok(())
+}
+
+fn validate_model_risk_details(details: &BTreeMap<String, String>) -> Result<(), OperationsError> {
+    let expected_keys = [
+        "backtest_artifact_hash",
+        "change_summary",
+        "change_summary_hash",
+        "decision",
+        "reason",
+        "strategy_bundle_hash",
+        "strategy_id",
+        "strategy_version",
+    ];
+    validate_exact_detail_keys(details, &expected_keys, "model-risk record")?;
+    validate_canonical_id(
+        "model-risk strategy_id",
+        required_detail(details, "strategy_id", "model-risk record")?,
+    )?;
+    let strategy_version = required_detail(details, "strategy_version", "model-risk record")?;
+    if strategy_version.len() > 128 || strategy_version.contains(['\r', '\n']) {
+        return Err(OperationsError(
+            "model-risk strategy_version must be a concise one-line value".to_owned(),
+        ));
+    }
+    for key in [
+        "strategy_bundle_hash",
+        "backtest_artifact_hash",
+        "change_summary_hash",
+    ] {
+        validate_sha256(
+            &format!("model-risk {key}"),
+            required_detail(details, key, "model-risk record")?,
+        )?;
+    }
+    ModelRiskDecision::parse(required_detail(details, "decision", "model-risk record")?)?;
+    let change_summary = required_detail(details, "change_summary", "model-risk record")?;
+    let reason = required_detail(details, "reason", "model-risk record")?;
+    if change_summary.len() > 512
+        || reason.len() > 512
+        || change_summary.contains(['\r', '\n'])
+        || reason.contains(['\r', '\n'])
+        || sha256(change_summary)
+            != required_detail(details, "change_summary_hash", "model-risk record")?
+    {
+        return Err(OperationsError(
+            "model-risk record has invalid change-summary or reason evidence".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_game_day_details(details: &BTreeMap<String, String>) -> Result<(), OperationsError> {
+    let expected_keys = [
+        "evidence_hash",
+        "fault_plan_hash",
+        "postmortem_summary",
+        "reconciliation_hash",
+        "result",
+        "scenario_id",
+    ];
+    validate_exact_detail_keys(details, &expected_keys, "game-day record")?;
+    validate_canonical_id(
+        "game-day scenario_id",
+        required_detail(details, "scenario_id", "game-day record")?,
+    )?;
+    if !matches!(
+        required_detail(details, "result", "game-day record")?,
+        "PASS" | "FAIL"
+    ) {
+        return Err(OperationsError(
+            "game-day result must be PASS or FAIL".to_owned(),
+        ));
+    }
+    for key in ["fault_plan_hash", "evidence_hash", "reconciliation_hash"] {
+        validate_sha256(
+            &format!("game-day {key}"),
+            required_detail(details, key, "game-day record")?,
+        )?;
+    }
+    let summary = required_detail(details, "postmortem_summary", "game-day record")?;
+    if summary.len() > 512 || summary.contains(['\r', '\n']) {
+        return Err(OperationsError(
+            "game-day postmortem_summary must be concise and one-line".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_detail_keys(
+    details: &BTreeMap<String, String>,
+    expected_keys: &[&str],
+    evidence_name: &str,
+) -> Result<(), OperationsError> {
+    if details.len() != expected_keys.len()
+        || details
+            .keys()
+            .any(|key| !expected_keys.contains(&key.as_str()))
+    {
+        return Err(OperationsError(format!(
+            "{evidence_name} has an invalid evidence shape"
+        )));
+    }
+    Ok(())
+}
+
+fn required_detail<'a>(
+    details: &'a BTreeMap<String, String>,
+    key: &str,
+    evidence_name: &str,
+) -> Result<&'a str, OperationsError> {
+    details
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| OperationsError(format!("{evidence_name} lacks {key}")))
 }
 
 fn is_event_type(value: &str) -> bool {
@@ -2668,6 +2958,83 @@ mod tests {
         content = content.replace("report_generated", "report_edited");
         fs::write(&path, content).unwrap();
         assert!(OperationalJournal::inspect(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn model_risk_and_game_day_records_are_typed_and_append_only() {
+        let path = std::env::temp_dir().join(format!(
+            "follon-operations-governance-{}-{}.ndjson",
+            std::process::id(),
+            "typed-records"
+        ));
+        let _ = fs::remove_file(&path);
+        let change_summary = "Adjusted entry threshold after reproducible replay review";
+        let mut journal = OperationalJournal::open(&path).unwrap();
+        journal
+            .append(JournalEntryInput {
+                entry_id: "model.risk.001".to_owned(),
+                event_type: MODEL_RISK_EVENT_TYPE.to_owned(),
+                occurred_at: "2026-08-10T17:00:00Z".to_owned(),
+                actor: "operator.alice".to_owned(),
+                details: BTreeMap::from([
+                    ("strategy_id".to_owned(), "strategy.mean_revert".to_owned()),
+                    ("strategy_version".to_owned(), "1.2.1".to_owned()),
+                    ("strategy_bundle_hash".to_owned(), "a".repeat(64)),
+                    ("backtest_artifact_hash".to_owned(), "b".repeat(64)),
+                    ("decision".to_owned(), "HOLD".to_owned()),
+                    ("change_summary".to_owned(), change_summary.to_owned()),
+                    ("change_summary_hash".to_owned(), sha256(change_summary)),
+                    (
+                        "reason".to_owned(),
+                        "Awaiting the next independently reconciled PAPER session.".to_owned(),
+                    ),
+                ]),
+            })
+            .unwrap();
+        journal
+            .append(JournalEntryInput {
+                entry_id: "game.day.001".to_owned(),
+                event_type: GAME_DAY_EVENT_TYPE.to_owned(),
+                occurred_at: "2026-08-10T18:00:00Z".to_owned(),
+                actor: "operator.alice".to_owned(),
+                details: BTreeMap::from([
+                    (
+                        "scenario_id".to_owned(),
+                        "game_day.reconnect.001".to_owned(),
+                    ),
+                    ("result".to_owned(), "PASS".to_owned()),
+                    ("fault_plan_hash".to_owned(), "c".repeat(64)),
+                    ("evidence_hash".to_owned(), "d".repeat(64)),
+                    ("reconciliation_hash".to_owned(), "e".repeat(64)),
+                    (
+                        "postmortem_summary".to_owned(),
+                        "Connection loss recovered with a clean independent reconciliation."
+                            .to_owned(),
+                    ),
+                ]),
+            })
+            .unwrap();
+        assert!(journal
+            .append(JournalEntryInput {
+                entry_id: "model.risk.invalid".to_owned(),
+                event_type: MODEL_RISK_EVENT_TYPE.to_owned(),
+                occurred_at: "2026-08-10T19:00:00Z".to_owned(),
+                actor: "operator.alice".to_owned(),
+                details: BTreeMap::from([(
+                    "strategy_id".to_owned(),
+                    "strategy.mean_revert".to_owned(),
+                )]),
+            })
+            .is_err());
+        drop(journal);
+        let records = OperationalJournal::read_verified_records(&path).unwrap();
+        let model_risk = model_risk_records(&records).unwrap();
+        let game_days = game_day_records(&records).unwrap();
+        assert_eq!(model_risk.len(), 1);
+        assert_eq!(model_risk[0].decision, ModelRiskDecision::Hold);
+        assert_eq!(game_days.len(), 1);
+        assert!(game_days[0].passed);
         fs::remove_file(path).unwrap();
     }
 

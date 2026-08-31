@@ -195,7 +195,7 @@ FEATURES: tuple[dict[str, object], ...] = (
         "title": "Operations workbench",
         "state": "gated",
         "summary": "Risk cockpit, attribution, alerts, schedules, journals, configuration, and reports.",
-        "capabilities": ["Risk cockpit", "P&L attribution", "Stable alert projection", "Daily UTC scheduling", "Typed schedule completion", "Hash-chained operations journal", "Parameter/configuration diff", "Two-person risk-limit evidence", "Immutable dashboard and reports"],
+        "capabilities": ["Risk cockpit", "P&L attribution", "Stable alert projection", "Daily UTC scheduling", "Typed schedule completion", "Hash-chained operations journal", "Model-risk decision register", "Fault-injection game-day register", "Parameter/configuration diff", "Two-person risk-limit evidence", "Immutable dashboard and reports"],
         "boundary": "Deterministic projection only; no wall clock, background jobs, or order controls.",
         "gate": "Product adoption evidence: 0 of 5 unaided design partners.",
         "screens": ["Command Center", "Risk Cockpit", "Portfolio", "Replay and Incidents", "Journal"],
@@ -230,8 +230,8 @@ FEATURES: tuple[dict[str, object], ...] = (
         "id": "execution-risk",
         "title": "Execution & portfolio risk",
         "state": "implemented",
-        "summary": "Deterministic EMS planning and portfolio-wide pre-trade risk exposed through the versioned gRPC boundary.",
-        "capabilities": ["Immediate, exact TWAP, forecast VWAP, POV, and arrival-price scheduling over gRPC", "Strict cancel-before-replace passive plans over gRPC with post-only chase collars", "Fee/latency/price-aware smart venue routing", "Bracket, trailing-stop, and basket planning", "Atomic ratio-bound, net-price-protected option-combination plans over gRPC", "Gross, net, leverage, concentration, drawdown, and margin limits", "Sector, asset-class, currency, strategy, and instrument limits", "Greeks, self-trade, open-order, and order-rate controls"],
+        "summary": "Deterministic EMS planning, frozen-benchmark transaction-cost analysis, and portfolio-wide pre-trade risk exposed through versioned local contracts.",
+        "capabilities": ["Immediate, exact TWAP, forecast VWAP, POV, and arrival-price scheduling over gRPC", "Strict cancel-before-replace passive plans over gRPC with post-only chase collars", "Fee/latency/price-aware smart venue routing", "Bracket, trailing-stop, and basket planning", "Atomic ratio-bound, net-price-protected option-combination plans over gRPC", "Frozen arrival/target implementation-shortfall and fee analysis", "Explicit local p99 risk-evaluator benchmark artifacts", "Gross, net, leverage, concentration, drawdown, and margin limits", "Sector, asset-class, currency, strategy, and instrument limits", "Greeks, self-trade, open-order, and order-rate controls"],
         "boundary": "Planning and risk decisions are broker-neutral; every capital-bearing submission still requires controlled-LIVE approval and its reviewed adapter.",
         "gate": "Focused Rust and gRPC contract tests pass locally; broker-backed acceptance remains external.",
         "screens": ["Execution Blotter", "Risk Cockpit", "Portfolio"],
@@ -317,6 +317,19 @@ def classify_artifact(path: Path) -> tuple[str, str]:
         sample = ""
     if path.suffix.lower() == ".ipynb":
         return "research", "Research notebook"
+    if "transaction_cost_schema_version" in sample or "tca" in name:
+        return "execution-risk", "Transaction-cost analysis"
+    if "benchmark_schema_version" in sample and "p99_micros" in sample:
+        return "execution-risk", "Risk latency benchmark"
+    if (
+        "model_risk_register_schema_version" in sample
+        or "game_day_register_schema_version" in sample
+        or "operations.model_risk_recorded.v1" in sample
+        or "operations.game_day_recorded.v1" in sample
+        or "model-risk" in name
+        or "game-day" in name
+    ):
+        return "operations", "Operations governance evidence"
     if "option_dashboard_schema_version" in sample or "option" in name:
         return "options", "Options analytics"
     if '"environment":"live"' in sample or "live" in name:
@@ -540,6 +553,7 @@ def workspace_snapshot() -> dict[str, object]:
     events: list[dict[str, object]] = []
     journals: list[dict[str, object]] = []
     commercial: list[dict[str, object]] = []
+    execution_evidence: list[dict[str, object]] = []
     paper_candidates: list[tuple[str, str, dict[str, object]]] = []
     live_candidates: list[tuple[str, str, dict[str, object]]] = []
     operations_candidates: list[tuple[str, str, dict[str, object]]] = []
@@ -587,6 +601,10 @@ def workspace_snapshot() -> dict[str, object]:
                         "content_sha256": payload.get("parquet_sha256"),
                     }
                 )
+            elif "transaction_cost" in payload or "benchmark_schema_version" in payload:
+                execution_evidence.append(
+                    {"artifact": name, "modified_at": metadata["modified_at"], "data": payload}
+                )
             elif payload.get("artifact_schema_version") in {1, 2} and isinstance(payload.get("report"), dict):
                 backtests.append(
                     {
@@ -629,6 +647,7 @@ def workspace_snapshot() -> dict[str, object]:
     backtests.sort(key=lambda item: str(item["modified_at"]), reverse=True)
     experiments.sort(key=lambda item: str(item["artifact"]), reverse=True)
     manifests.sort(key=lambda item: str(item["modified_at"]), reverse=True)
+    execution_evidence.sort(key=lambda item: str(item["modified_at"]), reverse=True)
 
     feature_counts = {str(feature["id"]): 0 for feature in FEATURES}
     for artifact in artifacts:
@@ -658,6 +677,7 @@ def workspace_snapshot() -> dict[str, object]:
         "events": events[:MAX_WORKSPACE_RECORDS],
         "journals": journals[:MAX_WORKSPACE_RECORDS],
         "commercial": commercial[:MAX_WORKSPACE_RECORDS],
+        "execution_evidence": execution_evidence[:MAX_WORKSPACE_RECORDS],
         "paper": latest_dashboard(paper_candidates),
         "live": latest_dashboard(live_candidates),
         "operations": latest_dashboard(operations_candidates),

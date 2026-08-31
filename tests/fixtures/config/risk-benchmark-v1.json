@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-08-30T21:30:00Z",
+  "warmup_iterations": 25,
+  "measured_iterations": 100,
+  "threshold_micros": 5000,
+  "policy": {
+    "version": "risk.benchmark.v1",
+    "global_kill_switch": false,
+    "max_gross_exposure": "1000000",
+    "max_abs_net_exposure": "1000000",
+    "max_leverage_bps": "50000",
+    "max_concentration_bps": "10000",
+    "max_daily_loss": "100000",
+    "max_drawdown_bps": "10000",
+    "max_margin_utilization_bps": "10000",
+    "max_abs_delta": "1000000",
+    "max_abs_gamma": "1000000",
+    "max_open_orders": 100,
+    "max_order_rate": 100,
+    "allowed_instruments": ["equity.spy"],
+    "restricted_instruments": [],
+    "sector_limits": { "index": "1000000" },
+    "asset_class_limits": { "equity": "1000000" },
+    "currency_limits": { "USD": "1000000" },
+    "strategy_limits": { "strategy.benchmark": "1000000" }
+  },
+  "snapshot": {
+    "equity": "100000",
+    "peak_equity": "100000",
+    "daily_pnl": "0",
+    "margin_used": "0",
+    "positions": [
+      {
+        "account_id": "account.paper",
+        "strategy_id": "strategy.benchmark",
+        "instrument_id": "equity.spy",
+        "asset_class": "equity",
+        "sector": "index",
+        "currency": "USD",
+        "quantity": "10",
+        "mark_price": "100",
+        "multiplier": "1",
+        "delta": "10",
+        "gamma": "0"
+      }
+    ],
+    "resting_orders": [],
+    "recent_order_count": 0
+  },
+  "candidate": {
+    "intent_id": "intent.risk.benchmark.1",
+    "account_id": "account.paper",
+    "strategy_id": "strategy.benchmark",
+    "instrument_id": "equity.spy",
+    "asset_class": "equity",
+    "sector": "index",
+    "currency": "USD",
+    "side": "BUY",
+    "quantity": "1",
+    "mark_price": "100",
+    "multiplier": "1",
+    "delta": "1",
+    "gamma": "0"
+  }
+}

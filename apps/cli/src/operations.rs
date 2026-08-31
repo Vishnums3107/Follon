@@ -15,10 +15,11 @@ use follon_cli::{sha256_text, write_immutable};
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
 use follon_operations::{
     apply_schedule_completions, canonical_dashboard_json, derive_schedule_statuses,
-    derive_schedule_statuses_with_completions, markdown_report, AttributionCategory,
-    AttributionEntry, DailySchedule, JournalEntryInput, JournalInspection, OperationalHealth,
-    OperationalJournal, OperationalPosition, OperationsSnapshot, ParameterApproval,
-    ParameterControl, ParameterSet, ParameterValue, ReproducibilityStamp, RiskLimits,
+    derive_schedule_statuses_with_completions, game_day_records, markdown_report,
+    model_risk_records, AttributionCategory, AttributionEntry, DailySchedule, GameDayRecord,
+    JournalEntryInput, JournalInspection, ModelRiskRecord, OperationalHealth, OperationalJournal,
+    OperationalPosition, OperationsSnapshot, ParameterApproval, ParameterControl, ParameterSet,
+    ParameterValue, ReproducibilityStamp, RiskLimits, GAME_DAY_EVENT_TYPE, MODEL_RISK_EVENT_TYPE,
     SCHEDULE_COMPLETION_EVENT_TYPE,
 };
 use serde::Deserialize;
@@ -188,6 +189,10 @@ enum Command {
     Schedule(ScheduleArguments),
     CompleteSchedule(CompleteScheduleArguments),
     Journal(JournalArguments),
+    ModelRiskRecord(ModelRiskRecordArguments),
+    ModelRiskRegister(RegisterArguments),
+    GameDayRecord(GameDayRecordArguments),
+    GameDayRegister(RegisterArguments),
 }
 
 struct ProjectionArguments {
@@ -226,6 +231,38 @@ struct JournalArguments {
     actor: String,
     occurred_at: String,
     details: BTreeMap<String, String>,
+}
+
+struct ModelRiskRecordArguments {
+    journal_path: PathBuf,
+    record_id: String,
+    actor: String,
+    occurred_at: String,
+    strategy_id: String,
+    strategy_version: String,
+    strategy_bundle_hash: String,
+    backtest_artifact_hash: String,
+    decision: String,
+    change_summary: String,
+    reason: String,
+}
+
+struct GameDayRecordArguments {
+    journal_path: PathBuf,
+    record_id: String,
+    actor: String,
+    occurred_at: String,
+    scenario_id: String,
+    result: String,
+    fault_plan_hash: String,
+    evidence_hash: String,
+    reconciliation_hash: String,
+    postmortem_summary: String,
+}
+
+struct RegisterArguments {
+    journal_path: PathBuf,
+    output_path: PathBuf,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -356,6 +393,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", record.canonical_json());
             eprintln!("operations journal: {}", journal.path().display());
         }
+        Command::ModelRiskRecord(arguments) => {
+            let mut journal = OperationalJournal::open(&arguments.journal_path)?;
+            let change_summary_hash = sha256_text(&arguments.change_summary);
+            let record = journal.append(JournalEntryInput {
+                entry_id: arguments.record_id,
+                event_type: MODEL_RISK_EVENT_TYPE.to_owned(),
+                occurred_at: arguments.occurred_at,
+                actor: arguments.actor,
+                details: BTreeMap::from([
+                    ("strategy_id".to_owned(), arguments.strategy_id),
+                    ("strategy_version".to_owned(), arguments.strategy_version),
+                    (
+                        "strategy_bundle_hash".to_owned(),
+                        arguments.strategy_bundle_hash,
+                    ),
+                    (
+                        "backtest_artifact_hash".to_owned(),
+                        arguments.backtest_artifact_hash,
+                    ),
+                    ("decision".to_owned(), arguments.decision),
+                    ("change_summary".to_owned(), arguments.change_summary),
+                    ("change_summary_hash".to_owned(), change_summary_hash),
+                    ("reason".to_owned(), arguments.reason),
+                ]),
+            })?;
+            println!("{}", record.canonical_json());
+            eprintln!("model-risk record: {}", journal.path().display());
+        }
+        Command::ModelRiskRegister(arguments) => {
+            let (journal, records) = OperationalJournal::read_verified(&arguments.journal_path)?;
+            if !journal.healthy {
+                return Err(
+                    "cannot publish a model-risk register from an unhealthy journal".into(),
+                );
+            }
+            let register =
+                canonical_model_risk_register_json(&journal, &model_risk_records(&records)?);
+            publish(&arguments.output_path, &register)?;
+            eprintln!("model-risk register: {}", arguments.output_path.display());
+        }
+        Command::GameDayRecord(arguments) => {
+            let mut journal = OperationalJournal::open(&arguments.journal_path)?;
+            let record = journal.append(JournalEntryInput {
+                entry_id: arguments.record_id,
+                event_type: GAME_DAY_EVENT_TYPE.to_owned(),
+                occurred_at: arguments.occurred_at,
+                actor: arguments.actor,
+                details: BTreeMap::from([
+                    ("scenario_id".to_owned(), arguments.scenario_id),
+                    ("result".to_owned(), arguments.result),
+                    ("fault_plan_hash".to_owned(), arguments.fault_plan_hash),
+                    ("evidence_hash".to_owned(), arguments.evidence_hash),
+                    (
+                        "reconciliation_hash".to_owned(),
+                        arguments.reconciliation_hash,
+                    ),
+                    (
+                        "postmortem_summary".to_owned(),
+                        arguments.postmortem_summary,
+                    ),
+                ]),
+            })?;
+            println!("{}", record.canonical_json());
+            eprintln!("game-day record: {}", journal.path().display());
+        }
+        Command::GameDayRegister(arguments) => {
+            let (journal, records) = OperationalJournal::read_verified(&arguments.journal_path)?;
+            if !journal.healthy {
+                return Err("cannot publish a game-day register from an unhealthy journal".into());
+            }
+            let register = canonical_game_day_register_json(&journal, &game_day_records(&records)?);
+            publish(&arguments.output_path, &register)?;
+            eprintln!("game-day register: {}", arguments.output_path.display());
+        }
     }
     Ok(())
 }
@@ -394,6 +505,22 @@ fn parse_command(arguments: Vec<String>) -> Result<Command, Box<dyn std::error::
             parse_complete_schedule_arguments(remainder)?,
         )),
         "journal" => Ok(Command::Journal(parse_journal_arguments(remainder)?)),
+        "model-risk-record" => Ok(Command::ModelRiskRecord(parse_model_risk_record_arguments(
+            remainder,
+        )?)),
+        "model-risk-register" => Ok(Command::ModelRiskRegister(parse_register_arguments(
+            remainder,
+            "model-risk-register",
+            "var/follon-model-risk-register.json",
+        )?)),
+        "game-day-record" => Ok(Command::GameDayRecord(parse_game_day_record_arguments(
+            remainder,
+        )?)),
+        "game-day-register" => Ok(Command::GameDayRegister(parse_register_arguments(
+            remainder,
+            "game-day-register",
+            "var/follon-game-day-register.json",
+        )?)),
         _ => Err(usage().into()),
     }
 }
@@ -677,6 +804,280 @@ fn parse_journal_arguments(
         occurred_at,
         details,
     })
+}
+
+fn parse_model_risk_record_arguments(
+    arguments: &[String],
+) -> Result<ModelRiskRecordArguments, Box<dyn std::error::Error>> {
+    let mut journal_path = PathBuf::from(DEFAULT_JOURNAL);
+    let mut journal_explicit = false;
+    let mut record_id = None;
+    let mut actor = None;
+    let mut occurred_at = None;
+    let mut strategy_id = None;
+    let mut strategy_version = None;
+    let mut strategy_bundle_hash = None;
+    let mut backtest_artifact_hash = None;
+    let mut decision = None;
+    let mut change_summary = None;
+    let mut reason = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = arguments[index].as_str();
+        match flag {
+            "--journal" => {
+                if journal_explicit {
+                    return Err("--journal may be specified only once".into());
+                }
+                index += 1;
+                journal_path = PathBuf::from(required(arguments, index, "--journal")?);
+                journal_explicit = true;
+            }
+            "--record-id" => {
+                assign_once(&mut record_id, required(arguments, index + 1, flag)?, flag)?
+            }
+            "--actor" => assign_once(&mut actor, required(arguments, index + 1, flag)?, flag)?,
+            "--occurred-at" => assign_once(
+                &mut occurred_at,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--strategy-id" => assign_once(
+                &mut strategy_id,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--strategy-version" => assign_once(
+                &mut strategy_version,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--strategy-bundle-hash" => assign_once(
+                &mut strategy_bundle_hash,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--backtest-artifact-hash" => assign_once(
+                &mut backtest_artifact_hash,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--decision" => {
+                assign_once(&mut decision, required(arguments, index + 1, flag)?, flag)?
+            }
+            "--change-summary" => assign_once(
+                &mut change_summary,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--reason" => assign_once(&mut reason, required(arguments, index + 1, flag)?, flag)?,
+            value if value.starts_with('-') => {
+                return Err(format!("unsupported argument: {value}").into())
+            }
+            _ => return Err("model-risk-record accepts only named arguments".into()),
+        }
+        if flag != "--journal" {
+            index += 1;
+        }
+        index += 1;
+    }
+    let record_id = record_id.ok_or("--record-id is required")?;
+    let actor = actor.ok_or("--actor is required")?;
+    let occurred_at = occurred_at.ok_or("--occurred-at is required")?;
+    let strategy_id = strategy_id.ok_or("--strategy-id is required")?;
+    let strategy_version = strategy_version.ok_or("--strategy-version is required")?;
+    let strategy_bundle_hash = strategy_bundle_hash.ok_or("--strategy-bundle-hash is required")?;
+    let backtest_artifact_hash =
+        backtest_artifact_hash.ok_or("--backtest-artifact-hash is required")?;
+    let decision = decision.ok_or("--decision is required")?;
+    let change_summary = change_summary.ok_or("--change-summary is required")?;
+    let reason = reason.ok_or("--reason is required")?;
+    for (name, value) in [
+        ("--record-id", record_id.as_str()),
+        ("--actor", actor.as_str()),
+        ("--strategy-id", strategy_id.as_str()),
+    ] {
+        validate_canonical_id(name, value)?;
+    }
+    validate_utc_timestamp("--occurred-at", &occurred_at)?;
+    if strategy_version.len() > 128 || strategy_version.contains(['\r', '\n']) {
+        return Err("--strategy-version must be a concise one-line value".into());
+    }
+    if !matches!(decision.as_str(), "PROMOTE" | "DEMOTE" | "HOLD") {
+        return Err("--decision must be PROMOTE, DEMOTE, or HOLD".into());
+    }
+    validate_sha256_argument("--strategy-bundle-hash", &strategy_bundle_hash)?;
+    validate_sha256_argument("--backtest-artifact-hash", &backtest_artifact_hash)?;
+    validate_concise_text("--change-summary", &change_summary)?;
+    validate_concise_text("--reason", &reason)?;
+    Ok(ModelRiskRecordArguments {
+        journal_path,
+        record_id,
+        actor,
+        occurred_at,
+        strategy_id,
+        strategy_version,
+        strategy_bundle_hash,
+        backtest_artifact_hash,
+        decision,
+        change_summary,
+        reason,
+    })
+}
+
+fn parse_game_day_record_arguments(
+    arguments: &[String],
+) -> Result<GameDayRecordArguments, Box<dyn std::error::Error>> {
+    let mut journal_path = PathBuf::from(DEFAULT_JOURNAL);
+    let mut journal_explicit = false;
+    let mut record_id = None;
+    let mut actor = None;
+    let mut occurred_at = None;
+    let mut scenario_id = None;
+    let mut result = None;
+    let mut fault_plan_hash = None;
+    let mut evidence_hash = None;
+    let mut reconciliation_hash = None;
+    let mut postmortem_summary = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = arguments[index].as_str();
+        match flag {
+            "--journal" => {
+                if journal_explicit {
+                    return Err("--journal may be specified only once".into());
+                }
+                index += 1;
+                journal_path = PathBuf::from(required(arguments, index, "--journal")?);
+                journal_explicit = true;
+            }
+            "--record-id" => {
+                assign_once(&mut record_id, required(arguments, index + 1, flag)?, flag)?
+            }
+            "--actor" => assign_once(&mut actor, required(arguments, index + 1, flag)?, flag)?,
+            "--occurred-at" => assign_once(
+                &mut occurred_at,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--scenario-id" => assign_once(
+                &mut scenario_id,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--result" => assign_once(&mut result, required(arguments, index + 1, flag)?, flag)?,
+            "--fault-plan-hash" => assign_once(
+                &mut fault_plan_hash,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--evidence-hash" => assign_once(
+                &mut evidence_hash,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--reconciliation-hash" => assign_once(
+                &mut reconciliation_hash,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            "--postmortem-summary" => assign_once(
+                &mut postmortem_summary,
+                required(arguments, index + 1, flag)?,
+                flag,
+            )?,
+            value if value.starts_with('-') => {
+                return Err(format!("unsupported argument: {value}").into())
+            }
+            _ => return Err("game-day-record accepts only named arguments".into()),
+        }
+        if flag != "--journal" {
+            index += 1;
+        }
+        index += 1;
+    }
+    let record_id = record_id.ok_or("--record-id is required")?;
+    let actor = actor.ok_or("--actor is required")?;
+    let occurred_at = occurred_at.ok_or("--occurred-at is required")?;
+    let scenario_id = scenario_id.ok_or("--scenario-id is required")?;
+    let result = result.ok_or("--result is required")?;
+    let fault_plan_hash = fault_plan_hash.ok_or("--fault-plan-hash is required")?;
+    let evidence_hash = evidence_hash.ok_or("--evidence-hash is required")?;
+    let reconciliation_hash = reconciliation_hash.ok_or("--reconciliation-hash is required")?;
+    let postmortem_summary = postmortem_summary.ok_or("--postmortem-summary is required")?;
+    for (name, value) in [
+        ("--record-id", record_id.as_str()),
+        ("--actor", actor.as_str()),
+        ("--scenario-id", scenario_id.as_str()),
+    ] {
+        validate_canonical_id(name, value)?;
+    }
+    validate_utc_timestamp("--occurred-at", &occurred_at)?;
+    if !matches!(result.as_str(), "PASS" | "FAIL") {
+        return Err("--result must be PASS or FAIL".into());
+    }
+    for (name, value) in [
+        ("--fault-plan-hash", fault_plan_hash.as_str()),
+        ("--evidence-hash", evidence_hash.as_str()),
+        ("--reconciliation-hash", reconciliation_hash.as_str()),
+    ] {
+        validate_sha256_argument(name, value)?;
+    }
+    validate_concise_text("--postmortem-summary", &postmortem_summary)?;
+    Ok(GameDayRecordArguments {
+        journal_path,
+        record_id,
+        actor,
+        occurred_at,
+        scenario_id,
+        result,
+        fault_plan_hash,
+        evidence_hash,
+        reconciliation_hash,
+        postmortem_summary,
+    })
+}
+
+fn parse_register_arguments(
+    arguments: &[String],
+    command: &str,
+    default_output: &str,
+) -> Result<RegisterArguments, Box<dyn std::error::Error>> {
+    if arguments.len() > 2 || arguments.iter().any(|argument| argument.starts_with('-')) {
+        return Err(
+            format!("usage: follon-operations {command} [journal.ndjson] [register.json]").into(),
+        );
+    }
+    Ok(RegisterArguments {
+        journal_path: arguments
+            .first()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_JOURNAL)),
+        output_path: arguments
+            .get(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(default_output)),
+    })
+}
+
+fn validate_sha256_argument(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{name} must be a lowercase SHA-256 hex digest").into());
+    }
+    Ok(())
+}
+
+fn validate_concise_text(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.is_empty() || value.len() > 512 || value.contains(['\r', '\n']) {
+        return Err(
+            format!("{name} must be a non-empty one-line value of at most 512 characters").into(),
+        );
+    }
+    Ok(())
 }
 
 fn assign_once(
@@ -973,6 +1374,68 @@ fn parameter_json(value: &ParameterValue) -> String {
     )
 }
 
+fn canonical_model_risk_register_json(
+    journal: &JournalInspection,
+    records: &[ModelRiskRecord],
+) -> String {
+    let records = records
+        .iter()
+        .map(|record| {
+            format!(
+                "{{\"actor\":{},\"backtest_artifact_hash\":{},\"change_summary\":{},\"change_summary_hash\":{},\"decision\":{},\"occurred_at\":{},\"reason\":{},\"record_id\":{},\"strategy_bundle_hash\":{},\"strategy_id\":{},\"strategy_version\":{}}}",
+                json_string(&record.actor),
+                json_string(&record.backtest_artifact_hash),
+                json_string(&record.change_summary),
+                json_string(&record.change_summary_hash),
+                json_string(record.decision.as_str()),
+                json_string(&record.occurred_at),
+                json_string(&record.reason),
+                json_string(&record.record_id),
+                json_string(&record.strategy_bundle_hash),
+                json_string(&record.strategy_id),
+                json_string(&record.strategy_version),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"journal\":{{\"head_hash\":{},\"sequence\":{}}},\"model_risk_register_schema_version\":1,\"records\":[{}]}}",
+        json_string(&journal.head_hash),
+        journal.sequence,
+        records,
+    )
+}
+
+fn canonical_game_day_register_json(
+    journal: &JournalInspection,
+    records: &[GameDayRecord],
+) -> String {
+    let records = records
+        .iter()
+        .map(|record| {
+            format!(
+                "{{\"actor\":{},\"evidence_hash\":{},\"fault_plan_hash\":{},\"occurred_at\":{},\"passed\":{},\"postmortem_summary\":{},\"reconciliation_hash\":{},\"record_id\":{},\"scenario_id\":{}}}",
+                json_string(&record.actor),
+                json_string(&record.evidence_hash),
+                json_string(&record.fault_plan_hash),
+                json_string(&record.occurred_at),
+                record.passed,
+                json_string(&record.postmortem_summary),
+                json_string(&record.reconciliation_hash),
+                json_string(&record.record_id),
+                json_string(&record.scenario_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"game_day_register_schema_version\":1,\"journal\":{{\"head_hash\":{},\"sequence\":{}}},\"records\":[{}]}}",
+        json_string(&journal.head_hash),
+        journal.sequence,
+        records,
+    )
+}
+
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization cannot fail")
 }
@@ -982,7 +1445,7 @@ fn optional_json_string(value: Option<&str>) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  follon-operations validate-config [operations.json]\n  follon-operations config-diff <previous operations.json> <target operations.json> [changes.json]\n  follon-operations dashboard [operations.json] [dashboard.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations report [operations.json] [report.md] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations schedule [operations.json] [schedule.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations complete-schedule [operations.json] --schedule-id <id> --entry-id <id> --actor <id> --occurred-at <UTC> [--journal journal.ndjson]\n  follon-operations journal --entry-id <id> --event-type <type> --actor <id> --occurred-at <UTC> [--journal journal.ndjson] [--detail key=value]"
+    "usage:\n  follon-operations validate-config [operations.json]\n  follon-operations config-diff <previous operations.json> <target operations.json> [changes.json]\n  follon-operations dashboard [operations.json] [dashboard.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations report [operations.json] [report.md] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations schedule [operations.json] [schedule.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations complete-schedule [operations.json] --schedule-id <id> --entry-id <id> --actor <id> --occurred-at <UTC> [--journal journal.ndjson]\n  follon-operations model-risk-record --record-id <id> --actor <id> --occurred-at <UTC> --strategy-id <id> --strategy-version <version> --strategy-bundle-hash <sha256> --backtest-artifact-hash <sha256> --decision <PROMOTE|DEMOTE|HOLD> --change-summary <text> --reason <text> [--journal journal.ndjson]\n  follon-operations model-risk-register [journal.ndjson] [register.json]\n  follon-operations game-day-record --record-id <id> --actor <id> --occurred-at <UTC> --scenario-id <id> --result <PASS|FAIL> --fault-plan-hash <sha256> --evidence-hash <sha256> --reconciliation-hash <sha256> --postmortem-summary <text> [--journal journal.ndjson]\n  follon-operations game-day-register [journal.ndjson] [register.json]\n  follon-operations journal --entry-id <id> --event-type <type> --actor <id> --occurred-at <UTC> [--journal journal.ndjson] [--detail key=value]"
 }
 
 #[cfg(test)]

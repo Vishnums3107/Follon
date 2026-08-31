@@ -73,6 +73,10 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   and replay/configuration evidence. It has
   no broker, credential, wall-clock, background-execution, or order-control
   capability.
+- Immutable end-of-day execution-cost analysis against frozen arrival and target
+  benchmarks, typed model-risk and fault-game-day journals/registers, and a
+  versioned local risk-latency benchmark. These are evidence mechanisms, not
+  claims of broker-backed acceptance, production availability, or legal approval.
 - A deterministic European-options core for versioned chain snapshots,
   fixed-point implied volatility/Greeks, multi-leg expiry scenarios, explicit
   cash/physical exercise and assignment settlement, and explicit-time

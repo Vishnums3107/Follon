@@ -18,6 +18,47 @@ Supply an authoritative `--as-of` UTC time for every view. Do not infer it from 
 6. Publish the immutable Markdown report. If the same path already has different bytes, stop: do not overwrite the existing evidence.
 7. Record an explicit non-secret journal fact only after the associated work is complete. Use a unique idempotency key; preserve the resulting JSON line and journal head hash with the report.
 
+## Execution cost, model-risk, and game-day evidence
+
+Run `follon-tca <tca-v1.json> <new-tca.json>` after the session with frozen
+arrival and target benchmarks, all fills, and exact explicit fees. It refuses
+duplicate fill evidence, overfills, stale/non-positive benchmarks, malformed
+identities, and incompatible accounting. Preserve the JSON, Markdown summary,
+and manifest together; an implementation-shortfall result is a measurement, not
+proof of acceptable trading quality.
+
+Record an evidence-based strategy decision only after preserving the exact
+strategy bundle and backtest artifacts:
+
+```powershell
+follon-operations model-risk-record --record-id <id> --actor <operator.id> `
+  --occurred-at <UTC> --strategy-id <id> --strategy-version <version> `
+  --strategy-bundle-hash <sha256> --backtest-artifact-hash <sha256> `
+  --decision <PROMOTE|DEMOTE|HOLD> --change-summary <one-line-text> `
+  --reason <one-line-text> --journal <journal.ndjson>
+follon-operations model-risk-register <journal.ndjson> <new-register.json>
+```
+
+Run a fault-injection game day on the approved cadence; recover, reconcile, and
+retain independent test evidence before writing the typed result:
+
+```powershell
+follon-operations game-day-record --record-id <id> --actor <operator.id> `
+  --occurred-at <UTC> --scenario-id <id> --result <PASS|FAIL> `
+  --fault-plan-hash <sha256> --evidence-hash <sha256> `
+  --reconciliation-hash <sha256> --postmortem-summary <one-line-text> `
+  --journal <journal.ndjson>
+follon-operations game-day-register <journal.ndjson> <new-register.json>
+```
+
+Both typed records are hash-chained and validate their exact evidence shape.
+They establish only that a declared, linked artifact was recorded; a human must
+review the source evidence. Generate risk latency observations with
+`follon-risk-benchmark <risk-benchmark-v1.json> <new-benchmark.json>` using a
+frozen policy/snapshot/candidate. It measures only the local core on the
+machine and build that ran it; it is not a 99.9% availability claim or a
+production load test.
+
 The workbench only validates hash-bound approval evidence. It does not verify
 human identities, signatures, authorization policy ownership, or revocation;
 do not treat the local `config-diff` artifact as an execution authorization.

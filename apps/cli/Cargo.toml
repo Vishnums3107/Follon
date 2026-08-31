@@ -12,12 +12,14 @@ follon-backtest = { path = "../../core/backtest" }
 follon-control-plane = { path = "../../core/control-plane" }
 follon-commercial = { path = "../../core/commercial" }
 follon-domain = { path = "../../core/domain" }
+follon-execution = { path = "../../core/execution" }
 follon-instrument = { path = "../../core/instrument" }
 follon-live = { path = "../../core/live" }
 follon-market-data = { path = "../../core/market-data" }
 follon-operations = { path = "../../core/operations" }
 follon-options = { path = "../../core/options" }
 follon-paper = { path = "../../core/paper" }
+follon-risk = { path = "../../core/risk" }
 follon-secrets = { path = "../../core/secrets" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -55,6 +57,14 @@ path = "src/options.rs"
 [[bin]]
 name = "follon-admin"
 path = "src/admin.rs"
+
+[[bin]]
+name = "follon-tca"
+path = "src/tca.rs"
+
+[[bin]]
+name = "follon-risk-benchmark"
+path = "src/risk_benchmark.rs"
 
 [lints]
 workspace = true

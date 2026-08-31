@@ -369,12 +369,14 @@ dependencies = [
  "follon-commercial",
  "follon-control-plane",
  "follon-domain",
+ "follon-execution",
  "follon-instrument",
  "follon-live",
  "follon-market-data",
  "follon-operations",
  "follon-options",
  "follon-paper",
+ "follon-risk",
  "follon-secrets",
  "serde",
  "serde_json",
@@ -417,6 +419,7 @@ name = "follon-execution"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "serde_json",
 ]
 
 [[package]]

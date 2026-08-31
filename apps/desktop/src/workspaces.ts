@@ -83,6 +83,7 @@ export type WorkspaceSnapshot = Readonly<{
   events: readonly SnapshotRecord[];
   journals: readonly SnapshotRecord[];
   commercial: readonly SnapshotRecord[];
+  execution_evidence: readonly SnapshotRecord[];
   paper: SnapshotDashboard | null;
   live: SnapshotDashboard | null;
   operations: SnapshotDashboard | null;
@@ -121,7 +122,7 @@ export function parseWorkspaceSnapshot(value: unknown): WorkspaceSnapshot {
         "execution-risk", "accounting", "identity", "platform",
       ]) || !Array.isArray(value.datasets) || !Array.isArray(value.notebooks) || !Array.isArray(value.backtests) || !Array.isArray(value.experiments) ||
       !Array.isArray(value.manifests) || !Array.isArray(value.events) ||
-      !Array.isArray(value.journals) || !Array.isArray(value.commercial) ||
+      !Array.isArray(value.journals) || !Array.isArray(value.commercial) || !Array.isArray(value.execution_evidence) ||
       !Array.isArray(value.commercial_artifacts)) {
     throw new Error("The workspace projection does not match the v1 read-only contract.");
   }
@@ -129,7 +130,7 @@ export function parseWorkspaceSnapshot(value: unknown): WorkspaceSnapshot {
       !value.commercial_artifacts.every(isEvidenceArtifact)) {
     throw new Error("The workspace projection contains invalid typed evidence.");
   }
-  for (const item of [...value.experiments, ...value.manifests, ...value.events, ...value.journals, ...value.commercial]) {
+  for (const item of [...value.experiments, ...value.manifests, ...value.events, ...value.journals, ...value.commercial, ...value.execution_evidence]) {
     if (!isSnapshotRecord(item)) {
       throw new Error("The workspace projection contains an invalid record.");
     }
@@ -455,6 +456,34 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
     ];
   }), "No immutable risk-decision events are available.", (index) => context.onOpenArtifact(riskDecisions[index]?.artifact ?? ""));
   root.append(risk);
+
+  const tcaRows: Array<{ artifact: string; values: string[] }> = [];
+  const benchmarkRows: Array<{ artifact: string; values: string[] }> = [];
+  for (const evidence of snapshot.execution_evidence) {
+    const transactionCost = record(evidence.data.transaction_cost);
+    const reports = Array.isArray(transactionCost.reports) ? transactionCost.reports : [];
+    for (const candidate of reports) {
+      const report = record(candidate);
+      tcaRows.push({
+        artifact: evidence.artifact,
+        values: [evidence.artifact, field(report, "analysis_id"), field(report, "strategy_id"), field(report, "side"), field(report, "filled_quantity"), field(report, "execution_vwap"), field(report, "arrival_total_cost"), field(report, "target_total_cost")],
+      });
+    }
+    const measurement = record(evidence.data.measurement);
+    if (measurement.p99_micros !== undefined) {
+      benchmarkRows.push({
+        artifact: evidence.artifact,
+        values: [evidence.artifact, field(evidence.data, "observed_at"), field(evidence.data, "policy_version"), field(measurement, "p99_micros"), field(measurement, "threshold_micros"), measurement.within_threshold === true ? "Within local threshold" : "Outside local threshold"],
+      });
+    }
+  }
+  const tca = createPanel("Transaction-cost analysis", "Immutable implementation-shortfall evidence measured from caller-supplied frozen arrival and target benchmarks; it is not a broker-statement acceptance claim.");
+  appendTableOrEmpty(tca, ["Artifact", "Analysis", "Strategy", "Side", "Filled", "VWAP", "Arrival total", "Target total"], tcaRows.map((row) => row.values), "No transaction-cost artifact is indexed.", (index) => context.onOpenArtifact(tcaRows[index]?.artifact ?? ""));
+  root.append(tca);
+
+  const benchmark = createPanel("Local risk-evaluator benchmark", "Explicit-hardware local timing observation only; production availability and load evidence remain separate gates.");
+  appendTableOrEmpty(benchmark, ["Artifact", "Observed at", "Policy", "p99 (µs)", "Threshold (µs)", "Result"], benchmarkRows.map((row) => row.values), "No local risk benchmark artifact is indexed.", (index) => context.onOpenArtifact(benchmarkRows[index]?.artifact ?? ""));
+  root.append(benchmark);
 
   const lifecycle = createPanel("Broker lifecycle condition coverage", "Explicit handling for the out-of-order and modification cases recorded in the system review.");
   appendTableOrEmpty(lifecycle, ["Condition", "Implementation", "Invariant"], OMS_LIFECYCLE_COVERAGE.map((row) => [...row]), "No lifecycle coverage metadata is available.");

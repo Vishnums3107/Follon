@@ -16,5 +16,6 @@ Current records:
 - [Customer onboarding runbook](07-customer-onboarding-runbook.md)
 - [Dashboard deployment runbook](08-dashboard-deployment-runbook.md)
 - [Production operations and evidence runbook](09-production-operations-runbook.md)
+- [Personal trading mandate template](10-personal-trading-mandate-template.md)
 
 > Note: two files share the `02-` prefix; they are distinct documents.
