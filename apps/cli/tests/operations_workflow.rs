@@ -169,3 +169,86 @@ fn parameter_change_and_journal_backed_schedule_workflow_is_reproducible() {
 
     fs::remove_dir_all(&workspace).unwrap();
 }
+
+#[test]
+fn model_risk_and_game_day_evidence_registers_are_hash_bound_and_immutable() {
+    let workspace = std::env::temp_dir().join(format!(
+        "follon-operations-governance-workflow-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).unwrap();
+    let journal_path = workspace.join("operations.journal.ndjson");
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let c = "c".repeat(64);
+    run(command().args([
+        "model-risk-record",
+        "--journal",
+        journal_path.to_str().unwrap(),
+        "--record-id",
+        "model.risk.1",
+        "--actor",
+        "operator.alice",
+        "--occurred-at",
+        "2026-08-30T21:30:00Z",
+        "--strategy-id",
+        "strategy.mean_revert",
+        "--strategy-version",
+        "2026.08.30",
+        "--strategy-bundle-hash",
+        &a,
+        "--backtest-artifact-hash",
+        &b,
+        "--decision",
+        "HOLD",
+        "--change-summary",
+        "No material model change",
+        "--reason",
+        "Awaiting independent validation evidence",
+    ]));
+    run(command().args([
+        "game-day-record",
+        "--journal",
+        journal_path.to_str().unwrap(),
+        "--record-id",
+        "game.day.1",
+        "--actor",
+        "operator.alice",
+        "--occurred-at",
+        "2026-08-30T22:30:00Z",
+        "--scenario-id",
+        "fault.broker_disconnect",
+        "--result",
+        "PASS",
+        "--fault-plan-hash",
+        &a,
+        "--evidence-hash",
+        &b,
+        "--reconciliation-hash",
+        &c,
+        "--postmortem-summary",
+        "Recovery and reconciliation evidence retained",
+    ]));
+    let model_register = workspace.join("model-risk-register.json");
+    run(command().args([
+        "model-risk-register",
+        journal_path.to_str().unwrap(),
+        model_register.to_str().unwrap(),
+    ]));
+    let game_register = workspace.join("game-day-register.json");
+    run(command().args([
+        "game-day-register",
+        journal_path.to_str().unwrap(),
+        game_register.to_str().unwrap(),
+    ]));
+    let model: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&model_register).unwrap()).unwrap();
+    assert_eq!(model["model_risk_register_schema_version"], 1);
+    assert_eq!(model["records"][0]["decision"], "HOLD");
+    let game: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&game_register).unwrap()).unwrap();
+    assert_eq!(game["game_day_register_schema_version"], 1);
+    assert_eq!(game["records"][0]["passed"], true);
+    fs::remove_dir_all(&workspace).unwrap();
+}

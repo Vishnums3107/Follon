@@ -14,6 +14,9 @@
 | Parameter/config tools | Strict unknown-field rejecting configuration import, exact source-byte hash, bounded decimal parameter revisions with direct predecessor fingerprint linkage, and static fail-closed binding of all six cockpit risk limits to `TWO_PERSON` approval evidence under the built-in risk-limit policy | Implemented and tested |
 | Replay UI | Strict operations-dashboard parser and read-only desktop view for risk, alerts, attribution, schedules, source identities, and journal cursor | Implemented and typechecked |
 | Reports | Idempotently published JSON dashboard, schedule-plan JSON, and Markdown operations report from the same selected configuration and UTC `as_of` time | Implemented and tested |
+| Model-risk and resilience governance | Typed, fsynced SHA-256-chained model promotion/demotion/hold records and fault-game-day outcomes with immutable evidence hashes; canonical read-only registers | Implemented and tested |
+| End-of-day execution review | Immutable transaction-cost analysis over frozen arrival/target benchmarks, exact fills/fees/partial fills, and strategy/algorithm/order-type aggregation | Implemented and tested |
+| Risk SLO measurement | Frozen-policy local evaluator benchmark with caller-selected warmup, count, threshold, input hash, and p99 timing artifact | Implemented and tested; not production availability evidence |
 
 ## Reproducibility boundary
 
@@ -30,6 +33,8 @@ cargo run -p follon-cli --bin follon-operations -- validate-config tests/fixture
 cargo run -p follon-cli --bin follon-operations -- dashboard tests/fixtures/config/operations-v1.json var/operations-dashboard.json --as-of 2026-08-10T16:30:00Z --journal var/follon-operations.journal.ndjson
 cargo run -p follon-cli --bin follon-operations -- report tests/fixtures/config/operations-v1.json var/operations-report.md --as-of 2026-08-10T16:30:00Z --journal var/follon-operations.journal.ndjson
 cargo run -p follon-cli --bin follon-operations -- schedule tests/fixtures/config/operations-v1.json var/operations-schedule.json --as-of 2026-08-10T16:30:00Z
+cargo run -p follon-cli --bin follon-tca -- tests/fixtures/config/tca-v1.json var/tca.json
+cargo run -p follon-cli --bin follon-risk-benchmark -- tests/fixtures/config/risk-benchmark-v1.json var/risk-benchmark.json
 ```
 
 Compare parameter revisions before an approved rollout. The artifact includes
@@ -56,6 +61,16 @@ for that configuration:
 ```powershell
 cargo run -p follon-cli --bin follon-operations -- complete-schedule tests/fixtures/config/operations-v1.json --journal var/follon-operations.journal.ndjson --schedule-id schedule.reconcile --entry-id journal.schedule.reconcile.20260810 --actor operator.alice --occurred-at 2026-08-10T21:20:00Z
 ```
+
+Record a completed model-risk decision or fault-injection exercise only after
+the linked artifact has been independently retained. The typed commands reject
+missing/invalid IDs, non-canonical time, unbounded text, unsupported outcomes,
+and malformed SHA-256 evidence; use `model-risk-register` and
+`game-day-register` to publish the verified read-only registers. The desktop
+Execution Blotter renders TCA and local benchmark artifacts, while operations
+governance registers remain available through the Journal/operations evidence
+filter. None of these mechanisms create a broker, customer, or compliance
+acceptance record.
 
 Load `var/operations-dashboard.json` into the desktop shell after `npm run build` within `apps/desktop`. The UI only renders validated evidence; it has no parameter, schedule, approval, journal, or trading controls.
 

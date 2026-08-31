@@ -308,6 +308,19 @@ class DashboardServerContract(unittest.TestCase):
             "option_dashboard_schema_version": 1,
             "analytics": [],
         }), encoding="utf-8")
+        (EVIDENCE_ROOT / "tca.json").write_text(json.dumps({
+            "as_of": "2026-08-30T21:30:00Z",
+            "input_sha256": "a" * 64,
+            "transaction_cost": {
+                "transaction_cost_schema_version": 1,
+                "reports": [{"analysis_id": "tca.spy.1"}],
+                "buckets": [],
+            },
+        }), encoding="utf-8")
+        (EVIDENCE_ROOT / "model-risk-register.json").write_text(json.dumps({
+            "model_risk_register_schema_version": 1,
+            "records": [],
+        }), encoding="utf-8")
         (EVIDENCE_ROOT / "events.ndjson").write_text(json.dumps({
             "event_id": "evt-1",
             "event_type": "order.state_changed.v1",
@@ -371,6 +384,10 @@ class DashboardServerContract(unittest.TestCase):
         self.assertEqual(snapshot["paper"]["artifact"], "paper-dashboard.json")
         self.assertEqual(snapshot["operations"]["artifact"], "operations-dashboard.json")
         self.assertEqual(snapshot["options"]["artifact"], "options-dashboard.json")
+        self.assertEqual(snapshot["execution_evidence"][0]["artifact"], "tca.json")
+        artifacts = {item["name"]: item for item in server.list_evidence()}
+        self.assertEqual(artifacts["tca.json"]["feature"], "execution-risk")
+        self.assertEqual(artifacts["model-risk-register.json"]["feature"], "operations")
 
     def test_documented_primary_screens_are_integrated_in_static_shell(self) -> None:
         index_source = INDEX_PATH.read_text(encoding="utf-8")

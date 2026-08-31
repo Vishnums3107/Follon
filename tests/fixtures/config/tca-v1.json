@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-08-30T21:30:00Z",
+  "analyses": [
+    {
+      "analysis_id": "tca.spy.001",
+      "strategy_id": "strategy.mean_revert",
+      "parent_order_id": "parent.spy.001",
+      "execution_algorithm": "twap-v1",
+      "order_type": "limit",
+      "side": "BUY",
+      "arrival_price": "100",
+      "target_price": "100.50",
+      "requested_quantity": "10",
+      "fills": [
+        { "execution_id": "execution.spy.001", "quantity": "4", "price": "100.25", "fee": "0.10" },
+        { "execution_id": "execution.spy.002", "quantity": "6", "price": "100.75", "fee": "0.15" }
+      ]
+    }
+  ]
+}
