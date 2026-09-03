@@ -45,6 +45,8 @@ decision changes.
 
 ### 04-experience — UX safety rules and primary screens
 - [UX and primary screens](04-experience/01-ux-and-primary-screens.md)
+- [UI overhaul audit — preflight](04-experience/02-ui-overhaul-audit.md) — current desktop UI architecture, design constraints, and baseline-capture gate.
+- [UI overhaul task list](04-experience/03-ui-overhaul-task-list.md) — visible redesign sequence and verification checklist.
 
 ### 05-quality-security — reliability, testing, security, compliance
 - [Reliability and testing](05-quality-security/01-reliability-and-testing.md)

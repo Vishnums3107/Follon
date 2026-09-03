@@ -244,6 +244,8 @@ fn policy(document: PolicyDocument) -> Result<PortfolioRiskPolicy, Box<dyn std::
         asset_class_limits: decimal_map(document.asset_class_limits)?,
         currency_limits: decimal_map(document.currency_limits)?,
         strategy_limits: decimal_map(document.strategy_limits)?,
+        max_news_slippage_bps: None,
+        max_spread_multiplier_bps: None,
     })
 }
 

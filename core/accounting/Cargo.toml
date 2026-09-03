@@ -8,6 +8,8 @@ authors.workspace = true
 
 [dependencies]
 follon-domain = { path = "../domain" }
+csv = "1.3"
+serde = { version = "1.0", features = ["derive"] }
 
 [lib]
 path = "src/lib.rs"

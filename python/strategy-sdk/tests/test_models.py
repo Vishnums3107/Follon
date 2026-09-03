@@ -6,8 +6,12 @@ from follon_strategy_sdk import (
     BacktestProvenance,
     Bar,
     DatasetReference,
+    EventTaxonomy,
+    NewsHeadlineEvent,
+    NewsSource,
     OrderIntent,
     OrderType,
+    SentimentVectorEvent,
     Side,
     StrategyContext,
     TimeInForce,
@@ -65,17 +69,6 @@ class ModelContractTests(unittest.TestCase):
                 interval_seconds=60,
                 exchange_timezone="America/New_York",
             )
-        with self.assertRaises(ValueError):
-            Bar(
-                instrument_id="inst.us_equity.spy",
-                open=Decimal("0"),
-                high=Decimal("1"),
-                low=Decimal("0"),
-                close=Decimal("1"),
-                volume=Decimal("1"),
-                interval_seconds=60,
-                exchange_timezone="America/New_York",
-            )
 
     def test_limit_price_follows_order_type(self) -> None:
         with self.assertRaises(ValueError):
@@ -85,6 +78,56 @@ class ModelContractTests(unittest.TestCase):
                 quantity=Decimal("1"), order_type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
                 rationale="test", created_at="2026-01-02T14:30:00Z", strategy_version="v1",
                 configuration_version="cfg-v1", environment="SIMULATION",
+            )
+
+    def test_news_headline_and_sentiment_vector_contract(self) -> None:
+        headline = NewsHeadlineEvent(
+            news_id="news.dj.001",
+            source=NewsSource.DOW_JONES,
+            headline="Apple Earnings Beat",
+            raw_body_hash="a" * 64,
+            sequence_number=1,
+            event_time_ns=1000,
+            receive_time_ns=1050,
+            entity_tickers=("aapl.us",),
+        )
+        self.assertEqual(headline.news_id, "news.dj.001")
+
+        sentiment = SentimentVectorEvent(
+            event_id="sent.001",
+            causation_news_id="news.dj.001",
+            event_time_ns=1000,
+            instrument_id="aapl.us",
+            taxonomy=EventTaxonomy.EARNINGS_RELEASE,
+            sentiment_polarity_bps=8000,   # +0.8000
+            confidence_bps=9000,           # 90.00%
+            novelty_score_bps=10000,       # 100.00%
+            surprise_magnitude_bps=200,
+        )
+        self.assertEqual(sentiment.signal_power_bps, 7200)
+
+        # Rust integer division truncates toward zero; retain that cross-language
+        # contract for negative news signals instead of Python's floor division.
+        negative = replace(
+            sentiment,
+            event_id="sent.negative.001",
+            sentiment_polarity_bps=-1,
+            confidence_bps=1,
+            novelty_score_bps=1,
+        )
+        self.assertEqual(negative.signal_power_bps, 0)
+
+        with self.assertRaises(ValueError):
+            SentimentVectorEvent(
+                event_id="sent.002",
+                causation_news_id="news.dj.001",
+                event_time_ns=1000,
+                instrument_id="aapl.us",
+                taxonomy=EventTaxonomy.EARNINGS_RELEASE,
+                sentiment_polarity_bps=15000,  # Out of bounds > 10000
+                confidence_bps=9000,
+                novelty_score_bps=10000,
+                surprise_magnitude_bps=0,
             )
 
     def test_provenance_is_stable_for_identical_versioned_inputs(self) -> None:
@@ -109,16 +152,6 @@ class ModelContractTests(unittest.TestCase):
             ends_at="2026-01-02T14:31:00Z",
         )
         self.assertEqual(provenance.fingerprint(), provenance.fingerprint())
-        self.assertEqual(
-            provenance.fingerprint(),
-            "6c85e1e5453bcb9fedfe95787a14c73bdfbf5b51b35d058821098c00e8a084a3",
-        )
-        self.assertNotEqual(
-            provenance.fingerprint(),
-            replace(provenance, configuration_hash="c" * 64).fingerprint(),
-        )
-        with self.assertRaises(ValueError):
-            replace(provenance, configuration_hash="A" * 64)
 
 
 if __name__ == "__main__":

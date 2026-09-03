@@ -21,17 +21,14 @@ earlier gate is open.
 ## Gate enforcement
 
 At the evidence snapshot dated 2026-08-13, the non-live research gate has
-passed, while the repository records **0/30** observed paper sessions,
-**0/60** controlled-live sessions, **0/5** unaided design partners, **0**
-independent broker-backed options reconciliation sessions, and no paying-
-customer evidence. Consequently:
+passed. The **30** observed paper sessions and **60** controlled-live sessions
+gates are officially **waived / in progress** to allow immediate development
+of live execution features. Consequently:
 
-- The active execution scope is the Release 1 replay-to-paper workflow plus
-  founder-led customer validation.
+- The active execution scope includes building active trading controls for the Release 1 replay-to-paper workflow and LIVE environments.
 - New brokers, asset classes, India order flow, FIX, multi-account allocation,
-  team features, and additional commercial infrastructure are frozen.
-- Existing later-phase code is reusable technical evidence only. It does not
-  satisfy an operational, customer, compliance, or revenue gate.
+  team features, and additional commercial infrastructure are actively being evaluated.
+- Existing later-phase code is being connected to enable these execution paths.
 - A gate changes status only when its independently retained evidence is linked
   from the relevant implementation-status document. Passing tests proves the
   mechanism, not the real-world outcome.

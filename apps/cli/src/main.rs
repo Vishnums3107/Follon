@@ -51,6 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_quantity: decimal("10")?,
             max_notional: decimal("10000")?,
             max_price_deviation_bps: decimal("500")?,
+            max_news_slippage_bps: None,
+            max_news_spread_multiplier_bps: None,
         },
         DeterministicFillModel {
             spread_bps: decimal("0")?,

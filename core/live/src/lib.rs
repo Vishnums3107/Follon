@@ -231,6 +231,115 @@ pub struct LiveActivationRequest {
     pub expires_at: String,
 }
 
+/// Four-eyes human authorization record for a controlled-live news canary order.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LiveNewsCanaryApproval {
+    /// Canonical approval identity.
+    pub approval_id: String,
+    /// Human operator submitting the request.
+    pub requested_by: String,
+    /// Independent human operator verifying and approving the intent.
+    pub approved_by: String,
+    /// Associated news headline/sentiment event ID.
+    pub news_event_id: String,
+    /// Approved intent ID.
+    pub intent_id: String,
+    /// UTC signature timestamp.
+    pub signed_at: String,
+}
+
+impl LiveNewsCanaryApproval {
+    /// Validates four-eyes separation and canonical IDs.
+    pub fn validate(&self) -> Result<(), LiveError> {
+        validate_canonical_id("news approval_id", &self.approval_id)?;
+        validate_canonical_id("news requested_by", &self.requested_by)?;
+        validate_canonical_id("news approved_by", &self.approved_by)?;
+        validate_canonical_id("news news_event_id", &self.news_event_id)?;
+        validate_canonical_id("news intent_id", &self.intent_id)?;
+        validate_utc_timestamp("news signed_at", &self.signed_at)?;
+        if self.requested_by == self.approved_by {
+            return Err(LiveError(
+                "live news canary approval requires distinct requester and approver identities"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stable SHA-256 signature hash.
+    pub fn signature_hash(&self) -> Result<String, LiveError> {
+        self.validate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(format!(
+            "approval_id={}\nrequested_by={}\napproved_by={}\nnews_event_id={}\nintent_id={}\nsigned_at={}\n",
+            self.approval_id, self.requested_by, self.approved_by, self.news_event_id, self.intent_id, self.signed_at
+        ));
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+}
+
+/// Managed macro event blackout window gate.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LiveMacroBlackoutWindow {
+    /// Blackout window identity.
+    pub window_id: String,
+    /// Event taxonomy / description (e.g. CPI, FOMC).
+    pub event_label: String,
+    /// UTC start of blackout buffer.
+    pub starts_at: String,
+    /// UTC end of blackout buffer.
+    pub ends_at: String,
+}
+
+impl LiveMacroBlackoutWindow {
+    /// Validates window bounds.
+    pub fn validate(&self) -> Result<(), LiveError> {
+        validate_canonical_id("blackout window_id", &self.window_id)?;
+        validate_utc_timestamp("blackout starts_at", &self.starts_at)?;
+        validate_utc_timestamp("blackout ends_at", &self.ends_at)?;
+        if self.event_label.trim().is_empty() || self.ends_at <= self.starts_at {
+            return Err(LiveError(
+                "blackout window requires non-empty label and ends_at after starts_at".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns true if `as_of_time` falls inside the blackout window.
+    pub fn is_active_at(&self, as_of_time: &str) -> bool {
+        self.starts_at.as_str() <= as_of_time && as_of_time <= self.ends_at.as_str()
+    }
+}
+
+/// Evaluates real-time live execution news shock shield and returns reason codes.
+pub fn evaluate_live_news_shock_shield(
+    reference_price: Decimal,
+    execution_price: Decimal,
+    max_news_slippage_bps: Decimal,
+    current_spread: Option<Decimal>,
+    baseline_spread: Option<Decimal>,
+    max_spread_multiplier_bps: Option<Decimal>,
+) -> Result<Vec<String>, LiveError> {
+    let mut reasons = Vec::new();
+    let deviation = price_deviation_bps(reference_price, execution_price)?;
+    if deviation > max_news_slippage_bps {
+        reasons.push("LIVE_NEWS_SLIPPAGE_COLLAR_EXCEEDED".to_owned());
+    }
+    if let (Some(max_mult), Some(spread), Some(baseline)) =
+        (max_spread_multiplier_bps, current_spread, baseline_spread)
+    {
+        if baseline > Decimal::ZERO {
+            let max_allowed = baseline
+                .checked_mul(max_mult)?
+                .checked_div(Decimal::from_integer(10_000)?)?;
+            if spread > max_allowed {
+                reasons.push("LIVE_LIQUIDITY_HOLE_DETECTED".to_owned());
+            }
+        }
+    }
+    Ok(reasons)
+}
+
 impl LiveActivation {
     /// Creates an activation cryptographically bound to the supplied immutable live controls.
     ///
@@ -4133,5 +4242,62 @@ mod tests {
         )
         .is_err());
         std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn test_controlled_live_news_safety_kernel() {
+        // 1. Four-eyes approval validation
+        let approval = LiveNewsCanaryApproval {
+            approval_id: "app.001".to_owned(),
+            requested_by: "trader.alice".to_owned(),
+            approved_by: "risk.bob".to_owned(),
+            news_event_id: "news.dj.001".to_owned(),
+            intent_id: "intent.001".to_owned(),
+            signed_at: "2026-09-01T14:00:00Z".to_owned(),
+        };
+        assert!(approval.validate().is_ok());
+        assert!(approval.signature_hash().is_ok());
+
+        // Four-eyes failure (requester == approver)
+        let same_operator = LiveNewsCanaryApproval {
+            approved_by: "trader.alice".to_owned(),
+            ..approval.clone()
+        };
+        assert!(same_operator.validate().is_err());
+
+        // 2. Macro blackout window
+        let blackout = LiveMacroBlackoutWindow {
+            window_id: "window.cpi.001".to_owned(),
+            event_label: "US CPI Release".to_owned(),
+            starts_at: "2026-09-01T13:28:00Z".to_owned(),
+            ends_at: "2026-09-01T13:32:00Z".to_owned(),
+        };
+        assert!(blackout.validate().is_ok());
+        assert!(blackout.is_active_at("2026-09-01T13:30:00Z"));
+        assert!(!blackout.is_active_at("2026-09-01T14:00:00Z"));
+
+        // 3. Live news shock shield evaluation
+        let clean_shield = evaluate_live_news_shock_shield(
+            Decimal::from_str("100").unwrap(),
+            Decimal::from_str("100.20").unwrap(),
+            Decimal::from_str("50").unwrap(),
+            Some(Decimal::from_str("0.04").unwrap()),
+            Some(Decimal::from_str("0.02").unwrap()),
+            Some(Decimal::from_str("30000").unwrap()),
+        )
+        .expect("shield");
+        assert!(clean_shield.is_empty());
+
+        let shock_shield = evaluate_live_news_shock_shield(
+            Decimal::from_str("100").unwrap(),
+            Decimal::from_str("101.00").unwrap(), // 100 BPS > 50 BPS max
+            Decimal::from_str("50").unwrap(),
+            Some(Decimal::from_str("0.10").unwrap()), // 5.0x > 3.0x max
+            Some(Decimal::from_str("0.02").unwrap()),
+            Some(Decimal::from_str("30000").unwrap()),
+        )
+        .expect("shield");
+        assert!(shock_shield.contains(&"LIVE_NEWS_SLIPPAGE_COLLAR_EXCEEDED".to_owned()));
+        assert!(shock_shield.contains(&"LIVE_LIQUIDITY_HOLE_DETECTED".to_owned()));
     }
 }

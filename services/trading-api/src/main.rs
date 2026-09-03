@@ -424,6 +424,8 @@ fn risk_policy(policy: &api::PortfolioRiskPolicy) -> Result<PortfolioRiskPolicy,
         asset_class_limits: bucket_limits("asset_class_limits", &policy.asset_class_limits)?,
         currency_limits: bucket_limits("currency_limits", &policy.currency_limits)?,
         strategy_limits: bucket_limits("strategy_limits", &policy.strategy_limits)?,
+        max_news_slippage_bps: None,
+        max_spread_multiplier_bps: None,
     })
 }
 

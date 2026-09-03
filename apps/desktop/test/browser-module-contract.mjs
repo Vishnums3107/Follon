@@ -17,13 +17,14 @@ for (const id of ["workspace-detail", "workspace-summary", "workspace-canvas", "
 }
 assert.doesNotMatch(appShell, /id="workspace-evidence"[^>]*\shidden(?:\s|>)/u);
 
-for (const font of ["SF Pro Display", "SF Pro Text", "SF Compact", "SF Mono"]) {
-  assert.ok(styles.includes(font), `missing requested system font mapping: ${font}`);
+for (const font of ["Inter", "JetBrains Mono"]) {
+  assert.ok(styles.includes(font), `missing terminal font mapping: ${font}`);
 }
-const colorTokens = [...`${styles}\n${favicon}`.matchAll(/#[0-9a-fA-F]{3,8}\b/gu)].map((match) => match[0].toLowerCase());
-assert.ok(colorTokens.every((color) => color === "#000" || color === "#fff"), `non-monochrome color found: ${colorTokens.join(", ")}`);
-assert.match(styles, /body\s*\{[^}]*background:\s*var\(--white\)/su);
-assert.match(styles, /\.workspace-detail\s*\{[^}]*background:\s*var\(--black\)/su);
+for (const token of ["--color-bg-base", "--color-surface-1", "--color-accent", "--color-signal-buy", "--color-signal-sell"]) {
+  assert.ok(styles.includes(token), `missing terminal design token: ${token}`);
+}
+assert.match(styles, /body\s*\{[^}]*background:\s*var\(--color-bg-base\)/su);
+assert.match(styles, /\.workspace-detail\s*\{[^}]*background:\s*var\(--color-surface-1\)/su);
 
 const visited = new Set();
 async function verifyModule(relativePath) {
@@ -38,17 +39,18 @@ async function verifyModule(relativePath) {
 }
 
 await verifyModule("main.js");
-assert.deepEqual([...visited].sort(), ["catalog.js", "evidence.js", "main.js", "workspaces.js"]);
+assert.deepEqual([...visited].sort(), ["OrderTicket.js", "catalog.js", "evidence.js", "main.js", "workspaces.js"]);
 const main = await readFile(resolve(appDirectory, "src", "main.ts"), "utf8");
 const workspaces = await readFile(resolve(appDirectory, "src", "workspaces.ts"), "utf8");
 const workspaceContracts = new Map([
   ["command-center", ["System, broker, strategy, and risk status", "Environment readiness", "Attention queue"]],
   ["research-lab", ["Dataset inventory", "Notebook inventory", "Experiment catalogue"]],
+  ["news-cockpit", ["Headline evidence", "Sentiment signals", "Causally linked risk decisions"]],
   ["strategy-studio", ["Version and deployment identities", "Worker contract"]],
   ["backtest-explorer", ["Run comparison", "Trade evidence", "Regime and sensitivity dimensions"]],
   ["execution-blotter", ["Causal execution blotter", "Explainable risk decisions", "Broker lifecycle condition coverage"]],
   ["risk-cockpit", ["Exposure and loss control", "Versioned risk limits", "Alerts and reconciliation"]],
-  ["portfolio", ["Internal positions", "P&L attribution", "Options scenario and book reconciliation"]],
+  ["portfolio", ["Positions and realized P&L", "P&L attribution", "Options scenario and book reconciliation"]],
   ["replay-incidents", ["Event distribution", "Causal replay timeline", "Incident and recovery state"]],
   ["journal", ["Chain integrity", "Unified append-only journal", "Details / annotation"]],
   ["administration", ["Commercial ledger", "Deployment and administrative controls", "Privileged-action boundary"]],
@@ -79,4 +81,11 @@ assert.match(workspaces, /Regime and sensitivity dimensions/u);
 assert.match(workspaces, /missing tags are reported explicitly rather than inferred/u);
 assert.match(workspaces, /Decisions, annotations, and review evidence/u);
 assert.match(workspaces, /Details \/ annotation/u);
+assert.match(workspaces, /news\.headline\.v1/u);
+assert.match(workspaces, /snapshot\.events\.filter/u);
+assert.match(workspaces, /Order ticket/u);
+assert.match(workspaces, /cancel_order/u);
+assert.match(workspaces, /close_position/u);
+assert.doesNotMatch(workspaces, /5 Integrated/u);
+assert.doesNotMatch(workspaces, /Apple Reports Record Q3 Earnings/u);
 console.log("Browser module graph / workspace shell contract passed");

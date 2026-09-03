@@ -164,3 +164,108 @@ class OrderIntent:
             "configuration_version": self.configuration_version,
             "environment": self.environment,
         }
+
+
+class NewsSource(StrEnum):
+    """Declared provenance labels for local-fixture news payloads."""
+
+    DOW_JONES = "DOW_JONES"
+    BLOOMBERG_BPIPE = "BLOOMBERG_BPIPE"
+    REFINITIV_MRN = "REFINITIV_MRN"
+    SEC_EDGAR = "SEC_EDGAR"
+    FED_BLS = "FED_BLS"
+
+
+class EventTaxonomy(StrEnum):
+    """Categorized event classification taxonomy."""
+
+    EARNINGS_RELEASE = "EARNINGS_RELEASE"
+    GUIDANCE_REVISION = "GUIDANCE_REVISION"
+    M_AND_A = "M_AND_A"
+    FDA_DECISION = "FDA_DECISION"
+    MACRO_CPI = "MACRO_CPI"
+    MACRO_FED_RATE = "MACRO_FED_RATE"
+    LITIGATION = "LITIGATION"
+
+
+@dataclass(frozen=True, slots=True)
+class NewsHeadlineEvent:
+    """Normalized news headline provided to strategy callbacks."""
+
+    news_id: str
+    source: NewsSource
+    headline: str
+    raw_body_hash: str
+    sequence_number: int
+    event_time_ns: int
+    receive_time_ns: int
+    entity_tickers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _canonical_id("news_id", self.news_id)
+        if not isinstance(self.source, NewsSource):
+            raise ValueError("source must be a supported NewsSource")
+        if not self.headline.strip():
+            raise ValueError("headline text cannot be empty")
+        if len(self.raw_body_hash) != 64 or any(character not in "0123456789abcdef" for character in self.raw_body_hash):
+            raise ValueError("raw_body_hash must be a 64-character SHA256 hex string")
+        if (
+            not isinstance(self.sequence_number, int)
+            or isinstance(self.sequence_number, bool)
+            or self.sequence_number < 0
+            or not isinstance(self.event_time_ns, int)
+            or isinstance(self.event_time_ns, bool)
+            or not isinstance(self.receive_time_ns, int)
+            or isinstance(self.receive_time_ns, bool)
+            or self.event_time_ns <= 0
+            or self.receive_time_ns <= 0
+        ):
+            raise ValueError("event_time_ns and receive_time_ns must be positive")
+        for ticker in self.entity_tickers:
+            _canonical_id("entity_ticker", ticker)
+
+
+@dataclass(frozen=True, slots=True)
+class SentimentVectorEvent:
+    """Extracted sentiment vector event provided to event-driven news strategies."""
+
+    event_id: str
+    causation_news_id: str
+    event_time_ns: int
+    instrument_id: str
+    taxonomy: EventTaxonomy
+    sentiment_polarity_bps: int
+    confidence_bps: int
+    novelty_score_bps: int
+    surprise_magnitude_bps: int
+
+    def __post_init__(self) -> None:
+        _canonical_id("event_id", self.event_id)
+        _canonical_id("causation_news_id", self.causation_news_id)
+        _canonical_id("instrument_id", self.instrument_id)
+        if not isinstance(self.taxonomy, EventTaxonomy):
+            raise ValueError("taxonomy must be a supported EventTaxonomy")
+        if not isinstance(self.event_time_ns, int) or isinstance(self.event_time_ns, bool) or self.event_time_ns <= 0:
+            raise ValueError("event_time_ns must be positive")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in (
+                self.sentiment_polarity_bps,
+                self.confidence_bps,
+                self.novelty_score_bps,
+                self.surprise_magnitude_bps,
+            )
+        ):
+            raise ValueError("news sentiment scores must be integers")
+        if not -10000 <= self.sentiment_polarity_bps <= 10000:
+            raise ValueError("sentiment_polarity_bps must be between -10000 and 10000")
+        if not 0 <= self.confidence_bps <= 10000:
+            raise ValueError("confidence_bps must be between 0 and 10000")
+        if not 0 <= self.novelty_score_bps <= 10000:
+            raise ValueError("novelty_score_bps must be between 0 and 10000")
+
+    @property
+    def signal_power_bps(self) -> int:
+        """Returns composite signal power in basis points."""
+        numerator = self.sentiment_polarity_bps * self.confidence_bps * self.novelty_score_bps
+        return numerator // 100_000_000 if numerator >= 0 else -((-numerator) // 100_000_000)

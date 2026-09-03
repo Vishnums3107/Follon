@@ -17,6 +17,7 @@ const WORKSPACE_GROUPS: readonly Readonly<{
     { id: "research-lab", title: "Research Lab", subtitle: "Datasets and experiments" },
     { id: "strategy-studio", title: "Strategy Studio", subtitle: "Versions and deployment" },
     { id: "backtest-explorer", title: "Backtest Explorer", subtitle: "Runs and comparisons" },
+    { id: "news-cockpit", title: "News Cockpit", subtitle: "Sentiment & headline evidence" },
   ] },
   { label: "Operate", workspaces: [
     { id: "execution-blotter", title: "Execution Blotter", subtitle: "OMS lifecycle evidence" },
@@ -30,8 +31,8 @@ const WORKSPACE_GROUPS: readonly Readonly<{
   ] },
 ];
 
-/** React-owned application shell. The existing fail-closed evidence controller
- * is loaded only after every bounded target has mounted. */
+/** React-owned application shell. The desktop controller is loaded only after
+ * every workspace target has mounted. */
 export function AppShell(): React.JSX.Element {
   useEffect(() => {
     void import("./main.js").catch((error: unknown) => {
@@ -45,15 +46,15 @@ export function AppShell(): React.JSX.Element {
 
   return (
     <>
-      <header className="site-header">
-        <a className="brand" href="/" aria-label="Follon evidence dashboard home">
+      <header className="site-header f-card f-card--elevated">
+        <a className="brand" href="/" aria-label="Follon trading terminal home">
           <span className="brand-mark" aria-hidden="true">F</span><span>Follon</span>
         </a>
         <nav className="header-nav" aria-label="Dashboard sections">
           <a href="#system">System</a><a href="#workspaces">Workspaces</a>
           <a href="#capabilities">Capabilities</a><a href="#artifacts">Evidence</a>
         </nav>
-        <span className="environment-badge">READ ONLY</span>
+        <span className="environment-badge f-badge f-badge--accent">TRADING TERMINAL</span>
       </header>
 
       <main id="app">
@@ -61,13 +62,13 @@ export function AppShell(): React.JSX.Element {
           <p className="eyebrow">Unified trading operations</p>
           <h1 id="dashboard-title">One view across the Follon system.</h1>
           <p className="intro">Monitor research, replay, PAPER, controlled-live safety, operations, options, and commercial evidence from a single deployment surface.</p>
-          <div className="safety-note"><strong>Safety boundary</strong><span>This dashboard verifies and displays evidence. Broker actions, kill switches, approvals, credentials, payments, privacy deletion, and release signing remain in their hardened operator boundaries.</span></div>
+          <div className="safety-note"><strong>Trading boundary</strong><span>Order submit, cancel, and position-close requests use the native desktop command route. Risk, OMS, broker credentials, approvals, and audit recording remain in their owning application boundaries.</span></div>
         </section>
 
         <section id="workspaces" className="dashboard-section" aria-labelledby="workspaces-title">
           <div className="section-heading">
             <div><p className="eyebrow">Integrated application</p><h2 id="workspaces-title">Operator workspaces</h2></div>
-            <p className="section-copy">Ten purpose-built views over the complete implemented research, trading-control, operations, options, and commercial evidence model.</p>
+            <p className="section-copy">Eleven purpose-built views over the complete implemented research, trading-control, operations, options, and commercial evidence model.</p>
           </div>
           <div className="workspace-shell">
             <aside className="workspace-sidebar" aria-label="Dashboard workspaces">
@@ -87,10 +88,10 @@ export function AppShell(): React.JSX.Element {
                 </div>
               ))}
             </aside>
-            <section id="workspace-detail" className="workspace-detail" aria-live="polite" aria-labelledby="workspace-detail-title">
+            <section id="workspace-detail" className="workspace-detail f-card f-card--elevated" aria-live="polite" aria-labelledby="workspace-detail-title">
               <div className="workspace-detail-heading">
                 <div><p className="eyebrow">Active workspace</p><h3 id="workspace-detail-title">Command Center</h3></div>
-                <div className="workspace-header-actions"><span id="workspace-artifact-count" className="workspace-count">Loading evidence</span><button id="refresh-workspace" type="button">Refresh workspace</button></div>
+                <div className="workspace-header-actions"><span id="workspace-artifact-count" className="workspace-count f-badge">Loading evidence</span><button id="refresh-workspace" className="f-btn f-btn--primary" type="button">Refresh workspace</button></div>
               </div>
               <p id="workspace-detail-copy" className="workspace-detail-copy">System health, acceptance gates, and evidence from every implemented Follon capability.</p>
               <div id="workspace-feature-badges" className="workspace-badges" />
@@ -110,7 +111,7 @@ export function AppShell(): React.JSX.Element {
         <section id="system" className="dashboard-section" aria-labelledby="system-title">
           <div className="section-heading">
             <div><p className="eyebrow">Runtime</p><h2 id="system-title">System health</h2></div>
-            <button id="refresh-system" type="button">Refresh health</button>
+            <button id="refresh-system" className="f-btn" type="button">Refresh health</button>
           </div>
           <div id="system-overview" className="metric-grid" aria-live="polite" />
         </section>
@@ -133,13 +134,13 @@ export function AppShell(): React.JSX.Element {
           </div>
           <div className="source-actions">
             <label className="field-label" htmlFor="feature-filter">Feature area</label>
-            <select id="feature-filter" aria-label="Filter evidence by feature"><option value="all">All features</option></select>
+            <select id="feature-filter" className="f-select" aria-label="Filter evidence by feature"><option value="all">All features</option></select>
             <label className="field-label" htmlFor="artifact-search">Search artifacts</label>
-            <input id="artifact-search" type="search" placeholder="Name, type, or feature" autoComplete="off" />
+            <input id="artifact-search" className="f-input" type="search" placeholder="Name, type, or feature" autoComplete="off" />
             <label className="field-label" htmlFor="server-evidence">Available evidence</label>
             <div className="control-row">
-              <select id="server-evidence" aria-label="Available server evidence" disabled><option>Loading local evidence…</option></select>
-              <button id="refresh-evidence" type="button">Refresh</button>
+              <select id="server-evidence" className="f-select" aria-label="Available server evidence" disabled><option>Loading local evidence…</option></select>
+              <button id="refresh-evidence" className="f-btn" type="button">Refresh</button>
             </div>
             <label className="upload-label" htmlFor="event-log-file">Or choose a local evidence file</label>
             <input id="event-log-file" type="file" accept=".ndjson,.json,.md,.csv,application/x-ndjson,application/json,text/markdown,text/csv" />
@@ -149,7 +150,7 @@ export function AppShell(): React.JSX.Element {
         <div className="artifact-toolbar"><span id="artifact-meta">No artifact selected</span><a id="download-artifact" className="download-link" href="#" hidden>Download original</a></div>
         <section id="evidence" aria-live="polite" />
       </main>
-      <footer>Follon unified dashboard · Evidence-first · No browser-based trading controls</footer>
+      <footer>Follon trading terminal · Native Risk/OMS command route</footer>
     </>
   );
 }

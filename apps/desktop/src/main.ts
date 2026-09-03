@@ -41,7 +41,7 @@ const apiOrigin = isTauriRuntime ? "http://127.0.0.1:8080" : window.location.ori
 
 function apiUrl(path: string): string {
   if (!path.startsWith("/api/v1/")) {
-    throw new Error("API paths must use the versioned read-only boundary.");
+    throw new Error("API paths must use the versioned evidence boundary.");
   }
   return new URL(path, apiOrigin).toString();
 }
@@ -49,6 +49,7 @@ function apiUrl(path: string): string {
 const WORKSPACES: readonly WorkspaceDefinition[] = [
   { id: "command-center", title: "Command Center", description: "System health, acceptance gates, and evidence from every implemented Follon capability.", features: ["market-data", "replay", "research", "paper", "controlled-live", "operations", "options", "commercial", "execution-risk", "accounting", "identity", "platform"] },
   { id: "research-lab", title: "Research Lab", description: "Historical datasets, normalized market data, experiment records, reports, and deterministic options analysis.", features: ["market-data", "research", "options"] },
+  { id: "news-cockpit", title: "News Cockpit", description: "Validated headline and sentiment evidence, their deterministic signal values, and linked risk decisions.", features: ["news", "research", "execution-risk"] },
   { id: "strategy-studio", title: "Strategy Studio", description: "Strategy bundle, worker runtime, configuration, replay, and reproducibility identities without browser-side code execution.", features: ["research", "replay"] },
   { id: "backtest-explorer", title: "Backtest Explorer", description: "Completed backtest artifacts, event trails, reports, manifests, trades, and repeatability evidence.", features: ["research", "replay"] },
   { id: "execution-blotter", title: "Execution Blotter", description: "Intent, EMS plan, risk decision, order lifecycle, fill, rejection, replacement, and reconciliation evidence across simulation, PAPER, and controlled LIVE.", features: ["replay", "paper", "controlled-live", "execution-risk"] },
@@ -137,25 +138,25 @@ function renderContents(contents: string, source: string): void {
       const dashboard = parseOptionsDashboard(contents);
       events = [];
       renderOptionsDashboard(evidenceRoot, dashboard);
-      setStatus(`Loaded read-only deterministic options evidence from ${source}.`, "success");
+      setStatus(`Loaded deterministic options evidence from ${source}.`, "success");
     } catch {
       try {
         const dashboard = parseOperationsDashboard(contents);
         events = [];
         renderOperationsDashboard(evidenceRoot, dashboard);
-        setStatus(`Loaded read-only operations workbench evidence from ${source}.`, "success");
+        setStatus(`Loaded operations workbench evidence from ${source}.`, "success");
       } catch {
         try {
           const dashboard = parseLiveMonitoringDashboard(contents);
           events = [];
           renderLiveMonitoringDashboard(evidenceRoot, dashboard);
-          setStatus(`Loaded read-only controlled-live monitoring state from ${source}.`, "success");
+          setStatus(`Loaded controlled-live monitoring state from ${source}.`, "success");
         } catch {
           try {
             const dashboard = parsePaperDashboard(contents);
             events = [];
             renderPaperDashboard(evidenceRoot, dashboard);
-            setStatus(`Loaded read-only PAPER operations state from ${source}.`, "success");
+            setStatus(`Loaded PAPER operations state from ${source}.`, "success");
           } catch {
             try {
               events = parseEvidenceLog(contents);

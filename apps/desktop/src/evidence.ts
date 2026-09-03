@@ -297,7 +297,7 @@ export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   return events;
 }
 
-/** Parses a server-owned paper-operations snapshot; it never creates an action. */
+/** Parses a server-owned PAPER operations evidence snapshot. */
 export function parsePaperDashboard(json: string): PaperDashboard {
   let value: unknown;
   try {
@@ -306,12 +306,12 @@ export function parsePaperDashboard(json: string): PaperDashboard {
     throw new Error("Paper dashboard is not valid JSON.");
   }
   if (!isPaperDashboard(value)) {
-    throw new Error("Paper dashboard does not match the v2 read-only contract.");
+    throw new Error("Paper dashboard does not match the v2 evidence contract.");
   }
   return value;
 }
 
-/** Parses a controlled-live monitoring projection; this format has no action fields. */
+/** Parses a controlled-live monitoring evidence projection. */
 export function parseLiveMonitoringDashboard(json: string): LiveMonitoringDashboard {
   let value: unknown;
   try {
@@ -320,12 +320,12 @@ export function parseLiveMonitoringDashboard(json: string): LiveMonitoringDashbo
     throw new Error("Controlled-live monitoring dashboard is not valid JSON.");
   }
   if (!isLiveMonitoringDashboard(value)) {
-    throw new Error("Controlled-live monitoring dashboard does not match the v2 read-only contract.");
+    throw new Error("Controlled-live monitoring dashboard does not match the v2 evidence contract.");
   }
   return value;
 }
 
-/** Parses the versioned read-only operator workbench dashboard. */
+/** Parses the versioned operator-workbench evidence dashboard. */
 export function parseOperationsDashboard(json: string): OperationsDashboard {
   let value: unknown;
   try {
@@ -334,7 +334,7 @@ export function parseOperationsDashboard(json: string): OperationsDashboard {
     throw new Error("Operations dashboard is not valid JSON.");
   }
   if (!isOperationsDashboard(value)) {
-    throw new Error("Operations dashboard does not match the v1 read-only contract.");
+    throw new Error("Operations dashboard does not match the v1 evidence contract.");
   }
   return value;
 }
@@ -416,7 +416,7 @@ export function renderEvidence(root: HTMLElement, events: readonly EvidenceEvent
   }
 }
 
-/** Renders paper risk and reconciliation state without offering trading controls. */
+/** Renders PAPER risk and reconciliation evidence. */
 export function renderPaperDashboard(root: HTMLElement, dashboard: PaperDashboard): void {
   root.replaceChildren();
   const heading = document.createElement("h1");
@@ -424,7 +424,7 @@ export function renderPaperDashboard(root: HTMLElement, dashboard: PaperDashboar
   root.append(heading);
 
   const environment = document.createElement("p");
-  environment.textContent = `Environment: ${dashboard.environment}. This screen is read-only.`;
+  environment.textContent = `Environment: ${dashboard.environment}. Use the Order Ticket for active requests.`;
   root.append(environment);
 
   const summary = document.createElement("dl");
@@ -567,7 +567,7 @@ export function renderLiveMonitoringDashboard(root: HTMLElement, dashboard: Live
   root.append(table);
 }
 
-/** Renders risk, attribution, schedules, replay identities, and journal evidence without actions. */
+/** Renders risk, attribution, schedules, replay identities, and journal evidence. */
 export function renderOperationsDashboard(root: HTMLElement, dashboard: OperationsDashboard): void {
   root.replaceChildren();
   const heading = document.createElement("h1");
@@ -575,7 +575,7 @@ export function renderOperationsDashboard(root: HTMLElement, dashboard: Operatio
   root.append(heading);
 
   const boundary = document.createElement("p");
-  boundary.textContent = `Environment: ${dashboard.environment}. Read-only cockpit; this screen cannot change a parameter, schedule, journal, approval, or order.`;
+  boundary.textContent = `Environment: ${dashboard.environment}. This is an evidence view; use the active controls in Command Center or Execution Blotter to submit a request.`;
   root.append(boundary);
 
   const summary = document.createElement("dl");
@@ -670,7 +670,7 @@ export function renderOperationsDashboard(root: HTMLElement, dashboard: Operatio
   }
 }
 
-/** Renders a frozen options chain and reconciliation projection without any trade action. */
+/** Renders a frozen options chain and reconciliation evidence projection. */
 export function renderOptionsDashboard(root: HTMLElement, dashboard: OptionsDashboard): void {
   root.replaceChildren();
   const heading = document.createElement("h1");
@@ -678,7 +678,7 @@ export function renderOptionsDashboard(root: HTMLElement, dashboard: OptionsDash
   root.append(heading);
 
   const boundary = document.createElement("p");
-  boundary.textContent = "Read-only deterministic European-option analytics. This screen cannot request quotes, alter a multi-leg order, approve a trade, or change a broker position.";
+  boundary.textContent = "Deterministic European-option analytics. Use the active trading controls for supported order-entry requests.";
   root.append(boundary);
 
   const summary = document.createElement("dl");

@@ -557,6 +557,189 @@ pub struct AuditTrail {
     pub summary: String,
 }
 
+/// Declared origin of a normalized news headline.
+///
+/// The replay/local-fixture slice recognizes these stable labels only. They
+/// describe fixture provenance and do not imply that a vendor transport is
+/// configured or connected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NewsSource {
+    /// Dow Jones-compatible fixture provenance.
+    DowJones,
+    /// Bloomberg B-PIPE-compatible fixture provenance.
+    BloombergBPipe,
+    /// Refinitiv MRN-compatible fixture provenance.
+    RefinitivMrn,
+    /// SEC EDGAR-compatible fixture provenance.
+    SecEdgar,
+    /// Federal Reserve or BLS-compatible fixture provenance.
+    FedBls,
+}
+
+impl NewsSource {
+    /// Stable contract representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DowJones => "DOW_JONES",
+            Self::BloombergBPipe => "BLOOMBERG_BPIPE",
+            Self::RefinitivMrn => "REFINITIV_MRN",
+            Self::SecEdgar => "SEC_EDGAR",
+            Self::FedBls => "FED_BLS",
+        }
+    }
+
+    /// Parses the stable contract representation.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "DOW_JONES" => Ok(Self::DowJones),
+            "BLOOMBERG_BPIPE" => Ok(Self::BloombergBPipe),
+            "REFINITIV_MRN" => Ok(Self::RefinitivMrn),
+            "SEC_EDGAR" => Ok(Self::SecEdgar),
+            "FED_BLS" => Ok(Self::FedBls),
+            _ => Err(DomainError("invalid news source".to_owned())),
+        }
+    }
+}
+
+/// A deterministic taxonomy assigned by a declared local classifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventTaxonomy {
+    /// Quarterly or annual earnings announcement.
+    EarningsRelease,
+    /// Executive guidance revision.
+    GuidanceRevision,
+    /// Merger, acquisition, or buyout.
+    MergerAcquisition,
+    /// Regulatory or FDA trial decision.
+    FdaDecision,
+    /// Consumer Price Index release.
+    MacroCpi,
+    /// Federal Reserve interest-rate decision.
+    MacroFedRate,
+    /// Corporate litigation or settlement.
+    Litigation,
+}
+
+impl EventTaxonomy {
+    /// Stable contract representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EarningsRelease => "EARNINGS_RELEASE",
+            Self::GuidanceRevision => "GUIDANCE_REVISION",
+            Self::MergerAcquisition => "M_AND_A",
+            Self::FdaDecision => "FDA_DECISION",
+            Self::MacroCpi => "MACRO_CPI",
+            Self::MacroFedRate => "MACRO_FED_RATE",
+            Self::Litigation => "LITIGATION",
+        }
+    }
+
+    /// Parses the stable contract representation.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "EARNINGS_RELEASE" => Ok(Self::EarningsRelease),
+            "GUIDANCE_REVISION" => Ok(Self::GuidanceRevision),
+            "M_AND_A" => Ok(Self::MergerAcquisition),
+            "FDA_DECISION" => Ok(Self::FdaDecision),
+            "MACRO_CPI" => Ok(Self::MacroCpi),
+            "MACRO_FED_RATE" => Ok(Self::MacroFedRate),
+            "LITIGATION" => Ok(Self::Litigation),
+            _ => Err(DomainError("invalid news taxonomy".to_owned())),
+        }
+    }
+}
+
+/// Schema-validated payload of a `news.headline.v1` evidence event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewsHeadline {
+    /// Source-native, canonical headline identity.
+    pub news_id: String,
+    /// Declared fixture/local-file source.
+    pub source: NewsSource,
+    /// Immutable headline text.
+    pub headline: String,
+    /// Lowercase SHA-256 hash of the source body retained outside this payload.
+    pub raw_body_hash: String,
+    /// Source-provided sequence number.
+    pub sequence_number: u64,
+    /// Source publication time in UTC Unix nanoseconds.
+    pub event_time_ns: u64,
+    /// Local fixture-ingress time in UTC Unix nanoseconds.
+    pub receive_time_ns: u64,
+    /// Canonical instruments explicitly associated with the item.
+    pub entity_tickers: Vec<String>,
+}
+
+impl NewsHeadline {
+    /// Validates the versioned payload contract.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_canonical_id("news_id", &self.news_id)?;
+        if self.headline.trim().is_empty()
+            || self.raw_body_hash.len() != 64
+            || !self
+                .raw_body_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.event_time_ns == 0
+            || self.receive_time_ns == 0
+        {
+            return Err(DomainError("invalid news headline payload".to_owned()));
+        }
+        for instrument_id in &self.entity_tickers {
+            validate_canonical_id("news entity_ticker", instrument_id)?;
+        }
+        Ok(())
+    }
+}
+
+/// Schema-validated payload of a `news.sentiment.v1` evidence event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SentimentVector {
+    /// Deterministic local-classifier output identity.
+    pub event_id: String,
+    /// Source `NewsHeadline.news_id` that caused this vector.
+    pub causation_news_id: String,
+    /// Source publication time inherited from its headline, in UTC Unix nanoseconds.
+    pub event_time_ns: u64,
+    /// Canonical target instrument.
+    pub instrument_id: String,
+    /// Declared deterministic classification.
+    pub taxonomy: EventTaxonomy,
+    /// Directional integer basis points in the inclusive range -10000..=10000.
+    pub sentiment_polarity_bps: i32,
+    /// Integer confidence basis points in the inclusive range 0..=10000.
+    pub confidence_bps: u32,
+    /// Integer novelty basis points in the inclusive range 0..=10000.
+    pub novelty_score_bps: u32,
+    /// Extracted numeric surprise, expressed in integer basis points.
+    pub surprise_magnitude_bps: i32,
+}
+
+impl SentimentVector {
+    /// Validates the versioned payload contract.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_canonical_id("sentiment event_id", &self.event_id)?;
+        validate_canonical_id("causation_news_id", &self.causation_news_id)?;
+        validate_canonical_id("instrument_id", &self.instrument_id)?;
+        if self.event_time_ns == 0
+            || !(-10_000..=10_000).contains(&self.sentiment_polarity_bps)
+            || self.confidence_bps > 10_000
+            || self.novelty_score_bps > 10_000
+        {
+            return Err(DomainError("invalid news sentiment payload".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Computes signal power using integer basis-point arithmetic only.
+    pub fn signal_power_bps(&self) -> i64 {
+        (i64::from(self.sentiment_polarity_bps)
+            * i64::from(self.confidence_bps)
+            * i64::from(self.novelty_score_bps))
+            / 100_000_000
+    }
+}
+
 /// First-slice event families supported by the stable envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventPayload {
@@ -576,6 +759,10 @@ pub enum EventPayload {
     Pnl(PnlSnapshot),
     /// An immutable audit trail summary.
     Audit(AuditTrail),
+    /// A normalized fixture/local-file news headline.
+    NewsHeadline(NewsHeadline),
+    /// A deterministic local sentiment vector.
+    NewsSentiment(SentimentVector),
 }
 
 impl EventPayload {
@@ -590,6 +777,8 @@ impl EventPayload {
             Self::Position(_) => "portfolio.position_updated.v1",
             Self::Pnl(_) => "portfolio.pnl_updated.v1",
             Self::Audit(_) => "audit.trail.v1",
+            Self::NewsHeadline(_) => "news.headline.v1",
+            Self::NewsSentiment(_) => "news.sentiment.v1",
         }
     }
 
@@ -626,6 +815,19 @@ impl EventPayload {
             Self::Audit(audit) => format!(
                 "{{\"correlation_id\":{},\"event_ids\":{},\"summary\":{}}}",
                 json_string(&audit.correlation_id), json_strings(&audit.event_ids), json_string(&audit.summary)
+            ),
+            Self::NewsHeadline(headline) => format!(
+                "{{\"entity_tickers\":{},\"event_time_ns\":{},\"headline\":{},\"news_id\":{},\"raw_body_hash\":{},\"receive_time_ns\":{},\"sequence_number\":{},\"source\":{}}}",
+                json_strings(&headline.entity_tickers), headline.event_time_ns, json_string(&headline.headline),
+                json_string(&headline.news_id), json_string(&headline.raw_body_hash), headline.receive_time_ns,
+                headline.sequence_number, json_string(headline.source.as_str())
+            ),
+            Self::NewsSentiment(sentiment) => format!(
+                "{{\"causation_news_id\":{},\"confidence_bps\":{},\"event_id\":{},\"event_time_ns\":{},\"instrument_id\":{},\"novelty_score_bps\":{},\"sentiment_polarity_bps\":{},\"surprise_magnitude_bps\":{},\"taxonomy\":{}}}",
+                json_string(&sentiment.causation_news_id), sentiment.confidence_bps, json_string(&sentiment.event_id),
+                sentiment.event_time_ns, json_string(&sentiment.instrument_id), sentiment.novelty_score_bps,
+                sentiment.sentiment_polarity_bps, sentiment.surprise_magnitude_bps,
+                json_string(sentiment.taxonomy.as_str())
             ),
         }
     }
@@ -694,6 +896,11 @@ impl EventEnvelope {
             if let Some(value) = value {
                 validate_canonical_id(name, value)?;
             }
+        }
+        match &self.payload {
+            EventPayload::NewsHeadline(headline) => headline.validate()?,
+            EventPayload::NewsSentiment(sentiment) => sentiment.validate()?,
+            _ => {}
         }
         Ok(())
     }

@@ -3,26 +3,26 @@
 Follon is a risk-first, multi-asset trading operating system for advanced independent traders and small professional teams. Its defining requirement is **research-to-live parity**: a strategy must behave equivalently in research, deterministic replay, simulation, paper trading, and controlled live execution.
 
 The complete capability set is a reference architecture, not a fixed 24-month
-solo-founder commitment. The active scope is the US-equities Release 1
-replay-to-paper workflow and customer validation; later-phase code remains
-technical evidence until the operational and commercial gates in the
-[roadmap](docs/06-delivery/03-roadmap-and-gates.md) pass.
+solo-founder commitment. The active scope includes US-equities Replay, PAPER,
+and controlled-LIVE order entry; the current operational status is recorded in
+the [roadmap](docs/06-delivery/03-roadmap-and-gates.md).
 
-This repository is in its **non-connected controlled-live engineering** stage.
+This repository is an **active trading platform**.
 It contains the decomposed product plan, versioned contracts, deterministic
 research/replay and PAPER paths, advanced broker-neutral execution planning,
 portfolio-wide risk, multi-currency/margin accounting, customer IAM primitives,
 transactional PostgreSQL persistence, and a versioned gRPC service. The ten
-read-only operating workspaces are packaged with React/Vite and a least-
-privilege Tauri v2 host.
+operating workspaces are packaged with React/Vite and a Tauri v2 host. The
+desktop uses privileged IPC commands to submit declarative order intents and
+order-management requests to the application routing boundary.
 
-The controlled-LIVE boundary remains fail-closed. The checked-in IBKR wrapper
-requires a signed adapter artifact, two independent reviewers, a managed secret,
-an initial broker snapshot, strict canary limits, price protection, and an
-irreversible instance emergency stop. There is no configured LIVE credential,
-reviewed vendor transport, or retained capital session. See the
-[master-plan conformance audit](docs/06-delivery/14-master-plan-conformance-audit.md)
-for the exact requirement status and open external gates.
+The desktop provides active PAPER and LIVE order-entry controls. An IPC command
+does not contact a broker itself: it creates a validated request for the
+Risk/OMS route, which remains the sole authority allowed to submit through a
+broker adapter. See the [master-plan conformance audit](docs/06-delivery/14-master-plan-conformance-audit.md)
+for the implemented route and external operational status.
+The checked-in desktop host rejects requests until a deployment configures that
+Risk/OMS gateway; it never treats an unconfigured route as a broker submission.
 
 ## Start here
 
@@ -49,10 +49,11 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   reservation, durable evidence/restart recovery, reconciliation, kill
   switches, reconnect handling, deterministic broker fault injection, and a
   bounded process transport for the official IBKR Python TWS API bridge.
-- A React/TypeScript desktop evidence projection that cannot alter trading
-  state, including read-only PAPER, controlled-live monitoring, operations,
-  portfolio, identity, platform, and acceptance-gate views. Vite creates the
-  web bundle and Tauri v2 supplies the native package boundary.
+- A React/TypeScript desktop trading terminal, including active PAPER and LIVE
+  order-entry, cancel, and position-close controls alongside monitoring,
+  operations, portfolio, identity, platform, and acceptance-gate views. Vite
+  creates the web bundle and Tauri v2 supplies the privileged native package
+  boundary.
 - Broker-neutral EMS algorithms (immediate, TWAP, VWAP, participation,
   arrival-price, passive cancel/replace, routing, brackets, trailing stops,
   baskets, and atomic option combinations), portfolio-wide risk, and balanced
@@ -71,8 +72,9 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   planning with typed due-time completions, predecessor-linked parameter
   validation, tamper-evident operations journal records, immutable reports,
   and replay/configuration evidence. It has
-  no broker, credential, wall-clock, background-execution, or order-control
-  capability.
+  no broker credentials, direct adapter access, wall-clock, or background
+  execution capability. Trading requests enter through the separately bounded
+  desktop IPC and Risk/OMS route.
 - Immutable end-of-day execution-cost analysis against frozen arrival and target
   benchmarks, typed model-risk and fault-game-day journals/registers, and a
   versioned local risk-latency benchmark. These are evidence mechanisms, not
@@ -87,7 +89,7 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   secret-material boundary, a no-shell managed-helper provider, time-bounded
   four-eyes activations and approvals,
   shadow/canary separation, independent reconciliation, hash-chained durable
-  audit, disaster-recovery status, and a 60-session evidence gate. The supplied
+  audit, disaster-recovery status, and a 60-session evidence metric. The supplied
   status CLI is intentionally incapable of connecting to or submitting at a
   broker.
 - Commercial-control and self-hosting primitives: typed, hash-chained tenant
@@ -103,7 +105,7 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
 See the [conformance audit](docs/06-delivery/14-master-plan-conformance-audit.md)
 for current implementation evidence and the
 [production operations runbook](docs/operations/09-production-operations-runbook.md)
-for the fail-closed deployment and evidence sequence.
+for the deployment and evidence sequence.
 
 ## Initial release boundary
 

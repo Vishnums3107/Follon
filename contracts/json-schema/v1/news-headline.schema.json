@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/news-headline.schema.json",
+  "title": "News Headline Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "news_id", "source", "headline", "raw_body_hash", "sequence_number",
+    "event_time_ns", "receive_time_ns", "entity_tickers"
+  ],
+  "properties": {
+    "news_id": { "$ref": "#/$defs/id" },
+    "source": { "type": "string", "enum": ["DOW_JONES", "BLOOMBERG_BPIPE", "REFINITIV_MRN", "SEC_EDGAR", "FED_BLS"] },
+    "headline": { "type": "string", "minLength": 1 },
+    "raw_body_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "sequence_number": { "type": "integer", "minimum": 0 },
+    "event_time_ns": { "type": "integer", "minimum": 1 },
+    "receive_time_ns": { "type": "integer", "minimum": 1 },
+    "entity_tickers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/id" }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 }
+  }
+}

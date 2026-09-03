@@ -605,6 +605,169 @@ pub fn analyze_chain(
     Ok(analytics)
 }
 
+/// Individual point on a 2D implied volatility surface (Strike x Expiration).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolatilitySurfacePoint {
+    /// Option contract identity.
+    pub option_id: String,
+    /// Strike price.
+    pub strike: Decimal,
+    /// UTC expiration timestamp.
+    pub expiration_at: String,
+    /// Call or Put right.
+    pub right: OptionRight,
+    /// Solved implied volatility.
+    pub implied_volatility: Decimal,
+}
+
+/// Bounded 2D volatility surface constructed from an OptionChain snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolatilitySurface {
+    /// Originating chain identity.
+    pub chain_id: String,
+    /// Underlying instrument identity.
+    pub underlying_instrument_id: String,
+    /// Underlying mark price.
+    pub underlying_mark: Decimal,
+    /// UTC snapshot timestamp.
+    pub snapshot_at: String,
+    /// Surface points.
+    pub points: Vec<VolatilitySurfacePoint>,
+}
+
+impl VolatilitySurface {
+    /// Returns stable SHA-256 fingerprint of the volatility surface.
+    pub fn fingerprint(&self) -> Result<String, OptionError> {
+        validate_canonical_id("volatility surface chain_id", &self.chain_id)?;
+        validate_canonical_id(
+            "volatility surface underlying",
+            &self.underlying_instrument_id,
+        )?;
+        let mut points = self.points.clone();
+        points.sort_by(|left, right| left.option_id.cmp(&right.option_id));
+        let mut canonical = format!(
+            "chain_id={}\nunderlying={}\nsnapshot_at={}\nunderlying_mark={}\n",
+            self.chain_id, self.underlying_instrument_id, self.snapshot_at, self.underlying_mark
+        );
+        for pt in points {
+            canonical.push_str(&format!(
+                "point={}\nstrike={}\nexpiration={}\nright={}\niv={}\n",
+                pt.option_id,
+                pt.strike,
+                pt.expiration_at,
+                pt.right.as_str(),
+                pt.implied_volatility
+            ));
+        }
+        Ok(sha256(&canonical))
+    }
+}
+
+/// Generates a VolatilitySurface from an OptionChain and risk-free rate.
+pub fn generate_volatility_surface(
+    chain: &OptionChain,
+    risk_free_rate: Decimal,
+) -> Result<VolatilitySurface, OptionError> {
+    let analytics = analyze_chain(chain, risk_free_rate)?;
+    let mut points = Vec::with_capacity(analytics.len());
+    for item in analytics {
+        let contract = chain
+            .contract(&item.option_id)
+            .ok_or_else(|| OptionError("contract missing from chain".to_owned()))?;
+        points.push(VolatilitySurfacePoint {
+            option_id: item.option_id,
+            strike: contract.strike,
+            expiration_at: contract.expiration_at.clone(),
+            right: contract.right,
+            implied_volatility: item.implied_volatility,
+        });
+    }
+    points.sort_by(|left, right| left.option_id.cmp(&right.option_id));
+    Ok(VolatilitySurface {
+        chain_id: chain.chain_id.clone(),
+        underlying_instrument_id: chain.underlying_instrument_id.clone(),
+        underlying_mark: chain.underlying_mark,
+        snapshot_at: chain.snapshot_at.clone(),
+        points,
+    })
+}
+
+/// Result of a news event volatility shock scenario evaluation on an OptionChain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewsVolatilityShockResult {
+    /// Baseline total model value across all chain options before shock.
+    pub pre_shock_model_value: Decimal,
+    /// Post-shock total model value after applying vol_shock_bps.
+    pub post_shock_model_value: Decimal,
+    /// Total vega P&L shift in account currency.
+    pub vega_pnl: Decimal,
+    /// Average implied volatility before shock.
+    pub mean_pre_shock_iv: Decimal,
+    /// Average implied volatility after shock.
+    pub mean_post_shock_iv: Decimal,
+}
+
+/// Evaluates portfolio option chain value shifts under a news event volatility shock.
+pub fn evaluate_news_volatility_shock(
+    chain: &OptionChain,
+    vol_shock_bps: Decimal,
+    risk_free_rate: Decimal,
+) -> Result<NewsVolatilityShockResult, OptionError> {
+    let analytics = analyze_chain(chain, risk_free_rate)?;
+    if analytics.is_empty() {
+        return Err(OptionError("chain has no analytics".to_owned()));
+    }
+    let shock_decimal = vol_shock_bps.checked_div(Decimal::from_integer(10_000)?)?;
+
+    let mut pre_shock_total = Decimal::ZERO;
+    let mut post_shock_total = Decimal::ZERO;
+    let mut sum_pre_iv = Decimal::ZERO;
+    let mut sum_post_iv = Decimal::ZERO;
+
+    for item in &analytics {
+        let contract = chain
+            .contract(&item.option_id)
+            .ok_or_else(|| OptionError("contract missing".to_owned()))?;
+        let contract_time = time_to_expiry_years(&chain.snapshot_at, &contract.expiration_at)?;
+
+        let raw_post_iv = item.implied_volatility.checked_add(shock_decimal)?;
+        let post_iv = if raw_post_iv < MIN_VOLATILITY {
+            MIN_VOLATILITY
+        } else if raw_post_iv > MAX_VOLATILITY {
+            MAX_VOLATILITY
+        } else {
+            raw_post_iv
+        };
+
+        let post_greeks = european_greeks(&EuropeanModelInput {
+            underlying_price: chain.underlying_mark,
+            strike: contract.strike,
+            risk_free_rate,
+            volatility: post_iv,
+            time_to_expiry_years: contract_time,
+            right: contract.right,
+        })?;
+
+        let contract_pre_val = item.greeks.model_price.checked_mul(contract.multiplier)?;
+        let contract_post_val = post_greeks.model_price.checked_mul(contract.multiplier)?;
+
+        pre_shock_total = pre_shock_total.checked_add(contract_pre_val)?;
+        post_shock_total = post_shock_total.checked_add(contract_post_val)?;
+        sum_pre_iv = sum_pre_iv.checked_add(item.implied_volatility)?;
+        sum_post_iv = sum_post_iv.checked_add(post_iv)?;
+    }
+
+    let count = Decimal::from_integer(analytics.len() as i64)?;
+    let vega_pnl = post_shock_total.checked_sub(pre_shock_total)?;
+    Ok(NewsVolatilityShockResult {
+        pre_shock_model_value: pre_shock_total,
+        post_shock_model_value: post_shock_total,
+        vega_pnl,
+        mean_pre_shock_iv: sum_pre_iv.checked_div(count)?,
+        mean_post_shock_iv: sum_post_iv.checked_div(count)?,
+    })
+}
+
 /// One option strategy-leg economic direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptionLegSide {
@@ -1916,5 +2079,25 @@ mod tests {
             "2026-08-10T16:29:59Z",
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_volatility_surface_and_news_shock() {
+        let chain = chain();
+        let rate = decimal("0.05");
+
+        // 1. Surface generation & fingerprint stability
+        let surface = generate_volatility_surface(&chain, rate).expect("surface");
+        assert_eq!(surface.points.len(), 2);
+        let fp1 = surface.fingerprint().expect("fingerprint");
+        let fp2 = surface.fingerprint().expect("fingerprint");
+        assert_eq!(fp1, fp2);
+
+        // 2. News volatility shock scenario (+500 BPS = +5.0% IV)
+        let shock_res =
+            evaluate_news_volatility_shock(&chain, decimal("500"), rate).expect("shock");
+        assert!(shock_res.post_shock_model_value > shock_res.pre_shock_model_value);
+        assert!(shock_res.vega_pnl > Decimal::ZERO);
+        assert!(shock_res.mean_post_shock_iv > shock_res.mean_pre_shock_iv);
     }
 }
