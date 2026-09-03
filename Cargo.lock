@@ -397,7 +397,7 @@ dependencies = [
  "follon-instrument",
  "follon-market-data",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
 ]
 
 [[package]]
@@ -421,7 +421,7 @@ dependencies = [
  "follon-secrets",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "time",
 ]
 
@@ -434,7 +434,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "time",
 ]
 
@@ -446,7 +446,7 @@ dependencies = [
  "follon-instrument",
  "follon-news",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
 ]
 
 [[package]]
@@ -486,7 +486,7 @@ dependencies = [
  "hmac 0.12.1",
  "rand_core 0.6.4",
  "sha1",
- "sha2 0.10.9",
+ "sha2",
 ]
 
 [[package]]
@@ -507,7 +507,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "time",
 ]
 
@@ -535,7 +535,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "time",
 ]
 
@@ -545,7 +545,7 @@ version = "0.1.0"
 dependencies = [
  "follon-domain",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "time",
 ]
 
@@ -559,7 +559,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "time",
 ]
 
@@ -572,7 +572,7 @@ dependencies = [
  "postgres",
  "postgres-native-tls",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
 ]
 
 [[package]]
@@ -1384,7 +1384,7 @@ dependencies = [
  "md-5",
  "memchr",
  "rand",
- "sha2 0.11.0",
+ "sha2",
  "stringprep",
 ]
 
@@ -1933,17 +1933,6 @@ name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
