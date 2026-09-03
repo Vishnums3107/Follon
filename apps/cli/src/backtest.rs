@@ -652,6 +652,8 @@ fn load_runtime_configuration(
         max_quantity: decimal(&document.risk.max_quantity)?,
         max_notional: decimal(&document.risk.max_notional)?,
         max_price_deviation_bps: decimal(&document.risk.max_price_deviation_bps)?,
+        max_news_slippage_bps: None,
+        max_news_spread_multiplier_bps: None,
     };
     risk_policy.validate()?;
     let fill_model = DeterministicFillModel {

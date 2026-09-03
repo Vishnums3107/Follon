@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         2,
         include_str!("../migrations/0002_product_projections.sql"),
     ),
+    (3, include_str!("../migrations/0003_news_events.sql")),
 ];
 
 /// Durable persistence failure.
@@ -438,10 +439,12 @@ mod tests {
             "customer_users_tenant_user_id_key",
             "FOREIGN KEY (tenant_id, source_event_id)",
             "PENDING_REPLACE",
+            "news_headlines",
+            "news_sentiments",
         ] {
             assert!(migration_sql.contains(required), "missing {required}");
         }
-        assert_eq!(MIGRATIONS.len(), 2);
+        assert_eq!(MIGRATIONS.len(), 3);
     }
 
     #[test]

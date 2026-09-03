@@ -2359,6 +2359,8 @@ mod tests {
                 max_quantity: Decimal::from_integer(10).unwrap(),
                 max_notional: Decimal::from_integer(10_000).unwrap(),
                 max_price_deviation_bps: Decimal::from_integer(500).unwrap(),
+                max_news_slippage_bps: None,
+                max_news_spread_multiplier_bps: None,
             },
             DeterministicFillModel {
                 spread_bps: Decimal::ZERO,

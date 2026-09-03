@@ -9,6 +9,10 @@ import {
   parsePaperDashboard,
 } from "./evidence.js";
 import { FeatureDefinition, SystemStatus } from "./catalog.js";
+import { createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { OrderTicket } from "./OrderTicket.js";
+import { invoke } from "@tauri-apps/api/core";
 
 export type EvidenceArtifact = Readonly<{
   name: string;
@@ -99,7 +103,34 @@ export type WorkspaceContext = Readonly<{
   onOpenArtifact: (name: string) => void;
 }>;
 
-type Metric = readonly [label: string, value: string, detail: string, state?: "good" | "warn" | "bad"];
+type Metric = readonly [label: string, value: string, detail: string, state?: "good" | "warn" | "bad", isSignature?: boolean];
+
+type NativeCommandReceipt = Readonly<{
+  command: string;
+  requestId: string;
+  status: string;
+  orderId: string | null;
+  message: string;
+}>;
+
+type TradingEnvironment = "SIMULATION" | "PAPER" | "LIVE";
+
+type CancelOrderIntent = Readonly<{
+  requestId: string;
+  accountId: string;
+  orderId: string;
+  correlationId: string;
+  environment: TradingEnvironment;
+}>;
+
+type ClosePositionIntent = Readonly<{
+  requestId: string;
+  accountId: string;
+  instrumentId: string;
+  correlationId: string;
+  environment: TradingEnvironment;
+  rationale: string;
+}>;
 
 const OMS_LIFECYCLE_COVERAGE: ReadonlyArray<readonly [string, string, string]> = [
   ["Fill before acknowledgement", "Handled", "Execution evidence is authoritative and idempotent"],
@@ -124,7 +155,7 @@ export function parseWorkspaceSnapshot(value: unknown): WorkspaceSnapshot {
       !Array.isArray(value.manifests) || !Array.isArray(value.events) ||
       !Array.isArray(value.journals) || !Array.isArray(value.commercial) || !Array.isArray(value.execution_evidence) ||
       !Array.isArray(value.commercial_artifacts)) {
-    throw new Error("The workspace projection does not match the v1 read-only contract.");
+    throw new Error("The workspace projection does not match the v1 evidence contract.");
   }
   if (!value.datasets.every(isDatasetSummary) || !value.notebooks.every(isNotebookSummary) || !value.backtests.every(isBacktestSummary) ||
       !value.commercial_artifacts.every(isEvidenceArtifact)) {
@@ -158,6 +189,9 @@ export function renderWorkspace(
       break;
     case "research-lab":
       renderResearchLab(summaryRoot, canvasRoot, snapshot, context);
+      break;
+    case "news-cockpit":
+      renderNewsCockpit(summaryRoot, canvasRoot, snapshot, context);
       break;
     case "strategy-studio":
       renderStrategyStudio(summaryRoot, canvasRoot, snapshot, context);
@@ -204,11 +238,20 @@ function renderCommandCenter(
   const alertCount = (operations?.alerts.length ?? 0) + (paper?.unexplained_incidents ?? 0) +
     (live?.unresolved_incidents ?? 0) + (paper?.unknown_orders ?? 0) + (live?.unknown_orders ?? 0);
   renderMetrics(summaryRoot, [
-    ["Runtime services", services.length === 0 ? "Unavailable" : `${healthyServices}/${services.length}`, "Dashboard, gRPC kernel, PostgreSQL, and object storage", healthyServices === services.length ? "good" : "bad"],
+    ["Runtime services", services.length === 0 ? "Unavailable" : `${healthyServices}/${services.length}`, "Dashboard, gRPC kernel, PostgreSQL, and object storage", healthyServices === services.length ? "good" : "bad", true],
     ["Indexed evidence", String(snapshot.counts.artifacts ?? 0), "Immutable artifacts across the complete repository"],
     ["Operator attention", String(alertCount), "Alerts, unknown orders, and unresolved discrepancies", alertCount === 0 ? "good" : "bad"],
     ["External gates", `${openGateCount} open`, "PAPER, LIVE, partner, broker-options, and commercial evidence", openGateCount === 0 ? "good" : "warn"],
   ]);
+
+  const orderControlPanel = createPanel("Active Trading Control", "Submit declarative PAPER or LIVE order intents to the configured Risk/OMS route.");
+  const orderControlContainer = document.createElement("div");
+  orderControlPanel.append(orderControlContainer);
+  root.append(orderControlPanel);
+  createRoot(orderControlContainer).render(createElement(OrderTicket, {
+    defaultAccountId: paper?.account_id ?? live?.account_id ?? "",
+    defaultEnvironment: paper === undefined ? "LIVE" : "PAPER",
+  }));
 
   const serviceSection = createPanel("Runtime and dependencies", "Live health from the container boundary.");
   const serviceRows = context.status === null ? [] : Object.entries(context.status.services).map(([name, service]) => [
@@ -291,6 +334,67 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     root.append(chain);
   }
   root.append(renderFeatureEvidence(context, ["market-data", "research", "options"]));
+}
+
+function renderNewsCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
+  const headlines = snapshot.events.filter((item) => field(item.data, "event_type") === "news.headline.v1");
+  const sentiments = snapshot.events.filter((item) => field(item.data, "event_type") === "news.sentiment.v1");
+  const headlinesByNewsId = new Map(headlines.map((item) => [field(record(item.data.payload), "news_id"), item]));
+  const sentimentEventIds = new Set(sentiments.flatMap((item) => [
+    field(item.data, "event_id"),
+    field(record(item.data.payload), "event_id"),
+  ]).filter(Boolean));
+  const riskDecisions = snapshot.events.filter((item) =>
+    field(item.data, "event_type") === "risk.decision.v1" && sentimentEventIds.has(field(item.data, "causation_id"))
+  );
+  const sources = new Set(headlines.map((item) => field(record(item.data.payload), "source")).filter(Boolean));
+  renderMetrics(summaryRoot, [
+    ["Headlines", String(headlines.length), "Validated news.headline.v1 envelopes"],
+    ["Sentiment vectors", String(sentiments.length), "Deterministic news.sentiment.v1 evidence"],
+    ["Sources", String(sources.size), "Declared provenance labels in stored headline evidence"],
+    ["Linked risk decisions", String(riskDecisions.length), "Causation links from sentiment through pre-trade risk"],
+  ]);
+
+  const headlinePanel = createPanel("Headline evidence", "Stored source labels and headlines are rendered from immutable events; an empty workspace does not infer providers or market activity.");
+  appendTableOrEmpty(headlinePanel, ["Time", "Source", "News ID", "Headline", "Instruments", "Artifact"], headlines.map((item) => {
+    const payload = record(item.data.payload);
+    const instruments = Array.isArray(payload.entity_tickers) ? payload.entity_tickers.map(text).join(", ") : "";
+    return [
+      field(item.data, "event_time"), field(payload, "source"), field(payload, "news_id"), field(payload, "headline"), instruments, item.artifact,
+    ];
+  }), "No headline evidence is available.", (index) => context.onOpenArtifact(headlines[index]?.artifact ?? ""));
+  root.append(headlinePanel);
+
+  const sentimentPanel = createPanel("Sentiment signals", "Signal power is derived from stored integer-BPS polarity and confidence values; no browser-side classifier is used.");
+  appendTableOrEmpty(sentimentPanel, ["Time", "Instrument", "Taxonomy", "Polarity", "Confidence", "Novelty", "Surprise", "Signal power", "Headline", "Artifact"], sentiments.map((item) => {
+    const payload = record(item.data.payload);
+    const polarity = Number(field(payload, "sentiment_polarity_bps"));
+    const confidence = Number(field(payload, "confidence_bps"));
+    const signalPower = Number.isFinite(polarity) && Number.isFinite(confidence)
+      ? `${Math.round(Math.abs(polarity) * confidence / 10_000)} bps`
+      : "Unavailable";
+    const headline = headlinesByNewsId.get(field(payload, "causation_news_id"));
+    return [
+      field(item.data, "event_time"), field(payload, "instrument_id"), field(payload, "taxonomy"),
+      field(payload, "sentiment_polarity_bps"), field(payload, "confidence_bps"), field(payload, "novelty_score_bps"),
+      field(payload, "surprise_magnitude_bps"), signalPower,
+      headline === undefined ? "No stored headline link" : field(record(headline.data.payload), "headline"), item.artifact,
+    ];
+  }), "No sentiment evidence is available.", (index) => context.onOpenArtifact(sentiments[index]?.artifact ?? ""));
+  root.append(sentimentPanel);
+
+  const riskPanel = createPanel("Causally linked risk decisions", "Only recorded risk decisions with a direct stored causation link to a sentiment event are shown.");
+  appendTableOrEmpty(riskPanel, ["Time", "Decision", "Intent", "Reason codes", "Causation", "Artifact"], riskDecisions.map((item) => {
+    const payload = record(item.data.payload);
+    const reasonCodes = Array.isArray(payload.reason_codes) ? payload.reason_codes.map(text).join(", ") : field(payload, "reason_code");
+    return [
+      field(item.data, "event_time"), field(payload, "decision") || field(payload, "outcome"), field(payload, "intent_id"),
+      reasonCodes, field(item.data, "causation_id"), item.artifact,
+    ];
+  }), "No stored risk decisions are causally linked to news sentiment.", (index) => context.onOpenArtifact(riskDecisions[index]?.artifact ?? ""));
+  root.append(riskPanel);
+
+  root.append(renderFeatureEvidence(context, ["news", "research", "execution-risk"]));
 }
 
 function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: WorkspaceSnapshot, context: WorkspaceContext): void {
@@ -431,13 +535,39 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
   ], "No execution environment snapshots are available.");
   root.append(environment);
 
+  const ticket = createPanel("Order ticket", "Submit a declarative PAPER or LIVE intent to the configured Risk/OMS route.");
+  const ticketRoot = document.createElement("div");
+  ticket.append(ticketRoot);
+  root.append(ticket);
+  createRoot(ticketRoot).render(createElement(OrderTicket, {
+    defaultAccountId: paper?.account_id ?? live?.account_id ?? "",
+    defaultEnvironment: paper === undefined ? "LIVE" : "PAPER",
+  }));
+
   const blotter = createPanel("Causal execution blotter", "Every row links event, causation, correlation, actor, and normalized lifecycle payload.");
-  appendTableOrEmpty(blotter, ["Time", "Phase", "Order / intent", "State / decision", "Quantity", "Correlation", "Source"], executionEvents.slice(0, 300).map((item) => {
+  const blotterRows = executionEvents.slice(0, 300).map((item) => {
     const payload = record(item.data.payload);
     return [field(item.data, "event_time"), field(item.data, "event_type"), field(payload, "order_id") || field(payload, "intent_id") || field(payload, "execution_id"),
       field(payload, "new_state") || field(payload, "status") || (payload.approved === true ? "APPROVED" : payload.approved === false ? "REJECTED" : field(payload, "reason")),
       field(payload, "quantity") || field(payload, "filled_quantity") || field(payload, "cumulative_quantity"), field(item.data, "correlation_id"), item.artifact];
-  }), "No execution lifecycle events are available.", (index) => context.onOpenArtifact(executionEvents[index]?.artifact ?? ""));
+  });
+  appendTableOrEmpty(blotter, ["Time", "Phase", "Order / intent", "State / decision", "Quantity", "Correlation", "Source"], blotterRows, "No execution lifecycle events are available.", (index) => context.onOpenArtifact(executionEvents[index]?.artifact ?? ""), [
+    {
+      label: "Cancel",
+      onClick: (index) => {
+        const intent = cancelIntentForEvent(executionEvents[index]);
+        if (intent !== undefined) {
+          dispatchTradingCommand(
+            "cancel_order",
+            intent,
+            `Request cancellation of OMS order ${intent.orderId}?`,
+          );
+        }
+      },
+      showIf: (row, index) => cancelIntentForEvent(executionEvents[index]) !== undefined &&
+        !["FILLED", "CANCELLED", "REJECTED", "EXPIRED"].includes(row[3]),
+    },
+  ]);
   root.append(blotter);
 
   const riskDecisions = snapshot.events.filter((item) => field(item.data, "event_type") === "risk.decision.v1");
@@ -543,12 +673,47 @@ function renderPortfolio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: 
     ["Options reconciliation", options === undefined ? "Unavailable" : options.reconciliation.clean ? "Clean" : `${options.reconciliation.issues.length} issue(s)`, "BACKTEST / PAPER / LIVE declared books", options?.reconciliation.clean ? "good" : "warn"],
     ["Scenario points", String(options?.strategy.scenarios.length ?? 0), "Deterministic multi-leg expiry outcomes"],
   ]);
-  const positions = createPanel("Internal positions", "Independent portfolio truth; reconciliation differences are not overwritten.");
+  const positions = createPanel("Positions and realized P&L", "Aggregated portfolio evidence. Live environments sync to the broker automatically.");
   const positionRows: string[][] = [];
-  for (const item of operations?.positions ?? []) positionRows.push(["OPERATIONS", item.instrument_id, item.quantity, item.average_cost, item.mark_price, item.realized_pnl]);
-  for (const item of paper?.positions ?? []) positionRows.push(["PAPER", item.instrument_id, item.quantity, item.average_cost, "—", item.realized_pnl]);
-  for (const item of live?.positions ?? []) positionRows.push(["LIVE", item.instrument_id, item.quantity, item.average_cost, "—", item.realized_pnl]);
-  appendTableOrEmpty(positions, ["Source", "Instrument", "Quantity", "Average cost", "Mark", "Realized P&L"], positionRows, "No internal positions are present in the latest snapshots.");
+  const closeIntents: Array<ClosePositionIntent | undefined> = [];
+  for (const item of operations?.positions ?? []) {
+    positionRows.push(["OPERATIONS", item.instrument_id, item.quantity, item.average_cost, item.mark_price, item.realized_pnl]);
+    closeIntents.push(undefined);
+  }
+  for (const item of paper?.positions ?? []) {
+    positionRows.push(["PAPER", item.instrument_id, item.quantity, item.average_cost, "—", item.realized_pnl]);
+    closeIntents.push(closePositionIntent(
+      paper?.account_id,
+      item.instrument_id,
+      "PAPER",
+      "Requested from the PAPER portfolio table",
+    ));
+  }
+  for (const item of live?.positions ?? []) {
+    positionRows.push(["LIVE", item.instrument_id, item.quantity, item.average_cost, "—", item.realized_pnl]);
+    closeIntents.push(closePositionIntent(
+      live?.account_id,
+      item.instrument_id,
+      "LIVE",
+      "Requested from the LIVE portfolio table",
+    ));
+  }
+  appendTableOrEmpty(positions, ["Source", "Instrument", "Quantity", "Average cost", "Mark", "Realized P&L"], positionRows, "No internal positions are present in the latest snapshots.", undefined, [
+    {
+      label: "Close",
+      onClick: (index) => {
+        const intent = closeIntents[index];
+        if (intent !== undefined) {
+          dispatchTradingCommand(
+            "close_position",
+            intent,
+            `Request a Risk/OMS-managed close of ${intent.instrumentId} in ${intent.accountId}?`,
+          );
+        }
+      },
+      showIf: (row, index) => closeIntents[index] !== undefined && Number(row[2]) !== 0,
+    },
+  ]);
   root.append(positions);
 
   const attribution = createPanel("P&L attribution", "Immutable accounting movements grouped by instrument and category.");
@@ -674,7 +839,7 @@ function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snaps
   appendDefinition(boundary, [
     ["Never accepted by this server", "Broker credentials, payment cards, private signing keys, password/MFA material, or live approval secrets"],
     ["Operator-only commands", "Provisioning, retention execution, release signing, entitlement checks, kill switches, schedule completion, and journal append"],
-    ["Why", "They require stronger identity, confirmation, filesystem, two-person, offline-signing, or broker boundaries than this local read-only dashboard provides"],
+    ["Why", "They require stronger identity, confirmation, filesystem, two-person, offline-signing, or broker boundaries than the evidence API provides"],
   ]);
   root.append(boundary);
   root.append(renderFeatureEvidence(context, ["commercial", "identity", "platform"]));
@@ -713,9 +878,9 @@ function renderArtifactPanel(title: string, artifacts: readonly EvidenceArtifact
 
 function renderMetrics(root: HTMLElement, metrics: readonly Metric[]): void {
   root.replaceChildren();
-  for (const [label, value, detail, state] of metrics) {
+  for (const [label, value, detail, state, isSignature] of metrics) {
     const card = document.createElement("article");
-    card.className = `workspace-metric${state === undefined ? "" : ` metric-${state}`}`;
+    card.className = `workspace-metric${state === undefined ? "" : ` metric-${state}`}${isSignature ? " f-card--signature" : ""}`;
     const labelElement = document.createElement("p");
     labelElement.className = "metric-label";
     labelElement.textContent = label;
@@ -757,12 +922,79 @@ function appendDefinition(parent: HTMLElement, values: ReadonlyArray<readonly [s
   parent.append(list);
 }
 
+function isTradingEnvironment(value: string): value is TradingEnvironment {
+  return value === "SIMULATION" || value === "PAPER" || value === "LIVE";
+}
+
+function cancelIntentForEvent(item: SnapshotRecord | undefined): CancelOrderIntent | undefined {
+  if (item === undefined) {
+    return undefined;
+  }
+  const payload = record(item.data.payload);
+  const accountId = field(payload, "account_id");
+  const orderId = field(payload, "order_id");
+  const environment = field(payload, "environment");
+  const correlationId = field(item.data, "correlation_id") || field(payload, "correlation_id");
+  if (!accountId || !orderId || !correlationId || !isTradingEnvironment(environment)) {
+    return undefined;
+  }
+  return {
+    requestId: `request.cancel.${orderId}`,
+    accountId,
+    orderId,
+    correlationId,
+    environment,
+  };
+}
+
+function closePositionIntent(
+  accountId: string | undefined,
+  instrumentId: string,
+  environment: TradingEnvironment,
+  rationale: string,
+): ClosePositionIntent | undefined {
+  if (accountId === undefined || accountId.length === 0 || instrumentId.length === 0) {
+    return undefined;
+  }
+  return {
+    requestId: `request.close.${accountId}.${instrumentId}`,
+    accountId,
+    instrumentId,
+    correlationId: `correlation.close.${accountId}.${instrumentId}`,
+    environment,
+    rationale,
+  };
+}
+
+function dispatchTradingCommand(
+  command: "cancel_order" | "close_position",
+  intent: CancelOrderIntent | ClosePositionIntent,
+  confirmation: string,
+): void {
+  if (!window.confirm(confirmation)) {
+    return;
+  }
+  void invoke<NativeCommandReceipt>(command, { intent })
+    .then((receipt) => {
+      const orderId = receipt.orderId === null ? "" : ` (${receipt.orderId})`;
+      window.alert(`${receipt.status}: ${receipt.message}${orderId}`);
+    })
+    .catch((error: unknown) => {
+      window.alert(error instanceof Error ? error.message : String(error));
+    });
+}
+
 function appendTableOrEmpty(
   parent: HTMLElement,
   headers: readonly string[],
   rows: readonly (readonly string[])[],
   emptyText: string,
   onRow?: (index: number) => void,
+  actions?: {
+    label: string;
+    onClick: (rowIndex: number) => void;
+    showIf?: (row: readonly string[], rowIndex: number) => boolean;
+  }[],
 ): void {
   if (rows.length === 0) {
     const empty = document.createElement("p");
@@ -772,8 +1004,9 @@ function appendTableOrEmpty(
     return;
   }
   const scroll = document.createElement("div");
-  scroll.className = "table-scroll";
+  scroll.className = "table-scroll f-table-container";
   const table = document.createElement("table");
+  table.className = "f-table";
   const heading = document.createElement("thead");
   const headerRow = document.createElement("tr");
   for (const header of headers) {
@@ -781,6 +1014,14 @@ function appendTableOrEmpty(
     cell.scope = "col";
     cell.textContent = header;
     headerRow.append(cell);
+  }
+  if (actions) {
+    for (const action of actions) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.textContent = action.label;
+      headerRow.append(cell);
+    }
   }
   heading.append(headerRow);
   table.append(heading);
@@ -798,10 +1039,29 @@ function appendTableOrEmpty(
         }
       });
     }
-    for (const value of values) {
+    values.forEach((value, cellIndex) => {
       const cell = document.createElement("td");
+      cell.setAttribute("data-label", headers[cellIndex] || "");
       cell.textContent = value || "—";
       row.append(cell);
+    });
+    if (actions) {
+      actions.forEach(action => {
+        const cell = document.createElement("td");
+        if (!action.showIf || action.showIf(values, index)) {
+          const btn = document.createElement("button");
+          btn.className = "f-btn";
+          btn.textContent = action.label;
+          btn.style.padding = "0.25rem 0.5rem";
+          btn.style.fontSize = "0.75rem";
+          btn.onclick = (e) => {
+            e.stopPropagation();
+            action.onClick(index);
+          };
+          cell.append(btn);
+        }
+        row.append(cell);
+      });
     }
     body.append(row);
   });

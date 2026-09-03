@@ -25,8 +25,9 @@ use follon_live::{
     LiveBrokerReplaceRequest, LiveBrokerSubmitResult, LiveError,
 };
 use follon_paper::{
-    BrokerAccountSnapshot, BrokerEvent, BrokerOrderRequest, BrokerOrderSnapshot,
-    BrokerPositionSnapshot, BrokerSubmitResult, PaperBrokerAdapter, PaperError,
+    BrokerAccountSnapshot, BrokerComboRequest, BrokerEvent, BrokerOrderRequest,
+    BrokerOrderSnapshot, BrokerPositionSnapshot, BrokerSubmitResult, PaperBrokerAdapter,
+    PaperError,
 };
 use follon_secrets::SecretMaterial;
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,15 @@ pub trait IbkrPaperGatewayTransport {
         &mut self,
         request: &BrokerOrderRequest,
     ) -> Result<BrokerSubmitResult, PaperError>;
+    /// Sends one normalized paper combination request (BAG order).
+    fn submit_paper_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        Err(PaperError(
+            "IBKR transport does not implement BAG orders".to_owned(),
+        ))
+    }
     /// Requests cancellation of one pre-generated client order identity.
     fn cancel_paper_order(&mut self, client_order_id: &str) -> Result<(), PaperError>;
     /// Drains normalized IBKR order/execution evidence.
@@ -457,6 +467,62 @@ impl IbkrPaperGatewayTransport for IbkrPaperBridgeProcessTransport {
         self.accept_bridge_contract(normalized)
     }
 
+    fn submit_paper_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        validate_canonical_id("IBKR client_order_id", &request.client_order_id)?;
+        validate_canonical_id("IBKR account_id", &request.account_id)?;
+        for leg in &request.legs {
+            validate_canonical_id("IBKR leg instrument_id", &leg.instrument_id)?;
+            if leg.ratio == 0 {
+                return Err(PaperError(
+                    "IBKR paper combo leg ratio must be positive".to_owned(),
+                ));
+            }
+        }
+        let legs = request
+            .legs
+            .iter()
+            .map(|leg| {
+                json!({
+                    "instrument_id": leg.instrument_id,
+                    "side": leg.side.as_str(),
+                    "ratio": leg.ratio,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let value = self.request(
+            "submit_combo",
+            json!({
+                "client_order_id": request.client_order_id,
+                "account_id": request.account_id,
+                "legs": legs,
+                "limit_price": request.limit_price.map(|price| price.to_string()),
+            }),
+        )?;
+
+        let normalized = serde_json::from_value::<SubmitBridgeResult>(value)
+            .map_err(|_| PaperError("IBKR submit response is malformed".to_owned()))
+            .and_then(|result| match result.status.as_str() {
+                "ACKNOWLEDGED" => {
+                    let broker_order_id = result.broker_order_id.ok_or_else(|| {
+                        PaperError("IBKR acknowledgement has no broker order ID".to_owned())
+                    })?;
+                    validate_canonical_id("IBKR broker_order_id", &broker_order_id)?;
+                    Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
+                }
+                "REJECTED" => Ok(BrokerSubmitResult::Rejected {
+                    reason: required_bridge_reason(result.reason)?,
+                }),
+                _ => Err(PaperError(
+                    "IBKR submit response has an unknown status".to_owned(),
+                )),
+            });
+        self.accept_bridge_contract(normalized)
+    }
+
     fn cancel_paper_order(&mut self, client_order_id: &str) -> Result<(), PaperError> {
         validate_canonical_id("IBKR cancellation client_order_id", client_order_id)?;
         let value = self.request("cancel", json!({ "client_order_id": client_order_id }))?;
@@ -681,6 +747,18 @@ impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapte
             ));
         }
         self.transport.submit_paper_order(request)
+    }
+
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        if request.account_id != self.configuration.account_id {
+            return Err(PaperError(
+                "IBKR paper request account does not match configuration".to_owned(),
+            ));
+        }
+        self.transport.submit_paper_combo(request)
     }
 
     fn cancel(&mut self, client_order_id: &str) -> Result<(), PaperError> {

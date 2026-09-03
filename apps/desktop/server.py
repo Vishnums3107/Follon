@@ -274,6 +274,18 @@ FEATURES: tuple[dict[str, object], ...] = (
         "source": "adapters/persistence/postgres + services/trading-api + apps/desktop",
         "documentation": "docs/operations/08-dashboard-deployment-runbook.md",
     },
+    {
+        "id": "news",
+        "title": "News & event intelligence",
+        "state": "replay-paper",
+        "summary": "Validated local-fixture headline ingress, deterministic integer-BPS sentiment vectors, replay-to-paper intent evidence, and pre-trade shock collars.",
+        "capabilities": ["Schema-validated local NDJSON headline fixtures", "Deterministic taxonomy and integer-BPS baseline scoring", "Canonical replay ordering with source sequence and causal evidence", "Python headline and sentiment callbacks", "Pre-trade news slippage and spread-multiplier collars", "Read-only news-to-risk evidence projection"],
+        "boundary": "No vendor feed, latency claim, credential, broker connection, or automated live execution is included. Every strategy intent remains subject to the risk kernel before simulation.",
+        "gate": "Replay/local-fixture unit and integration evidence can be run locally; vendor licensing, data-quality validation, and paper-session operational evidence remain external gates.",
+        "screens": ["News Cockpit", "Research Lab", "Risk Cockpit"],
+        "source": "core/news + core/control-plane + python/strategy-sdk",
+        "documentation": "docs/01-domain/08-news-event-driven-trading-architecture.md",
+    },
 )
 
 
@@ -315,6 +327,8 @@ def classify_artifact(path: Path) -> tuple[str, str]:
             sample = handle.read(32_768).lower()
     except OSError:
         sample = ""
+    if "headline" in sample or "sentiment" in sample or "news" in name:
+        return "news", "News & sentiment intelligence"
     if path.suffix.lower() == ".ipynb":
         return "research", "Research notebook"
     if "transaction_cost_schema_version" in sample or "tca" in name:
@@ -323,6 +337,7 @@ def classify_artifact(path: Path) -> tuple[str, str]:
         return "execution-risk", "Risk latency benchmark"
     if (
         "model_risk_register_schema_version" in sample
+
         or "game_day_register_schema_version" in sample
         or "operations.model_risk_recorded.v1" in sample
         or "operations.game_day_recorded.v1" in sample

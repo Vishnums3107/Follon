@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Read-only desktop window with no custom native commands.",
+  "description": "Desktop window with bounded native trading commands.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

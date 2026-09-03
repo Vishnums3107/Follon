@@ -16,6 +16,7 @@ follon-execution = { path = "../../core/execution" }
 follon-instrument = { path = "../../core/instrument" }
 follon-live = { path = "../../core/live" }
 follon-market-data = { path = "../../core/market-data" }
+follon-news = { path = "../../core/news" }
 follon-operations = { path = "../../core/operations" }
 follon-options = { path = "../../core/options" }
 follon-paper = { path = "../../core/paper" }
@@ -65,6 +66,10 @@ path = "src/tca.rs"
 [[bin]]
 name = "follon-risk-benchmark"
 path = "src/risk_benchmark.rs"
+
+[[bin]]
+name = "follon-news"
+path = "src/news_cli.rs"
 
 [lints]
 workspace = true

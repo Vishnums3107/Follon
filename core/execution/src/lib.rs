@@ -150,6 +150,195 @@ impl ExecutionPlan {
     }
 }
 
+/// Plans a Time-Weighted Average Price (TWAP) execution schedule.
+pub fn plan_twap_execution(
+    parent: &ParentOrder,
+    duration_seconds: u64,
+    num_slices: usize,
+    kind: ChildOrderKind,
+) -> Result<ExecutionPlan, ExecutionError> {
+    parent.validate()?;
+    if num_slices == 0 || num_slices > 1000 {
+        return Err(ExecutionError(
+            "TWAP num_slices must be between 1 and 1000".to_owned(),
+        ));
+    }
+    let num_dec = Decimal::from_integer(num_slices as i64)?;
+    let raw_slice_qty = parent.quantity.checked_div(num_dec)?;
+    if raw_slice_qty <= Decimal::ZERO {
+        return Err(ExecutionError(
+            "TWAP slice quantity is too small for parent quantity".to_owned(),
+        ));
+    }
+
+    let interval_seconds = if num_slices > 1 {
+        duration_seconds / (num_slices as u64 - 1)
+    } else {
+        0
+    };
+
+    let mut children = Vec::with_capacity(num_slices);
+    let mut scheduled_qty = Decimal::ZERO;
+
+    for i in 0..num_slices {
+        let child_qty = if i == num_slices - 1 {
+            parent.quantity.checked_sub(scheduled_qty)?
+        } else {
+            raw_slice_qty
+        };
+
+        if child_qty > Decimal::ZERO {
+            scheduled_qty = scheduled_qty.checked_add(child_qty)?;
+            children.push(ChildInstruction {
+                child_order_id: format!("{}-twap-{}", parent.parent_order_id, i + 1),
+                scheduled_after_seconds: (i as u64) * interval_seconds,
+                venue: None,
+                quantity: child_qty,
+                kind,
+                limit_price: parent.limit_price,
+                stop_price: None,
+            });
+        }
+    }
+
+    let unallocated_quantity = parent.quantity.checked_sub(scheduled_qty)?;
+    let plan = ExecutionPlan {
+        parent_order_id: parent.parent_order_id.clone(),
+        algorithm: "follon-twap-v1".to_owned(),
+        children,
+        unallocated_quantity,
+    };
+    plan.validate_against(parent)?;
+    Ok(plan)
+}
+
+/// Plans a Volume-Weighted Average Price (VWAP) execution schedule using an empirical volume curve.
+pub fn plan_vwap_execution(
+    parent: &ParentOrder,
+    interval_seconds: u64,
+    volume_profile: &[Decimal],
+    kind: ChildOrderKind,
+) -> Result<ExecutionPlan, ExecutionError> {
+    parent.validate()?;
+    if volume_profile.is_empty() || volume_profile.len() > 1000 {
+        return Err(ExecutionError(
+            "VWAP volume_profile must contain between 1 and 1000 slices".to_owned(),
+        ));
+    }
+
+    let mut profile_sum = Decimal::ZERO;
+    for fraction in volume_profile {
+        if *fraction < Decimal::ZERO {
+            return Err(ExecutionError(
+                "VWAP volume profile fractions cannot be negative".to_owned(),
+            ));
+        }
+        profile_sum = profile_sum.checked_add(*fraction)?;
+    }
+    if profile_sum <= Decimal::ZERO {
+        return Err(ExecutionError(
+            "VWAP volume profile sum must be positive".to_owned(),
+        ));
+    }
+
+    let mut children = Vec::with_capacity(volume_profile.len());
+    let mut scheduled_qty = Decimal::ZERO;
+    let total_slices = volume_profile.len();
+
+    for (index, fraction) in volume_profile.iter().enumerate() {
+        let child_qty = if index == total_slices - 1 {
+            parent.quantity.checked_sub(scheduled_qty)?
+        } else {
+            parent
+                .quantity
+                .checked_mul(*fraction)?
+                .checked_div(profile_sum)?
+        };
+
+        if child_qty > Decimal::ZERO {
+            scheduled_qty = scheduled_qty.checked_add(child_qty)?;
+            children.push(ChildInstruction {
+                child_order_id: format!("{}-vwap-{}", parent.parent_order_id, index + 1),
+                scheduled_after_seconds: (index as u64) * interval_seconds,
+                venue: None,
+                quantity: child_qty,
+                kind,
+                limit_price: parent.limit_price,
+                stop_price: None,
+            });
+        }
+    }
+
+    let unallocated_quantity = parent.quantity.checked_sub(scheduled_qty)?;
+    let plan = ExecutionPlan {
+        parent_order_id: parent.parent_order_id.clone(),
+        algorithm: "follon-vwap-v1".to_owned(),
+        children,
+        unallocated_quantity,
+    };
+    plan.validate_against(parent)?;
+    Ok(plan)
+}
+
+/// Plans an Arrival Price optimal execution schedule with front-loaded urgency decay.
+pub fn plan_arrival_price_execution(
+    parent: &ParentOrder,
+    total_horizon_seconds: u64,
+    urgency_bps: Decimal,
+    kind: ChildOrderKind,
+) -> Result<ExecutionPlan, ExecutionError> {
+    parent.validate()?;
+    if urgency_bps <= Decimal::ZERO || urgency_bps > Decimal::from_integer(10_000)? {
+        return Err(ExecutionError(
+            "arrival price urgency_bps must be between 1 and 10000".to_owned(),
+        ));
+    }
+
+    let num_slices = 4;
+    let interval = total_horizon_seconds / num_slices as u64;
+
+    let weights = [
+        Decimal::from_scaled(40_000_000),
+        Decimal::from_scaled(30_000_000),
+        Decimal::from_scaled(20_000_000),
+        Decimal::from_scaled(10_000_000),
+    ];
+
+    let mut children = Vec::with_capacity(num_slices);
+    let mut scheduled_qty = Decimal::ZERO;
+
+    for (index, weight) in weights.iter().enumerate() {
+        let child_qty = if index == num_slices - 1 {
+            parent.quantity.checked_sub(scheduled_qty)?
+        } else {
+            parent.quantity.checked_mul(*weight)?
+        };
+
+        if child_qty > Decimal::ZERO {
+            scheduled_qty = scheduled_qty.checked_add(child_qty)?;
+            children.push(ChildInstruction {
+                child_order_id: format!("{}-arrival-{}", parent.parent_order_id, index + 1),
+                scheduled_after_seconds: (index as u64) * interval,
+                venue: None,
+                quantity: child_qty,
+                kind,
+                limit_price: parent.limit_price,
+                stop_price: None,
+            });
+        }
+    }
+
+    let unallocated_quantity = parent.quantity.checked_sub(scheduled_qty)?;
+    let plan = ExecutionPlan {
+        parent_order_id: parent.parent_order_id.clone(),
+        algorithm: "follon-arrival-price-v1".to_owned(),
+        children,
+        unallocated_quantity,
+    };
+    plan.validate_against(parent)?;
+    Ok(plan)
+}
+
 /// One normalized execution used exclusively for transaction-cost analysis.
 ///
 /// The record is independent of a broker wire format. It cannot create, amend,
@@ -1700,5 +1889,48 @@ mod tests {
         let mut duplicate = buy;
         duplicate.parent_order_id = "parent.alpha.duplicate".to_owned();
         assert!(analyze_transaction_costs(&[duplicate.clone(), duplicate]).is_err());
+    }
+
+    #[test]
+    fn test_execution_planners_twap_vwap_arrival() {
+        let parent = ParentOrder {
+            parent_order_id: "parent.test.100".to_owned(),
+            account_id: "acct.paper.001".to_owned(),
+            instrument_id: "aapl.us".to_owned(),
+            side: Side::Buy,
+            quantity: amount("100"),
+            limit_price: Some(amount("150")),
+        };
+
+        // 1. TWAP Planner (4 slices over 300s -> 100s intervals, 25 qty each)
+        let twap_plan = plan_twap_execution(&parent, 300, 4, ChildOrderKind::Limit).expect("twap");
+        assert_eq!(twap_plan.children.len(), 4);
+        assert_eq!(twap_plan.unallocated_quantity, Decimal::ZERO);
+        assert_eq!(twap_plan.children[0].quantity, amount("25"));
+        assert_eq!(twap_plan.children[0].scheduled_after_seconds, 0);
+        assert_eq!(twap_plan.children[3].scheduled_after_seconds, 300);
+
+        // 2. VWAP Planner (4 slices with weights 10%, 20%, 30%, 40%)
+        let profile = vec![
+            amount("0.10"),
+            amount("0.20"),
+            amount("0.30"),
+            amount("0.40"),
+        ];
+        let vwap_plan =
+            plan_vwap_execution(&parent, 60, &profile, ChildOrderKind::Limit).expect("vwap");
+        assert_eq!(vwap_plan.children.len(), 4);
+        assert_eq!(vwap_plan.unallocated_quantity, Decimal::ZERO);
+        assert_eq!(vwap_plan.children[0].quantity, amount("10"));
+        assert_eq!(vwap_plan.children[3].quantity, amount("40"));
+
+        // 3. Arrival Price Planner (4 front-loaded decay slices: 40%, 30%, 20%, 10%)
+        let arrival_plan =
+            plan_arrival_price_execution(&parent, 120, amount("5000"), ChildOrderKind::Limit)
+                .expect("arrival");
+        assert_eq!(arrival_plan.children.len(), 4);
+        assert_eq!(arrival_plan.unallocated_quantity, Decimal::ZERO);
+        assert_eq!(arrival_plan.children[0].quantity, amount("40"));
+        assert_eq!(arrival_plan.children[3].quantity, amount("10"));
     }
 }

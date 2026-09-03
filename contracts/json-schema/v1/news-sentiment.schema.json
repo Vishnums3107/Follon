@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/news-sentiment.schema.json",
+  "title": "News Sentiment Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id", "causation_news_id", "instrument_id", "taxonomy",
+    "sentiment_polarity_bps", "confidence_bps", "novelty_score_bps",
+    "surprise_magnitude_bps", "event_time_ns"
+  ],
+  "properties": {
+    "event_id": { "$ref": "#/$defs/id" },
+    "causation_news_id": { "$ref": "#/$defs/id" },
+    "instrument_id": { "$ref": "#/$defs/id" },
+    "taxonomy": {
+      "type": "string",
+      "enum": [
+        "EARNINGS_RELEASE", "GUIDANCE_REVISION", "M_AND_A", "FDA_DECISION",
+        "MACRO_CPI", "MACRO_FED_RATE", "LITIGATION"
+      ]
+    },
+    "sentiment_polarity_bps": { "type": "integer", "minimum": -10000, "maximum": 10000 },
+    "confidence_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "novelty_score_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "surprise_magnitude_bps": { "type": "integer" },
+    "event_time_ns": { "type": "integer", "minimum": 1 }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 }
+  }
+}

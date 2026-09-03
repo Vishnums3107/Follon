@@ -227,6 +227,10 @@ pub struct PortfolioRiskPolicy {
     pub currency_limits: BTreeMap<String, Decimal>,
     /// Per-strategy gross limits.
     pub strategy_limits: BTreeMap<String, Decimal>,
+    /// Optional maximum news slippage allowed in basis points.
+    pub max_news_slippage_bps: Option<Decimal>,
+    /// Optional maximum spread multiplier allowed in basis points.
+    pub max_spread_multiplier_bps: Option<Decimal>,
 }
 
 impl PortfolioRiskPolicy {
@@ -280,8 +284,53 @@ impl PortfolioRiskPolicy {
                 }
             }
         }
+        if let Some(slippage) = self.max_news_slippage_bps {
+            if slippage <= Decimal::ZERO || slippage > ten_thousand {
+                return Err(RiskError("invalid max_news_slippage_bps limit".to_owned()));
+            }
+        }
+        if let Some(spread_mult) = self.max_spread_multiplier_bps {
+            if spread_mult <= Decimal::ZERO {
+                return Err(RiskError(
+                    "invalid max_spread_multiplier_bps limit".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// Evaluates news shock price collar and spread widening protections.
+pub fn evaluate_news_shock_collar(
+    policy: &PortfolioRiskPolicy,
+    reference_price: Decimal,
+    requested_price: Decimal,
+    current_spread: Option<Decimal>,
+    baseline_spread: Option<Decimal>,
+) -> Result<Vec<String>, RiskError> {
+    policy.validate()?;
+    let mut reasons = Vec::new();
+    if let Some(max_slippage) = policy.max_news_slippage_bps {
+        let deviation = follon_domain::price_deviation_bps(reference_price, requested_price)?;
+        if deviation > max_slippage {
+            reasons.push("NEWS_SLIPPAGE_EXCEEDED".to_owned());
+        }
+    }
+    if let (Some(max_mult_bps), Some(spread), Some(baseline)) = (
+        policy.max_spread_multiplier_bps,
+        current_spread,
+        baseline_spread,
+    ) {
+        if baseline > Decimal::ZERO {
+            let max_allowed = baseline
+                .checked_mul(max_mult_bps)?
+                .checked_div(Decimal::from_integer(10_000)?)?;
+            if spread > max_allowed {
+                reasons.push("LIQUIDITY_HOLE_DETECTED".to_owned());
+            }
+        }
+    }
+    Ok(reasons)
 }
 
 /// Exact aggregate metrics retained with each decision.
@@ -596,6 +645,8 @@ mod tests {
             asset_class_limits: BTreeMap::new(),
             currency_limits: BTreeMap::from([("USD".to_owned(), amount("100000"))]),
             strategy_limits: BTreeMap::new(),
+            max_news_slippage_bps: None,
+            max_spread_multiplier_bps: None,
         }
     }
 
@@ -688,5 +739,36 @@ mod tests {
                 "missing {code}"
             );
         }
+    }
+
+    #[test]
+    fn test_news_shock_collar_protection() {
+        let mut policy = policy();
+        policy.max_news_slippage_bps = Some(amount("50")); // 50 BPS max price drift
+        policy.max_spread_multiplier_bps = Some(amount("30000")); // 3.0x max spread expansion
+
+        // 1. Normal price (100 -> 100.40 = 40 BPS deviation): Passed
+        let clean_reasons = evaluate_news_shock_collar(
+            &policy,
+            amount("100"),
+            amount("100.40"),
+            Some(amount("0.05")),
+            Some(amount("0.02")),
+        )
+        .expect("reasons");
+        assert!(clean_reasons.is_empty());
+
+        // 2. High slippage (100 -> 101.00 = 100 BPS deviation > 50 BPS max): Failed
+        // 3. Liquidity hole (current spread 0.10 > 3.0 * baseline 0.02 = 0.06): Failed
+        let shock_reasons = evaluate_news_shock_collar(
+            &policy,
+            amount("100"),
+            amount("101.00"),
+            Some(amount("0.10")),
+            Some(amount("0.02")),
+        )
+        .expect("reasons");
+        assert!(shock_reasons.contains(&"NEWS_SLIPPAGE_EXCEEDED".to_owned()));
+        assert!(shock_reasons.contains(&"LIQUIDITY_HOLE_DETECTED".to_owned()));
     }
 }

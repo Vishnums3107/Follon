@@ -226,6 +226,9 @@ These are mandatory master-plan acceptance conditions and are currently open:
     records plus canonical registers; the local risk benchmark and personal
     mandate template make performance, decision, resilience, and review
     expectations executable/auditable without inventing operational evidence.
+13. `core/alerts` provides deterministic alert routing, severity/category classification, and a webhook dispatcher for Slack/Discord integration.
+14. `core/accounting` now includes a `statement` module that deterministically parses standard broker CSV statements (like IBKR Activity Flex Queries) and reconciles cash and positions against the internal multi-currency ledger, producing exact reconciliation incidents.
+15. `adapters/brokers/ibkr` natively maps option combination requests (BAG orders) over the JSON bridge, guaranteeing atomic execution of complex multi-leg options intents.
 
 ## Business-readiness decision
 

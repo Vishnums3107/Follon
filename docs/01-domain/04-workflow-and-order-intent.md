@@ -3,11 +3,20 @@
 ## Canonical flow
 
 ```text
-Market event → strategy → order intent → risk decision → OMS order
-→ broker submission/simulation → execution → portfolio update → audit event → UI stream
+Market event -> strategy ------------------> order intent
+Desktop UI -> Tauri command -> order intent
+                                      |
+                                      v
+                         risk decision -> OMS order
+                         -> broker submission/simulation
+                         -> execution -> portfolio update
+                         -> audit event -> UI stream
 ```
 
-An intent is a declarative request, not a broker command. Only the trading core may turn an approved intent into an OMS order. Strategy code never calls a broker adapter.
+An intent is a declarative request, not a broker command. The desktop can
+create a user-originated intent through a Tauri IPC command, but only the
+trading core may turn an approved intent into an OMS order. Strategy code and
+desktop IPC never call a broker adapter directly.
 
 ## Initial order-intent contract
 

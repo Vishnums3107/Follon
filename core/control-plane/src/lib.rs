@@ -12,10 +12,12 @@ use std::str::FromStr;
 
 use follon_domain::{
     price_deviation_bps, validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar, Decimal,
-    DecimalError, DomainError, EventEnvelope, EventPayload, Fill, OrderIntent, OrderState,
-    OrderStateChange, OrderType, PnlSnapshot, PositionSnapshot, RiskDecision, Side, TimeInForce,
+    DecimalError, DomainError, EventEnvelope, EventPayload, Fill, NewsHeadline, OrderIntent,
+    OrderState, OrderStateChange, OrderType, PnlSnapshot, PositionSnapshot, RiskDecision,
+    SentimentVector, Side, TimeInForce,
 };
 use follon_instrument::{InstrumentRegistry, TradingCalendar};
+use follon_news::replay_time_from_unix_ns;
 use sha2::{Digest, Sha256};
 
 /// Error returned by the deterministic trading kernel.
@@ -468,6 +470,26 @@ pub trait Strategy {
     /// Handles one normalized bar and may emit exactly one declarative intent.
     fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError>;
 
+    /// Receives a normalized local-fixture headline. Headlines may update
+    /// strategy state but cannot directly create an order intent.
+    fn on_news_headline(
+        &mut self,
+        _headline: &NewsHeadline,
+        _replay_time: &str,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Receives a deterministic sentiment vector and may emit one declarative
+    /// intent. Risk remains the only route to OMS/simulation.
+    fn on_news_sentiment(
+        &mut self,
+        _sentiment: &SentimentVector,
+        _replay_time: &str,
+    ) -> Result<Option<OrderIntent>, EngineError> {
+        Ok(None)
+    }
+
     /// Receives an execution after the replay portfolio has applied it.
     ///
     /// The default deliberately does nothing. Isolated workers use this hook to
@@ -901,7 +923,7 @@ impl ProcessStrategyWorker {
         bar: &Bar,
         replay_time: &str,
     ) -> Result<Option<OrderIntent>, EngineError> {
-        let mut frame = serde_json::json!({
+        let frame = serde_json::json!({
             "protocol_version": 1,
             "type": "market_bar",
             "context": {
@@ -914,8 +936,55 @@ impl ProcessStrategyWorker {
             },
             "bar": worker_bar_payload(bar),
         });
+        self.request_worker_frame(frame, replay_time, Some(bar))
+    }
+
+    fn request_news_headline(
+        &mut self,
+        headline: &NewsHeadline,
+        replay_time: &str,
+    ) -> Result<(), EngineError> {
+        let frame = serde_json::json!({
+            "protocol_version": 1,
+            "type": "news_headline",
+            "context": worker_context_payload(&self.identity, replay_time),
+            "headline": worker_headline_payload(headline),
+        });
+        if self
+            .request_worker_frame(frame, replay_time, None)?
+            .is_some()
+        {
+            return Err(EngineError(
+                "strategy worker headline callback returned an order intent".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn request_news_sentiment(
+        &mut self,
+        sentiment: &SentimentVector,
+        replay_time: &str,
+    ) -> Result<Option<OrderIntent>, EngineError> {
+        let frame = serde_json::json!({
+            "protocol_version": 1,
+            "type": "news_sentiment",
+            "context": worker_context_payload(&self.identity, replay_time),
+            "sentiment": worker_sentiment_payload(sentiment),
+        });
+        self.request_worker_frame(frame, replay_time, None)
+    }
+
+    fn request_worker_frame(
+        &mut self,
+        mut frame: serde_json::Value,
+        replay_time: &str,
+        observed_bar: Option<&Bar>,
+    ) -> Result<Option<OrderIntent>, EngineError> {
         if let Some(services) = self.services.as_mut() {
-            services.observe_bar(bar, replay_time)?;
+            if let Some(bar) = observed_bar {
+                services.observe_bar(bar, replay_time)?;
+            }
             frame
                 .as_object_mut()
                 .expect("worker request frame remains an object")
@@ -1028,6 +1097,22 @@ impl ProcessStrategyWorker {
 impl Strategy for ProcessStrategyWorker {
     fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError> {
         self.request_intent(bar, replay_time)
+    }
+
+    fn on_news_headline(
+        &mut self,
+        headline: &NewsHeadline,
+        replay_time: &str,
+    ) -> Result<(), EngineError> {
+        self.request_news_headline(headline, replay_time)
+    }
+
+    fn on_news_sentiment(
+        &mut self,
+        sentiment: &SentimentVector,
+        replay_time: &str,
+    ) -> Result<Option<OrderIntent>, EngineError> {
+        self.request_news_sentiment(sentiment, replay_time)
     }
 
     fn on_execution(
@@ -1183,6 +1268,47 @@ fn worker_bar_payload(bar: &Bar) -> serde_json::Value {
     })
 }
 
+fn worker_context_payload(
+    identity: &StrategyWorkerIdentity,
+    replay_time: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "account_id": identity.account_id,
+        "strategy_id": identity.strategy_id,
+        "strategy_version": identity.strategy_version,
+        "configuration_version": identity.configuration_version,
+        "replay_time": replay_time,
+        "environment": identity.environment,
+    })
+}
+
+fn worker_headline_payload(headline: &NewsHeadline) -> serde_json::Value {
+    serde_json::json!({
+        "news_id": headline.news_id,
+        "source": headline.source.as_str(),
+        "headline": headline.headline,
+        "raw_body_hash": headline.raw_body_hash,
+        "sequence_number": headline.sequence_number,
+        "event_time_ns": headline.event_time_ns,
+        "receive_time_ns": headline.receive_time_ns,
+        "entity_tickers": headline.entity_tickers,
+    })
+}
+
+fn worker_sentiment_payload(sentiment: &SentimentVector) -> serde_json::Value {
+    serde_json::json!({
+        "event_id": sentiment.event_id,
+        "causation_news_id": sentiment.causation_news_id,
+        "event_time_ns": sentiment.event_time_ns,
+        "instrument_id": sentiment.instrument_id,
+        "taxonomy": sentiment.taxonomy.as_str(),
+        "sentiment_polarity_bps": sentiment.sentiment_polarity_bps,
+        "confidence_bps": sentiment.confidence_bps,
+        "novelty_score_bps": sentiment.novelty_score_bps,
+        "surprise_magnitude_bps": sentiment.surprise_magnitude_bps,
+    })
+}
+
 fn json_fingerprint(
     values: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, EngineError> {
@@ -1265,6 +1391,41 @@ pub struct RiskPolicy {
     pub max_notional: Decimal,
     /// Maximum absolute limit-price distance from the current mark in basis points.
     pub max_price_deviation_bps: Decimal,
+    /// Optional maximum movement from a fixed pre-headline reference price.
+    pub max_news_slippage_bps: Option<Decimal>,
+    /// Optional maximum current/baseline spread multiplier in basis points.
+    pub max_news_spread_multiplier_bps: Option<Decimal>,
+}
+
+/// Explicit market facts used only for a news-driven intent evaluation.
+///
+/// These facts are replay inputs, not wall-clock observations. Prices remain
+/// fixed-point [`Decimal`] values throughout the decision and simulation path.
+#[derive(Clone, Debug)]
+pub struct NewsShockContext {
+    /// Immutable mark captured immediately before the causative headline.
+    pub pre_headline_reference_price: Decimal,
+    /// Optional full current spread in instrument price units.
+    pub current_spread: Option<Decimal>,
+    /// Optional full baseline spread in instrument price units.
+    pub baseline_spread: Option<Decimal>,
+}
+
+impl NewsShockContext {
+    /// Validates replay-supplied shock facts.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.pre_headline_reference_price <= Decimal::ZERO
+            || self
+                .current_spread
+                .is_some_and(|spread| spread < Decimal::ZERO)
+            || self
+                .baseline_spread
+                .is_some_and(|spread| spread <= Decimal::ZERO)
+        {
+            return Err(EngineError("invalid news shock context".to_owned()));
+        }
+        Ok(())
+    }
 }
 
 impl RiskPolicy {
@@ -1276,6 +1437,12 @@ impl RiskPolicy {
             || self.max_notional <= Decimal::ZERO
             || self.max_price_deviation_bps < Decimal::ZERO
             || self.max_price_deviation_bps >= ten_thousand
+            || self
+                .max_news_slippage_bps
+                .is_some_and(|limit| limit <= Decimal::ZERO || limit >= ten_thousand)
+            || self
+                .max_news_spread_multiplier_bps
+                .is_some_and(|limit| limit <= Decimal::ZERO)
         {
             return Err(EngineError("invalid deterministic risk policy".to_owned()));
         }
@@ -1336,6 +1503,60 @@ impl RiskPolicy {
                 estimated_notional,
             ),
         })
+    }
+
+    /// Applies the ordinary pre-trade policy plus explicit news shock collars.
+    pub fn evaluate_news(
+        &self,
+        intent: &OrderIntent,
+        bar: &Bar,
+        replay_time: &str,
+        shock: &NewsShockContext,
+    ) -> Result<RiskDecision, EngineError> {
+        shock.validate()?;
+        let mut decision = self.evaluate(intent, bar, replay_time)?;
+        let requested_price = intent.limit_price.unwrap_or(bar.close);
+        let news_slippage_bps =
+            price_deviation_bps(shock.pre_headline_reference_price, requested_price)?;
+        let mut reasons = decision.reason_codes;
+        reasons.retain(|reason| reason != "APPROVED");
+        if self
+            .max_news_slippage_bps
+            .is_some_and(|limit| news_slippage_bps > limit)
+        {
+            reasons.push("NEWS_SLIPPAGE_EXCEEDED".to_owned());
+        }
+        let spread_multiplier_bps = match (shock.current_spread, shock.baseline_spread) {
+            (Some(current), Some(baseline)) => Some(
+                current
+                    .checked_mul(Decimal::from_integer(10_000)?)?
+                    .checked_div(baseline)?,
+            ),
+            _ => None,
+        };
+        if self
+            .max_news_spread_multiplier_bps
+            .is_some_and(|limit| spread_multiplier_bps.is_some_and(|multiplier| multiplier > limit))
+        {
+            reasons.push("LIQUIDITY_HOLE_DETECTED".to_owned());
+        }
+        reasons.sort();
+        reasons.dedup();
+        decision.approved = reasons.is_empty();
+        if decision.approved {
+            reasons.push("APPROVED".to_owned());
+        }
+        decision.reason_codes = reasons;
+        decision.evaluated_limits.push_str(&format!(
+            ",news_reference_price={},news_requested_price={},news_slippage_bps={},max_news_slippage_bps={},news_spread_multiplier_bps={},max_news_spread_multiplier_bps={}",
+            shock.pre_headline_reference_price,
+            requested_price,
+            news_slippage_bps,
+            self.max_news_slippage_bps.map_or_else(|| "UNSET".to_owned(), |limit| limit.to_string()),
+            spread_multiplier_bps.map_or_else(|| "UNAVAILABLE".to_owned(), |multiplier| multiplier.to_string()),
+            self.max_news_spread_multiplier_bps.map_or_else(|| "UNSET".to_owned(), |limit| limit.to_string()),
+        ));
+        Ok(decision)
     }
 }
 
@@ -1773,6 +1994,8 @@ pub struct ReplayEngine {
     fill_model: DeterministicFillModel,
     portfolios: BTreeMap<(String, String), Portfolio>,
     working_orders: BTreeMap<String, SimulatedWorkingOrder>,
+    news_headline_event_ids: BTreeMap<String, String>,
+    news_sentiment_event_ids: BTreeSet<String>,
 }
 
 impl ReplayEngine {
@@ -1803,6 +2026,8 @@ impl ReplayEngine {
             fill_model,
             portfolios: BTreeMap::new(),
             working_orders: BTreeMap::new(),
+            news_headline_event_ids: BTreeMap::new(),
+            news_sentiment_event_ids: BTreeSet::new(),
         })
     }
 
@@ -2014,6 +2239,275 @@ impl ReplayEngine {
             position: latest_position,
             pnl: latest_pnl,
         })
+    }
+
+    /// Appends and dispatches one validated local-fixture headline.
+    ///
+    /// Headlines are evidence/state callbacks only. Any executable intent must
+    /// originate from a later causally linked sentiment vector.
+    pub fn process_news_headline(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        headline: NewsHeadline,
+    ) -> Result<ReplayResult, EngineError> {
+        headline.validate()?;
+        if self.news_headline_event_ids.contains_key(&headline.news_id) {
+            return Err(EngineError("duplicate news headline in replay".to_owned()));
+        }
+        let event_time = replay_time_from_unix_ns(headline.event_time_ns).map_err(|error| {
+            EngineError(format!(
+                "news headline replay timestamp is invalid: {}",
+                error.0
+            ))
+        })?;
+        self.clock.advance_to(&event_time)?;
+        let correlation_id = format!("corr-news-{}", headline.news_id);
+        let event = self.emit(
+            sink,
+            EventPayload::NewsHeadline(headline.clone()),
+            &event_time,
+            &correlation_id,
+            None,
+            "news_ingress",
+            "local_fixture",
+            None,
+            None,
+            None,
+        )?;
+        self.news_headline_event_ids
+            .insert(headline.news_id.clone(), event.event_id.clone());
+        strategy.on_news_headline(&headline, self.clock.now())?;
+        Ok(ReplayResult {
+            events: vec![event],
+            position: None,
+            pnl: None,
+        })
+    }
+
+    /// Replays one causally linked sentiment vector through strategy, risk,
+    /// OMS, deterministic simulation, portfolio, and audit evidence.
+    pub fn process_news_sentiment(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        account_id: &str,
+        sentiment: SentimentVector,
+        market: Bar,
+        shock: NewsShockContext,
+    ) -> Result<ReplayResult, EngineError> {
+        sentiment.validate()?;
+        market.validate()?;
+        shock.validate()?;
+        if sentiment.instrument_id != market.instrument_id {
+            return Err(EngineError(
+                "news sentiment and market snapshot instruments must match".to_owned(),
+            ));
+        }
+        if self.news_sentiment_event_ids.contains(&sentiment.event_id) {
+            return Err(EngineError("duplicate news sentiment in replay".to_owned()));
+        }
+        let headline_event_id = self
+            .news_headline_event_ids
+            .get(&sentiment.causation_news_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError("news sentiment has no persisted headline cause".to_owned())
+            })?;
+        let event_time = replay_time_from_unix_ns(sentiment.event_time_ns).map_err(|error| {
+            EngineError(format!(
+                "news sentiment replay timestamp is invalid: {}",
+                error.0
+            ))
+        })?;
+        self.clock.advance_to(&event_time)?;
+        let correlation_id = format!("corr-news-{}", sentiment.causation_news_id);
+        let sentiment_event = self.emit(
+            sink,
+            EventPayload::NewsSentiment(sentiment.clone()),
+            &event_time,
+            &correlation_id,
+            Some(&headline_event_id),
+            "news_classifier",
+            "local_fixture",
+            Some(account_id),
+            None,
+            Some(&sentiment.instrument_id),
+        )?;
+        self.news_sentiment_event_ids
+            .insert(sentiment.event_id.clone());
+        let sentiment_event_id = sentiment_event.event_id.clone();
+        let mut events = vec![sentiment_event];
+        let mut latest_position = None;
+        let mut latest_pnl = None;
+        let Some(intent) = strategy.on_news_sentiment(&sentiment, self.clock.now())? else {
+            return Ok(ReplayResult {
+                events,
+                position: latest_position,
+                pnl: latest_pnl,
+            });
+        };
+        self.process_news_intent(
+            sink,
+            strategy,
+            account_id,
+            &market,
+            &shock,
+            &sentiment_event_id,
+            intent,
+            &mut events,
+            &mut latest_position,
+            &mut latest_pnl,
+        )?;
+        Ok(ReplayResult {
+            events,
+            position: latest_position,
+            pnl: latest_pnl,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_news_intent(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        account_id: &str,
+        market: &Bar,
+        shock: &NewsShockContext,
+        causation_id: &str,
+        intent: OrderIntent,
+        events: &mut Vec<EventEnvelope>,
+        latest_position: &mut Option<PositionSnapshot>,
+        latest_pnl: &mut Option<PnlSnapshot>,
+    ) -> Result<(), EngineError> {
+        intent.validate()?;
+        if intent.account_id != account_id
+            || intent.configuration_version != self.configuration_version
+        {
+            return Err(EngineError(
+                "strategy intent does not match replay account or configuration".to_owned(),
+            ));
+        }
+        if self
+            .working_orders
+            .contains_key(&format!("order-{}", intent.intent_id))
+        {
+            return Err(EngineError(
+                "simulator rejected a duplicate working-order identity".to_owned(),
+            ));
+        }
+        let current_time = self.clock.now().to_owned();
+        let intent_event = self.emit(
+            sink,
+            EventPayload::OrderIntent(intent.clone()),
+            &current_time,
+            &intent.correlation_id,
+            Some(causation_id),
+            &intent.strategy_id,
+            "strategy_worker",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let intent_event_id = intent_event.event_id.clone();
+        events.push(intent_event);
+        let decision = self
+            .policy
+            .evaluate_news(&intent, market, self.clock.now(), shock)?;
+        let current_time = self.clock.now().to_owned();
+        let decision_event = self.emit(
+            sink,
+            EventPayload::RiskDecision(decision.clone()),
+            &current_time,
+            &intent.correlation_id,
+            Some(&intent_event_id),
+            "risk_engine",
+            "trading_core",
+            Some(account_id),
+            Some(&intent.strategy_id),
+            Some(&intent.instrument_id),
+        )?;
+        let decision_event_id = decision_event.event_id.clone();
+        events.push(decision_event);
+        if !decision.approved {
+            let audit = self.audit_event(
+                sink,
+                &intent,
+                &decision_event_id,
+                events.iter().map(|event| event.event_id.clone()).collect(),
+                "news-driven intent was rejected before OMS order creation",
+            )?;
+            events.push(audit);
+            return Ok(());
+        }
+        let mut order = OmsOrder::from_approved_intent(intent.clone(), &decision)?;
+        let created = OrderStateChange {
+            order_id: order.order_id.clone(),
+            previous_state: None,
+            new_state: OrderState::Created,
+            reason: "created from auditable news risk approval".to_owned(),
+        };
+        self.emit_order_change(sink, events, &intent, &decision_event_id, created)?;
+        for (state, reason) in [
+            (OrderState::Approved, "news risk approval accepted by OMS"),
+            (
+                OrderState::PendingSubmit,
+                "queued for deterministic simulator",
+            ),
+            (OrderState::Submitted, "simulator submission accepted"),
+            (
+                OrderState::Acknowledged,
+                "simulator acknowledged submission",
+            ),
+        ] {
+            let change = order.transition(state, reason)?;
+            self.emit_order_change(sink, events, &intent, &decision_event_id, change)?;
+        }
+        let mut working = SimulatedWorkingOrder {
+            remaining_quantity: intent.quantity,
+            // A news event uses the supplied point-in-time market snapshot for
+            // an immediate deterministic simulation when the configured latency
+            // is zero. Nonzero latency is made visible as an acknowledged order.
+            eligible_on_bar: self
+                .bar_sequence
+                .checked_add(u64::from(self.fill_model.latency_bars))
+                .ok_or_else(|| EngineError("simulated order latency overflow".to_owned()))?,
+            fill_sequence: 0,
+            causation_id: events
+                .last()
+                .expect("acknowledgement event was emitted")
+                .event_id
+                .clone(),
+            order,
+        };
+        if self.fill_model.latency_bars == 0 {
+            if let Some((position, pnl)) = self.attempt_simulated_fill(
+                sink,
+                events,
+                strategy,
+                account_id,
+                market,
+                &mut working,
+            )? {
+                *latest_position = Some(position);
+                *latest_pnl = Some(pnl);
+            }
+        } else {
+            let audit = self.audit_event(
+                sink,
+                &intent,
+                &working.causation_id,
+                events.iter().map(|event| event.event_id.clone()).collect(),
+                "approved news order remains acknowledged until a later market bar advances its deterministic latency",
+            )?;
+            working.causation_id = audit.event_id.clone();
+            events.push(audit);
+        }
+        if working.remaining_quantity > Decimal::ZERO {
+            self.working_orders
+                .insert(working.order.order_id.clone(), working);
+        }
+        Ok(())
     }
 
     fn attempt_simulated_fill(
@@ -2303,6 +2797,8 @@ mod tests {
                 max_quantity: Decimal::from_integer(10).unwrap(),
                 max_notional: Decimal::from_integer(10_000).unwrap(),
                 max_price_deviation_bps: Decimal::from_integer(500).unwrap(),
+                max_news_slippage_bps: None,
+                max_news_spread_multiplier_bps: None,
             },
             DeterministicFillModel {
                 spread_bps: Decimal::ZERO,
@@ -2602,6 +3098,8 @@ mod tests {
             max_quantity: Decimal::from_integer(10).unwrap(),
             max_notional: Decimal::from_integer(10_000).unwrap(),
             max_price_deviation_bps: Decimal::from_integer(100).unwrap(),
+            max_news_slippage_bps: None,
+            max_news_spread_multiplier_bps: None,
         };
         let order = simulated_order(
             Side::Buy,
@@ -3069,5 +3567,260 @@ mod tests {
             second.position.unwrap().quantity,
             Decimal::from_integer(2).unwrap()
         );
+    }
+
+    struct NewsIntentStrategy;
+
+    impl Strategy for NewsIntentStrategy {
+        fn on_bar(
+            &mut self,
+            _bar: &Bar,
+            _replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Ok(None)
+        }
+
+        fn on_news_sentiment(
+            &mut self,
+            sentiment: &SentimentVector,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Ok(Some(OrderIntent {
+                intent_id: format!("intent-{}", sentiment.event_id),
+                account_id: "acct-paper-001".to_owned(),
+                strategy_id: "strategy-news-001".to_owned(),
+                instrument_id: sentiment.instrument_id.clone(),
+                correlation_id: format!("corr-news-{}", sentiment.causation_news_id),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(1)?,
+                order_type: OrderType::Market,
+                limit_price: None,
+                time_in_force: TimeInForce::Day,
+                rationale: "deterministic news fixture signal".to_owned(),
+                created_at: replay_time.to_owned(),
+                strategy_version: "strategy-news-v1".to_owned(),
+                configuration_version: "cfg-example-1".to_owned(),
+                environment: "SIMULATION".to_owned(),
+            }))
+        }
+    }
+
+    fn news_headline() -> NewsHeadline {
+        NewsHeadline {
+            news_id: "news.fixture.001".to_owned(),
+            source: follon_domain::NewsSource::DowJones,
+            headline: "Apple reports earnings beat".to_owned(),
+            raw_body_hash: "a".repeat(64),
+            sequence_number: 1,
+            event_time_ns: 1_788_260_400_000_000_000,
+            receive_time_ns: 1_788_260_400_000_000_001,
+            entity_tickers: vec!["inst.us_equity.spy".to_owned()],
+        }
+    }
+
+    fn news_sentiment() -> SentimentVector {
+        SentimentVector {
+            event_id: "sent.news.fixture.001.1".to_owned(),
+            causation_news_id: "news.fixture.001".to_owned(),
+            event_time_ns: 1_788_260_400_000_000_000,
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            taxonomy: follon_domain::EventTaxonomy::EarningsRelease,
+            sentiment_polarity_bps: 9_000,
+            confidence_bps: 9_000,
+            novelty_score_bps: 10_000,
+            surprise_magnitude_bps: 250,
+        }
+    }
+
+    fn news_engine() -> ReplayEngine {
+        ReplayEngine::new(
+            "2026-09-01T10:59:59Z",
+            "core-news-v1",
+            "cfg-example-1",
+            RiskPolicy {
+                version: "risk-news-v1".to_owned(),
+                global_kill_switch: false,
+                max_quantity: Decimal::from_integer(10).unwrap(),
+                max_notional: Decimal::from_integer(10_000).unwrap(),
+                max_price_deviation_bps: Decimal::from_integer(500).unwrap(),
+                max_news_slippage_bps: Some(Decimal::from_integer(50).unwrap()),
+                max_news_spread_multiplier_bps: Some(Decimal::from_integer(30_000).unwrap()),
+            },
+            DeterministicFillModel {
+                spread_bps: Decimal::ZERO,
+                slippage_bps: Decimal::ZERO,
+                flat_fee: Decimal::from_str("0.10").unwrap(),
+                latency_bars: 0,
+                max_fill_quantity: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn replay_news_fixture(shock_reference: Decimal) -> Vec<EventEnvelope> {
+        let mut engine = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = NewsIntentStrategy;
+        let headline = engine
+            .process_news_headline(&mut store, &mut strategy, news_headline())
+            .unwrap();
+        let sentiment = engine
+            .process_news_sentiment(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                news_sentiment(),
+                bar(),
+                NewsShockContext {
+                    pre_headline_reference_price: shock_reference,
+                    current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                    baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+                },
+            )
+            .unwrap();
+        headline
+            .events
+            .into_iter()
+            .chain(sentiment.events)
+            .collect()
+    }
+
+    #[test]
+    fn news_fixture_replay_is_identical_and_reaches_auditable_simulation() {
+        let first = replay_news_fixture(Decimal::from_integer(100).unwrap());
+        let second = replay_news_fixture(Decimal::from_integer(100).unwrap());
+        let first_json: Vec<_> = first.iter().map(EventEnvelope::canonical_json).collect();
+        let second_json: Vec<_> = second.iter().map(EventEnvelope::canonical_json).collect();
+        assert_eq!(first_json, second_json);
+        let headline = first
+            .iter()
+            .find(|event| event.event_type == "news.headline.v1")
+            .unwrap();
+        let sentiment = first
+            .iter()
+            .find(|event| event.event_type == "news.sentiment.v1")
+            .unwrap();
+        let intent = first
+            .iter()
+            .find(|event| event.event_type == "intent.created.v1")
+            .unwrap();
+        assert_eq!(
+            sentiment.causation_id.as_deref(),
+            Some(headline.event_id.as_str())
+        );
+        assert_eq!(
+            intent.causation_id.as_deref(),
+            Some(sentiment.event_id.as_str())
+        );
+        assert!(first
+            .iter()
+            .any(|event| event.event_type == "risk.decision.v1"));
+        assert!(first
+            .iter()
+            .any(|event| event.event_type == "execution.fill.v1"));
+        assert!(first
+            .iter()
+            .any(|event| event.event_type == "audit.trail.v1"));
+    }
+
+    #[test]
+    fn rejected_news_shock_collar_cannot_create_an_order() {
+        let events = replay_news_fixture(Decimal::from_integer(99).unwrap());
+        let decision = events
+            .iter()
+            .find(|event| event.event_type == "risk.decision.v1")
+            .unwrap();
+        let EventPayload::RiskDecision(decision) = &decision.payload else {
+            panic!("risk event has the wrong payload");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"NEWS_SLIPPAGE_EXCEEDED".to_owned()));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "order.state_changed.v1"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "execution.fill.v1"));
+    }
+
+    #[test]
+    fn duplicate_news_sentiment_is_rejected_before_strategy_or_evidence_effects() {
+        let mut engine = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = NewsIntentStrategy;
+        engine
+            .process_news_headline(&mut store, &mut strategy, news_headline())
+            .unwrap();
+        let shock = NewsShockContext {
+            pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+            current_spread: Some(Decimal::from_str("0.02").unwrap()),
+            baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+        };
+        engine
+            .process_news_sentiment(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                news_sentiment(),
+                bar(),
+                shock.clone(),
+            )
+            .unwrap();
+        let counts_before = [
+            "intent.created.v1",
+            "order.state_changed.v1",
+            "execution.fill.v1",
+            "audit.trail.v1",
+        ]
+        .into_iter()
+        .map(|event_type| {
+            (
+                event_type,
+                store
+                    .events()
+                    .iter()
+                    .filter(|event| event.event_type == event_type)
+                    .count(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        let event_count_before = store.events().len();
+
+        let duplicate = engine.process_news_sentiment(
+            &mut store,
+            &mut strategy,
+            "acct-paper-001",
+            news_sentiment(),
+            bar(),
+            shock,
+        );
+        assert!(duplicate.is_err());
+        assert_eq!(store.events().len(), event_count_before);
+        for (event_type, count_before) in counts_before {
+            assert_eq!(
+                store
+                    .events()
+                    .iter()
+                    .filter(|event| event.event_type == event_type)
+                    .count(),
+                count_before,
+                "duplicate sentiment changed {event_type} evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_news_timestamp_fails_before_evidence_is_appended() {
+        let mut engine = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = NewsIntentStrategy;
+        let mut malformed = news_headline();
+        malformed.event_time_ns = 0;
+        assert!(engine
+            .process_news_headline(&mut store, &mut strategy, malformed)
+            .is_err());
+        assert!(store.events().is_empty());
     }
 }

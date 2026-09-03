@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package follon.trading.v1;
+
+// Declared provenance labels for local-fixture news payloads. These enum values
+// do not imply a configured vendor transport.
+enum NewsSource {
+  NEWS_SOURCE_UNSPECIFIED = 0;
+  NEWS_SOURCE_DOW_JONES = 1;
+  NEWS_SOURCE_BLOOMBERG_BPIPE = 2;
+  NEWS_SOURCE_REFINITIV_MRN = 3;
+  NEWS_SOURCE_SEC_EDGAR = 4;
+  NEWS_SOURCE_FED_BLS = 5;
+}
+
+// Categorized event classification taxonomy.
+enum EventTaxonomy {
+  EVENT_TAXONOMY_UNSPECIFIED = 0;
+  EVENT_TAXONOMY_EARNINGS_RELEASE = 1;
+  EVENT_TAXONOMY_GUIDANCE_REVISION = 2;
+  EVENT_TAXONOMY_M_AND_A = 3;
+  EVENT_TAXONOMY_FDA_DECISION = 4;
+  EVENT_TAXONOMY_MACRO_CPI = 5;
+  EVENT_TAXONOMY_MACRO_FED_RATE = 6;
+  EVENT_TAXONOMY_LITIGATION = 7;
+}
+
+// Payload of a normalized raw headline evidence event (news.headline.v1).
+// The immutable Follon event envelope supplies the evidence event ID.
+message NewsHeadlineEvent {
+  string news_id = 1;
+  NewsSource source = 2;
+  string headline = 3;
+  string raw_body_hash = 4;
+  uint64 sequence_number = 5;
+  uint64 event_time_ns = 6;
+  uint64 receive_time_ns = 7;
+  repeated string entity_tickers = 8;
+}
+
+// Payload of an extracted deterministic sentiment evidence event
+// (news.sentiment.v1). The envelope causation ID points to its headline event.
+message SentimentVectorEvent {
+  string event_id = 1;
+  string causation_news_id = 2;
+  uint64 event_time_ns = 3;
+  string instrument_id = 4;
+  EventTaxonomy taxonomy = 5;
+  int32 sentiment_polarity_bps = 6;  // Range: -10000 (-1.0000) to +10000 (+1.0000)
+  uint32 confidence_bps = 7;           // Range: 0 to 10000 (100.00%)
+  uint32 novelty_score_bps = 8;        // Range: 0 (syndicated copy) to 10000 (primary)
+  int32 surprise_magnitude_bps = 9;    // Numerical delta in basis points (e.g. EPS/CPI surprise)
+}

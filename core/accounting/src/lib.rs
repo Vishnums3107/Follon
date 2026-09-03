@@ -3,6 +3,8 @@
 //! Journal entries balance independently in every currency. Valuation never
 //! invents an FX rate: a missing or stale quote fails the entire snapshot.
 
+pub mod statement;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 

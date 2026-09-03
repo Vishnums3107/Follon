@@ -17,7 +17,15 @@ import sys
 from typing import Any, TextIO
 
 from .bundle import StrategyBundle, strategy_bundle_hash
-from .models import Bar, OrderIntent, StrategyContext
+from .models import (
+    Bar,
+    EventTaxonomy,
+    NewsHeadlineEvent,
+    NewsSource,
+    OrderIntent,
+    SentimentVectorEvent,
+    StrategyContext,
+)
 from .services import (
     HistoricalDataService,
     MetricsSink,
@@ -114,6 +122,97 @@ def _bar(payload: dict[str, Any]) -> Bar:
     )
 
 
+def _headline(payload: dict[str, Any]) -> NewsHeadlineEvent:
+    _require_exact_fields(
+        payload,
+        {
+            "news_id",
+            "source",
+            "headline",
+            "raw_body_hash",
+            "sequence_number",
+            "event_time_ns",
+            "receive_time_ns",
+            "entity_tickers",
+        },
+        "news headline",
+    )
+    sequence_number = payload.get("sequence_number")
+    event_time_ns = payload.get("event_time_ns")
+    receive_time_ns = payload.get("receive_time_ns")
+    entity_tickers = payload.get("entity_tickers")
+    if (
+        not isinstance(sequence_number, int)
+        or isinstance(sequence_number, bool)
+        or not isinstance(event_time_ns, int)
+        or isinstance(event_time_ns, bool)
+        or not isinstance(receive_time_ns, int)
+        or isinstance(receive_time_ns, bool)
+        or not isinstance(entity_tickers, list)
+        or not all(isinstance(ticker, str) for ticker in entity_tickers)
+    ):
+        raise WorkerProtocolError("news headline has invalid integer or entity fields")
+    try:
+        source = NewsSource(_required_string(payload, "source"))
+    except ValueError as error:
+        raise WorkerProtocolError("news headline has invalid source") from error
+    return NewsHeadlineEvent(
+        news_id=_required_string(payload, "news_id"),
+        source=source,
+        headline=_required_string(payload, "headline"),
+        raw_body_hash=_required_string(payload, "raw_body_hash"),
+        sequence_number=sequence_number,
+        event_time_ns=event_time_ns,
+        receive_time_ns=receive_time_ns,
+        entity_tickers=tuple(entity_tickers),
+    )
+
+
+def _sentiment(payload: dict[str, Any]) -> SentimentVectorEvent:
+    _require_exact_fields(
+        payload,
+        {
+            "event_id",
+            "causation_news_id",
+            "event_time_ns",
+            "instrument_id",
+            "taxonomy",
+            "sentiment_polarity_bps",
+            "confidence_bps",
+            "novelty_score_bps",
+            "surprise_magnitude_bps",
+        },
+        "news sentiment",
+    )
+    integer_fields = (
+        "event_time_ns",
+        "sentiment_polarity_bps",
+        "confidence_bps",
+        "novelty_score_bps",
+        "surprise_magnitude_bps",
+    )
+    if any(
+        not isinstance(payload.get(field), int) or isinstance(payload.get(field), bool)
+        for field in integer_fields
+    ):
+        raise WorkerProtocolError("news sentiment has invalid integer fields")
+    try:
+        taxonomy = EventTaxonomy(_required_string(payload, "taxonomy"))
+    except ValueError as error:
+        raise WorkerProtocolError("news sentiment has invalid taxonomy") from error
+    return SentimentVectorEvent(
+        event_id=_required_string(payload, "event_id"),
+        causation_news_id=_required_string(payload, "causation_news_id"),
+        event_time_ns=payload["event_time_ns"],
+        instrument_id=_required_string(payload, "instrument_id"),
+        taxonomy=taxonomy,
+        sentiment_polarity_bps=payload["sentiment_polarity_bps"],
+        confidence_bps=payload["confidence_bps"],
+        novelty_score_bps=payload["novelty_score_bps"],
+        surprise_magnitude_bps=payload["surprise_magnitude_bps"],
+    )
+
+
 def _services(payload: dict[str, Any], replay_time: str) -> StrategyServices:
     _require_exact_fields(payload, {"history", "portfolio", "state"}, "strategy services")
     history = payload.get("history")
@@ -198,33 +297,46 @@ def _services(payload: dict[str, Any], replay_time: str) -> StrategyServices:
     )
 
 
-def _read_frame(line: str) -> tuple[StrategyContext, Bar, bool]:
+def _read_frame(
+    line: str,
+) -> tuple[StrategyContext, str, Bar | NewsHeadlineEvent | SentimentVectorEvent, bool]:
     try:
         frame = json.loads(line)
     except json.JSONDecodeError as error:
         raise WorkerProtocolError("frame is not valid JSON") from error
     if not isinstance(frame, dict):
         raise WorkerProtocolError("frame must be a JSON object")
-    expected = {"protocol_version", "type", "context", "bar"}
+    frame_type = frame.get("type")
+    payload_name = {
+        "market_bar": "bar",
+        "news_headline": "headline",
+        "news_sentiment": "sentiment",
+    }.get(frame_type)
+    if payload_name is None:
+        raise WorkerProtocolError("unsupported worker frame type")
+    expected = {"protocol_version", "type", "context", payload_name}
     fields = set(frame)
     if fields not in (expected, expected | {"services"}):
         raise WorkerProtocolError("frame has missing or unknown fields")
     if frame.get("protocol_version") != PROTOCOL_VERSION:
         raise WorkerProtocolError("unsupported worker protocol version")
-    if frame.get("type") != "market_bar":
-        raise WorkerProtocolError("worker accepts only market_bar frames")
     context = frame.get("context")
-    bar = frame.get("bar")
-    if not isinstance(context, dict) or not isinstance(bar, dict):
-        raise WorkerProtocolError("market_bar requires object context and bar")
+    payload = frame.get(payload_name)
+    if not isinstance(context, dict) or not isinstance(payload, dict):
+        raise WorkerProtocolError(f"{frame_type} requires object context and {payload_name}")
     base_context = _context(context)
+    parsed_payload = {
+        "market_bar": _bar,
+        "news_headline": _headline,
+        "news_sentiment": _sentiment,
+    }[frame_type](payload)
     service_payload = frame.get("services")
     if service_payload is None:
-        return base_context, _bar(bar), False
+        return base_context, frame_type, parsed_payload, False
     if not isinstance(service_payload, dict):
         raise WorkerProtocolError("services must be an object")
     services = _services(service_payload, base_context.replay_time)
-    return _context(context, services), _bar(bar), True
+    return _context(context, services), frame_type, parsed_payload, True
 
 
 def _metric_payload(metric: StrategyMetric) -> dict[str, object]:
@@ -267,13 +379,21 @@ def run_worker(
             )
             return 2
         try:
-            context, bar, service_frame = _read_frame(line)
+            context, frame_type, payload, service_frame = _read_frame(line)
             if (
                 context.strategy_id != bundle.strategy_id
                 or context.strategy_version != bundle.strategy_version
             ):
                 raise WorkerProtocolError("context does not match announced strategy bundle")
-            intent = strategy.on_bar(context, bar)
+            if frame_type == "market_bar":
+                intent = strategy.on_bar(context, payload)  # type: ignore[arg-type]
+            elif frame_type == "news_headline":
+                headline_result = strategy.on_news_headline(context, payload)  # type: ignore[arg-type]
+                if headline_result is not None:
+                    raise WorkerProtocolError("on_news_headline must not return an intent")
+                intent = None
+            else:
+                intent = strategy.on_news_sentiment(context, payload)  # type: ignore[arg-type]
             if intent is not None and not isinstance(intent, OrderIntent):
                 raise WorkerProtocolError("strategy must return an OrderIntent or None")
             output: dict[str, Any] = {

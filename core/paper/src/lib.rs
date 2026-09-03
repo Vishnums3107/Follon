@@ -105,6 +105,30 @@ pub struct BrokerOrderRequest {
     pub limit_price: Option<Decimal>,
 }
 
+/// A normalized request for an atomic option combination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerComboRequest {
+    /// OMS-generated immutable client idempotency key.
+    pub client_order_id: String,
+    /// Paper account selected for the operation.
+    pub account_id: String,
+    /// Exact combination legs.
+    pub legs: Vec<BrokerComboLeg>,
+    /// Limit price for the entire combination.
+    pub limit_price: Option<Decimal>,
+}
+
+/// A leg within a combo request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerComboLeg {
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// Requested side.
+    pub side: Side,
+    /// Exact requested quantity ratio.
+    pub ratio: u32,
+}
+
 impl BrokerOrderRequest {
     fn from_order(order: &OmsOrder) -> Self {
         Self {
@@ -302,6 +326,15 @@ pub struct BrokerAccountSnapshot {
 pub trait PaperBrokerAdapter {
     /// Submits exactly one client-idempotent paper order.
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError>;
+    /// Submits an atomic combination order.
+    fn submit_combo(
+        &mut self,
+        _request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        Err(PaperError(
+            "broker adapter does not support native combos".to_owned(),
+        ))
+    }
     /// Requests cancellation by the immutable client idempotency key.
     fn cancel(&mut self, client_order_id: &str) -> Result<(), PaperError>;
     /// Requests a price-only replacement. The result arrives through [`BrokerEvent`].

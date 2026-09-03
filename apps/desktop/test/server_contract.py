@@ -129,7 +129,7 @@ class DashboardServerContract(unittest.TestCase):
         )
         self.assertIsNotNone(server.evidence_file("acceptance/run-a/artifact.json"))
         self.assertIsNone(server.evidence_file("acceptance/../outside.json"))
-        self.assertEqual(len(server.FEATURES), 12)
+        self.assertEqual(len(server.FEATURES), 13)
         self.assertTrue(all(feature["screens"] for feature in server.FEATURES))
 
     def test_symlink_escape_is_rejected(self) -> None:
@@ -395,6 +395,7 @@ class DashboardServerContract(unittest.TestCase):
         screens = {
             "Command Center",
             "Research Lab",
+            "News Cockpit",
             "Strategy Studio",
             "Backtest Explorer",
             "Execution Blotter",
