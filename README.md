@@ -107,11 +107,19 @@ for current implementation evidence and the
 [production operations runbook](docs/operations/09-production-operations-runbook.md)
 for the deployment and evidence sequence.
 
-## Initial release boundary
+## Current evidence boundary
 
-- US equities and ETFs through one Interactive Brokers integration.
-- Bar and quote data, single account, paper then limited-capital live trading.
-- Market, limit, stop, and bracket orders.
-- End-of-day and intraday strategies.
+- The checked-in operational adapter is IBKR PAPER-only. PAPER composition now
+  uses an OMS-owned, account-isolated adapter registry; additional routes need
+  their own reviewed adapter contract and reconciliation evidence.
+- Multi-account cash and position aggregation is a deterministic, read-only
+  fixed-point accounting projection. It does not authorize allocation,
+  cross-account transfer, settlement netting, or an additional broker route.
+- Current executable evidence remains US-equities/ETF data and the documented
+  PAPER/controlled-LIVE workflows. The broader institutional target and its
+  independently deliverable phases are recorded in
+  [RFC 0001](docs/rfcs/0001-institutional-platform-phased-delivery.md).
 
-High-frequency trading, custody, investment advice, unrestricted data redistribution, mobile, social features, and multiple brokers are out of scope for the initial release.
+No feature is represented as broker-approved, custody-capable, regulated,
+mobile-enabled, or operationally live until the relevant phase's contract,
+adapter evidence, reconciliation, and release gates are complete.

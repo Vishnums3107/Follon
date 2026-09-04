@@ -8,8 +8,8 @@ use std::str::FromStr;
 use follon_cli::write_immutable;
 use follon_domain::{validate_canonical_id, Decimal};
 use follon_paper::{
-    IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperRiskPolicy,
-    PaperTradingService,
+    IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerRegistry,
+    PaperBrokerRoute, PaperRiskPolicy, PaperTradingService,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ struct PaperConfigurationDocument {
     configuration_id: String,
     configuration_version: String,
     account: PaperAccountDocument,
+    adapter: Option<PaperAdapterRouteDocument>,
     risk: PaperRiskDocument,
     kill_switch_version: String,
 }
@@ -31,6 +32,14 @@ struct PaperAccountDocument {
     account_id: String,
     currency: String,
     initial_cash: String,
+    environment: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaperAdapterRouteDocument {
+    adapter_id: String,
+    venue_id: String,
     environment: String,
 }
 
@@ -74,6 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let (configuration, configuration_hash) = load_configuration(&arguments.configuration_path)?;
+    let schema_version = configuration.schema_version;
+    let configured_adapter_route = configuration.adapter;
     let account = PaperAccount {
         account_id: configuration.account.account_id,
         currency: configuration.account.currency,
@@ -91,12 +102,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_realized_loss: decimal(&configuration.risk.max_realized_loss)?,
         max_market_data_age_seconds: configuration.risk.max_market_data_age_seconds,
     };
-    let adapter = IbkrPaperAdapter::new(&account)?;
+    let mut brokers = PaperBrokerRegistry::new();
+    if schema_version == 1 {
+        brokers.register_legacy_ibkr_paper_route(&account)?;
+    } else {
+        let adapter = configured_adapter_route
+            .ok_or("paper configuration schema v2 requires an explicit adapter route")?;
+        let route = PaperBrokerRoute {
+            account_id: account.account_id.clone(),
+            adapter_id: adapter.adapter_id,
+            venue_id: adapter.venue_id,
+            environment: adapter.environment,
+        };
+        brokers.register(route, Box::new(IbkrPaperAdapter::new(&account)?))?;
+    }
     let mut service = PaperTradingService::open_durable(
         account,
         risk,
         KillSwitchRegistry::new(configuration.kill_switch_version)?,
-        adapter,
+        brokers,
         &arguments.journal_path,
     )?;
     if let Some(action) = arguments.kill_switch_action {
@@ -126,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_arguments(arguments: Vec<String>) -> Result<CommandArguments, Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
-    let mut configuration_path = PathBuf::from("tests/fixtures/config/paper-v1.json");
+    let mut configuration_path = PathBuf::from("tests/fixtures/config/paper-v2.json");
     let mut configuration_explicit = false;
     let mut kill_switch_action = None;
     let mut index = 0;
@@ -228,7 +252,7 @@ fn load_configuration(
         return Err("paper configuration must be between 1 byte and 1 MiB".into());
     }
     let document: PaperConfigurationDocument = serde_json::from_slice(&bytes)?;
-    if document.schema_version != 1 {
+    if !matches!(document.schema_version, 1 | 2) {
         return Err("unsupported paper configuration schema version".into());
     }
     for (name, value) in [
@@ -239,6 +263,30 @@ fn load_configuration(
     }
     if document.configuration_version.is_empty() {
         return Err("paper configuration_version is required".into());
+    }
+    match (document.schema_version, document.adapter.as_ref()) {
+        (1, Some(_)) => {
+            return Err(
+                "paper configuration schema v1 does not permit adapter routing fields".into(),
+            )
+        }
+        (2, None) => {
+            return Err("paper configuration schema v2 requires an explicit adapter route".into())
+        }
+        (_, Some(adapter)) => {
+            validate_canonical_id("paper adapter_id", &adapter.adapter_id)?;
+            validate_canonical_id("paper venue_id", &adapter.venue_id)?;
+            if adapter.environment != document.account.environment
+                || !adapter.adapter_id.starts_with("adapter.ibkr.paper.")
+                || adapter.venue_id != "venue.ibkr.paper"
+            {
+                return Err(
+                    "paper CLI supports only a PAPER adapter.ibkr.paper.* route at venue.ibkr.paper"
+                        .into(),
+                );
+            }
+        }
+        _ => {}
     }
     Ok((document, format!("{:x}", Sha256::digest(bytes))))
 }
@@ -256,7 +304,7 @@ mod tests {
         let defaults = parse_arguments(Vec::new()).unwrap();
         assert_eq!(
             defaults.configuration_path,
-            PathBuf::from("tests/fixtures/config/paper-v1.json")
+            PathBuf::from("tests/fixtures/config/paper-v2.json")
         );
         assert!(parse_arguments(vec!["--unknown".to_owned()]).is_err());
         assert!(parse_arguments(vec!["--config".to_owned()]).is_err());
@@ -278,5 +326,16 @@ mod tests {
             .and_then(Path::parent)
             .unwrap();
         assert!(load_configuration(&root.join("tests/fixtures/config/paper-v1.json")).is_ok());
+        assert!(load_configuration(&root.join("tests/fixtures/config/paper-v2.json")).is_ok());
+        let invalid_route_path = std::env::temp_dir().join(format!(
+            "follon-paper-invalid-route-{}.json",
+            std::process::id()
+        ));
+        let invalid_route = fs::read_to_string(root.join("tests/fixtures/config/paper-v2.json"))
+            .unwrap()
+            .replace("venue.ibkr.paper", "venue.fix.paper");
+        fs::write(&invalid_route_path, invalid_route).unwrap();
+        assert!(load_configuration(&invalid_route_path).is_err());
+        let _ = fs::remove_file(&invalid_route_path);
     }
 }

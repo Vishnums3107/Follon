@@ -1,5 +1,20 @@
 # Contract compatibility policy
 
+## PAPER adapter-route migration (v1 to v2)
+
+PAPER configuration v2 adds a required non-secret adapter route. Producers
+must publish `contracts/json-schema/v2/paper-configuration.schema.json` before
+selecting a registry route. Consumers accept v1 only to reopen and reconcile an
+existing single-account local-IBKR PAPER journal; its exact derived legacy
+route intentionally retains the v1 journal fingerprint and cannot initialize a
+new journal. New or changed routes require v2, which binds the route labels and
+the adapter's non-secret implementation/configuration fingerprint to the
+durable PAPER configuration. Rollback selects the v1-compatible reader only
+for the unchanged pre-existing route; it does not delete, rewrite, or repoint a
+journal. A v1-to-v2 cutover occurs only after clean reconciliation with no
+working or `UNKNOWN` orders: retain the v1 journal as immutable evidence and
+begin a separately named v2 journal.
+
 The event envelope is the replay and audit boundary. Published v1 payloads are
 additive-only: fields may be added only when consumers can ignore them, and no
 field may be renamed, retyped, or silently change meaning. Breaking changes
@@ -16,7 +31,7 @@ canonical intent and applies risk before creating an OMS order.
 
 ## Verification
 
-- Validate JSON ingress against the schemas in `json-schema/v1`.
+- Validate JSON ingress against the applicable versioned schema in `json-schema`.
 - Ensure canonical event serialization remains stable with deterministic replay tests.
 - Treat new required fields or changed enum meaning as a major contract change.
 - Document a producer/consumer migration before publishing an incompatible version.
