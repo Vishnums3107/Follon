@@ -269,6 +269,231 @@ pub struct MarginPosition {
     pub multiplier: Decimal,
 }
 
+/// One independently reconciled account snapshot eligible for aggregation.
+///
+/// This is deliberately a read-only projection input. It does not imply that
+/// balances can be transferred, positions can be netted for settlement, or an
+/// order approved for one account may be submitted for another.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountPortfolioSnapshot {
+    /// Canonical account identity.
+    pub account_id: String,
+    /// Canonical point-in-time at which every cash and position value is valid.
+    pub as_of: String,
+    /// Immutable reconciliation evidence identity for this account snapshot.
+    pub reconciliation_id: String,
+    /// SHA-256 fingerprint of the shared valuation/configuration inputs.
+    pub configuration_fingerprint: String,
+    /// Exact available or debit cash by native currency.
+    pub cash_by_currency: BTreeMap<Currency, Decimal>,
+    /// Independently marked positions for this account.
+    pub positions: Vec<MarginPosition>,
+}
+
+/// Deterministic cross-account position projection for one complete identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatedPosition {
+    /// Canonical instrument identifier.
+    pub instrument_id: String,
+    /// Margin/asset class supplied by the account snapshots.
+    pub asset_class: String,
+    /// Settlement currency.
+    pub currency: Currency,
+    /// Exact signed quantity summed across contributing accounts.
+    pub quantity: Decimal,
+    /// Common positive contract multiplier validated across all sources.
+    pub multiplier: Decimal,
+    /// Exact signed native-currency marked value summed from each source mark.
+    ///
+    /// The projection intentionally does not manufacture a single consolidated
+    /// mark price when venues supplied different authoritative marks.
+    pub market_value: Decimal,
+    /// Canonical source accounts in stable order for audit attribution.
+    pub contributing_account_ids: Vec<String>,
+}
+
+/// Read-only aggregate of reconciled account snapshots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiAccountPortfolioSnapshot {
+    /// Shared canonical point-in-time accepted for every source snapshot.
+    pub as_of: String,
+    /// Shared SHA-256 valuation/configuration fingerprint.
+    pub configuration_fingerprint: String,
+    /// Number of independently supplied accounts.
+    pub account_count: u32,
+    /// Reconciliation evidence identity retained by source account.
+    pub reconciliation_ids_by_account: BTreeMap<String, String>,
+    /// Exact total cash by native currency, including debit balances.
+    pub cash_by_currency: BTreeMap<Currency, Decimal>,
+    /// Positions in stable `(instrument, asset class, currency)` order.
+    pub positions: Vec<AggregatedPosition>,
+}
+
+#[derive(Clone, Debug)]
+struct AggregatedPositionAccumulator {
+    quantity: Decimal,
+    multiplier: Decimal,
+    market_value: Decimal,
+    contributing_account_ids: BTreeSet<String>,
+}
+
+/// Aggregates cash and marked positions from independently reconciled accounts.
+///
+/// The result is deterministic irrespective of input snapshot order. It uses
+/// fixed-point values only and retains native currencies and source-account
+/// attribution, so consumers cannot silently invent an FX rate or a blended
+/// venue mark. An account or source position may occur only once per snapshot.
+pub fn aggregate_account_portfolios(
+    accounts: &[AccountPortfolioSnapshot],
+) -> Result<MultiAccountPortfolioSnapshot, AccountingError> {
+    if accounts.is_empty() || accounts.len() > u32::MAX as usize {
+        return Err(AccountingError(
+            "multi-account aggregation requires between one and u32::MAX accounts".to_owned(),
+        ));
+    }
+    let mut account_ids = BTreeSet::new();
+    let mut as_of = None;
+    let mut configuration_fingerprint = None;
+    let mut reconciliation_ids_by_account = BTreeMap::new();
+    let mut cash_by_currency = BTreeMap::new();
+    let mut positions: BTreeMap<(String, String, Currency), AggregatedPositionAccumulator> =
+        BTreeMap::new();
+
+    for account in accounts {
+        validate_canonical_id("aggregate account_id", &account.account_id)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_utc_timestamp("aggregate snapshot as_of", &account.as_of)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_canonical_id("aggregate reconciliation_id", &account.reconciliation_id)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_sha256_fingerprint(
+            "aggregate configuration_fingerprint",
+            &account.configuration_fingerprint,
+        )?;
+        if !account_ids.insert(account.account_id.clone()) {
+            return Err(AccountingError(
+                "multi-account aggregation received duplicate account_id".to_owned(),
+            ));
+        }
+        match as_of.as_deref() {
+            Some(existing) if existing != account.as_of => {
+                return Err(AccountingError(
+                    "multi-account aggregation requires one common as_of timestamp".to_owned(),
+                ));
+            }
+            None => as_of = Some(account.as_of.clone()),
+            _ => {}
+        }
+        match configuration_fingerprint.as_deref() {
+            Some(existing) if existing != account.configuration_fingerprint => {
+                return Err(AccountingError(
+                    "multi-account aggregation requires one common configuration fingerprint"
+                        .to_owned(),
+                ));
+            }
+            None => configuration_fingerprint = Some(account.configuration_fingerprint.clone()),
+            _ => {}
+        }
+        reconciliation_ids_by_account.insert(
+            account.account_id.clone(),
+            account.reconciliation_id.clone(),
+        );
+        for (currency, cash) in &account.cash_by_currency {
+            let total = cash_by_currency
+                .get(currency)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .checked_add(*cash)?;
+            cash_by_currency.insert(currency.clone(), total);
+        }
+
+        let mut source_position_ids = BTreeSet::new();
+        for position in &account.positions {
+            validate_canonical_id("aggregate instrument_id", &position.instrument_id)
+                .map_err(|error| AccountingError(error.0))?;
+            validate_canonical_id("aggregate asset_class", &position.asset_class)
+                .map_err(|error| AccountingError(error.0))?;
+            if position.quantity == Decimal::ZERO
+                || position.mark_price <= Decimal::ZERO
+                || position.multiplier <= Decimal::ZERO
+            {
+                return Err(AccountingError(
+                    "invalid position in multi-account aggregation".to_owned(),
+                ));
+            }
+            let key = (
+                position.instrument_id.clone(),
+                position.asset_class.clone(),
+                position.currency.clone(),
+            );
+            if !source_position_ids.insert(key.clone()) {
+                return Err(AccountingError(
+                    "account snapshot has duplicate position identity".to_owned(),
+                ));
+            }
+            let market_value = position
+                .quantity
+                .checked_mul(position.mark_price)?
+                .checked_mul(position.multiplier)?;
+            let aggregate = positions
+                .entry(key)
+                .or_insert(AggregatedPositionAccumulator {
+                    quantity: Decimal::ZERO,
+                    multiplier: position.multiplier,
+                    market_value: Decimal::ZERO,
+                    contributing_account_ids: BTreeSet::new(),
+                });
+            if aggregate.multiplier != position.multiplier {
+                return Err(AccountingError(
+                    "account snapshots disagree on a position contract multiplier".to_owned(),
+                ));
+            }
+            aggregate.quantity = aggregate.quantity.checked_add(position.quantity)?;
+            aggregate.market_value = aggregate.market_value.checked_add(market_value)?;
+            aggregate
+                .contributing_account_ids
+                .insert(account.account_id.clone());
+        }
+    }
+
+    let positions = positions
+        .into_iter()
+        .map(
+            |((instrument_id, asset_class, currency), aggregate)| AggregatedPosition {
+                instrument_id,
+                asset_class,
+                currency,
+                quantity: aggregate.quantity,
+                multiplier: aggregate.multiplier,
+                market_value: aggregate.market_value,
+                contributing_account_ids: aggregate.contributing_account_ids.into_iter().collect(),
+            },
+        )
+        .collect();
+    Ok(MultiAccountPortfolioSnapshot {
+        as_of: as_of.expect("non-empty account aggregation has an as_of timestamp"),
+        configuration_fingerprint: configuration_fingerprint
+            .expect("non-empty account aggregation has a configuration fingerprint"),
+        account_count: accounts.len() as u32,
+        reconciliation_ids_by_account,
+        cash_by_currency,
+        positions,
+    })
+}
+
+fn validate_sha256_fingerprint(name: &str, value: &str) -> Result<(), AccountingError> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'a' | b'b' | b'c' | b'd' | b'e' | b'f')
+        })
+    {
+        return Err(AccountingError(format!(
+            "{name} must be a lowercase SHA-256 hex digest"
+        )));
+    }
+    Ok(())
+}
+
 /// Initial and maintenance requirements in basis points of absolute marked value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarginRate {
@@ -862,6 +1087,119 @@ mod tests {
         })
         .unwrap();
         assert!(value_margin_account(&cash, &[], &fx, &policy, 20).is_err());
+    }
+
+    #[test]
+    fn aggregates_multi_account_cash_and_positions_deterministically() {
+        let usd = currency("USD");
+        let eur = currency("EUR");
+        let first = AccountPortfolioSnapshot {
+            account_id: "acct.paper.001".to_owned(),
+            as_of: "2026-01-02T21:00:00Z".to_owned(),
+            reconciliation_id: "reconciliation.paper.001".to_owned(),
+            configuration_fingerprint: "a".repeat(64),
+            cash_by_currency: BTreeMap::from([
+                (usd.clone(), amount("1000")),
+                (eur.clone(), amount("200")),
+            ]),
+            positions: vec![MarginPosition {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                asset_class: "equity".to_owned(),
+                currency: usd.clone(),
+                quantity: amount("2"),
+                mark_price: amount("10"),
+                multiplier: amount("1"),
+            }],
+        };
+        let second = AccountPortfolioSnapshot {
+            account_id: "acct.paper.002".to_owned(),
+            as_of: "2026-01-02T21:00:00Z".to_owned(),
+            reconciliation_id: "reconciliation.paper.002".to_owned(),
+            configuration_fingerprint: "a".repeat(64),
+            cash_by_currency: BTreeMap::from([
+                (usd.clone(), amount("-50")),
+                (eur.clone(), amount("100")),
+            ]),
+            positions: vec![
+                MarginPosition {
+                    instrument_id: "inst.option.spy.call".to_owned(),
+                    asset_class: "option".to_owned(),
+                    currency: usd.clone(),
+                    quantity: amount("3"),
+                    mark_price: amount("5"),
+                    multiplier: amount("100"),
+                },
+                MarginPosition {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    asset_class: "equity".to_owned(),
+                    currency: usd.clone(),
+                    quantity: amount("-1"),
+                    mark_price: amount("12"),
+                    multiplier: amount("1"),
+                },
+            ],
+        };
+
+        let forward = aggregate_account_portfolios(&[first.clone(), second.clone()]).unwrap();
+        let replay = aggregate_account_portfolios(&[second, first]).unwrap();
+        assert_eq!(forward, replay);
+        assert_eq!(forward.account_count, 2);
+        assert_eq!(forward.as_of, "2026-01-02T21:00:00Z");
+        assert_eq!(forward.reconciliation_ids_by_account.len(), 2);
+        assert_eq!(forward.cash_by_currency[&usd], amount("950"));
+        assert_eq!(forward.cash_by_currency[&eur], amount("300"));
+        assert_eq!(forward.positions.len(), 2);
+        let equity = forward
+            .positions
+            .iter()
+            .find(|position| position.instrument_id == "inst.us_equity.spy")
+            .unwrap();
+        assert_eq!(equity.quantity, amount("1"));
+        assert_eq!(equity.market_value, amount("8"));
+        assert_eq!(
+            equity.contributing_account_ids,
+            vec!["acct.paper.001".to_owned(), "acct.paper.002".to_owned()]
+        );
+        let option = forward
+            .positions
+            .iter()
+            .find(|position| position.instrument_id == "inst.option.spy.call")
+            .unwrap();
+        assert_eq!(option.market_value, amount("1500"));
+    }
+
+    #[test]
+    fn refuses_duplicate_account_or_position_identity_in_aggregation() {
+        let account = AccountPortfolioSnapshot {
+            account_id: "acct.paper.001".to_owned(),
+            as_of: "2026-01-02T21:00:00Z".to_owned(),
+            reconciliation_id: "reconciliation.paper.001".to_owned(),
+            configuration_fingerprint: "a".repeat(64),
+            cash_by_currency: BTreeMap::new(),
+            positions: vec![MarginPosition {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                asset_class: "equity".to_owned(),
+                currency: currency("USD"),
+                quantity: amount("1"),
+                mark_price: amount("100"),
+                multiplier: amount("1"),
+            }],
+        };
+        assert!(aggregate_account_portfolios(&[account.clone(), account.clone()]).is_err());
+        let mut multiplier_mismatch = account.clone();
+        multiplier_mismatch.account_id = "acct.paper.002".to_owned();
+        multiplier_mismatch.positions[0].multiplier = amount("100");
+        assert!(aggregate_account_portfolios(&[account.clone(), multiplier_mismatch]).is_err());
+        let mut stale_snapshot = account.clone();
+        stale_snapshot.account_id = "acct.paper.003".to_owned();
+        stale_snapshot.reconciliation_id = "reconciliation.paper.003".to_owned();
+        stale_snapshot.as_of = "2026-01-02T21:00:01Z".to_owned();
+        assert!(aggregate_account_portfolios(&[account.clone(), stale_snapshot]).is_err());
+        let mut duplicate_position = account;
+        duplicate_position
+            .positions
+            .push(duplicate_position.positions[0].clone());
+        assert!(aggregate_account_portfolios(&[duplicate_position]).is_err());
     }
 
     #[test]

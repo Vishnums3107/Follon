@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "configuration_id": "config.paper.baseline",
+  "configuration_version": "v2",
+  "account": {
+    "account_id": "acct.paper.001",
+    "currency": "USD",
+    "initial_cash": "100000",
+    "environment": "PAPER"
+  },
+  "adapter": {
+    "adapter_id": "adapter.ibkr.paper.001",
+    "venue_id": "venue.ibkr.paper",
+    "environment": "PAPER"
+  },
+  "risk": {
+    "policy_version": "paper-risk-v1",
+    "trading_calendar_id": "cal.us_equities.nyse.v1",
+    "max_order_quantity": "100",
+    "max_order_notional": "50000",
+    "max_price_deviation_bps": "100",
+    "max_open_orders": 10,
+    "max_position_quantity": "1000",
+    "max_realized_loss": "10000",
+    "max_market_data_age_seconds": 5
+  },
+  "kill_switch_version": "paper-kills-v1"
+}

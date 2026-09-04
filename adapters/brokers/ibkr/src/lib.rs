@@ -25,9 +25,9 @@ use follon_live::{
     LiveBrokerReplaceRequest, LiveBrokerSubmitResult, LiveError,
 };
 use follon_paper::{
-    BrokerAccountSnapshot, BrokerComboRequest, BrokerEvent, BrokerOrderRequest,
-    BrokerOrderSnapshot, BrokerPositionSnapshot, BrokerSubmitResult, PaperBrokerAdapter,
-    PaperError,
+    BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboRequest, BrokerEvent,
+    BrokerOrderRequest, BrokerOrderSnapshot, BrokerPositionSnapshot, BrokerSubmitResult,
+    PaperBrokerAdapter, PaperError,
 };
 use follon_secrets::SecretMaterial;
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ pub trait IbkrPaperGatewayTransport {
     /// Sends one normalized paper combination request (BAG order).
     fn submit_paper_combo(
         &mut self,
-        request: &BrokerComboRequest,
+        _request: &BrokerComboRequest,
     ) -> Result<BrokerSubmitResult, PaperError> {
         Err(PaperError(
             "IBKR transport does not implement BAG orders".to_owned(),
@@ -740,6 +740,21 @@ impl<T: IbkrPaperGatewayTransport> IbkrPaperGatewayAdapter<T> {
 }
 
 impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapter<T> {
+    fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        if account_id != self.configuration.account_id {
+            return Err(PaperError(
+                "IBKR paper adapter configuration account does not match request".to_owned(),
+            ));
+        }
+        Ok(format!(
+            "ibkr-paper-gateway-v1|{}|{}|{}|{}",
+            self.configuration.account_id,
+            self.configuration.host,
+            self.configuration.port,
+            self.configuration.environment
+        ))
+    }
+
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
         if request.account_id != self.configuration.account_id {
             return Err(PaperError(
@@ -761,11 +776,21 @@ impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapte
         self.transport.submit_paper_combo(request)
     }
 
-    fn cancel(&mut self, client_order_id: &str) -> Result<(), PaperError> {
-        self.transport.cancel_paper_order(client_order_id)
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+        if request.account_id != self.configuration.account_id {
+            return Err(PaperError(
+                "IBKR paper cancellation account does not match configuration".to_owned(),
+            ));
+        }
+        self.transport.cancel_paper_order(&request.client_order_id)
     }
 
-    fn poll(&mut self) -> Result<Vec<BrokerEvent>, PaperError> {
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+        if account_id != self.configuration.account_id {
+            return Err(PaperError(
+                "IBKR paper poll account does not match configuration".to_owned(),
+            ));
+        }
         self.transport.poll_paper_events()
     }
 
@@ -778,7 +803,12 @@ impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapte
         self.transport.paper_account_snapshot(account_id)
     }
 
-    fn reconnect(&mut self) -> Result<(), PaperError> {
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+        if account_id != self.configuration.account_id {
+            return Err(PaperError(
+                "IBKR paper reconnect account does not match configuration".to_owned(),
+            ));
+        }
         self.transport.reconnect_paper()
     }
 }
