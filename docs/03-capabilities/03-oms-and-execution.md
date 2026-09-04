@@ -52,3 +52,20 @@ to a native atomic broker order or reject it before transmitting any leg.
 ## Adapter contract
 
 The broker adapter converts canonical submit/cancel/replace and account-data contracts to broker protocol operations, then normalizes acknowledgements, rejects, status, executions, positions, and balances back into canonical events. It does not decide risk policy or own portfolio truth.
+
+PAPER adapter composition is account-isolated. `PaperBrokerRegistry` binds a
+canonical account to one reviewed adapter instance and venue metadata, then
+selects that route only from the OMS request account. Submission, cancellation,
+replacement, polling, snapshot, and reconnection are explicitly account scoped.
+An unknown account route, a duplicate route, or an attempted cross-account
+operation fails closed; it is never redirected to a default broker. The
+registry is an OMS-side wiring mechanism, not a client capability, and does not
+contain broker credentials. Its route order is deterministic, while evidence
+within each account remains in normalized broker arrival order.
+
+Multi-account cash and position reporting is a read-only, fixed-point
+accounting projection. It accepts only source snapshots with one common
+point-in-time and configuration fingerprint, retains each source reconciliation
+identity, preserves native currencies/source-account attribution and the sum of
+source marked values, and does not manufacture a blended mark or authorize
+cross-account netting, allocation, or settlement.

@@ -88,6 +88,48 @@ impl PaperAccount {
     }
 }
 
+/// Version of the normalized PAPER adapter contract implemented in this crate.
+///
+/// Version 2 makes every stateful adapter operation explicitly account scoped,
+/// allowing a deployment composition to route several isolated broker accounts
+/// without making a client order id globally meaningful.
+pub const PAPER_BROKER_ADAPTER_CONTRACT_VERSION: u32 = 2;
+
+/// Controlled deployment binding of a PAPER account to one adapter instance and venue.
+///
+/// This is configuration metadata only. It grants no client, strategy, or UI
+/// access to the adapter and does not contain a credential or endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaperBrokerRoute {
+    /// Canonical OMS account identity routed by this binding.
+    pub account_id: String,
+    /// Deployment-local canonical identity for exactly one adapter instance.
+    pub adapter_id: String,
+    /// Canonical venue identity used for evidence and operational configuration.
+    pub venue_id: String,
+    /// Must be the literal value `PAPER`.
+    pub environment: String,
+}
+
+impl PaperBrokerRoute {
+    /// Validates an account-isolated PAPER route before it is registered.
+    pub fn validate(&self) -> Result<(), PaperError> {
+        for (name, value) in [
+            ("paper broker route account_id", self.account_id.as_str()),
+            ("paper broker route adapter_id", self.adapter_id.as_str()),
+            ("paper broker route venue_id", self.venue_id.as_str()),
+        ] {
+            validate_canonical_id(name, value)?;
+        }
+        if self.environment != "PAPER" {
+            return Err(PaperError(
+                "paper broker routes must use the PAPER environment".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A normalized order request sent only by the OMS to a paper broker adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerOrderRequest {
@@ -116,6 +158,36 @@ pub struct BrokerComboRequest {
     pub legs: Vec<BrokerComboLeg>,
     /// Limit price for the entire combination.
     pub limit_price: Option<Decimal>,
+}
+
+impl BrokerComboRequest {
+    fn validate(&self) -> Result<(), PaperError> {
+        for (name, value) in [
+            ("combo client_order_id", self.client_order_id.as_str()),
+            ("combo account_id", self.account_id.as_str()),
+        ] {
+            validate_canonical_id(name, value)?;
+        }
+        if self.legs.is_empty() || self.legs.len() > 16 {
+            return Err(PaperError(
+                "paper combo request must contain between one and sixteen legs".to_owned(),
+            ));
+        }
+        if self.limit_price.is_some_and(|price| price <= Decimal::ZERO) {
+            return Err(PaperError(
+                "paper combo limit price must be positive".to_owned(),
+            ));
+        }
+        for leg in &self.legs {
+            validate_canonical_id("combo leg instrument_id", &leg.instrument_id)?;
+            if leg.ratio == 0 {
+                return Err(PaperError(
+                    "paper combo leg ratio must be positive".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A leg within a combo request.
@@ -165,6 +237,8 @@ impl BrokerOrderRequest {
 /// remain attributable to the same immutable OMS order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerReplaceRequest {
+    /// Account selected by the OMS for this immutable client identity.
+    pub account_id: String,
     /// Immutable OMS client identity.
     pub client_order_id: String,
     /// Current broker-native identity being superseded.
@@ -175,6 +249,7 @@ pub struct BrokerReplaceRequest {
 
 impl BrokerReplaceRequest {
     fn validate(&self) -> Result<(), PaperError> {
+        validate_canonical_id("replace account_id", &self.account_id)?;
         validate_canonical_id("replace client_order_id", &self.client_order_id)?;
         validate_canonical_id(
             "replace previous_broker_order_id",
@@ -185,6 +260,23 @@ impl BrokerReplaceRequest {
                 "replacement limit price must be positive".to_owned(),
             ));
         }
+        Ok(())
+    }
+}
+
+/// An account-scoped request to cancel one immutable OMS client identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerCancelRequest {
+    /// Account selected by the OMS for this immutable client identity.
+    pub account_id: String,
+    /// Immutable OMS client identity to cancel.
+    pub client_order_id: String,
+}
+
+impl BrokerCancelRequest {
+    fn validate(&self) -> Result<(), PaperError> {
+        validate_canonical_id("cancel account_id", &self.account_id)?;
+        validate_canonical_id("cancel client_order_id", &self.client_order_id)?;
         Ok(())
     }
 }
@@ -324,6 +416,31 @@ pub struct BrokerAccountSnapshot {
 
 /// Paper-only broker boundary. It has no live environment parameter.
 pub trait PaperBrokerAdapter {
+    /// Returns a stable non-secret fingerprint of this adapter implementation
+    /// and its account-specific transport configuration.
+    ///
+    /// Registries require a non-empty value at registration so a durable route
+    /// cannot be recovered against a different adapter configuration under the
+    /// same user-facing labels.
+    fn adapter_configuration_fingerprint(&self, _account_id: &str) -> Result<String, PaperError> {
+        Ok(String::new())
+    }
+    /// Returns stable non-secret routing configuration evidence for one account.
+    ///
+    /// The legacy single-adapter default is empty so existing PAPER journals
+    /// retain their configuration fingerprint. Multi-route implementations
+    /// must return a stable account route fingerprint so recovery cannot use a
+    /// different adapter or venue unnoticed.
+    fn configuration_fingerprint(&self, _account_id: &str) -> Result<String, PaperError> {
+        Ok(String::new())
+    }
+    /// Indicates whether this composition may initialize a new empty journal.
+    ///
+    /// The default permits a new PAPER service. A legacy migration composition
+    /// must be restricted to reopening a pre-existing journal.
+    fn permits_empty_journal(&self, _account_id: &str) -> bool {
+        true
+    }
     /// Submits exactly one client-idempotent paper order.
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError>;
     /// Submits an atomic combination order.
@@ -335,20 +452,210 @@ pub trait PaperBrokerAdapter {
             "broker adapter does not support native combos".to_owned(),
         ))
     }
-    /// Requests cancellation by the immutable client idempotency key.
-    fn cancel(&mut self, client_order_id: &str) -> Result<(), PaperError>;
+    /// Requests cancellation by the account-scoped immutable client identity.
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError>;
     /// Requests a price-only replacement. The result arrives through [`BrokerEvent`].
     fn replace(&mut self, _request: &BrokerReplaceRequest) -> Result<(), PaperError> {
         Err(PaperError(
             "paper broker adapter does not support order replacement".to_owned(),
         ))
     }
-    /// Drains normalized asynchronous evidence in arrival order.
-    fn poll(&mut self) -> Result<Vec<BrokerEvent>, PaperError>;
+    /// Drains one account's normalized asynchronous evidence in arrival order.
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError>;
     /// Returns an independent broker-side account snapshot for reconciliation.
     fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError>;
-    /// Re-establishes the paper connection. The caller must reconcile afterwards.
-    fn reconnect(&mut self) -> Result<(), PaperError>;
+    /// Re-establishes one account's paper connection. The caller must reconcile afterwards.
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError>;
+}
+
+/// Deterministic composition root for isolated PAPER broker-account routes.
+///
+/// The registry is only an OMS-side adapter selection mechanism. A route has
+/// no credentials and only delegates normalized requests after the caller's
+/// existing risk/OMS processing. `BTreeMap` storage makes route enumeration
+/// stable and unknown or duplicate bindings fail closed.
+pub struct PaperBrokerRegistry {
+    routes: BTreeMap<String, PaperBrokerRoute>,
+    adapters: BTreeMap<String, Box<dyn PaperBrokerAdapter>>,
+    adapter_configuration_fingerprints: BTreeMap<String, String>,
+    legacy_fingerprint_accounts: BTreeSet<String>,
+}
+
+impl Default for PaperBrokerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PaperBrokerRegistry {
+    /// Creates an empty registry; a deployment must register every PAPER route explicitly.
+    pub fn new() -> Self {
+        Self {
+            routes: BTreeMap::new(),
+            adapters: BTreeMap::new(),
+            adapter_configuration_fingerprints: BTreeMap::new(),
+            legacy_fingerprint_accounts: BTreeSet::new(),
+        }
+    }
+
+    /// Registers one isolated adapter instance for one canonical PAPER account.
+    pub fn register(
+        &mut self,
+        route: PaperBrokerRoute,
+        adapter: Box<dyn PaperBrokerAdapter>,
+    ) -> Result<(), PaperError> {
+        self.register_inner(route, adapter, false)
+    }
+
+    /// Registers the exact legacy local-IBKR PAPER composition without changing
+    /// its journal fingerprint.
+    ///
+    /// This is only a migration bridge for configuration schema v1 and can
+    /// reopen, but not initialize, a journal. New configurations must use
+    /// [`Self::register`] so the durable journal binds the route and actual
+    /// adapter configuration fingerprints.
+    pub fn register_legacy_ibkr_paper_route(
+        &mut self,
+        account: &PaperAccount,
+    ) -> Result<(), PaperError> {
+        account.validate()?;
+        let route = PaperBrokerRoute {
+            account_id: account.account_id.clone(),
+            adapter_id: format!("adapter.ibkr.paper.{}", account.account_id),
+            venue_id: "venue.ibkr.paper".to_owned(),
+            environment: "PAPER".to_owned(),
+        };
+        self.register_inner(route, Box::new(IbkrPaperAdapter::new(account)?), true)
+    }
+
+    fn register_inner(
+        &mut self,
+        route: PaperBrokerRoute,
+        adapter: Box<dyn PaperBrokerAdapter>,
+        preserve_legacy_fingerprint: bool,
+    ) -> Result<(), PaperError> {
+        route.validate()?;
+        if self.routes.contains_key(&route.account_id) {
+            return Err(PaperError(
+                "paper broker route already exists for account".to_owned(),
+            ));
+        }
+        if self.adapters.contains_key(&route.adapter_id) {
+            return Err(PaperError(
+                "paper broker adapter_id is already registered".to_owned(),
+            ));
+        }
+        let adapter_configuration_fingerprint =
+            adapter.adapter_configuration_fingerprint(&route.account_id)?;
+        if adapter_configuration_fingerprint.is_empty() {
+            return Err(PaperError(
+                "paper broker adapter must expose a non-secret configuration fingerprint"
+                    .to_owned(),
+            ));
+        }
+        self.adapters.insert(route.adapter_id.clone(), adapter);
+        self.adapter_configuration_fingerprints
+            .insert(route.adapter_id.clone(), adapter_configuration_fingerprint);
+        if preserve_legacy_fingerprint {
+            self.legacy_fingerprint_accounts
+                .insert(route.account_id.clone());
+        }
+        self.routes.insert(route.account_id.clone(), route);
+        Ok(())
+    }
+
+    /// Returns the configured routes in stable account-id order.
+    pub fn routes(&self) -> Vec<PaperBrokerRoute> {
+        self.routes.values().cloned().collect()
+    }
+
+    fn adapter_for_account(
+        &mut self,
+        account_id: &str,
+    ) -> Result<&mut (dyn PaperBrokerAdapter + '_), PaperError> {
+        validate_canonical_id("paper broker route account_id", account_id)?;
+        let adapter_id = self
+            .routes
+            .get(account_id)
+            .ok_or_else(|| {
+                PaperError("paper broker route is not configured for account".to_owned())
+            })?
+            .adapter_id
+            .clone();
+        match self.adapters.get_mut(&adapter_id) {
+            Some(adapter) => Ok(adapter.as_mut()),
+            None => Err(PaperError(
+                "paper broker route adapter is unavailable".to_owned(),
+            )),
+        }
+    }
+}
+
+impl PaperBrokerAdapter for PaperBrokerRegistry {
+    fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        validate_canonical_id("paper broker route account_id", account_id)?;
+        let route = self.routes.get(account_id).ok_or_else(|| {
+            PaperError("paper broker route is not configured for account".to_owned())
+        })?;
+        if self.legacy_fingerprint_accounts.contains(account_id) {
+            return Ok(String::new());
+        }
+        let adapter_configuration_fingerprint = self
+            .adapter_configuration_fingerprints
+            .get(&route.adapter_id)
+            .ok_or_else(|| PaperError("paper broker route adapter is unavailable".to_owned()))?;
+        Ok(hash_fingerprint_parts(&[
+            "paper-broker-route-v2",
+            &route.account_id,
+            &route.adapter_id,
+            &route.venue_id,
+            &route.environment,
+            adapter_configuration_fingerprint,
+        ]))
+    }
+
+    fn permits_empty_journal(&self, account_id: &str) -> bool {
+        !self.legacy_fingerprint_accounts.contains(account_id)
+    }
+
+    fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
+        request.validate()?;
+        self.adapter_for_account(&request.account_id)?
+            .submit(request)
+    }
+
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        request.validate()?;
+        self.adapter_for_account(&request.account_id)?
+            .submit_combo(request)
+    }
+
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+        request.validate()?;
+        self.adapter_for_account(&request.account_id)?
+            .cancel(request)
+    }
+
+    fn replace(&mut self, request: &BrokerReplaceRequest) -> Result<(), PaperError> {
+        request.validate()?;
+        self.adapter_for_account(&request.account_id)?
+            .replace(request)
+    }
+
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+        self.adapter_for_account(account_id)?.poll(account_id)
+    }
+
+    fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+        self.adapter_for_account(account_id)?.snapshot(account_id)
+    }
+
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+        self.adapter_for_account(account_id)?.reconnect(account_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +763,15 @@ impl IbkrPaperAdapter {
 }
 
 impl PaperBrokerAdapter for IbkrPaperAdapter {
+    fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        if account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match adapter configuration".to_owned(),
+            ));
+        }
+        Ok(format!("ibkr-paper-model-v1|{}", self.account_id))
+    }
+
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
         request.validate()?;
         if !self.connected {
@@ -496,8 +812,13 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
     }
 
-    fn cancel(&mut self, client_order_id: &str) -> Result<(), PaperError> {
-        validate_canonical_id("client_order_id", client_order_id)?;
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+        request.validate()?;
+        if request.account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match cancellation request".to_owned(),
+            ));
+        }
         if !self.connected {
             return Err(PaperError(
                 "IBKR paper connection is unavailable; cancellation outcome is unknown".to_owned(),
@@ -505,7 +826,7 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         }
         let order = self
             .orders
-            .get_mut(client_order_id)
+            .get_mut(&request.client_order_id)
             .ok_or_else(|| PaperError("paper broker does not know client order".to_owned()))?;
         if matches!(
             order.state,
@@ -515,7 +836,7 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         }
         order.state = OrderState::Cancelled;
         self.pending_events.push_back(BrokerEvent::Cancelled {
-            client_order_id: client_order_id.to_owned(),
+            client_order_id: request.client_order_id.clone(),
             reason: "IBKR_PAPER_CANCELLED".to_owned(),
         });
         Ok(())
@@ -523,6 +844,11 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
 
     fn replace(&mut self, request: &BrokerReplaceRequest) -> Result<(), PaperError> {
         request.validate()?;
+        if request.account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match replacement request".to_owned(),
+            ));
+        }
         if !self.connected {
             return Err(PaperError(
                 "IBKR paper connection is unavailable; replacement outcome is unknown".to_owned(),
@@ -555,7 +881,12 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Vec<BrokerEvent>, PaperError> {
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+        if account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match poll request".to_owned(),
+            ));
+        }
         if !self.connected {
             return Err(PaperError(
                 "IBKR paper connection is unavailable".to_owned(),
@@ -593,7 +924,12 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         })
     }
 
-    fn reconnect(&mut self) -> Result<(), PaperError> {
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+        if account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match reconnect request".to_owned(),
+            ));
+        }
         self.connected = true;
         Ok(())
     }
@@ -658,6 +994,18 @@ impl<B> FaultInjectingBroker<B> {
 }
 
 impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
+    fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        self.inner.adapter_configuration_fingerprint(account_id)
+    }
+
+    fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        self.inner.configuration_fingerprint(account_id)
+    }
+
+    fn permits_empty_journal(&self, account_id: &str) -> bool {
+        self.inner.permits_empty_journal(account_id)
+    }
+
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
         match self.next_fault(BrokerOperation::Submit) {
             Some(BrokerFault::Disconnect) => Err(PaperError(
@@ -673,12 +1021,12 @@ impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
         }
     }
 
-    fn cancel(&mut self, client_order_id: &str) -> Result<(), PaperError> {
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
         match self.next_fault(BrokerOperation::Cancel) {
             Some(BrokerFault::Disconnect) | Some(BrokerFault::AmbiguousAfterSubmit) => Err(
                 PaperError("fault injection made paper cancellation outcome ambiguous".to_owned()),
             ),
-            Some(BrokerFault::DuplicateFirstEvent) | None => self.inner.cancel(client_order_id),
+            Some(BrokerFault::DuplicateFirstEvent) | None => self.inner.cancel(request),
         }
     }
 
@@ -691,19 +1039,19 @@ impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
         }
     }
 
-    fn poll(&mut self) -> Result<Vec<BrokerEvent>, PaperError> {
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
         match self.next_fault(BrokerOperation::Poll) {
             Some(BrokerFault::Disconnect) | Some(BrokerFault::AmbiguousAfterSubmit) => Err(
                 PaperError("fault injection disconnected paper polling".to_owned()),
             ),
             Some(BrokerFault::DuplicateFirstEvent) => {
-                let mut events = self.inner.poll()?;
+                let mut events = self.inner.poll(account_id)?;
                 if let Some(first) = events.first().cloned() {
                     events.push(first);
                 }
                 Ok(events)
             }
-            None => self.inner.poll(),
+            None => self.inner.poll(account_id),
         }
     }
 
@@ -711,12 +1059,12 @@ impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
         self.inner.snapshot(account_id)
     }
 
-    fn reconnect(&mut self) -> Result<(), PaperError> {
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
         match self.next_fault(BrokerOperation::Reconnect) {
             Some(_) => Err(PaperError(
                 "fault injection rejected paper reconnect".to_owned(),
             )),
-            None => self.inner.reconnect(),
+            None => self.inner.reconnect(account_id),
         }
     }
 }
@@ -1424,6 +1772,7 @@ pub struct PaperTradingService<B> {
     risk_policy: PaperRiskPolicy,
     kill_switches: KillSwitchRegistry,
     broker: B,
+    broker_route_fingerprint: String,
     broker_connected: bool,
     cash: Decimal,
     orders: BTreeMap<String, PaperOrder>,
@@ -1450,12 +1799,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     ) -> Result<Self, PaperError> {
         account.validate()?;
         risk_policy.validate()?;
+        let broker_route_fingerprint = broker.configuration_fingerprint(&account.account_id)?;
         Ok(Self {
             cash: account.initial_cash,
             account,
             risk_policy,
             kill_switches,
             broker,
+            broker_route_fingerprint,
             broker_connected: true,
             orders: BTreeMap::new(),
             risk_evidence: BTreeMap::new(),
@@ -1482,6 +1833,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     ) -> Result<Self, PaperError> {
         let journal = FilePaperJournal::open(journal_path)?;
         let latest = journal.latest().cloned();
+        if latest.is_none() && !broker.permits_empty_journal(&account.account_id) {
+            return Err(PaperError(
+                "legacy PAPER adapter routing may only reopen an existing journal".to_owned(),
+            ));
+        }
         let mut service = Self::new(account, risk_policy, kill_switches, broker)?;
         if let Some(state) = latest {
             service.restore(state)?;
@@ -1732,7 +2088,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.order_mut(order_id)?
             .oms
             .transition(OrderState::PendingCancel, "PAPER_CANCEL_REQUESTED")?;
-        if let Err(error) = self.broker.cancel(order_id) {
+        let cancel = BrokerCancelRequest {
+            account_id: self.account.account_id.clone(),
+            client_order_id: order_id.to_owned(),
+        };
+        if let Err(error) = self.broker.cancel(&cancel) {
             self.order_mut(order_id)?
                 .oms
                 .transition(OrderState::Unknown, "PAPER_CANCEL_OUTCOME_UNKNOWN")?;
@@ -1789,6 +2149,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 .oms
                 .transition(OrderState::PendingReplace, "PAPER_REPLACE_REQUESTED")?;
             BrokerReplaceRequest {
+                account_id: order.oms.intent.account_id.clone(),
                 client_order_id: order.oms.order_id.clone(),
                 previous_broker_order_id,
                 limit_price: replacement_limit_price,
@@ -1813,7 +2174,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 "paper broker session is disconnected".to_owned(),
             ));
         }
-        let events = match self.broker.poll() {
+        let events = match self.broker.poll(&self.account.account_id) {
             Ok(events) => events,
             Err(error) => {
                 self.broker_connected = false;
@@ -1838,7 +2199,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         reconciled_at: &str,
     ) -> Result<ReconciliationReport, PaperError> {
         self.ensure_persistence_healthy()?;
-        if let Err(error) = self.broker.reconnect() {
+        if let Err(error) = self.broker.reconnect(&self.account.account_id) {
             self.broker_connected = false;
             self.persist()?;
             return Err(error);
@@ -2970,7 +3331,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         let max_position_quantity = self.risk_policy.max_position_quantity.to_string();
         let max_realized_loss = self.risk_policy.max_realized_loss.to_string();
         let max_market_data_age_seconds = self.risk_policy.max_market_data_age_seconds.to_string();
-        hash_fingerprint_parts(&[
+        let mut parts = vec![
             "paper-configuration-v2",
             &self.account.account_id,
             &self.account.currency,
@@ -2986,7 +3347,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             &max_realized_loss,
             &max_market_data_age_seconds,
             &self.kill_switches.version,
-        ])
+        ];
+        if !self.broker_route_fingerprint.is_empty() {
+            parts.push("paper-broker-route-fingerprint-v1");
+            parts.push(&self.broker_route_fingerprint);
+        }
+        hash_fingerprint_parts(&parts)
     }
 
     fn unexplained_incident_count(&self) -> u32 {
@@ -3451,6 +3817,66 @@ mod tests {
         .unwrap()
     }
 
+    fn broker_registry() -> PaperBrokerRegistry {
+        let account = account();
+        let second_account = PaperAccount {
+            account_id: "acct.paper.002".to_owned(),
+            currency: "USD".to_owned(),
+            initial_cash: decimal("initial cash", "25000").unwrap(),
+            environment: "PAPER".to_owned(),
+        };
+        let mut registry = PaperBrokerRegistry::new();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: second_account.account_id.clone(),
+                    adapter_id: "adapter.ibkr.paper.002".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(IbkrPaperAdapter::new(&second_account).unwrap()),
+            )
+            .unwrap();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: account.account_id.clone(),
+                    adapter_id: "adapter.ibkr.paper.001".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(IbkrPaperAdapter::new(&account).unwrap()),
+            )
+            .unwrap();
+        registry
+    }
+
+    fn registry_service() -> PaperTradingService<PaperBrokerRegistry> {
+        PaperTradingService::new(
+            account(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            broker_registry(),
+        )
+        .unwrap()
+    }
+
+    fn modern_registry(account: &PaperAccount, venue_id: &str) -> PaperBrokerRegistry {
+        let mut registry = PaperBrokerRegistry::new();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: account.account_id.clone(),
+                    adapter_id: format!("adapter.ibkr.paper.{}", account.account_id),
+                    venue_id: venue_id.to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(IbkrPaperAdapter::new(account).unwrap()),
+            )
+            .unwrap();
+        registry
+    }
+
     fn intent(intent_id: &str, created_at: &str) -> OrderIntent {
         OrderIntent {
             intent_id: intent_id.to_owned(),
@@ -3521,11 +3947,11 @@ mod tests {
             Err(PaperError("not used by reconciliation test".to_owned()))
         }
 
-        fn cancel(&mut self, _client_order_id: &str) -> Result<(), PaperError> {
+        fn cancel(&mut self, _request: &BrokerCancelRequest) -> Result<(), PaperError> {
             Err(PaperError("not used by reconciliation test".to_owned()))
         }
 
-        fn poll(&mut self) -> Result<Vec<BrokerEvent>, PaperError> {
+        fn poll(&mut self, _account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
             Ok(Vec::new())
         }
 
@@ -3540,7 +3966,7 @@ mod tests {
             })
         }
 
-        fn reconnect(&mut self) -> Result<(), PaperError> {
+        fn reconnect(&mut self, _account_id: &str) -> Result<(), PaperError> {
             Ok(())
         }
     }
@@ -3588,6 +4014,195 @@ mod tests {
         assert_eq!(dashboard.working_orders, 0);
         assert_eq!(dashboard.positions[0].quantity, "1.00000000");
         assert_eq!(dashboard.clean_paper_days, 1);
+    }
+
+    #[test]
+    fn paper_broker_registry_keeps_submission_behind_oms_risk() {
+        let mut service = registry_service();
+        assert_eq!(
+            service
+                .broker_mut()
+                .routes()
+                .into_iter()
+                .map(|route| route.account_id)
+                .collect::<Vec<_>>(),
+            vec!["acct.paper.001".to_owned(), "acct.paper.002".to_owned()]
+        );
+        let first_route_fingerprint = service
+            .broker_mut()
+            .configuration_fingerprint("acct.paper.001")
+            .unwrap();
+        let second_route_fingerprint = service
+            .broker_mut()
+            .configuration_fingerprint("acct.paper.002")
+            .unwrap();
+        assert_ne!(first_route_fingerprint, second_route_fingerprint);
+        let submitted = service
+            .submit_intent(
+                intent("intent-paper-registry", "2026-01-02T14:31:00Z"),
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        assert!(submitted.decision.approved);
+        assert_eq!(submitted.state, Some(OrderState::Acknowledged));
+        assert_eq!(service.synchronize().unwrap(), 1);
+    }
+
+    #[test]
+    fn paper_broker_registry_is_account_isolated_and_refuses_invalid_routes() {
+        let mut registry = broker_registry();
+        let request = BrokerOrderRequest {
+            client_order_id: "shared.client.order".to_owned(),
+            account_id: "acct.paper.001".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side: Side::Buy,
+            quantity: decimal("quantity", "1").unwrap(),
+            limit_price: None,
+        };
+        assert!(matches!(
+            registry.submit(&request).unwrap(),
+            BrokerSubmitResult::Acknowledged { .. }
+        ));
+        let second_submit = registry
+            .submit(&BrokerOrderRequest {
+                account_id: "acct.paper.002".to_owned(),
+                ..request.clone()
+            })
+            .unwrap();
+        assert!(matches!(
+            second_submit,
+            BrokerSubmitResult::Acknowledged { .. }
+        ));
+        registry
+            .cancel(&BrokerCancelRequest {
+                account_id: "acct.paper.001".to_owned(),
+                client_order_id: request.client_order_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(registry.poll("acct.paper.001").unwrap().len(), 2);
+        assert_eq!(registry.poll("acct.paper.002").unwrap().len(), 1);
+        assert!(registry
+            .submit(&BrokerOrderRequest {
+                account_id: "acct.paper.404".to_owned(),
+                ..request
+            })
+            .is_err());
+        let duplicate_account = account();
+        assert!(registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: duplicate_account.account_id.clone(),
+                    adapter_id: "adapter.ibkr.paper.duplicate".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(IbkrPaperAdapter::new(&duplicate_account).unwrap()),
+            )
+            .is_err());
+        assert!(registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: "acct.paper.003".to_owned(),
+                    adapter_id: "adapter.unfingerprinted.paper.003".to_owned(),
+                    venue_id: "venue.unfingerprinted.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(CashAndPositionMismatchBroker),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn legacy_single_account_journal_reopens_through_registry_without_rewriting_evidence() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-registry-migration-{}.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&journal_path);
+        let paper_account = account();
+        let mut legacy_service = PaperTradingService::open_durable(
+            paper_account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&paper_account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        legacy_service
+            .activate_kill_switch(KillSwitchScope::Global)
+            .unwrap();
+        drop(legacy_service);
+
+        let mut registry = PaperBrokerRegistry::new();
+        registry
+            .register_legacy_ibkr_paper_route(&paper_account)
+            .unwrap();
+        let recovered = PaperTradingService::open_durable(
+            paper_account,
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            registry,
+            &journal_path,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.kill_switches().active_keys(),
+            vec!["global".to_owned()]
+        );
+        drop(recovered);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn legacy_registry_refuses_empty_journals_and_modern_route_changes_fail_recovery() {
+        let legacy_path = std::env::temp_dir().join(format!(
+            "follon-paper-legacy-empty-{}.ndjson",
+            std::process::id()
+        ));
+        let modern_path = std::env::temp_dir().join(format!(
+            "follon-paper-route-mismatch-{}.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&legacy_path);
+        let _ = fs::remove_file(&modern_path);
+        let paper_account = account();
+
+        let mut legacy_registry = PaperBrokerRegistry::new();
+        legacy_registry
+            .register_legacy_ibkr_paper_route(&paper_account)
+            .unwrap();
+        assert!(PaperTradingService::open_durable(
+            paper_account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            legacy_registry,
+            &legacy_path,
+        )
+        .is_err());
+
+        let mut modern_service = PaperTradingService::open_durable(
+            paper_account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            modern_registry(&paper_account, "venue.ibkr.paper"),
+            &modern_path,
+        )
+        .unwrap();
+        modern_service
+            .activate_kill_switch(KillSwitchScope::Global)
+            .unwrap();
+        drop(modern_service);
+        assert!(PaperTradingService::open_durable(
+            paper_account,
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            modern_registry(&account(), "venue.ibkr.paper.changed"),
+            &modern_path,
+        )
+        .is_err());
+        let _ = fs::remove_file(&legacy_path);
+        let _ = fs::remove_file(&modern_path);
     }
 
     #[test]

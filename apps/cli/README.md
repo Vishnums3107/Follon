@@ -108,7 +108,7 @@ intent fails the backtest before it can be treated as a decision artifact.
 versioned configuration, and writes an immutable read-only dashboard snapshot:
 
 ```powershell
-cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-dashboard.json --config tests/fixtures/config/paper-v1.json
+cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-dashboard.json --config tests/fixtures/config/paper-v2.json
 ```
 
 The command accepts no live environment, endpoint, or credential option. A
@@ -116,8 +116,8 @@ local operator can persist one independent emergency control in the same
 durable journal while obtaining a refreshed dashboard:
 
 ```powershell
-cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-kill-active.json --config tests/fixtures/config/paper-v1.json --activate global
-cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-kill-cleared.json --config tests/fixtures/config/paper-v1.json --deactivate global
+cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-kill-active.json --config tests/fixtures/config/paper-v2.json --activate global
+cargo run -p follon-cli --bin follon-paper-status -- var/follon-paper.journal.ndjson var/follon-paper-kill-cleared.json --config tests/fixtures/config/paper-v2.json --deactivate global
 ```
 
 Supported scopes are `global`, `account:<canonical-id>`,
@@ -127,6 +127,13 @@ capability; the command is intentionally independent of broker availability.
 Because a control action changes the dashboard, it requires an unused immutable
 output path and refuses to mutate the journal if that evidence path already
 exists.
+
+Configuration v2 is the default and explicitly binds the current reviewed
+`adapter.ibkr.paper.*` / `venue.ibkr.paper` route into the journal fingerprint.
+V1 is accepted only to reopen an existing unchanged legacy IBKR PAPER journal;
+it cannot initialize a journal or describe a new route. After a clean final
+reconciliation with no working or `UNKNOWN` order, retain the v1 journal as
+immutable evidence and begin a separately named v2 journal.
 
 ## Deterministic operations workbench
 
