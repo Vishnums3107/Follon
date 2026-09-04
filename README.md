@@ -35,7 +35,7 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
 ## Implemented foundation
 
 - Fixed-point Rust domain types, immutable canonical event envelopes, and
-  effective-dated instrument reference data.
+  effective-dated equity, option, futures, and FX reference data.
 - Historical-bar CSV import, explicit replay clock and exchange-session model,
   canonical timestamp/order validation, append-only local NDJSON event storage,
   deterministic risk/OMS/simulator, and cumulative portfolio evidence flow.

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use follon_domain::{validate_canonical_id, Decimal, Side};
+use follon_fx::{FxPricingSnapshot, FxValueDate};
 
 /// Aggregate risk evaluation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +165,106 @@ impl CandidateOrder {
             Side::Buy => Ok(unsigned),
             Side::Sell => negate(unsigned),
         }
+    }
+}
+
+/// Identifiers and bucket selection for one FX candidate created from frozen pricing evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FxRiskOrderIdentity {
+    /// Stable intent identity.
+    pub intent_id: String,
+    /// Target account identity.
+    pub account_id: String,
+    /// Originating strategy identity.
+    pub strategy_id: String,
+    /// Canonical target FX instrument identity.
+    pub instrument_id: String,
+    /// Stable risk sector, normally `fx`.
+    pub sector: String,
+}
+
+/// Explicit replay-time context for selecting an FX risk mark.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FxRiskPricingContext {
+    /// Contract value date selected for the mark.
+    pub value_date: FxValueDate,
+    /// Explicit risk-evaluation timestamp from the replay or request context.
+    pub as_of: String,
+    /// Maximum accepted source-receive age.
+    pub maximum_quote_age_seconds: i64,
+}
+
+/// A generic risk candidate with the exact FX price evidence that created it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FxRiskCandidate {
+    /// Candidate supplied to the ordinary portfolio risk evaluator.
+    pub candidate: CandidateOrder,
+    /// Immutable market-data snapshot used to derive the candidate mark.
+    pub pricing_snapshot_id: String,
+    /// Immutable pricing/reference contract version.
+    pub pricing_reference_version: String,
+    /// Contract value date selected for the mark.
+    pub value_date: FxValueDate,
+}
+
+impl FxRiskCandidate {
+    /// Creates a candidate from an explicit-time FX price snapshot.
+    ///
+    /// The result contains no order transport. It must still be supplied to
+    /// [`evaluate_portfolio_risk`] and then enter the normal Risk/OMS flow.
+    pub fn from_pricing_snapshot(
+        identity: FxRiskOrderIdentity,
+        snapshot: &FxPricingSnapshot,
+        side: Side,
+        quantity: Decimal,
+        multiplier: Decimal,
+        pricing: FxRiskPricingContext,
+    ) -> Result<Self, RiskError> {
+        snapshot.validate().map_err(|error| RiskError(error.0))?;
+        if identity.instrument_id != snapshot.instrument_id {
+            return Err(RiskError(
+                "FX risk candidate instrument does not match pricing evidence".to_owned(),
+            ));
+        }
+        let mark_price = snapshot
+            .midpoint_at(
+                &pricing.value_date,
+                &pricing.as_of,
+                pricing.maximum_quote_age_seconds,
+            )
+            .map_err(|error| RiskError(error.0))?;
+        if quantity <= Decimal::ZERO || multiplier <= Decimal::ZERO {
+            return Err(RiskError(
+                "FX risk candidate quantity and multiplier must be positive".to_owned(),
+            ));
+        }
+        let absolute_delta = quantity.checked_mul(multiplier)?;
+        let delta = match side {
+            Side::Buy => absolute_delta,
+            Side::Sell => negate(absolute_delta)?,
+        };
+        let candidate = CandidateOrder {
+            intent_id: identity.intent_id,
+            account_id: identity.account_id,
+            strategy_id: identity.strategy_id,
+            instrument_id: identity.instrument_id,
+            asset_class: snapshot.product.risk_bucket().to_owned(),
+            sector: identity.sector,
+            currency: snapshot.pair.quote_currency().to_owned(),
+            side,
+            quantity,
+            mark_price,
+            multiplier,
+            delta,
+            gamma: Decimal::ZERO,
+        };
+        candidate.validate()?;
+        Ok(Self {
+            candidate,
+            pricing_snapshot_id: snapshot.snapshot_id.clone(),
+            pricing_reference_version: snapshot.reference_version.clone(),
+            value_date: pricing.value_date,
+        })
     }
 }
 
@@ -618,6 +719,8 @@ fn negate(value: Decimal) -> Result<Decimal, RiskError> {
 mod tests {
     use std::str::FromStr;
 
+    use follon_fx::{FxOutrightQuote, FxPair, FxPriceTerms, FxProduct};
+
     use super::*;
 
     fn amount(value: &str) -> Decimal {
@@ -663,6 +766,27 @@ mod tests {
             multiplier: amount("1"),
             delta: amount(quantity),
             gamma: Decimal::ZERO,
+        }
+    }
+
+    fn fx_spot_snapshot() -> FxPricingSnapshot {
+        FxPricingSnapshot {
+            snapshot_id: "fx.snapshot.001".to_owned(),
+            reference_version: "fx.price.v1".to_owned(),
+            instrument_id: "instrument.fx.eur-usd".to_owned(),
+            product: FxProduct::Spot,
+            pair: FxPair::new("EUR", "USD").unwrap(),
+            terms: FxPriceTerms::Outright {
+                value_date: FxValueDate::new("2026-01-06").unwrap(),
+                quote: FxOutrightQuote {
+                    bid: amount("1.1000"),
+                    ask: amount("1.1002"),
+                },
+            },
+            source_id: "source.fixture".to_owned(),
+            source_sequence: 1,
+            source_time: "2026-01-02T10:00:00Z".to_owned(),
+            received_at: "2026-01-02T10:00:01Z".to_owned(),
         }
     }
 
@@ -770,5 +894,78 @@ mod tests {
         .expect("reasons");
         assert!(shock_reasons.contains(&"NEWS_SLIPPAGE_EXCEEDED".to_owned()));
         assert!(shock_reasons.contains(&"LIQUIDITY_HOLE_DETECTED".to_owned()));
+    }
+
+    #[test]
+    fn fx_candidate_uses_frozen_price_evidence_and_normal_risk_policy() {
+        let snapshot = fx_spot_snapshot();
+        let candidate = FxRiskCandidate::from_pricing_snapshot(
+            FxRiskOrderIdentity {
+                intent_id: "intent.fx.001".to_owned(),
+                account_id: "account.paper.001".to_owned(),
+                strategy_id: "strategy.fx.alpha".to_owned(),
+                instrument_id: "instrument.fx.eur-usd".to_owned(),
+                sector: "fx".to_owned(),
+            },
+            &snapshot,
+            Side::Buy,
+            amount("10"),
+            amount("1"),
+            FxRiskPricingContext {
+                value_date: FxValueDate::new("2026-01-06").unwrap(),
+                as_of: "2026-01-02T10:00:03Z".to_owned(),
+                maximum_quote_age_seconds: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(candidate.candidate.asset_class, "fx_spot");
+        assert_eq!(candidate.candidate.currency, "USD");
+        assert_eq!(candidate.candidate.mark_price, amount("1.1001"));
+        assert_eq!(candidate.candidate.delta, amount("10"));
+
+        let mut fx_limited_policy = policy();
+        fx_limited_policy.asset_class_limits =
+            BTreeMap::from([("fx_spot".to_owned(), amount("10"))]);
+        let decision = evaluate_portfolio_risk(
+            &fx_limited_policy,
+            &PortfolioRiskSnapshot {
+                equity: amount("50000"),
+                peak_equity: amount("50000"),
+                daily_pnl: Decimal::ZERO,
+                margin_used: Decimal::ZERO,
+                positions: vec![],
+                resting_orders: vec![],
+                recent_order_count: 0,
+            },
+            Some(&candidate.candidate),
+        )
+        .unwrap();
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"ASSET_CLASS_LIMIT_EXCEEDED:fx_spot".to_owned()));
+
+        assert!(FxRiskCandidate::from_pricing_snapshot(
+            FxRiskOrderIdentity {
+                instrument_id: "instrument.fx.other".to_owned(),
+                ..FxRiskOrderIdentity {
+                    intent_id: "intent.fx.002".to_owned(),
+                    account_id: "account.paper.001".to_owned(),
+                    strategy_id: "strategy.fx.alpha".to_owned(),
+                    instrument_id: "instrument.fx.eur-usd".to_owned(),
+                    sector: "fx".to_owned(),
+                }
+            },
+            &snapshot,
+            Side::Buy,
+            amount("1"),
+            amount("1"),
+            FxRiskPricingContext {
+                value_date: FxValueDate::new("2026-01-06").unwrap(),
+                as_of: "2026-01-02T10:00:03Z".to_owned(),
+                maximum_quote_age_seconds: 5,
+            },
+        )
+        .is_err());
     }
 }

@@ -14,6 +14,12 @@ compatibility notes and deterministic serialization tests. Runtime
 configuration rejects unknown fields and is content-addressed from its exact
 bytes.
 
+`json-schema/v1/fx-pricing-snapshot.schema.json` is the `fx.price.v1`
+interchange shape for value-dated FX spot, forward, and swap observations. It
+does not imply a vendor connection or an executable FX route; a source adapter
+must still normalize and retain its evidence before the shared Risk/OMS path
+can consider a resulting declarative intent.
+
 ## PAPER configuration v2 migration
 
 `json-schema/v2/paper-configuration.schema.json` adds a required, non-secret

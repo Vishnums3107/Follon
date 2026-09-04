@@ -4,6 +4,7 @@ members = [
     "core/execution",
     "core/risk",
     "core/accounting",
+    "core/fx",
     "core/identity",
     "core/instrument",
     "core/market-data",

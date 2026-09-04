@@ -1,5 +1,5 @@
 [package]
-name = "follon-risk"
+name = "follon-fx"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 
 [dependencies]
 follon-domain = { path = "../domain" }
-follon-fx = { path = "../fx" }
+time = { version = "0.3.44", features = ["parsing"] }
 
 [lib]
 path = "src/lib.rs"
