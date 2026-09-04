@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, DomainError};
+use follon_fx::{FxPair, FxValueDate};
 
 /// Asset classes accepted by canonical reference-data contracts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +19,12 @@ pub enum AssetClass {
     Option,
     /// Listed future with complete contract/settlement economics.
     Future,
+    /// FX spot contract for a specific currency pair.
+    FxSpot,
+    /// Single-date FX forward contract.
+    FxForward,
+    /// Two-date FX swap contract.
+    FxSwap,
 }
 
 impl AssetClass {
@@ -28,6 +35,9 @@ impl AssetClass {
             Self::Etf => "ETF",
             Self::Option => "OPTION",
             Self::Future => "FUTURE",
+            Self::FxSpot => "FX_SPOT",
+            Self::FxForward => "FX_FORWARD",
+            Self::FxSwap => "FX_SWAP",
         }
     }
 }
@@ -154,6 +164,29 @@ pub enum InstrumentEconomics {
         /// Canonical margin class selected by the clearing configuration.
         margin_class: String,
     },
+    /// Settlement terms for a spot FX pair.
+    FxSpot {
+        /// Canonical base/quote pair.  The instrument currency is the quote currency.
+        pair: FxPair,
+        /// Number of business days from trade date to contractual value date.
+        settlement_business_days: u8,
+    },
+    /// Settlement terms for a single-date FX forward.
+    FxForward {
+        /// Canonical base/quote pair.  The instrument currency is the quote currency.
+        pair: FxPair,
+        /// Contractual forward value date.
+        value_date: FxValueDate,
+    },
+    /// Settlement terms for an FX swap's near and far exchanges.
+    FxSwap {
+        /// Canonical base/quote pair.  The instrument currency is the quote currency.
+        pair: FxPair,
+        /// Earlier near-leg value date.
+        near_value_date: FxValueDate,
+        /// Later far-leg value date.
+        far_value_date: FxValueDate,
+    },
 }
 
 impl InstrumentEconomics {
@@ -201,6 +234,50 @@ impl InstrumentEconomics {
                     return Err(DomainError(
                         "future last trade cannot follow expiration".to_owned(),
                     ));
+                }
+                Ok(())
+            }
+            (
+                AssetClass::FxSpot,
+                Self::FxSpot {
+                    pair,
+                    settlement_business_days,
+                },
+            ) => {
+                pair.validate().map_err(|error| DomainError(error.0))?;
+                if pair.quote_currency() != instrument.currency || *settlement_business_days > 5 {
+                    return Err(DomainError("invalid FX spot economics".to_owned()));
+                }
+                Ok(())
+            }
+            (AssetClass::FxForward, Self::FxForward { pair, value_date }) => {
+                pair.validate().map_err(|error| DomainError(error.0))?;
+                value_date
+                    .validate()
+                    .map_err(|error| DomainError(error.0))?;
+                if pair.quote_currency() != instrument.currency {
+                    return Err(DomainError("invalid FX forward economics".to_owned()));
+                }
+                Ok(())
+            }
+            (
+                AssetClass::FxSwap,
+                Self::FxSwap {
+                    pair,
+                    near_value_date,
+                    far_value_date,
+                },
+            ) => {
+                pair.validate().map_err(|error| DomainError(error.0))?;
+                near_value_date
+                    .validate()
+                    .map_err(|error| DomainError(error.0))?;
+                far_value_date
+                    .validate()
+                    .map_err(|error| DomainError(error.0))?;
+                if pair.quote_currency() != instrument.currency || near_value_date >= far_value_date
+                {
+                    return Err(DomainError("invalid FX swap economics".to_owned()));
                 }
                 Ok(())
             }
@@ -674,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_reference_data_validates_options_futures_and_settlement() {
+    fn complete_reference_data_validates_options_futures_fx_and_settlement() {
         let mut option = version("2026-01-01T00:00:00Z", None, "SPY260320C00500000").instrument;
         option.instrument_id = "instrument.spy-option".to_owned();
         option.asset_class = AssetClass::Option;
@@ -718,5 +795,87 @@ mod tests {
             },
         };
         complete.validate().expect("complete future reference");
+
+        let mut spot = version("2026-01-01T00:00:00Z", None, "EURUSD").instrument;
+        spot.instrument_id = "instrument.fx.eur-usd.spot".to_owned();
+        spot.asset_class = AssetClass::FxSpot;
+        spot.venue = "venue.fx.otc".to_owned();
+        spot.currency = "USD".to_owned();
+        spot.tick_size = Decimal::from_str("0.00001").unwrap();
+        spot.lot_size = Decimal::from_integer(1).unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: spot,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference.fx.spot.1".to_owned(),
+            },
+            economics: InstrumentEconomics::FxSpot {
+                pair: FxPair::new("EUR", "USD").unwrap(),
+                settlement_business_days: 2,
+            },
+        };
+        complete.validate().expect("complete FX spot reference");
+
+        let mut forward = version("2026-01-01T00:00:00Z", None, "EURUSD-1M").instrument;
+        forward.instrument_id = "instrument.fx.eur-usd.forward.20260206".to_owned();
+        forward.asset_class = AssetClass::FxForward;
+        forward.venue = "venue.fx.otc".to_owned();
+        forward.currency = "USD".to_owned();
+        forward.tick_size = Decimal::from_str("0.00001").unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: forward,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference.fx.forward.1".to_owned(),
+            },
+            economics: InstrumentEconomics::FxForward {
+                pair: FxPair::new("EUR", "USD").unwrap(),
+                value_date: FxValueDate::new("2026-02-06").unwrap(),
+            },
+        };
+        complete.validate().expect("complete FX forward reference");
+
+        let mut swap = version("2026-01-01T00:00:00Z", None, "EURUSD-SWAP").instrument;
+        swap.instrument_id = "instrument.fx.eur-usd.swap.20260106-20260206".to_owned();
+        swap.asset_class = AssetClass::FxSwap;
+        swap.venue = "venue.fx.otc".to_owned();
+        swap.currency = "USD".to_owned();
+        swap.tick_size = Decimal::from_str("0.00001").unwrap();
+        let complete = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument: swap,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference.fx.swap.1".to_owned(),
+            },
+            economics: InstrumentEconomics::FxSwap {
+                pair: FxPair::new("EUR", "USD").unwrap(),
+                near_value_date: FxValueDate::new("2026-01-06").unwrap(),
+                far_value_date: FxValueDate::new("2026-02-06").unwrap(),
+            },
+        };
+        complete.validate().expect("complete FX swap reference");
+    }
+
+    #[test]
+    fn fx_reference_rejects_quote_currency_mismatch() {
+        let mut instrument = version("2026-01-01T00:00:00Z", None, "EURUSD").instrument;
+        instrument.asset_class = AssetClass::FxSpot;
+        instrument.currency = "EUR".to_owned();
+        let invalid = CompleteInstrumentVersion {
+            reference: InstrumentVersion {
+                instrument,
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference.fx.invalid.1".to_owned(),
+            },
+            economics: InstrumentEconomics::FxSpot {
+                pair: FxPair::new("EUR", "USD").unwrap(),
+                settlement_business_days: 2,
+            },
+        };
+        assert!(invalid.validate().is_err());
     }
 }

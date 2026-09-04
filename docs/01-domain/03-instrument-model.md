@@ -8,12 +8,16 @@ The instrument service owns a canonical identity for every tradable product. Sym
 | --- | --- |
 | Identity | Internal instrument ID, symbol, exchange symbol, broker-specific IDs, asset class, venue, currency |
 | Trading rules | Tick size, lot size, multiplier, trading calendar, market sessions, settlement rules |
-| Derivative terms | Expiry, strike, option right, contract specification |
+| Derivative terms | Expiry, strike, option right, contract specification, FX base/quote pair and explicit value date(s) |
 | History | Corporate-action history and version-effective reference-data changes |
 
 ## Initial boundary
 
-Implement the fields required for US equities and ETFs first. Preserve nullable extension points for options and futures, but do not add option-chain behaviour until Release 2.
+The active operating boundary remains US equities and ETFs. The deterministic
+reference core also validates listed options/futures and FX spot/forward/swap
+economics for replay and evidence work. Those contracts do not configure a
+tradable broker route, market-data vendor, custody arrangement, or live asset
+class.
 
 ## Invariants
 
