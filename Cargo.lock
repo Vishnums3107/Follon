@@ -384,6 +384,7 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "follon-domain",
+ "follon-fx",
  "serde",
 ]
 
@@ -465,6 +466,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "follon-fx"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "time",
+]
+
+[[package]]
 name = "follon-ibkr-paper-adapter"
 version = "0.1.0"
 dependencies = [
@@ -494,6 +503,7 @@ name = "follon-instrument"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "follon-fx",
 ]
 
 [[package]]
@@ -580,6 +590,7 @@ name = "follon-risk"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "follon-fx",
 ]
 
 [[package]]

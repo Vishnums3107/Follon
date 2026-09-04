@@ -35,6 +35,7 @@ decision changes.
 - [Storage and protocols](02-architecture/02-storage-and-protocols.md) — persistence and wire protocols.
 - [Repository guide](02-architecture/03-repository-guide.md) — repository ownership and layout.
 - [ADR 0001: modular monolith](02-architecture/adr/0001-modular-monolith.md) — accepted architecture decision.
+- [ADR 0002: deterministic FX core](02-architecture/adr/0002-deterministic-fx-core.md) — value-dated FX pricing boundary.
 
 ### 03-capabilities — behavioural requirements for the trading kernel
 - [Market data and replay](03-capabilities/01-market-data-and-replay.md)

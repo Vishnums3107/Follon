@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
+use follon_fx::{FxPricingSnapshot, FxProduct, FxValueDate};
 
 /// Accounting or valuation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +200,37 @@ impl FxBook {
         self.quotes
             .insert((quote.base.clone(), quote.quote.clone()), quote);
         Ok(())
+    }
+
+    /// Imports a fresh deterministic **spot** midpoint for cash conversion.
+    ///
+    /// Forward and swap marks remain contract-specific position prices and are
+    /// deliberately not inserted into this generic cash-conversion book. This
+    /// prevents a caller from silently treating a dated contract as spot.
+    pub fn upsert_spot_pricing_snapshot(
+        &mut self,
+        snapshot: &FxPricingSnapshot,
+        value_date: &FxValueDate,
+        as_of: &str,
+        maximum_age_seconds: i64,
+    ) -> Result<(), AccountingError> {
+        if snapshot.product != FxProduct::Spot {
+            return Err(AccountingError(
+                "only FX spot snapshots may populate the cash conversion book".to_owned(),
+            ));
+        }
+        let quote_rate = snapshot
+            .midpoint_at(value_date, as_of, maximum_age_seconds)
+            .map_err(|error| AccountingError(error.0))?;
+        let observed_at_epoch_seconds = snapshot
+            .received_at_epoch_seconds()
+            .map_err(|error| AccountingError(error.0))?;
+        self.upsert(FxQuote {
+            base: Currency::new(snapshot.pair.base_currency())?,
+            quote: Currency::new(snapshot.pair.quote_currency())?,
+            quote_rate,
+            observed_at_epoch_seconds,
+        })
     }
 
     /// Converts an amount and fails if no fresh direct or inverse rate exists.
@@ -932,6 +964,8 @@ pub fn accrue_financing(
 mod tests {
     use std::str::FromStr;
 
+    use follon_fx::{FxOutrightQuote, FxPair, FxPriceTerms};
+
     use super::*;
 
     fn amount(value: &str) -> Decimal {
@@ -940,6 +974,27 @@ mod tests {
 
     fn currency(value: &str) -> Currency {
         Currency::new(value).expect("currency")
+    }
+
+    fn spot_snapshot() -> FxPricingSnapshot {
+        FxPricingSnapshot {
+            snapshot_id: "fx.snapshot.001".to_owned(),
+            reference_version: "fx.price.v1".to_owned(),
+            instrument_id: "instrument.fx.eur-usd".to_owned(),
+            product: FxProduct::Spot,
+            pair: FxPair::new("EUR", "USD").unwrap(),
+            terms: FxPriceTerms::Outright {
+                value_date: FxValueDate::new("2026-01-06").unwrap(),
+                quote: FxOutrightQuote {
+                    bid: amount("1.1000"),
+                    ask: amount("1.1002"),
+                },
+            },
+            source_id: "source.fixture".to_owned(),
+            source_sequence: 1,
+            source_time: "2026-01-02T10:00:00Z".to_owned(),
+            received_at: "2026-01-02T10:00:01Z".to_owned(),
+        }
     }
 
     #[test]
@@ -1087,6 +1142,38 @@ mod tests {
         })
         .unwrap();
         assert!(value_margin_account(&cash, &[], &fx, &policy, 20).is_err());
+    }
+
+    #[test]
+    fn accounting_accepts_only_fresh_spot_pricing_for_cash_conversion() {
+        let snapshot = spot_snapshot();
+        let date = FxValueDate::new("2026-01-06").unwrap();
+        let mut book = FxBook::default();
+        book.upsert_spot_pricing_snapshot(&snapshot, &date, "2026-01-02T10:00:03Z", 5)
+            .unwrap();
+        let observed = snapshot.received_at_epoch_seconds().unwrap();
+        assert_eq!(
+            book.convert(
+                amount("10"),
+                &currency("EUR"),
+                &currency("USD"),
+                observed + 2,
+                5,
+            )
+            .unwrap(),
+            amount("11.001")
+        );
+        assert!(book
+            .upsert_spot_pricing_snapshot(&snapshot, &date, "2026-01-02T10:00:07Z", 5)
+            .is_err());
+
+        let forward = FxPricingSnapshot {
+            product: FxProduct::Forward,
+            ..snapshot
+        };
+        assert!(book
+            .upsert_spot_pricing_snapshot(&forward, &date, "2026-01-02T10:00:03Z", 5,)
+            .is_err());
     }
 
     #[test]
