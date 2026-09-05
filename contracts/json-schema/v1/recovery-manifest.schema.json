@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/recovery-manifest.schema.json",
+  "title": "Follon Recovery Manifest Contract v1",
+  "description": "Schema for verifiable recovery capsules and restore drills (LIFE-01, LIFE-02).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "recovery_manifest_schema_version",
+    "manifest_id",
+    "release_id",
+    "generated_at",
+    "schema_checksums",
+    "configuration_hashes",
+    "backup_checksums",
+    "key_recovery_reference",
+    "restore_procedure_ref",
+    "last_drill"
+  ],
+  "properties": {
+    "recovery_manifest_schema_version": { "const": 1 },
+    "manifest_id": { "$ref": "#/$defs/canonicalId" },
+    "release_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "schema_checksums": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_name", "sha256"],
+        "properties": {
+          "schema_name": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      },
+      "minItems": 1
+    },
+    "configuration_hashes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["configuration_name", "sha256"],
+        "properties": {
+          "configuration_name": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "backup_checksums": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["destination", "checksum_sha256", "bytes"],
+        "properties": {
+          "destination": { "type": "string", "minLength": 1 },
+          "checksum_sha256": { "$ref": "#/$defs/sha256" },
+          "bytes": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "minItems": 1
+    },
+    "key_recovery_reference": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier or sealed reference to key recovery material; must not contain plaintext secrets"
+    },
+    "restore_procedure_ref": { "type": "string", "minLength": 1 },
+    "last_drill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["drill_at", "rto_seconds_measured", "rpo_seconds_measured", "result"],
+      "properties": {
+        "drill_at": { "type": "string", "format": "date-time" },
+        "rto_seconds_measured": { "type": "integer", "minimum": 0 },
+        "rpo_seconds_measured": { "type": "integer", "minimum": 0 },
+        "result": { "type": "string", "enum": ["PASSED", "FAILED"] }
+      }
+    }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

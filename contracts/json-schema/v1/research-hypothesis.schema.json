@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/research-hypothesis.schema.json",
+  "title": "Follon Research Hypothesis Contract v1",
+  "description": "Schema for frozen research hypotheses and evaluation plans (RES-01).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "hypothesis_schema_version",
+    "hypothesis_id",
+    "title",
+    "mechanism",
+    "universe",
+    "evaluation_horizon",
+    "assumptions",
+    "failure_criteria",
+    "frozen_evaluation_plan",
+    "predecessor_id",
+    "status",
+    "created_at",
+    "frozen_at"
+  ],
+  "properties": {
+    "hypothesis_schema_version": { "const": 1 },
+    "hypothesis_id": { "$ref": "#/$defs/canonicalId" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "mechanism": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "universe": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/canonicalId" },
+      "minItems": 1
+    },
+    "evaluation_horizon": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_time", "end_time", "holding_period"],
+      "properties": {
+        "start_time": { "type": "string", "format": "date-time" },
+        "end_time": { "type": "string", "format": "date-time" },
+        "holding_period": { "type": "string", "minLength": 1 }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "failure_criteria": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "frozen_evaluation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataset_id",
+        "dataset_version",
+        "dataset_hash",
+        "cost_model",
+        "slippage_bps",
+        "fee_model"
+      ],
+      "properties": {
+        "dataset_id": { "$ref": "#/$defs/canonicalId" },
+        "dataset_version": { "type": "string", "minLength": 1 },
+        "dataset_hash": { "$ref": "#/$defs/sha256" },
+        "cost_model": { "type": "string", "minLength": 1 },
+        "slippage_bps": { "type": "integer", "minimum": 0 },
+        "fee_model": { "type": "string", "minLength": 1 }
+      }
+    },
+    "predecessor_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/canonicalId" },
+        { "type": "null" }
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["DRAFT", "FROZEN", "EVALUATING", "CONFIRMED", "REJECTED"]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "frozen_at": {
+      "oneOf": [
+        { "type": "string", "format": "date-time" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

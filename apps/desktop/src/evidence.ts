@@ -268,6 +268,93 @@ export type OptionReconciliationIssue = Readonly<{
   observed: string;
 }>;
 
+export type ResearchHypothesis = Readonly<{
+  hypothesis_schema_version: 1;
+  hypothesis_id: string;
+  title: string;
+  mechanism: string;
+  universe: readonly string[];
+  evaluation_horizon: Readonly<{
+    start_time: string;
+    end_time: string;
+    holding_period: string;
+  }>;
+  assumptions: readonly string[];
+  failure_criteria: readonly string[];
+  frozen_evaluation_plan: Readonly<{
+    dataset_id: string;
+    dataset_version: string;
+    dataset_hash: string;
+    cost_model: string;
+    slippage_bps: number;
+    fee_model: string;
+  }>;
+  predecessor_id: string | null;
+  status: "DRAFT" | "FROZEN" | "EVALUATING" | "CONFIRMED" | "REJECTED";
+  created_at: string;
+  frozen_at: string | null;
+}>;
+
+export type ExperimentLineage = Readonly<{
+  lineage_schema_version: 1;
+  lineage_id: string;
+  hypothesis_id: string;
+  parent_run_ids: readonly string[];
+  input_fingerprints: ReadonlyArray<Readonly<{ name: string; fingerprint: string }>>;
+  output_fingerprints: ReadonlyArray<Readonly<{ name: string; fingerprint: string }>>;
+  candidate_trials: ReadonlyArray<Readonly<{
+    trial_id: string;
+    specification_hash: string;
+    return_bps: string;
+    max_drawdown_bps: string;
+    disposition: "PROMOTED" | "REJECTED" | "BENCHMARK";
+  }>>;
+  failed_candidates_count: number;
+  rejection_reasons: ReadonlyArray<Readonly<{ trial_id: string; reason: string }>>;
+  created_at: string;
+}>;
+
+export type ResearchJob = Readonly<{
+  job_schema_version: 1;
+  job_id: string;
+  idempotency_key: string;
+  strategy_id: string;
+  strategy_version: string;
+  dataset_id: string;
+  dataset_version: string;
+  frozen_specification_hash: string;
+  state_version: number;
+  state: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  worker_lease: Readonly<{
+    lease_id: string;
+    worker_id: string;
+    acquired_at: string;
+    expires_at: string;
+  }> | null;
+  output_manifest_hash: string | null;
+  failure_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}>;
+
+export type AssistantEvidence = Readonly<{
+  assistant_evidence_schema_version: 1;
+  query_id: string;
+  model_version: string;
+  prompt_template_version: string;
+  retrieved_record_ids: readonly string[];
+  generated_output: string;
+  tool_attempts: ReadonlyArray<Readonly<{
+    tool_name: string;
+    arguments_hash: string;
+    status: "SUCCESS" | "FAILED" | "BLOCKED";
+    evidence_id: string;
+  }>>;
+  uncertainty_score_bps: number;
+  human_disposition: "ACCEPTED" | "REJECTED" | "AMENDED" | "PENDING";
+  created_at: string;
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -349,6 +436,62 @@ export function parseOptionsDashboard(json: string): OptionsDashboard {
   }
   if (!isOptionsDashboard(value)) {
     throw new Error("Options dashboard does not match the v1 deterministic European-options contract.");
+  }
+  return value;
+}
+
+/** Parses a frozen research hypothesis and evaluation plan. */
+export function parseResearchHypothesis(json: string): ResearchHypothesis {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Research hypothesis is not valid JSON.");
+  }
+  if (!isResearchHypothesis(value)) {
+    throw new Error("Research hypothesis does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an experiment lineage and candidate trial memory record. */
+export function parseExperimentLineage(json: string): ExperimentLineage {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Experiment lineage is not valid JSON.");
+  }
+  if (!isExperimentLineage(value)) {
+    throw new Error("Experiment lineage does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an idempotent typed research job record. */
+export function parseResearchJob(json: string): ResearchJob {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Research job is not valid JSON.");
+  }
+  if (!isResearchJob(value)) {
+    throw new Error("Research job does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a read-only research assistant evidence record. */
+export function parseAssistantEvidence(json: string): AssistantEvidence {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Assistant evidence is not valid JSON.");
+  }
+  if (!isAssistantEvidence(value)) {
+    throw new Error("Assistant evidence does not match the v1 evidence contract.");
   }
   return value;
 }
@@ -1234,3 +1377,151 @@ function isHash(value: unknown): value is string {
 function isUtcTimestamp(value: unknown): value is string {
   return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value);
 }
+
+function isResearchHypothesis(value: unknown): value is ResearchHypothesis {
+  if (!hasExactKeys(value, [
+    "assumptions",
+    "created_at",
+    "evaluation_horizon",
+    "failure_criteria",
+    "frozen_at",
+    "frozen_evaluation_plan",
+    "hypothesis_id",
+    "hypothesis_schema_version",
+    "mechanism",
+    "predecessor_id",
+    "status",
+    "title",
+    "universe",
+  ])) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.hypothesis_schema_version !== 1 || !isCanonicalId(candidate.hypothesis_id)) return false;
+  if (typeof candidate.title !== "string" || candidate.title.length === 0) return false;
+  if (typeof candidate.mechanism !== "string" || candidate.mechanism.length === 0) return false;
+  if (!Array.isArray(candidate.universe) || candidate.universe.length === 0 || !candidate.universe.every(isCanonicalId)) return false;
+  if (!hasExactKeys(candidate.evaluation_horizon, ["end_time", "holding_period", "start_time"])) return false;
+  const horizon = candidate.evaluation_horizon as Record<string, unknown>;
+  if (!isUtcTimestamp(horizon.start_time) || !isUtcTimestamp(horizon.end_time) || typeof horizon.holding_period !== "string" || horizon.holding_period.length === 0) return false;
+  if (!Array.isArray(candidate.assumptions) || candidate.assumptions.length === 0 || !candidate.assumptions.every((a) => typeof a === "string" && a.length > 0)) return false;
+  if (!Array.isArray(candidate.failure_criteria) || candidate.failure_criteria.length === 0 || !candidate.failure_criteria.every((f) => typeof f === "string" && f.length > 0)) return false;
+  if (!hasExactKeys(candidate.frozen_evaluation_plan, ["cost_model", "dataset_hash", "dataset_id", "dataset_version", "fee_model", "slippage_bps"])) return false;
+  const plan = candidate.frozen_evaluation_plan as Record<string, unknown>;
+  if (!isCanonicalId(plan.dataset_id) || typeof plan.dataset_version !== "string" || !isHash(plan.dataset_hash) || typeof plan.cost_model !== "string" || !isNonNegativeInteger(plan.slippage_bps) || typeof plan.fee_model !== "string") return false;
+  if (candidate.predecessor_id !== null && !isCanonicalId(candidate.predecessor_id)) return false;
+  const validStatus = ["DRAFT", "FROZEN", "EVALUATING", "CONFIRMED", "REJECTED"];
+  if (typeof candidate.status !== "string" || !validStatus.includes(candidate.status)) return false;
+  if (!isUtcTimestamp(candidate.created_at)) return false;
+  if (candidate.frozen_at !== null && !isUtcTimestamp(candidate.frozen_at)) return false;
+  return true;
+}
+
+function isExperimentLineage(value: unknown): value is ExperimentLineage {
+  if (!hasExactKeys(value, [
+    "candidate_trials",
+    "created_at",
+    "failed_candidates_count",
+    "hypothesis_id",
+    "input_fingerprints",
+    "lineage_id",
+    "lineage_schema_version",
+    "output_fingerprints",
+    "parent_run_ids",
+    "rejection_reasons",
+  ])) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.lineage_schema_version !== 1 || !isCanonicalId(candidate.lineage_id) || !isCanonicalId(candidate.hypothesis_id)) return false;
+  if (!Array.isArray(candidate.parent_run_ids) || !candidate.parent_run_ids.every(isCanonicalId)) return false;
+  const isNamedHash = (entry: unknown) => hasExactKeys(entry, ["fingerprint", "name"]) && typeof (entry as Record<string, unknown>).name === "string" && isHash((entry as Record<string, unknown>).fingerprint);
+  if (!Array.isArray(candidate.input_fingerprints) || !candidate.input_fingerprints.every(isNamedHash)) return false;
+  if (!Array.isArray(candidate.output_fingerprints) || !candidate.output_fingerprints.every(isNamedHash)) return false;
+  if (!Array.isArray(candidate.candidate_trials)) return false;
+  const validDisposition = ["PROMOTED", "REJECTED", "BENCHMARK"];
+  for (const trial of candidate.candidate_trials) {
+    if (!hasExactKeys(trial, ["disposition", "max_drawdown_bps", "return_bps", "specification_hash", "trial_id"])) return false;
+    const t = trial as Record<string, unknown>;
+    if (!isCanonicalId(t.trial_id) || !isHash(t.specification_hash) || !isDecimal(t.return_bps) || !isDecimal(t.max_drawdown_bps) || typeof t.disposition !== "string" || !validDisposition.includes(t.disposition)) return false;
+  }
+  if (!isNonNegativeInteger(candidate.failed_candidates_count)) return false;
+  if (!Array.isArray(candidate.rejection_reasons)) return false;
+  for (const r of candidate.rejection_reasons) {
+    if (!hasExactKeys(r, ["reason", "trial_id"])) return false;
+    const item = r as Record<string, unknown>;
+    if (!isCanonicalId(item.trial_id) || typeof item.reason !== "string" || item.reason.length === 0) return false;
+  }
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isResearchJob(value: unknown): value is ResearchJob {
+  if (!hasExactKeys(value, [
+    "created_at",
+    "dataset_id",
+    "dataset_version",
+    "failure_reason",
+    "frozen_specification_hash",
+    "idempotency_key",
+    "job_id",
+    "job_schema_version",
+    "output_manifest_hash",
+    "state",
+    "state_version",
+    "strategy_id",
+    "strategy_version",
+    "updated_at",
+    "worker_lease",
+  ])) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.job_schema_version !== 1 || !isCanonicalId(candidate.job_id) || !isCanonicalId(candidate.idempotency_key) || !isCanonicalId(candidate.strategy_id) || typeof candidate.strategy_version !== "string") return false;
+  if (!isCanonicalId(candidate.dataset_id) || typeof candidate.dataset_version !== "string") return false;
+  if (!isHash(candidate.frozen_specification_hash)) return false;
+  if (!isPositiveInteger(candidate.state_version)) return false;
+  const validState = ["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"];
+  if (typeof candidate.state !== "string" || !validState.includes(candidate.state)) return false;
+  if (candidate.worker_lease !== null) {
+    if (!hasExactKeys(candidate.worker_lease, ["acquired_at", "expires_at", "lease_id", "worker_id"])) return false;
+    const lease = candidate.worker_lease as Record<string, unknown>;
+    if (!isCanonicalId(lease.lease_id) || !isCanonicalId(lease.worker_id) || !isUtcTimestamp(lease.acquired_at) || !isUtcTimestamp(lease.expires_at)) return false;
+  }
+  if (candidate.output_manifest_hash !== null && !isHash(candidate.output_manifest_hash)) return false;
+  if (candidate.failure_reason !== null && (typeof candidate.failure_reason !== "string" || candidate.failure_reason.length === 0)) return false;
+  return isUtcTimestamp(candidate.created_at) && isUtcTimestamp(candidate.updated_at);
+}
+
+function isAssistantEvidence(value: unknown): value is AssistantEvidence {
+  if (!hasExactKeys(value, [
+    "assistant_evidence_schema_version",
+    "created_at",
+    "generated_output",
+    "human_disposition",
+    "model_version",
+    "prompt_template_version",
+    "query_id",
+    "retrieved_record_ids",
+    "tool_attempts",
+    "uncertainty_score_bps",
+  ])) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.assistant_evidence_schema_version !== 1 || !isCanonicalId(candidate.query_id)) return false;
+  if (typeof candidate.model_version !== "string" || candidate.model_version.length === 0) return false;
+  if (typeof candidate.prompt_template_version !== "string" || candidate.prompt_template_version.length === 0) return false;
+  if (!Array.isArray(candidate.retrieved_record_ids) || candidate.retrieved_record_ids.length === 0 || !candidate.retrieved_record_ids.every((r) => typeof r === "string" && r.length > 0)) return false;
+  if (typeof candidate.generated_output !== "string" || candidate.generated_output.length === 0) return false;
+  if (!Array.isArray(candidate.tool_attempts)) return false;
+  for (const t of candidate.tool_attempts) {
+    if (!hasExactKeys(t, ["arguments_hash", "evidence_id", "status", "tool_name"])) return false;
+    const attempt = t as Record<string, unknown>;
+    if (typeof attempt.tool_name !== "string" || !isHash(attempt.arguments_hash) || !["SUCCESS", "FAILED", "BLOCKED"].includes(String(attempt.status)) || typeof attempt.evidence_id !== "string") return false;
+  }
+  if (!isNonNegativeInteger(candidate.uncertainty_score_bps) || candidate.uncertainty_score_bps > 10000) return false;
+  const validDisp = ["ACCEPTED", "REJECTED", "AMENDED", "PENDING"];
+  if (typeof candidate.human_disposition !== "string" || !validDisp.includes(candidate.human_disposition)) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+

@@ -25,9 +25,18 @@ The order-management system owns client IDs, broker IDs, the lifecycle state mac
 - Immediate market or price-protected limit children.
 - Exact fixed-point TWAP, forecast-volume VWAP, POV/participation, and
   urgency-weighted arrival-price schedules with quantity conservation.
+- Sequential display-size Iceberg schedules with strict fixed-point conservation
+  and elapsed refresh interval enforcement.
+- Deterministic AlgoWheel allocation across bounded non-wheel algorithms using
+  exact basis-point distribution and stable tie-breaking on schedule offsets.
 - Passive limit execution with monotonic post-only cancel/replace, minimum
   intervals, maximum replacements, hard parent limits, and adverse chase caps.
-- Fee/latency/price-aware multi-venue routing.
+- Capability-gated smart routing requiring verified venue capability records and
+  refusing unknown venues, duplicate records, or unsupported order kinds before
+  route decisions are emitted.
+- Content-addressed execution plan evidence (`ExecutionPlanEvidence`) binding
+  parent orders, scheduled children, route decisions, frozen benchmarks, and
+  a SHA-256 plan fingerprint under tenant RLS persistence.
 - Bracket/stop-limit children, monotonic trailing stops, and portfolio-sized
   baskets.
 - Ratio-bound, net-debit/net-credit-protected option combinations. An adapter

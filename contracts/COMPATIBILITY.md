@@ -24,6 +24,7 @@ Decimal quantities and monetary values are JSON strings with up to eight
 fractional digits. Floating-point JSON numbers are not permitted for accounting
 or order quantities.
 
+
 Protobuf fields are never reused. New fields receive new tag numbers; a removed
 field is reserved before the next compatibility release. Worker output is not
 trusted merely because it is schema-valid: the Rust core always validates the
@@ -45,3 +46,32 @@ adoption; after publication, changes such as a new required per-book identity,
 predecessor fingerprint, retention confirmation field, dataset identity/hash,
 or release-signature binding require a v2 schema plus a documented
 producer/consumer migration.
+
+## Execution plan evidence (Phase 3)
+
+`contracts/json-schema/v1/execution-plan-evidence.schema.json` introduces the
+additive `execution.plan.v1` evidence model. Existing orders remain on their
+original lifecycle contracts and are not rewritten or backfilled. Additive
+PostgreSQL tables `venue_capabilities`, `execution_plan_evidence`,
+`execution_route_decisions`, and `execution_benchmark_evidence` retain source-event
+linkage and SHA-256 content hashes under tenant RLS. Rollback disables Phase 3
+planners and readers while preserving all stored evidence for replay and audit.
+
+## Workstation and recovery contracts (Increment 1)
+
+`contracts/json-schema/v1/operator-task.schema.json` and
+`contracts/json-schema/v1/recovery-manifest.schema.json` are additive v1
+operational contracts for attention management and recovery verification.
+They preserve tenant and environment isolation, immutable transition history,
+and strict separation of secrets.
+
+## Research and assistant contracts (Increment 2)
+
+`contracts/json-schema/v1/research-hypothesis.schema.json`,
+`contracts/json-schema/v1/experiment-lineage.schema.json`,
+`contracts/json-schema/v1/research-job.schema.json`, and
+`contracts/json-schema/v1/assistant-evidence.schema.json` are additive v1
+contracts for the research-to-backtest workflow. They enforce frozen hypothesis
+specifications before evaluation, retention of failed optimization ideas, idempotent
+job execution leases, and read-only, citation-grounded assistant evidence.
+

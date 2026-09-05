@@ -15,8 +15,10 @@ Live mode requires explicit account selection, a persistent environment indicato
 | --- | --- |
 | Command Center | System, broker, strategy, and risk status |
 | Research Lab | Datasets, notebooks, experiments |
-| Strategy Studio | Strategy configuration, versioning, deployment |
-| Backtest Explorer | Results, trades, regimes, sensitivity |
+| Strategies | Strategy versions, bundle and configuration identities |
+| Marketplace | Search and inspect local research assets; commercial publishing and installation remain planned |
+| News | Stored headlines, sentiment signals, and causal risk evidence |
+| Backtest | Results, trades, regimes, sensitivity |
 | Execution Blotter | Intents, orders, fills, rejections |
 | Risk Cockpit | Exposure, limits, drawdown, kill switches |
 | Portfolio | Positions, attribution, scenarios |

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 type ExecutionEnvironment = "PAPER" | "LIVE";
@@ -18,23 +18,100 @@ type OrderTicketProps = Readonly<{
   defaultEnvironment?: ExecutionEnvironment;
 }>;
 
+const DRAFT_STORAGE_KEY = "follon:order_ticket_draft";
+
+type TicketDraft = Readonly<{
+  accountId?: string;
+  instrumentId?: string;
+  intentId?: string;
+  correlationId?: string;
+  createdAt?: string;
+  quantity?: string;
+  orderType?: OrderType;
+  limitPrice?: string;
+  environment?: ExecutionEnvironment;
+  timeInForce?: TimeInForce;
+  rationale?: string;
+}>;
+
+function loadTicketDraft(): TicketDraft {
+  try {
+    const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
+    if (raw !== null) {
+      return JSON.parse(raw) as TicketDraft;
+    }
+  } catch {
+    // Fall back to defaults if storage is disabled or corrupted
+  }
+  return {};
+}
+
+function persistTicketDraft(draft: TicketDraft): void {
+  try {
+    sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  } catch {
+    // Ignore storage quota or access issues
+  }
+}
+
+function clearTicketDraft(): void {
+  try {
+    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+  } catch {
+    // Ignore
+  }
+}
+
 export function OrderTicket({
   defaultAccountId = "",
   defaultEnvironment = "PAPER",
 }: OrderTicketProps): React.JSX.Element {
-  const [accountId, setAccountId] = useState(defaultAccountId);
-  const [instrumentId, setInstrumentId] = useState("");
-  const [intentId, setIntentId] = useState("");
-  const [correlationId, setCorrelationId] = useState("");
-  const [createdAt, setCreatedAt] = useState("");
-  const [quantity, setQuantity] = useState("1");
-  const [orderType, setOrderType] = useState<OrderType>("MARKET");
-  const [limitPrice, setLimitPrice] = useState("");
-  const [environment, setEnvironment] = useState<ExecutionEnvironment>(defaultEnvironment);
-  const [timeInForce, setTimeInForce] = useState<TimeInForce>("DAY");
-  const [rationale, setRationale] = useState("");
+  const [draft] = useState<TicketDraft>(() => loadTicketDraft());
+  const [accountId, setAccountId] = useState(draft.accountId ?? defaultAccountId);
+  const [instrumentId, setInstrumentId] = useState(draft.instrumentId ?? "");
+  const [intentId, setIntentId] = useState(draft.intentId ?? "");
+  const [correlationId, setCorrelationId] = useState(draft.correlationId ?? "");
+  const [createdAt, setCreatedAt] = useState(draft.createdAt ?? "");
+  const [quantity, setQuantity] = useState(draft.quantity ?? "1");
+  const [orderType, setOrderType] = useState<OrderType>(draft.orderType ?? "MARKET");
+  const [limitPrice, setLimitPrice] = useState(draft.limitPrice ?? "");
+  const [environment, setEnvironment] = useState<ExecutionEnvironment>(draft.environment ?? defaultEnvironment);
+  const [timeInForce, setTimeInForce] = useState<TimeInForce>(draft.timeInForce ?? "DAY");
+  const [rationale, setRationale] = useState(draft.rationale ?? "");
   const [status, setStatus] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    persistTicketDraft({
+      accountId,
+      instrumentId,
+      intentId,
+      correlationId,
+      createdAt,
+      quantity,
+      orderType,
+      limitPrice,
+      environment,
+      timeInForce,
+      rationale,
+    });
+  }, [accountId, instrumentId, intentId, correlationId, createdAt, quantity, orderType, limitPrice, environment, timeInForce, rationale]);
+
+  const handleClearDraft = (): void => {
+    clearTicketDraft();
+    setAccountId(defaultAccountId);
+    setInstrumentId("");
+    setIntentId("");
+    setCorrelationId("");
+    setCreatedAt("");
+    setQuantity("1");
+    setOrderType("MARKET");
+    setLimitPrice("");
+    setEnvironment(defaultEnvironment);
+    setTimeInForce("DAY");
+    setRationale("");
+    setStatus("Draft inputs cleared.");
+  };
 
   const handleSubmit = async (side: "BUY" | "SELL"): Promise<void> => {
     setSubmitting(true);
@@ -61,6 +138,7 @@ export function OrderTicket({
         },
       });
       const order = receipt.orderId === null ? "" : ` (${receipt.orderId})`;
+      clearTicketDraft();
       setStatus(`${receipt.status}: ${receipt.message}${order}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -204,6 +282,14 @@ export function OrderTicket({
           onClick={() => void handleSubmit("SELL")}
         >
           Sell
+        </button>
+        <button
+          className="f-btn f-btn--ghost"
+          type="button"
+          disabled={submitting}
+          onClick={handleClearDraft}
+        >
+          Clear Draft
         </button>
       </div>
       {status !== null && <p className="order-ticket-status">{status}</p>}

@@ -1,6 +1,6 @@
 # Follon trading terminal
 
-This client provides ten integrated operator workspaces, including active
+This client provides twelve integrated operator workspaces, including active
 order-entry controls for the PAPER and LIVE execution environments. A bounded
 `/api/v1/workspaces` projection combines dataset
 structure, experiments, backtests, manifests, causal events, OMS lifecycle,
@@ -43,7 +43,7 @@ evidence service has no broker credentials or order-entry endpoint; order
 controls use Tauri IPC instead.
 
 The documented screen catalogue is implemented as tailored workspaces: Command
-Center, Research Lab, Strategy Studio, Backtest Explorer, Execution Blotter,
+Center, Research Lab, Strategies, Marketplace, Backtest, News, Execution Blotter,
 Risk Cockpit, Portfolio, Replay and Incidents, Journal, and Administration.
 Each workspace renders domain-specific metrics and tables, links back to exact
 source artifacts, and keeps documented external acceptance gates visible.
@@ -71,3 +71,36 @@ npm run build:web
 cargo check --manifest-path src-tauri/Cargo.toml
 npm run build:desktop
 ```
+
+## Research navigation and local marketplace
+
+The primary navigation groups monitoring, research, trading operations, and
+administration. Strategies, Marketplace, Backtest, and News are dedicated
+workspaces. Existing strategy-studio, backtest-explorer, and news-cockpit route
+IDs remain compatible; Marketplace is available at `/#workspace/marketplace`.
+Navigation updates the document title and keyboard focus. Evidence section
+anchors preserve the selected workspace. Tables provide local text filtering
+and 20-record pages; filtering retains the original artifact/action mapping.
+These controls operate on the bounded server projection, not an unlimited
+historical database query.
+
+Marketplace lists only indexed market-data, research, and replay artifacts.
+Search, category selection, incremental listing, and artifact inspection work
+locally. Publishing, purchases, ratings, verified publisher identity, bundle
+installation, and executable strategy deployment require additional services.
+No synthetic listings, return claims, or approval badges are generated.
+
+Start the local evidence server in one terminal from the repository root:
+
+```powershell
+python apps/desktop/server.py
+```
+
+In another terminal, from `apps/desktop`, run `npm run dev`. Vite proxies
+`/api/v1` to `http://127.0.0.1:8080`; open `http://127.0.0.1:1420`.
+The production bundle remains available through the Python server after
+`npm run build:web`. Font stacks use installed fonts and system fallbacks;
+there is no external font request.
+
+See [the end-to-end product plan](../../docs/06-delivery/15-end-to-end-product-plan.md)
+for integration gaps, acceptance criteria, and the proposed implementation order.

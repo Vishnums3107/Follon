@@ -1,4 +1,4 @@
-﻿# Documentation index
+# Documentation index
 
 The original `Solo Trading Operating System Master Plan.pdf` is the source
 artifact. It has been decomposed into small, implementation-oriented documents
@@ -9,6 +9,8 @@ decision changes.
   [master-plan source map](00-source-map.md).
 - Architecture decisions live in `02-architecture/adr/`; operational procedures
   live under `operations/` once implementation begins.
+
+- [End-to-end product plan](06-delivery/15-end-to-end-product-plan.md) ? current implementation, remaining integrations, differentiated product proposals, and acceptance gates.
 
 ## Source artifacts
 
@@ -23,6 +25,7 @@ decision changes.
 - [Product charter](00-product/01-product-charter.md) — what the system is, constraints, and the reference-architecture classification.
 - [Scope and rollout](00-product/02-scope-and-rollout.md) — what is in/out and the market rollout plan.
 - [Customer, value, and commercial model](00-product/03-customer-value-and-commercial.md) — target customer, value, and commercial boundary.
+- [Features and constraints](00-product/04-features-and-constraints.md) — core functionalities, boundaries, and release scope.
 
 ### 01-domain — ubiquitous language and stable domain contracts
 - [Domain glossary](01-domain/01-glossary.md) — canonical terms and IDs.
@@ -36,6 +39,12 @@ decision changes.
 - [Repository guide](02-architecture/03-repository-guide.md) — repository ownership and layout.
 - [ADR 0001: modular monolith](02-architecture/adr/0001-modular-monolith.md) — accepted architecture decision.
 - [ADR 0002: deterministic FX core](02-architecture/adr/0002-deterministic-fx-core.md) — value-dated FX pricing boundary.
+- [ADR 0003: execution plan evidence](02-architecture/adr/0003-execution-plan-evidence.md) — execution-plan evidence and capability routing.
+
+### rfcs — request for comments and phased delivery
+- [RFC 0001: phased multi-asset platform delivery](rfcs/0001-institutional-platform-phased-delivery.md)
+- [RFC 0002: deterministic FX pricing and risk contracts](rfcs/0002-fx-pricing-risk.md)
+- [RFC 0003: execution-plan contracts, capability routing, and TCA evidence](rfcs/0003-execution-plan-evidence.md)
 
 ### 03-capabilities — behavioural requirements for the trading kernel
 - [Market data and replay](03-capabilities/01-market-data-and-replay.md)

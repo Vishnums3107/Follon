@@ -39,11 +39,21 @@ async function verifyModule(relativePath) {
 }
 
 await verifyModule("main.js");
-assert.deepEqual([...visited].sort(), ["OrderTicket.js", "catalog.js", "evidence.js", "main.js", "workspaces.js"]);
+assert.deepEqual([...visited].sort(), [
+  "OrderTicket.js",
+  "catalog.js",
+  "command-palette.js",
+  "evidence.js",
+  "main.js",
+  "routes.js",
+  "workspaces.js",
+]);
 const main = await readFile(resolve(appDirectory, "src", "main.ts"), "utf8");
+const routes = await readFile(resolve(appDirectory, "src", "routes.ts"), "utf8");
 const workspaces = await readFile(resolve(appDirectory, "src", "workspaces.ts"), "utf8");
 const workspaceContracts = new Map([
-  ["command-center", ["System, broker, strategy, and risk status", "Environment readiness", "Attention queue"]],
+  ["marketplace", ["Research asset marketplace", "Inspect asset"]],
+  ["command-center", ["Daily Operating Brief", "System, broker, strategy, and risk status", "Environment readiness", "Attention queue"]],
   ["research-lab", ["Dataset inventory", "Notebook inventory", "Experiment catalogue"]],
   ["news-cockpit", ["Headline evidence", "Sentiment signals", "Causally linked risk decisions"]],
   ["strategy-studio", ["Version and deployment identities", "Worker contract"]],
@@ -56,7 +66,7 @@ const workspaceContracts = new Map([
   ["administration", ["Commercial ledger", "Deployment and administrative controls", "Privileged-action boundary"]],
 ]);
 for (const [workspaceId, signatures] of workspaceContracts) {
-  assert.ok(main.includes(`id: "${workspaceId}"`), `missing primary navigation workspace ${workspaceId}`);
+  assert.ok(routes.includes(`id: "${workspaceId}"`) || main.includes(`id: "${workspaceId}"`), `missing primary navigation workspace ${workspaceId}`);
   assert.ok(workspaces.includes(`case "${workspaceId}"`), `missing workspace renderer ${workspaceId}`);
   for (const signature of signatures) {
     assert.ok(workspaces.includes(signature), `${workspaceId} is missing feature surface: ${signature}`);
@@ -68,7 +78,7 @@ assert.match(main, /const apiOrigin = isTauriRuntime \? "http:\/\/127\.0\.0\.1:8
 assert.match(main, /function apiUrl\(path: string\)/u);
 assert.doesNotMatch(main, /fetch\("\/api\/v1\//u);
 assert.match(main, /window\.addEventListener\("hashchange"/u);
-assert.match(main, /candidate\.origin === window\.location\.origin/u);
+assert.match(main, /candidate\.host === window\.location\.host/u);
 assert.match(main, /candidate\.protocol === expectedProtocol/u);
 assert.match(workspaces, /Explainable risk decisions/u);
 assert.match(workspaces, /function isDatasetSummary\(value: unknown\)/u);

@@ -4,7 +4,7 @@ The original `Solo Trading Operating System Master Plan.pdf` remains the source 
 
 | Master-plan section | Maintained in |
 | --- | --- |
-| 1–3. Executive decision, constraints, product definition | [Product charter](00-product/01-product-charter.md), [scope](00-product/02-scope-and-rollout.md), [customer/value](00-product/03-customer-value-and-commercial.md) |
+| 1–3. Executive decision, constraints, product definition | [Product charter](00-product/01-product-charter.md), [scope](00-product/02-scope-and-rollout.md), [customer/value](00-product/03-customer-value-and-commercial.md), [features/constraints](00-product/04-features-and-constraints.md) |
 | 4. Market rollout | [Scope and rollout](00-product/02-scope-and-rollout.md) |
 | 5. Capability map | [Capability specifications](03-capabilities/) and [domain contracts](01-domain/) |
 | 6–7. Architecture and repository | [System architecture](02-architecture/01-system-architecture.md), [storage/protocols](02-architecture/02-storage-and-protocols.md), [repository guide](02-architecture/03-repository-guide.md) |

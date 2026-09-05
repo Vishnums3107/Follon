@@ -15,9 +15,10 @@ const WORKSPACE_GROUPS: readonly Readonly<{
   ] },
   { label: "Research", workspaces: [
     { id: "research-lab", title: "Research Lab", subtitle: "Datasets and experiments" },
-    { id: "strategy-studio", title: "Strategy Studio", subtitle: "Versions and deployment" },
-    { id: "backtest-explorer", title: "Backtest Explorer", subtitle: "Runs and comparisons" },
-    { id: "news-cockpit", title: "News Cockpit", subtitle: "Sentiment & headline evidence" },
+    { id: "strategy-studio", title: "Strategies", subtitle: "Versions and reproducibility" },
+    { id: "marketplace", title: "Marketplace", subtitle: "Discover local research assets" },
+    { id: "backtest-explorer", title: "Backtest", subtitle: "Runs and comparisons" },
+    { id: "news-cockpit", title: "News", subtitle: "Headlines and signal provenance" },
   ] },
   { label: "Operate", workspaces: [
     { id: "execution-blotter", title: "Execution Blotter", subtitle: "OMS lifecycle evidence" },
@@ -46,6 +47,7 @@ export function AppShell(): React.JSX.Element {
 
   return (
     <>
+      <a className="skip-link" href="#workspace-detail">Skip to active workspace</a>
       <header className="site-header f-card f-card--elevated">
         <a className="brand" href="/" aria-label="Follon trading terminal home">
           <span className="brand-mark" aria-hidden="true">F</span><span>Follon</span>
@@ -54,21 +56,25 @@ export function AppShell(): React.JSX.Element {
           <a href="#system">System</a><a href="#workspaces">Workspaces</a>
           <a href="#capabilities">Capabilities</a><a href="#artifacts">Evidence</a>
         </nav>
+        <button id="open-palette" className="palette-trigger" type="button" aria-label="Open command palette (Ctrl+K)">
+          <span>Search & Actions</span>
+          <kbd className="palette-kbd">Ctrl+K</kbd>
+        </button>
         <span className="environment-badge f-badge f-badge--accent">TRADING TERMINAL</span>
       </header>
 
       <main id="app">
         <section className="hero" aria-labelledby="dashboard-title">
-          <p className="eyebrow">Unified trading operations</p>
-          <h1 id="dashboard-title">One view across the Follon system.</h1>
-          <p className="intro">Monitor research, replay, PAPER, controlled-live safety, operations, options, and commercial evidence from a single deployment surface.</p>
+          <p className="eyebrow">Research. Validate. Operate.</p>
+          <h1 id="dashboard-title">Your trading workspace.</h1>
+          <p className="intro">Discover research, inspect strategies, compare backtests, and follow every decision through risk, execution, and portfolio evidence.</p>
           <div className="safety-note"><strong>Trading boundary</strong><span>Order submit, cancel, and position-close requests use the native desktop command route. Risk, OMS, broker credentials, approvals, and audit recording remain in their owning application boundaries.</span></div>
         </section>
 
         <section id="workspaces" className="dashboard-section" aria-labelledby="workspaces-title">
           <div className="section-heading">
-            <div><p className="eyebrow">Integrated application</p><h2 id="workspaces-title">Operator workspaces</h2></div>
-            <p className="section-copy">Eleven purpose-built views over the complete implemented research, trading-control, operations, options, and commercial evidence model.</p>
+            <div><p className="eyebrow">Workspace navigator</p><h2 id="workspaces-title">Research to execution</h2></div>
+            <p className="section-copy">Twelve connected workspaces. Local evidence stays attributable to its original source.</p>
           </div>
           <div className="workspace-shell">
             <aside className="workspace-sidebar" aria-label="Dashboard workspaces">
@@ -88,7 +94,7 @@ export function AppShell(): React.JSX.Element {
                 </div>
               ))}
             </aside>
-            <section id="workspace-detail" className="workspace-detail f-card f-card--elevated" aria-live="polite" aria-labelledby="workspace-detail-title">
+            <section id="workspace-detail" tabIndex={-1} className="workspace-detail f-card f-card--elevated" aria-live="polite" aria-labelledby="workspace-detail-title">
               <div className="workspace-detail-heading">
                 <div><p className="eyebrow">Active workspace</p><h3 id="workspace-detail-title">Command Center</h3></div>
                 <div className="workspace-header-actions"><span id="workspace-artifact-count" className="workspace-count f-badge">Loading evidence</span><button id="refresh-workspace" className="f-btn f-btn--primary" type="button">Refresh workspace</button></div>

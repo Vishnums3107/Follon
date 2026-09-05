@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/experiment-lineage.schema.json",
+  "title": "Follon Experiment Lineage Contract v1",
+  "description": "Schema for experiment lineage, candidate trials, and failed-idea memory (RES-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lineage_schema_version",
+    "lineage_id",
+    "hypothesis_id",
+    "parent_run_ids",
+    "input_fingerprints",
+    "output_fingerprints",
+    "candidate_trials",
+    "failed_candidates_count",
+    "rejection_reasons",
+    "created_at"
+  ],
+  "properties": {
+    "lineage_schema_version": { "const": 1 },
+    "lineage_id": { "$ref": "#/$defs/canonicalId" },
+    "hypothesis_id": { "$ref": "#/$defs/canonicalId" },
+    "parent_run_ids": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/canonicalId" }
+    },
+    "input_fingerprints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "fingerprint"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "fingerprint": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "output_fingerprints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "fingerprint"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "fingerprint": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "candidate_trials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "trial_id",
+          "specification_hash",
+          "return_bps",
+          "max_drawdown_bps",
+          "disposition"
+        ],
+        "properties": {
+          "trial_id": { "$ref": "#/$defs/canonicalId" },
+          "specification_hash": { "$ref": "#/$defs/sha256" },
+          "return_bps": { "$ref": "#/$defs/decimalString" },
+          "max_drawdown_bps": { "$ref": "#/$defs/decimalString" },
+          "disposition": {
+            "type": "string",
+            "enum": ["PROMOTED", "REJECTED", "BENCHMARK"]
+          }
+        }
+      }
+    },
+    "failed_candidates_count": { "type": "integer", "minimum": 0 },
+    "rejection_reasons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trial_id", "reason"],
+        "properties": {
+          "trial_id": { "$ref": "#/$defs/canonicalId" },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "decimalString": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]{1,8})?$"
+    }
+  }
+}

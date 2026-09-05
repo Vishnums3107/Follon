@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/execution-plan-evidence.schema.json",
+  "title": "Follon Execution Plan Evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_id",
+    "parent_order_id",
+    "account_id",
+    "instrument_id",
+    "side",
+    "parent_quantity",
+    "algorithm",
+    "children",
+    "unallocated_quantity",
+    "route_decisions",
+    "plan_sha256",
+    "created_at"
+  ],
+  "properties": {
+    "evidence_id": { "$ref": "#/$defs/canonicalId" },
+    "parent_order_id": { "$ref": "#/$defs/canonicalId" },
+    "account_id": { "$ref": "#/$defs/canonicalId" },
+    "instrument_id": { "$ref": "#/$defs/canonicalId" },
+    "side": { "enum": ["BUY", "SELL"] },
+    "parent_quantity": { "$ref": "#/$defs/positiveDecimal" },
+    "limit_price": { "anyOf": [{ "$ref": "#/$defs/positiveDecimal" }, { "type": "null" }] },
+    "algorithm": { "type": "string", "minLength": 1 },
+    "children": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/childInstruction" }
+    },
+    "unallocated_quantity": { "$ref": "#/$defs/decimal" },
+    "source_capability_version": { "anyOf": [{ "$ref": "#/$defs/canonicalId" }, { "type": "null" }] },
+    "route_decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/routeDecision" }
+    },
+    "benchmarks": { "anyOf": [{ "$ref": "#/$defs/benchmarkEvidence" }, { "type": "null" }] },
+    "plan_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "created_at": { "$ref": "#/$defs/utc" }
+  },
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "decimal": { "type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "positiveDecimal": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,8})?$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "childInstruction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["child_order_id", "scheduled_after_seconds", "quantity", "kind"],
+      "properties": {
+        "child_order_id": { "$ref": "#/$defs/canonicalId" },
+        "scheduled_after_seconds": { "type": "integer", "minimum": 0 },
+        "venue": { "anyOf": [{ "$ref": "#/$defs/canonicalId" }, { "type": "null" }] },
+        "quantity": { "$ref": "#/$defs/positiveDecimal" },
+        "kind": { "enum": ["MARKET", "LIMIT", "STOP", "STOP_LIMIT"] },
+        "limit_price": { "anyOf": [{ "$ref": "#/$defs/positiveDecimal" }, { "type": "null" }] },
+        "stop_price": { "anyOf": [{ "$ref": "#/$defs/positiveDecimal" }, { "type": "null" }] }
+      }
+    },
+    "routeDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "parent_order_id",
+        "venue",
+        "capability_version",
+        "allocated_quantity",
+        "all_in_price",
+        "fee_per_unit",
+        "latency_rank"
+      ],
+      "properties": {
+        "decision_id": { "$ref": "#/$defs/canonicalId" },
+        "parent_order_id": { "$ref": "#/$defs/canonicalId" },
+        "venue": { "$ref": "#/$defs/canonicalId" },
+        "capability_version": { "$ref": "#/$defs/canonicalId" },
+        "allocated_quantity": { "$ref": "#/$defs/positiveDecimal" },
+        "all_in_price": { "$ref": "#/$defs/positiveDecimal" },
+        "fee_per_unit": { "$ref": "#/$defs/decimal" },
+        "latency_rank": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "benchmarkEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["benchmark_id", "parent_order_id", "arrival_price", "target_price", "source"],
+      "properties": {
+        "benchmark_id": { "$ref": "#/$defs/canonicalId" },
+        "parent_order_id": { "$ref": "#/$defs/canonicalId" },
+        "arrival_price": { "$ref": "#/$defs/positiveDecimal" },
+        "target_price": { "$ref": "#/$defs/positiveDecimal" },
+        "source": { "$ref": "#/$defs/canonicalId" }
+      }
+    }
+  }
+}

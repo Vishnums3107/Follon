@@ -125,7 +125,7 @@ fn handle_score(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn handle_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
         eprintln!("Error: 'replay' requires an input NDJSON file path.");
-        eprintln!("Example: follon-news replay var/news/2026-09-01-headlines.ndjson");
+        eprintln!("Example: follon-news replay tests/fixtures/news/2026-09-01-headlines.ndjson");
         std::process::exit(1);
     }
 

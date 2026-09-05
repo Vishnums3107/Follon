@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/operator-task.schema.json",
+  "title": "Follon Operator Task Contract v1",
+  "description": "Schema for attention queue and operational tasks (SOLO-03, SOLO-05).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_schema_version",
+    "task_id",
+    "cause",
+    "severity",
+    "environment",
+    "account_id",
+    "evidence_ids",
+    "permitted_action",
+    "state",
+    "created_at",
+    "updated_at",
+    "history"
+  ],
+  "properties": {
+    "task_schema_version": { "const": 1 },
+    "task_id": { "$ref": "#/$defs/canonicalId" },
+    "cause": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "severity": { "type": "string", "enum": ["INFO", "WARNING", "CRITICAL"] },
+    "environment": { "type": "string", "enum": ["SIMULATION", "PAPER", "LIVE"] },
+    "account_id": { "$ref": "#/$defs/canonicalId" },
+    "evidence_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "permitted_action": { "type": "string", "minLength": 1 },
+    "state": { "type": "string", "enum": ["OPEN", "ACKNOWLEDGED", "RESOLVED", "SUPPRESSED"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["timestamp", "actor", "state_transition", "rationale"],
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "actor": { "type": "string", "minLength": 1 },
+          "state_transition": { "type": "string", "enum": ["CREATED", "ACKNOWLEDGED", "RESOLVED", "SUPPRESSED"] },
+          "rationale": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    }
+  }
+}

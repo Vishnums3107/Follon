@@ -25,6 +25,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         4,
         include_str!("../migrations/0004_fx_reference_pricing.sql"),
     ),
+    (
+        5,
+        include_str!("../migrations/0005_execution_plan_evidence.sql"),
+    ),
 ];
 
 /// Durable persistence failure.
@@ -447,10 +451,14 @@ mod tests {
             "news_sentiments",
             "fx_instrument_economics_versions",
             "fx_pricing_snapshots",
+            "venue_capabilities",
+            "execution_plan_evidence",
+            "execution_route_decisions",
+            "execution_benchmark_evidence",
         ] {
             assert!(migration_sql.contains(required), "missing {required}");
         }
-        assert_eq!(MIGRATIONS.len(), 4);
+        assert_eq!(MIGRATIONS.len(), 5);
     }
 
     #[test]

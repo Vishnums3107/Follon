@@ -55,9 +55,11 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   creates the web bundle and Tauri v2 supplies the privileged native package
   boundary.
 - Broker-neutral EMS algorithms (immediate, TWAP, VWAP, participation,
-  arrival-price, passive cancel/replace, routing, brackets, trailing stops,
-  baskets, and atomic option combinations), portfolio-wide risk, and balanced
-  multi-currency/margin accounting. Scheduled, passive, combination, risk, and
+  arrival-price, iceberg, algo-wheel, passive cancel/replace, capability-gated
+  routing, brackets, trailing stops, baskets, and atomic option combinations),
+  content-addressed execution-plan evidence (`ExecutionPlanEvidence`),
+  portfolio-wide risk, and balanced multi-currency/margin accounting. Scheduled,
+  passive, combination, risk, and
   margin planning are exposed through the versioned gRPC API.
 - Customer IAM primitives with Argon2id, TOTP MFA, lockout, short opaque
   sessions, revocation, tenant isolation, and explicit RBAC permissions.

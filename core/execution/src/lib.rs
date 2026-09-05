@@ -7,7 +7,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use follon_domain::{price_deviation_bps, validate_canonical_id, Decimal, Side};
+use follon_domain::{
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Side,
+};
+use sha2::{Digest, Sha256};
 
 /// Execution planning failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +71,7 @@ impl ParentOrder {
 }
 
 /// Child instruction type understood by an adapter mapping layer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ChildOrderKind {
     /// Immediately executable market order.
     Market,
@@ -775,6 +778,15 @@ fn side_label(side: Side) -> &'static str {
     }
 }
 
+fn order_kind_label(kind: ChildOrderKind) -> &'static str {
+    match kind {
+        ChildOrderKind::Market => "MARKET",
+        ChildOrderKind::Limit => "LIMIT",
+        ChildOrderKind::Stop => "STOP",
+        ChildOrderKind::StopLimit => "STOP_LIMIT",
+    }
+}
+
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
@@ -817,14 +829,38 @@ pub enum ExecutionAlgorithm {
         /// Front-loading urgency in basis points, `[0, 10000]`.
         urgency_bps: u32,
     },
+    /// Sequential, display-size limit or market slices with exact fixed-point conservation.
+    Iceberg {
+        /// Visible display quantity per child slice.
+        display_quantity: Decimal,
+        /// Minimum elapsed seconds between consecutive child slices.
+        interval_seconds: u64,
+    },
+    /// Weighted allocation of a parent order across bounded, non-wheel sub-algorithms.
+    AlgoWheel {
+        /// Deterministic allocations with non-wheel sub-algorithms and positive basis points.
+        allocations: Vec<AlgoWheelAllocation>,
+    },
 }
 
-/// Plans immediate, TWAP, VWAP, participation, or arrival-price execution.
+/// One deterministic allocation branch in an algorithm wheel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlgoWheelAllocation {
+    /// Sub-algorithm to execute for this share. Must not be another AlgoWheel.
+    pub algorithm: ExecutionAlgorithm,
+    /// Share in basis points, `(0, 10000]`.
+    pub weight_bps: u32,
+}
+
+/// Plans immediate, TWAP, VWAP, participation, arrival-price, iceberg, or algo-wheel execution.
 pub fn plan_execution(
     parent: &ParentOrder,
     algorithm: &ExecutionAlgorithm,
 ) -> Result<ExecutionPlan, ExecutionError> {
     parent.validate()?;
+    if let ExecutionAlgorithm::AlgoWheel { allocations } = algorithm {
+        return plan_algo_wheel_execution(parent, allocations);
+    }
     let kind = if parent.limit_price.is_some() {
         ChildOrderKind::Limit
     } else {
@@ -929,6 +965,28 @@ pub fn plan_execution(
                 *interval_seconds,
             )
         }
+        ExecutionAlgorithm::Iceberg {
+            display_quantity,
+            interval_seconds,
+        } => {
+            if *display_quantity <= Decimal::ZERO || *interval_seconds == 0 {
+                return Err(ExecutionError("invalid iceberg configuration".to_owned()));
+            }
+            let mut remaining = parent.quantity;
+            let mut quantities = Vec::new();
+            while remaining > Decimal::ZERO {
+                if quantities.len() >= 10_000 {
+                    return Err(ExecutionError(
+                        "iceberg slice count exceeds maximum allowed".to_owned(),
+                    ));
+                }
+                let slice = remaining.min(*display_quantity);
+                quantities.push(slice);
+                remaining = remaining.checked_sub(slice)?;
+            }
+            ("iceberg-v1", quantities, *interval_seconds)
+        }
+        ExecutionAlgorithm::AlgoWheel { .. } => unreachable!("handled above"),
     };
     let mut allocated = Decimal::ZERO;
     let children = quantities
@@ -956,6 +1014,146 @@ pub fn plan_execution(
         algorithm: label.to_owned(),
         children,
         unallocated_quantity: parent.quantity.checked_sub(allocated)?,
+    };
+    plan.validate_against(parent)?;
+    Ok(plan)
+}
+
+/// Plans sequential, display-size iceberg execution with exact fixed-point conservation.
+pub fn plan_iceberg_execution(
+    parent: &ParentOrder,
+    display_quantity: Decimal,
+    interval_seconds: u64,
+    kind: ChildOrderKind,
+) -> Result<ExecutionPlan, ExecutionError> {
+    parent.validate()?;
+    if display_quantity <= Decimal::ZERO || interval_seconds == 0 {
+        return Err(ExecutionError("invalid iceberg configuration".to_owned()));
+    }
+    let mut remaining = parent.quantity;
+    let mut children = Vec::new();
+    let mut index = 0_usize;
+    while remaining > Decimal::ZERO {
+        if index >= 10_000 {
+            return Err(ExecutionError(
+                "iceberg slice count exceeds maximum allowed".to_owned(),
+            ));
+        }
+        let slice = remaining.min(display_quantity);
+        let offset = u64::try_from(index)
+            .ok()
+            .and_then(|val| val.checked_mul(interval_seconds))
+            .ok_or_else(|| ExecutionError("iceberg schedule offset overflowed".to_owned()))?;
+        children.push(ChildInstruction {
+            child_order_id: format!("{}.child.{:04}", parent.parent_order_id, index + 1),
+            scheduled_after_seconds: offset,
+            venue: None,
+            quantity: slice,
+            kind,
+            limit_price: parent.limit_price,
+            stop_price: None,
+        });
+        remaining = remaining.checked_sub(slice)?;
+        index += 1;
+    }
+    let plan = ExecutionPlan {
+        parent_order_id: parent.parent_order_id.clone(),
+        algorithm: "iceberg-v1".to_owned(),
+        children,
+        unallocated_quantity: Decimal::ZERO,
+    };
+    plan.validate_against(parent)?;
+    Ok(plan)
+}
+
+/// Plans an algorithm-wheel execution by allocating a parent across bounded sub-algorithms.
+pub fn plan_algo_wheel_execution(
+    parent: &ParentOrder,
+    allocations: &[AlgoWheelAllocation],
+) -> Result<ExecutionPlan, ExecutionError> {
+    parent.validate()?;
+    if allocations.is_empty() || allocations.len() > 100 {
+        return Err(ExecutionError(
+            "algorithm wheel requires between 1 and 100 allocations".to_owned(),
+        ));
+    }
+    let mut total_weight = 0_u32;
+    for alloc in allocations {
+        if matches!(alloc.algorithm, ExecutionAlgorithm::AlgoWheel { .. }) {
+            return Err(ExecutionError(
+                "algorithm wheel cannot contain nested wheel algorithms".to_owned(),
+            ));
+        }
+        if alloc.weight_bps == 0 || alloc.weight_bps > 10_000 {
+            return Err(ExecutionError(
+                "algorithm wheel allocation weight must be in (0, 10000]".to_owned(),
+            ));
+        }
+        total_weight = total_weight
+            .checked_add(alloc.weight_bps)
+            .ok_or_else(|| ExecutionError("algorithm wheel weight overflowed".to_owned()))?;
+    }
+    if total_weight != 10_000 {
+        return Err(ExecutionError(
+            "algorithm wheel weights must sum to exactly 10000 basis points".to_owned(),
+        ));
+    }
+
+    let weights = allocations
+        .iter()
+        .map(|alloc| Decimal::from_integer(i64::from(alloc.weight_bps)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sub_quantities = split_weighted_exact(parent.quantity, &weights)?;
+
+    let mut combined_children = Vec::new();
+    let mut total_unallocated = Decimal::ZERO;
+
+    for (wheel_index, (alloc, quantity)) in allocations.iter().zip(sub_quantities).enumerate() {
+        let sub_parent = ParentOrder {
+            parent_order_id: format!("{}.wheel.{:02}", parent.parent_order_id, wheel_index + 1),
+            account_id: parent.account_id.clone(),
+            instrument_id: parent.instrument_id.clone(),
+            side: parent.side,
+            quantity,
+            limit_price: parent.limit_price,
+        };
+        let sub_plan = plan_execution(&sub_parent, &alloc.algorithm)?;
+        total_unallocated = total_unallocated.checked_add(sub_plan.unallocated_quantity)?;
+
+        for (child_index, child) in sub_plan.children.into_iter().enumerate() {
+            combined_children.push((
+                child.scheduled_after_seconds,
+                wheel_index,
+                child_index,
+                child,
+            ));
+        }
+    }
+
+    // Deterministic ordering: sort by scheduled offset, breaking ties by wheel allocation index, then child index
+    combined_children.sort_by(
+        |(offset_a, wheel_a, child_a, _), (offset_b, wheel_b, child_b, _)| {
+            offset_a
+                .cmp(offset_b)
+                .then_with(|| wheel_a.cmp(wheel_b))
+                .then_with(|| child_a.cmp(child_b))
+        },
+    );
+
+    let children = combined_children
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, _, _, mut child))| {
+            child.child_order_id = format!("{}.child.{:04}", parent.parent_order_id, index + 1);
+            child
+        })
+        .collect();
+
+    let plan = ExecutionPlan {
+        parent_order_id: parent.parent_order_id.clone(),
+        algorithm: "algo-wheel-v1".to_owned(),
+        children,
+        unallocated_quantity: total_unallocated,
     };
     plan.validate_against(parent)?;
     Ok(plan)
@@ -1269,6 +1467,483 @@ fn compare_quotes(side: Side, left: &VenueQuote, right: &VenueQuote) -> Ordering
     price_order
         .then_with(|| left.latency_rank.cmp(&right.latency_rank))
         .then_with(|| left.venue.cmp(&right.venue))
+}
+
+/// Versioned trading capabilities declared for a specific venue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VenueCapability {
+    /// Canonical venue identity.
+    pub venue: String,
+    /// Stable version label of the capability contract, e.g. "venue.cap.v1".
+    pub capability_version: String,
+    /// Set of supported child order kinds on this venue.
+    pub supported_order_kinds: BTreeSet<ChildOrderKind>,
+    /// Whether this venue accepts iceberg orders.
+    pub supports_iceberg: bool,
+    /// Minimum order quantity accepted by the venue if configured.
+    pub min_quantity: Option<Decimal>,
+    /// Maximum order quantity accepted by the venue if configured.
+    pub max_quantity: Option<Decimal>,
+}
+
+impl VenueCapability {
+    /// Validates venue capability identity and bounds.
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        validate_canonical_id("venue", &self.venue)?;
+        validate_canonical_id("capability_version", &self.capability_version)?;
+        if self.supported_order_kinds.is_empty() {
+            return Err(ExecutionError(
+                "venue capability must declare at least one supported order kind".to_owned(),
+            ));
+        }
+        if let Some(min) = self.min_quantity {
+            if min <= Decimal::ZERO {
+                return Err(ExecutionError("min_quantity must be positive".to_owned()));
+            }
+        }
+        if let Some(max) = self.max_quantity {
+            if max <= Decimal::ZERO {
+                return Err(ExecutionError("max_quantity must be positive".to_owned()));
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_quantity, self.max_quantity) {
+            if min > max {
+                return Err(ExecutionError(
+                    "venue min_quantity cannot exceed max_quantity".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic routing decision made for an allocated slice of a parent order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteDecision {
+    /// Unique decision identity.
+    pub decision_id: String,
+    /// Parent order identity.
+    pub parent_order_id: String,
+    /// Selected venue.
+    pub venue: String,
+    /// Version of venue capability evaluated.
+    pub capability_version: String,
+    /// Quantity allocated to this venue.
+    pub allocated_quantity: Decimal,
+    /// Effective executable price including fees.
+    pub all_in_price: Decimal,
+    /// Fee per unit.
+    pub fee_per_unit: Decimal,
+    /// Latency rank used in tie-breaking.
+    pub latency_rank: u32,
+}
+
+/// Gated smart routing that requires explicit venue capability verification.
+///
+/// Refuses unknown venues, duplicate capability records, and unsupported order kinds
+/// before producing any route decisions.
+pub fn smart_route_with_capabilities(
+    parent: &ParentOrder,
+    quotes: &[VenueQuote],
+    capabilities: &[VenueCapability],
+) -> Result<(ExecutionPlan, Vec<RouteDecision>), ExecutionError> {
+    parent.validate()?;
+    if quotes.is_empty() || quotes.len() > 1_000 {
+        return Err(ExecutionError(
+            "smart routing requires between 1 and 1000 venue quotes".to_owned(),
+        ));
+    }
+
+    // 1. Validate capability records and check for duplicate venues
+    let mut cap_map = BTreeMap::new();
+    for cap in capabilities {
+        cap.validate()?;
+        if cap_map.insert(&cap.venue, cap).is_some() {
+            return Err(ExecutionError(format!(
+                "duplicate capability record for venue '{}'",
+                cap.venue
+            )));
+        }
+    }
+
+    // 2. Validate quotes: every quoted venue MUST have an authoritative capability record
+    let required_kind = if parent.limit_price.is_some() {
+        ChildOrderKind::Limit
+    } else {
+        ChildOrderKind::Market
+    };
+
+    for quote in quotes {
+        validate_canonical_id("venue", &quote.venue)?;
+        if quote.available_quantity <= Decimal::ZERO
+            || quote.price <= Decimal::ZERO
+            || quote.fee_per_unit < Decimal::ZERO
+        {
+            return Err(ExecutionError("invalid smart-routing quote".to_owned()));
+        }
+        let cap = cap_map.get(&quote.venue).ok_or_else(|| {
+            ExecutionError(format!(
+                "routing refused: unknown venue capability for '{}'",
+                quote.venue
+            ))
+        })?;
+        if !cap.supported_order_kinds.contains(&required_kind) {
+            return Err(ExecutionError(format!(
+                "routing refused: venue '{}' does not support required order kind {:?}",
+                quote.venue, required_kind
+            )));
+        }
+    }
+
+    // 3. Sort quotes deterministically by best all-in price, then latency rank, then venue
+    let mut ordered = quotes.to_vec();
+    ordered.sort_by(|left, right| compare_quotes(parent.side, left, right));
+
+    let mut remaining = parent.quantity;
+    let mut children = Vec::new();
+    let mut decisions = Vec::new();
+
+    for quote in ordered {
+        if remaining == Decimal::ZERO {
+            break;
+        }
+        let cap = cap_map.get(&quote.venue).expect("validated");
+        let mut available = quote.available_quantity;
+        if let Some(max) = cap.max_quantity {
+            available = available.min(max);
+        }
+        if let Some(min) = cap.min_quantity {
+            if available < min {
+                continue;
+            }
+        }
+        let quantity = available.min(remaining);
+        if let Some(min) = cap.min_quantity {
+            if quantity < min {
+                continue;
+            }
+        }
+        let protected = match (parent.side, parent.limit_price) {
+            (Side::Buy, Some(limit)) if quote.price > limit => continue,
+            (Side::Sell, Some(limit)) if quote.price < limit => continue,
+            _ => Some(quote.price),
+        };
+        let index = children.len() + 1;
+        let child_id = format!("{}.route.{index:04}", parent.parent_order_id);
+        children.push(ChildInstruction {
+            child_order_id: child_id.clone(),
+            scheduled_after_seconds: 0,
+            venue: Some(quote.venue.clone()),
+            quantity,
+            kind: required_kind,
+            limit_price: protected,
+            stop_price: None,
+        });
+        let all_in_price = match parent.side {
+            Side::Buy => quote.price.checked_add(quote.fee_per_unit)?,
+            Side::Sell => quote.price.checked_sub(quote.fee_per_unit)?,
+        };
+        decisions.push(RouteDecision {
+            decision_id: format!("{}.decision.{index:04}", parent.parent_order_id),
+            parent_order_id: parent.parent_order_id.clone(),
+            venue: quote.venue.clone(),
+            capability_version: cap.capability_version.clone(),
+            allocated_quantity: quantity,
+            all_in_price,
+            fee_per_unit: quote.fee_per_unit,
+            latency_rank: quote.latency_rank,
+        });
+        remaining = remaining.checked_sub(quantity)?;
+    }
+
+    let plan = ExecutionPlan {
+        parent_order_id: parent.parent_order_id.clone(),
+        algorithm: "smart-router-v1".to_owned(),
+        children,
+        unallocated_quantity: remaining,
+    };
+    plan.validate_against(parent)?;
+    Ok((plan, decisions))
+}
+
+/// Frozen pre/post-trade benchmarks associated with an execution plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionBenchmarkEvidence {
+    /// Unique benchmark identity.
+    pub benchmark_id: String,
+    /// Parent order identity.
+    pub parent_order_id: String,
+    /// Frozen arrival price at parent release.
+    pub arrival_price: Decimal,
+    /// Frozen algorithm target benchmark price.
+    pub target_price: Decimal,
+    /// Authoritative source of the benchmark mark.
+    pub source: String,
+}
+
+impl ExecutionBenchmarkEvidence {
+    /// Validates benchmark fields.
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        validate_canonical_id("benchmark_id", &self.benchmark_id)?;
+        validate_canonical_id("parent_order_id", &self.parent_order_id)?;
+        validate_canonical_id("source", &self.source)?;
+        if self.arrival_price <= Decimal::ZERO || self.target_price <= Decimal::ZERO {
+            return Err(ExecutionError(
+                "benchmark prices must be positive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable, content-addressed evidence record for an execution plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionPlanEvidence {
+    /// Unique evidence identity.
+    pub evidence_id: String,
+    /// Parent order identity.
+    pub parent_order_id: String,
+    /// Account selected for the order.
+    pub account_id: String,
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// Order economic side.
+    pub side: Side,
+    /// Total authorized parent quantity.
+    pub parent_quantity: Decimal,
+    /// Optional limit price.
+    pub limit_price: Option<Decimal>,
+    /// Execution algorithm label.
+    pub algorithm: String,
+    /// Scheduled child instructions.
+    pub children: Vec<ChildInstruction>,
+    /// Unallocated quantity if any.
+    pub unallocated_quantity: Decimal,
+    /// Source capability version if capability-routed.
+    pub source_capability_version: Option<String>,
+    /// Routing decisions if multi-venue routed.
+    pub route_decisions: Vec<RouteDecision>,
+    /// Optional frozen benchmarks.
+    pub benchmarks: Option<ExecutionBenchmarkEvidence>,
+    /// Content-addressed SHA-256 fingerprint.
+    pub plan_sha256: String,
+    /// Canonical RFC3339 creation timestamp.
+    pub created_at: String,
+}
+
+impl ExecutionPlanEvidence {
+    /// Creates and cryptographically fingerprints an execution plan evidence record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        evidence_id: String,
+        parent: &ParentOrder,
+        plan: &ExecutionPlan,
+        source_capability_version: Option<String>,
+        route_decisions: Vec<RouteDecision>,
+        benchmarks: Option<ExecutionBenchmarkEvidence>,
+        created_at: String,
+    ) -> Result<Self, ExecutionError> {
+        validate_canonical_id("evidence_id", &evidence_id)?;
+        parent.validate()?;
+        plan.validate_against(parent)?;
+        if let Some(ref version) = source_capability_version {
+            validate_canonical_id("source_capability_version", version)?;
+        }
+        for decision in &route_decisions {
+            validate_canonical_id("decision_id", &decision.decision_id)?;
+            if decision.parent_order_id != parent.parent_order_id {
+                return Err(ExecutionError(
+                    "route decision parent_order_id mismatch".to_owned(),
+                ));
+            }
+            validate_canonical_id("decision venue", &decision.venue)?;
+            validate_canonical_id("decision capability_version", &decision.capability_version)?;
+            if decision.allocated_quantity <= Decimal::ZERO
+                || decision.all_in_price <= Decimal::ZERO
+                || decision.fee_per_unit < Decimal::ZERO
+            {
+                return Err(ExecutionError(
+                    "invalid route decision economics".to_owned(),
+                ));
+            }
+        }
+        if let Some(ref benchmark) = benchmarks {
+            benchmark.validate()?;
+            if benchmark.parent_order_id != parent.parent_order_id {
+                return Err(ExecutionError(
+                    "benchmark evidence parent_order_id mismatch".to_owned(),
+                ));
+            }
+        }
+        validate_utc_timestamp("created_at", &created_at)?;
+
+        let unsigned_json = Self::build_canonical_json(
+            &evidence_id,
+            &parent.parent_order_id,
+            &parent.account_id,
+            &parent.instrument_id,
+            parent.side,
+            parent.quantity,
+            parent.limit_price,
+            &plan.algorithm,
+            &plan.children,
+            plan.unallocated_quantity,
+            source_capability_version.as_deref(),
+            &route_decisions,
+            benchmarks.as_ref(),
+            &created_at,
+            None,
+        );
+        let plan_sha256 = format!("{:x}", Sha256::digest(unsigned_json.as_bytes()));
+
+        Ok(Self {
+            evidence_id,
+            parent_order_id: parent.parent_order_id.clone(),
+            account_id: parent.account_id.clone(),
+            instrument_id: parent.instrument_id.clone(),
+            side: parent.side,
+            parent_quantity: parent.quantity,
+            limit_price: parent.limit_price,
+            algorithm: plan.algorithm.clone(),
+            children: plan.children.clone(),
+            unallocated_quantity: plan.unallocated_quantity,
+            source_capability_version,
+            route_decisions,
+            benchmarks,
+            plan_sha256,
+            created_at,
+        })
+    }
+
+    /// Verifies that `plan_sha256` matches the canonical hash of this evidence record.
+    pub fn verify_fingerprint(&self) -> bool {
+        let unsigned_json = Self::build_canonical_json(
+            &self.evidence_id,
+            &self.parent_order_id,
+            &self.account_id,
+            &self.instrument_id,
+            self.side,
+            self.parent_quantity,
+            self.limit_price,
+            &self.algorithm,
+            &self.children,
+            self.unallocated_quantity,
+            self.source_capability_version.as_deref(),
+            &self.route_decisions,
+            self.benchmarks.as_ref(),
+            &self.created_at,
+            None,
+        );
+        let expected_sha256 = format!("{:x}", Sha256::digest(unsigned_json.as_bytes()));
+        self.plan_sha256 == expected_sha256
+    }
+
+    /// Canonical JSON representation including the calculated `plan_sha256`.
+    pub fn canonical_json(&self) -> String {
+        Self::build_canonical_json(
+            &self.evidence_id,
+            &self.parent_order_id,
+            &self.account_id,
+            &self.instrument_id,
+            self.side,
+            self.parent_quantity,
+            self.limit_price,
+            &self.algorithm,
+            &self.children,
+            self.unallocated_quantity,
+            self.source_capability_version.as_deref(),
+            &self.route_decisions,
+            self.benchmarks.as_ref(),
+            &self.created_at,
+            Some(&self.plan_sha256),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_canonical_json(
+        evidence_id: &str,
+        parent_order_id: &str,
+        account_id: &str,
+        instrument_id: &str,
+        side: Side,
+        parent_quantity: Decimal,
+        limit_price: Option<Decimal>,
+        algorithm: &str,
+        children: &[ChildInstruction],
+        unallocated_quantity: Decimal,
+        source_capability_version: Option<&str>,
+        route_decisions: &[RouteDecision],
+        benchmarks: Option<&ExecutionBenchmarkEvidence>,
+        created_at: &str,
+        plan_sha256: Option<&str>,
+    ) -> String {
+        let children_json = children
+            .iter()
+            .map(|c| {
+                format!(
+                    "{{\"child_order_id\":{},\"kind\":{},\"limit_price\":{},\"quantity\":\"{}\",\"scheduled_after_seconds\":{},\"stop_price\":{},\"venue\":{}}}",
+                    json_string(&c.child_order_id),
+                    json_string(order_kind_label(c.kind)),
+                    c.limit_price.map(|p| format!("\"{p}\"")).unwrap_or_else(|| "null".to_owned()),
+                    c.quantity,
+                    c.scheduled_after_seconds,
+                    c.stop_price.map(|p| format!("\"{p}\"")).unwrap_or_else(|| "null".to_owned()),
+                    c.venue.as_deref().map(json_string).unwrap_or_else(|| "null".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let routes_json = route_decisions
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"allocated_quantity\":\"{}\",\"all_in_price\":\"{}\",\"capability_version\":{},\"decision_id\":{},\"fee_per_unit\":\"{}\",\"latency_rank\":{},\"parent_order_id\":{},\"venue\":{}}}",
+                    r.allocated_quantity,
+                    r.all_in_price,
+                    json_string(&r.capability_version),
+                    json_string(&r.decision_id),
+                    r.fee_per_unit,
+                    r.latency_rank,
+                    json_string(&r.parent_order_id),
+                    json_string(&r.venue),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let benchmarks_json = benchmarks
+            .map(|b| {
+                format!(
+                    "{{\"arrival_price\":\"{}\",\"benchmark_id\":{},\"parent_order_id\":{},\"source\":{},\"target_price\":\"{}\"}}",
+                    b.arrival_price,
+                    json_string(&b.benchmark_id),
+                    json_string(&b.parent_order_id),
+                    json_string(&b.source),
+                    b.target_price,
+                )
+            })
+            .unwrap_or_else(|| "null".to_owned());
+
+        format!(
+            "{{\"account_id\":{},\"algorithm\":{},\"benchmarks\":{},\"children\":[{}],\"created_at\":{},\"evidence_id\":{},\"instrument_id\":{},\"limit_price\":{},\"parent_order_id\":{},\"parent_quantity\":\"{}\",\"plan_sha256\":{},\"route_decisions\":[{}],\"side\":{},\"source_capability_version\":{},\"unallocated_quantity\":\"{}\"}}",
+            json_string(account_id),
+            json_string(algorithm),
+            benchmarks_json,
+            children_json,
+            json_string(created_at),
+            json_string(evidence_id),
+            json_string(instrument_id),
+            limit_price.map(|p| format!("\"{p}\"")).unwrap_or_else(|| "null".to_owned()),
+            json_string(parent_order_id),
+            parent_quantity,
+            plan_sha256.map(json_string).unwrap_or_else(|| "null".to_owned()),
+            routes_json,
+            json_string(side_label(side)),
+            source_capability_version.map(json_string).unwrap_or_else(|| "null".to_owned()),
+            unallocated_quantity,
+        )
+    }
 }
 
 /// Creates linked profit-taking and stop-loss children for an approved entry.
@@ -1932,5 +2607,236 @@ mod tests {
         assert_eq!(arrival_plan.unallocated_quantity, Decimal::ZERO);
         assert_eq!(arrival_plan.children[0].quantity, amount("40"));
         assert_eq!(arrival_plan.children[3].quantity, amount("10"));
+    }
+
+    #[test]
+    fn iceberg_conserves_parent_quantity_and_enforces_interval() {
+        let parent = parent("10.5");
+        let plan = plan_execution(
+            &parent,
+            &ExecutionAlgorithm::Iceberg {
+                display_quantity: amount("3"),
+                interval_seconds: 45,
+            },
+        )
+        .expect("iceberg plan");
+        assert_eq!(plan.algorithm, "iceberg-v1");
+        assert_eq!(plan.children.len(), 4);
+        assert_eq!(plan.children[0].quantity, amount("3"));
+        assert_eq!(plan.children[1].quantity, amount("3"));
+        assert_eq!(plan.children[2].quantity, amount("3"));
+        assert_eq!(plan.children[3].quantity, amount("1.5"));
+        assert_eq!(plan.children[0].scheduled_after_seconds, 0);
+        assert_eq!(plan.children[1].scheduled_after_seconds, 45);
+        assert_eq!(plan.children[2].scheduled_after_seconds, 90);
+        assert_eq!(plan.children[3].scheduled_after_seconds, 135);
+        assert_eq!(plan.unallocated_quantity, Decimal::ZERO);
+        assert_eq!(plan.children[0].kind, ChildOrderKind::Limit);
+        plan.validate_against(&parent).expect("conserved");
+
+        // Market iceberg when parent has no limit
+        let mut market_parent = parent.clone();
+        market_parent.quantity = amount("5");
+        market_parent.limit_price = None;
+        let mkt_plan =
+            plan_iceberg_execution(&market_parent, amount("2"), 30, ChildOrderKind::Market)
+                .expect("market iceberg");
+        assert_eq!(mkt_plan.children.len(), 3);
+        assert_eq!(mkt_plan.children[0].kind, ChildOrderKind::Market);
+        assert_eq!(mkt_plan.children[2].quantity, amount("1"));
+
+        // Refuse invalid configs
+        assert!(plan_iceberg_execution(&parent, amount("0"), 30, ChildOrderKind::Limit).is_err());
+        assert!(plan_iceberg_execution(&parent, amount("1"), 0, ChildOrderKind::Limit).is_err());
+    }
+
+    #[test]
+    fn algo_wheel_allocates_exact_weights_and_breaks_schedule_ties_deterministically() {
+        let parent = parent("100");
+        let wheel = ExecutionAlgorithm::AlgoWheel {
+            allocations: vec![
+                AlgoWheelAllocation {
+                    algorithm: ExecutionAlgorithm::Twap {
+                        slice_count: 2,
+                        interval_seconds: 60,
+                    },
+                    weight_bps: 6_000,
+                },
+                AlgoWheelAllocation {
+                    algorithm: ExecutionAlgorithm::Twap {
+                        slice_count: 2,
+                        interval_seconds: 60,
+                    },
+                    weight_bps: 4_000,
+                },
+            ],
+        };
+        let plan = plan_execution(&parent, &wheel).expect("wheel plan");
+        assert_eq!(plan.algorithm, "algo-wheel-v1");
+        assert_eq!(plan.children.len(), 4);
+        assert_eq!(plan.unallocated_quantity, Decimal::ZERO);
+
+        // Schedule offsets:
+        // Branch 0 (60%): 60 qty -> 2 slices of 30 at offsets 0 and 60
+        // Branch 1 (40%): 40 qty -> 2 slices of 20 at offsets 0 and 60
+        // Sorted ties: offset 0 has branch 0 child 1 (30), then branch 1 child 1 (20)
+        // Offset 60 has branch 0 child 2 (30), then branch 1 child 2 (20)
+        assert_eq!(plan.children[0].scheduled_after_seconds, 0);
+        assert_eq!(plan.children[0].quantity, amount("30"));
+        assert_eq!(plan.children[1].scheduled_after_seconds, 0);
+        assert_eq!(plan.children[1].quantity, amount("20"));
+        assert_eq!(plan.children[2].scheduled_after_seconds, 60);
+        assert_eq!(plan.children[2].quantity, amount("30"));
+        assert_eq!(plan.children[3].scheduled_after_seconds, 60);
+        assert_eq!(plan.children[3].quantity, amount("20"));
+
+        plan.validate_against(&parent).expect("conservation");
+
+        // Replay equality: running twice with identical inputs yields identical child orders
+        let plan_repeat = plan_execution(&parent, &wheel).expect("repeat");
+        assert_eq!(plan, plan_repeat);
+
+        // Reject nested algo-wheel
+        let nested = ExecutionAlgorithm::AlgoWheel {
+            allocations: vec![AlgoWheelAllocation {
+                algorithm: wheel.clone(),
+                weight_bps: 10_000,
+            }],
+        };
+        assert!(plan_execution(&parent, &nested).is_err());
+
+        // Reject weights not summing to 10000
+        let bad_weights = ExecutionAlgorithm::AlgoWheel {
+            allocations: vec![AlgoWheelAllocation {
+                algorithm: ExecutionAlgorithm::Immediate,
+                weight_bps: 5_000,
+            }],
+        };
+        assert!(plan_execution(&parent, &bad_weights).is_err());
+    }
+
+    #[test]
+    fn capability_gated_routing_refuses_unknown_duplicate_and_unsupported_venues() {
+        let parent = parent("10");
+        let quotes = vec![
+            VenueQuote {
+                venue: "venue.nyse".to_owned(),
+                available_quantity: amount("6"),
+                price: amount("100"),
+                fee_per_unit: amount("0.01"),
+                latency_rank: 1,
+            },
+            VenueQuote {
+                venue: "venue.nasdaq".to_owned(),
+                available_quantity: amount("6"),
+                price: amount("99.98"),
+                fee_per_unit: amount("0.01"),
+                latency_rank: 2,
+            },
+        ];
+
+        let mut supported_kinds = BTreeSet::new();
+        supported_kinds.insert(ChildOrderKind::Limit);
+
+        let valid_caps = vec![
+            VenueCapability {
+                venue: "venue.nyse".to_owned(),
+                capability_version: "cap.nyse.v1".to_owned(),
+                supported_order_kinds: supported_kinds.clone(),
+                supports_iceberg: true,
+                min_quantity: Some(amount("1")),
+                max_quantity: Some(amount("1000")),
+            },
+            VenueCapability {
+                venue: "venue.nasdaq".to_owned(),
+                capability_version: "cap.nasdaq.v1".to_owned(),
+                supported_order_kinds: supported_kinds.clone(),
+                supports_iceberg: false,
+                min_quantity: None,
+                max_quantity: None,
+            },
+        ];
+
+        // 1. Success case
+        let (plan, decisions) =
+            smart_route_with_capabilities(&parent, &quotes, &valid_caps).expect("gated route");
+        assert_eq!(plan.children.len(), 2);
+        assert_eq!(decisions.len(), 2);
+        // venue.nasdaq has all-in 99.99 vs nyse 100.01 -> nasdaq first
+        assert_eq!(decisions[0].venue, "venue.nasdaq");
+        assert_eq!(decisions[0].allocated_quantity, amount("6"));
+        assert_eq!(decisions[1].venue, "venue.nyse");
+        assert_eq!(decisions[1].allocated_quantity, amount("4"));
+        assert_eq!(plan.unallocated_quantity, Decimal::ZERO);
+
+        // 2. Refuses unknown venue capability
+        let partial_caps = vec![valid_caps[0].clone()];
+        assert!(smart_route_with_capabilities(&parent, &quotes, &partial_caps).is_err());
+
+        // 3. Refuses duplicate capability record
+        let duplicate_caps = vec![valid_caps[0].clone(), valid_caps[0].clone()];
+        assert!(smart_route_with_capabilities(&parent, &quotes, &duplicate_caps).is_err());
+
+        // 4. Refuses unsupported order kind
+        let mut market_only_kinds = BTreeSet::new();
+        market_only_kinds.insert(ChildOrderKind::Market);
+        let market_only_caps = vec![
+            valid_caps[0].clone(),
+            VenueCapability {
+                venue: "venue.nasdaq".to_owned(),
+                capability_version: "cap.nasdaq.v1".to_owned(),
+                supported_order_kinds: market_only_kinds,
+                supports_iceberg: false,
+                min_quantity: None,
+                max_quantity: None,
+            },
+        ];
+        // Parent is a Limit order, so nasdaq declaring only Market causes refusal
+        assert!(smart_route_with_capabilities(&parent, &quotes, &market_only_caps).is_err());
+    }
+
+    #[test]
+    fn execution_plan_evidence_binds_evidence_fingerprint_and_detects_tampering() {
+        let parent = parent("10");
+        let plan = plan_execution(
+            &parent,
+            &ExecutionAlgorithm::Twap {
+                slice_count: 2,
+                interval_seconds: 30,
+            },
+        )
+        .expect("twap");
+
+        let benchmark = ExecutionBenchmarkEvidence {
+            benchmark_id: "bmk.test.001".to_owned(),
+            parent_order_id: parent.parent_order_id.clone(),
+            arrival_price: amount("100"),
+            target_price: amount("100.05"),
+            source: "quote.mid.v1".to_owned(),
+        };
+
+        let evidence = ExecutionPlanEvidence::new(
+            "evidence.plan.001".to_owned(),
+            &parent,
+            &plan,
+            Some("cap.nyse.v1".to_owned()),
+            Vec::new(),
+            Some(benchmark),
+            "2026-09-04T10:00:00Z".to_owned(),
+        )
+        .expect("plan evidence");
+
+        assert!(evidence.verify_fingerprint());
+        assert!(!evidence.plan_sha256.is_empty());
+
+        let json = evidence.canonical_json();
+        assert!(json.contains("evidence.plan.001"));
+        assert!(json.contains("twap-v1"));
+        assert!(json.contains(&evidence.plan_sha256));
+
+        // Tamper detection: modifying quantity breaks fingerprint verification
+        let mut tampered = evidence.clone();
+        tampered.parent_quantity = amount("11");
+        assert!(!tampered.verify_fingerprint());
     }
 }

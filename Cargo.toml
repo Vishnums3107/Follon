@@ -17,7 +17,6 @@ members = [
     "core/secrets",
     "core/control-plane",
     "core/news",
-    "core/alerts",
     "apps/cli",
     "adapters/brokers/ibkr",
     "adapters/persistence/postgres",

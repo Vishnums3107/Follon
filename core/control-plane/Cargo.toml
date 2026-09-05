@@ -17,3 +17,4 @@ sha2 = "0.10.9"
 path = "src/lib.rs"
 
 [lints]
+workspace = true

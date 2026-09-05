@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/assistant-evidence.schema.json",
+  "title": "Follon Assistant Evidence Contract v1",
+  "description": "Schema for read-only, citation-grounded research copilot evidence (AI-01).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "assistant_evidence_schema_version",
+    "query_id",
+    "model_version",
+    "prompt_template_version",
+    "retrieved_record_ids",
+    "generated_output",
+    "tool_attempts",
+    "uncertainty_score_bps",
+    "human_disposition",
+    "created_at"
+  ],
+  "properties": {
+    "assistant_evidence_schema_version": { "const": 1 },
+    "query_id": { "$ref": "#/$defs/canonicalId" },
+    "model_version": { "type": "string", "minLength": 1 },
+    "prompt_template_version": { "type": "string", "minLength": 1 },
+    "retrieved_record_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "generated_output": { "type": "string", "minLength": 1, "maxLength": 8192 },
+    "tool_attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool_name", "arguments_hash", "status", "evidence_id"],
+        "properties": {
+          "tool_name": { "type": "string", "minLength": 1 },
+          "arguments_hash": { "$ref": "#/$defs/sha256" },
+          "status": { "type": "string", "enum": ["SUCCESS", "FAILED", "BLOCKED"] },
+          "evidence_id": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "uncertainty_score_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "human_disposition": {
+      "type": "string",
+      "enum": ["ACCEPTED", "REJECTED", "AMENDED", "PENDING"]
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

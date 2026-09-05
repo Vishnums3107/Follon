@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/research-job.schema.json",
+  "title": "Follon Research Job Contract v1",
+  "description": "Schema for typed idempotent research and backtest execution jobs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_schema_version",
+    "job_id",
+    "idempotency_key",
+    "strategy_id",
+    "strategy_version",
+    "dataset_id",
+    "dataset_version",
+    "frozen_specification_hash",
+    "state_version",
+    "state",
+    "worker_lease",
+    "output_manifest_hash",
+    "failure_reason",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "job_schema_version": { "const": 1 },
+    "job_id": { "$ref": "#/$defs/canonicalId" },
+    "idempotency_key": { "$ref": "#/$defs/canonicalId" },
+    "strategy_id": { "$ref": "#/$defs/canonicalId" },
+    "strategy_version": { "type": "string", "minLength": 1 },
+    "dataset_id": { "$ref": "#/$defs/canonicalId" },
+    "dataset_version": { "type": "string", "minLength": 1 },
+    "frozen_specification_hash": { "$ref": "#/$defs/sha256" },
+    "state_version": { "type": "integer", "minimum": 1 },
+    "state": {
+      "type": "string",
+      "enum": ["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
+    },
+    "worker_lease": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lease_id", "worker_id", "acquired_at", "expires_at"],
+          "properties": {
+            "lease_id": { "$ref": "#/$defs/canonicalId" },
+            "worker_id": { "$ref": "#/$defs/canonicalId" },
+            "acquired_at": { "type": "string", "format": "date-time" },
+            "expires_at": { "type": "string", "format": "date-time" }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "output_manifest_hash": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "failure_reason": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 1024 },
+        { "type": "null" }
+      ]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "canonicalId": {
+      "type": "string",
+      "pattern": "^[a-z0-9._-]+$",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

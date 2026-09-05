@@ -395,9 +395,10 @@ class DashboardServerContract(unittest.TestCase):
         screens = {
             "Command Center",
             "Research Lab",
-            "News Cockpit",
-            "Strategy Studio",
-            "Backtest Explorer",
+            "News",
+            "Strategies",
+            "Marketplace",
+            "Backtest",
             "Execution Blotter",
             "Risk Cockpit",
             "Portfolio",
@@ -422,7 +423,7 @@ class DashboardServerContract(unittest.TestCase):
 
         runtime_source = MAIN_SOURCE_PATH.read_text(encoding="utf-8")
         self.assertIn('const pathPrefix = "/workspace/"', runtime_source)
-        self.assertIn('`/#workspace/${encodeURIComponent(workspace.id)}`', runtime_source)
+        self.assertIn('`#workspace/${encodeURIComponent(workspace.id)}`', runtime_source)
         self.assertIn('fetch(apiUrl("/api/v1/workspaces")', runtime_source)
         self.assertIn('from "./evidence.js"', runtime_source)
         self.assertIn('from "./catalog.js"', runtime_source)
@@ -433,7 +434,7 @@ class DashboardServerContract(unittest.TestCase):
             "renderCommandCenter", "renderResearchLab", "renderStrategyStudio",
             "renderBacktestExplorer", "renderExecutionBlotter", "renderRiskCockpit",
             "renderPortfolio", "renderReplayAndIncidents", "renderJournal",
-            "renderAdministration",
+            "renderAdministration", "renderMarketplace", "renderNewsCockpit",
         ):
             self.assertIn(f"function {renderer}", workspace_source)
 
