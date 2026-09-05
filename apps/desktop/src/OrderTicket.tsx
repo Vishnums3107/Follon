@@ -113,6 +113,15 @@ export function OrderTicket({
     setStatus("Draft inputs cleared.");
   };
 
+  const handleAutofillMetadata = (): void => {
+    const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    const suffix = Math.random().toString(36).substring(2, 8);
+    if (!intentId.trim()) setIntentId(`intent.desk.${suffix}`);
+    if (!correlationId.trim()) setCorrelationId(`corr.desk.${suffix}`);
+    setCreatedAt(now);
+    setStatus("Generated canonical IDs and current UTC timestamp.");
+  };
+
   const handleSubmit = async (side: "BUY" | "SELL"): Promise<void> => {
     setSubmitting(true);
     setStatus(`Routing ${side} intent to Risk/OMS…`);
@@ -282,6 +291,14 @@ export function OrderTicket({
           onClick={() => void handleSubmit("SELL")}
         >
           Sell
+        </button>
+        <button
+          className="f-btn f-btn--ghost"
+          type="button"
+          disabled={submitting}
+          onClick={handleAutofillMetadata}
+        >
+          Generate IDs & Timestamp
         </button>
         <button
           className="f-btn f-btn--ghost"
