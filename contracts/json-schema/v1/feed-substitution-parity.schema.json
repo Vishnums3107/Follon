@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FeedSubstitutionParity",
+  "description": "Deterministic parity comparison between market data providers covering symbol mappings, adjustments, timestamps, and latency ranks (DATA-06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "parity_schema_version",
+    "comparison_id",
+    "primary_provider",
+    "candidate_provider",
+    "sample_start",
+    "sample_end",
+    "symbol_match_pct",
+    "timestamp_variance_micros_p99",
+    "adjustment_parity_verified",
+    "parity_disposition",
+    "created_at"
+  ],
+  "properties": {
+    "parity_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "comparison_id": {
+      "type": "string",
+      "pattern": "^feed-parity\\.[a-z0-9_.-]+$"
+    },
+    "primary_provider": { "type": "string" },
+    "candidate_provider": { "type": "string" },
+    "sample_start": { "type": "string", "format": "date-time" },
+    "sample_end": { "type": "string", "format": "date-time" },
+    "symbol_match_pct": { "type": "string" },
+    "timestamp_variance_micros_p99": { "type": "integer", "minimum": 0 },
+    "adjustment_parity_verified": { "type": "boolean" },
+    "parity_disposition": {
+      "type": "string",
+      "enum": ["QUALIFIED_FOR_SUBSTITUTION", "DEFICIENT_COVERAGE", "TIMESTAMP_DESYNC", "UNRECONCILED_SPLITS"]
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

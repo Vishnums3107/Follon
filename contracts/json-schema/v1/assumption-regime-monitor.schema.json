@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AssumptionRegimeMonitor",
+  "description": "Assumption-aware regime telemetry tracking volatility, liquidity, trend, and correlation shifts and their impact on strategy assumptions (DATA-05).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "regime_schema_version",
+    "regime_id",
+    "as_of_time",
+    "lookback_bars",
+    "current_regime",
+    "indicators",
+    "impacted_strategy_assumptions",
+    "model_version",
+    "created_at"
+  ],
+  "properties": {
+    "regime_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "regime_id": {
+      "type": "string",
+      "pattern": "^regime\\.[a-z0-9_.-]+$"
+    },
+    "as_of_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "lookback_bars": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "current_regime": {
+      "type": "string",
+      "enum": ["LOW_VOL_TRENDING", "ELEVATED_VOL_TRENDING", "HIGH_VOL_CHOPPY", "LIQUIDITY_COMPRESSION", "EXTREME_STRESS"]
+    },
+    "indicators": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["realized_vol_annual_bps", "effective_spread_bps", "trend_strength_bps", "cross_asset_correlation_bps"],
+      "properties": {
+        "realized_vol_annual_bps": { "type": "integer" },
+        "effective_spread_bps": { "type": "integer" },
+        "trend_strength_bps": { "type": "integer" },
+        "cross_asset_correlation_bps": { "type": "integer" }
+      }
+    },
+    "impacted_strategy_assumptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["strategy_id", "assumed_condition", "observed_condition", "breach_status"],
+        "properties": {
+          "strategy_id": { "type": "string" },
+          "assumed_condition": { "type": "string" },
+          "observed_condition": { "type": "string" },
+          "breach_status": { "type": "string", "enum": ["COMPATIBLE", "ELEVATED_RISK", "ASSUMPTION_VIOLATED"] }
+        }
+      }
+    },
+    "model_version": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -582,6 +582,126 @@ export type ContinuityPolicy = Readonly<{
   created_at: string;
 }>;
 
+export type AssumptionRegimeMonitor = Readonly<{
+  regime_schema_version: 1;
+  regime_id: string;
+  as_of_time: string;
+  lookback_bars: number;
+  current_regime: "LOW_VOL_TRENDING" | "ELEVATED_VOL_TRENDING" | "HIGH_VOL_CHOPPY" | "LIQUIDITY_COMPRESSION" | "EXTREME_STRESS";
+  indicators: Readonly<{
+    realized_vol_annual_bps: number;
+    effective_spread_bps: number;
+    trend_strength_bps: number;
+    cross_asset_correlation_bps: number;
+  }>;
+  impacted_strategy_assumptions: ReadonlyArray<Readonly<{
+    strategy_id: string;
+    assumed_condition: string;
+    observed_condition: string;
+    breach_status: "COMPATIBLE" | "ELEVATED_RISK" | "ASSUMPTION_VIOLATED";
+  }>>;
+  model_version: string;
+  created_at: string;
+}>;
+
+export type FeedSubstitutionParity = Readonly<{
+  parity_schema_version: 1;
+  comparison_id: string;
+  primary_provider: string;
+  candidate_provider: string;
+  sample_start: string;
+  sample_end: string;
+  symbol_match_pct: string;
+  timestamp_variance_micros_p99: number;
+  adjustment_parity_verified: boolean;
+  parity_disposition: "QUALIFIED_FOR_SUBSTITUTION" | "DEFICIENT_COVERAGE" | "TIMESTAMP_DESYNC" | "UNRECONCILED_SPLITS";
+  created_at: string;
+}>;
+
+export type ExecutionCoachBenchmark = Readonly<{
+  coach_schema_version: 1;
+  analysis_id: string;
+  order_id: string;
+  instrument_id: string;
+  arrival_price: string;
+  target_price: string;
+  realized_vwap: string;
+  pre_trade_estimated_cost_bps: number;
+  realized_shortfall_bps: number;
+  slippage_drag_bps: number;
+  market_impact_bps: number;
+  fee_drag_bps: number;
+  execution_grade: "OPTIMAL" | "ACCEPTABLE" | "ELEVATED_SLIPPAGE" | "DEFICIENT_ROUTING";
+  created_at: string;
+}>;
+
+export type ScenarioLossSimulation = Readonly<{
+  simulation_schema_version: 1;
+  simulation_id: string;
+  account_id: string;
+  scenario_name: string;
+  shock_assumptions: Readonly<{
+    equity_shock_pct: string;
+    volatility_multiplier: string;
+    spread_expansion_multiplier: string;
+    financing_rate_shock_bps: number;
+  }>;
+  estimated_loss_usd: string;
+  estimated_loss_bps: number;
+  liquidity_haircut_usd: string;
+  stressed_margin_utilization_pct: string;
+  capital_adequate: boolean;
+  created_at: string;
+}>;
+
+export type CapitalAllocationPlan = Readonly<{
+  allocation_schema_version: 1;
+  plan_id: string;
+  total_capital_usd: string;
+  cash_reserve_bps: number;
+  allocations: ReadonlyArray<Readonly<{
+    strategy_id: string;
+    allocated_capital_usd: string;
+    target_weight_bps: number;
+    expected_sharpe: string;
+  }>>;
+  risk_policy_version: string;
+  approved_by_policy: boolean;
+  created_at: string;
+}>;
+
+export type SandboxInstallationPreview = Readonly<{
+  preview_schema_version: 1;
+  preview_id: string;
+  asset_id: string;
+  asset_version: string;
+  manifest_hash: string;
+  declared_permissions: readonly string[];
+  resource_caps: Readonly<{
+    max_memory_mb: number;
+    max_cpu_percent: number;
+    filesystem_isolated: boolean;
+  }>;
+  untrusted_capabilities_detected: number;
+  rollback_snapshot_id: string;
+  disposition: "QUALIFIED_FOR_ISOLATED_INSTALL" | "PERMISSION_OVERREACH_REJECTED" | "TAMPERED_MANIFEST_REJECTED";
+  created_at: string;
+}>;
+
+export type AdapterQualification = Readonly<{
+  qualification_schema_version: 1;
+  qualification_id: string;
+  venue: string;
+  asset_class: "US_EQUITY" | "EQUITY_OPTION" | "SPOT_FX" | "COMMODITY_FUTURES";
+  adapter_version: string;
+  supported_capabilities: readonly string[];
+  single_writer_fenced: boolean;
+  reconciliation_pass_rate_pct: string;
+  operational_gate_status: "QUALIFIED" | "PROVISIONAL" | "EXPIRED" | "REVOKED";
+  created_at: string;
+  expires_at: string;
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -845,6 +965,104 @@ export function parseContinuityPolicy(json: string): ContinuityPolicy {
   }
   if (!isContinuityPolicy(value)) {
     throw new Error("Continuity policy does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an assumption-aware regime monitor record (DATA-05). */
+export function parseAssumptionRegimeMonitor(json: string): AssumptionRegimeMonitor {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Assumption regime monitor is not valid JSON.");
+  }
+  if (!isAssumptionRegimeMonitor(value)) {
+    throw new Error("Assumption regime monitor does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a feed substitution parity record (DATA-06). */
+export function parseFeedSubstitutionParity(json: string): FeedSubstitutionParity {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Feed substitution parity is not valid JSON.");
+  }
+  if (!isFeedSubstitutionParity(value)) {
+    throw new Error("Feed substitution parity does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an execution coach benchmark analysis record (EXEC-03, RES-07). */
+export function parseExecutionCoachBenchmark(json: string): ExecutionCoachBenchmark {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Execution coach benchmark is not valid JSON.");
+  }
+  if (!isExecutionCoachBenchmark(value)) {
+    throw new Error("Execution coach benchmark does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a scenario stress loss simulation record (RISK-02). */
+export function parseScenarioLossSimulation(json: string): ScenarioLossSimulation {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Scenario loss simulation is not valid JSON.");
+  }
+  if (!isScenarioLossSimulation(value)) {
+    throw new Error("Scenario loss simulation does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a capital allocation plan record (RISK-03). */
+export function parseCapitalAllocationPlan(json: string): CapitalAllocationPlan {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Capital allocation plan is not valid JSON.");
+  }
+  if (!isCapitalAllocationPlan(value)) {
+    throw new Error("Capital allocation plan does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a sandboxed installation preview record (ASSET-03, ASSET-04). */
+export function parseSandboxInstallationPreview(json: string): SandboxInstallationPreview {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Sandbox installation preview is not valid JSON.");
+  }
+  if (!isSandboxInstallationPreview(value)) {
+    throw new Error("Sandbox installation preview does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an adapter qualification and single-writer fencing record (LIFE-07, PORT-02). */
+export function parseAdapterQualification(json: string): AdapterQualification {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Adapter qualification is not valid JSON.");
+  }
+  if (!isAdapterQualification(value)) {
+    throw new Error("Adapter qualification does not match the v1 evidence contract.");
   }
   return value;
 }
@@ -2157,6 +2375,174 @@ function isContinuityPolicy(value: unknown): value is ContinuityPolicy {
   if (typeof candidate.away_mode_permitted !== "boolean") return false;
   if (!["RETAIN_UNKNOWN_AND_ESCALATE", "CANCEL_LOCAL_WORKING_ONLY", "HOLD_STATE"].includes(String(candidate.broker_disconnect_action))) return false;
   return isUtcTimestamp(candidate.created_at);
+}
+
+function isAssumptionRegimeMonitor(value: unknown): value is AssumptionRegimeMonitor {
+  if (!hasExactKeys(value, [
+    "as_of_time",
+    "created_at",
+    "current_regime",
+    "impacted_strategy_assumptions",
+    "indicators",
+    "lookback_bars",
+    "model_version",
+    "regime_id",
+    "regime_schema_version",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.regime_schema_version !== 1 || !isCanonicalId(candidate.regime_id)) return false;
+  if (!isUtcTimestamp(candidate.as_of_time) || !isUtcTimestamp(candidate.created_at) || !isPositiveInteger(candidate.lookback_bars)) return false;
+  if (!["LOW_VOL_TRENDING", "ELEVATED_VOL_TRENDING", "HIGH_VOL_CHOPPY", "LIQUIDITY_COMPRESSION", "EXTREME_STRESS"].includes(String(candidate.current_regime))) return false;
+  if (!hasExactKeys(candidate.indicators, ["cross_asset_correlation_bps", "effective_spread_bps", "realized_vol_annual_bps", "trend_strength_bps"])) return false;
+  const ind = candidate.indicators as Record<string, unknown>;
+  if (typeof ind.realized_vol_annual_bps !== "number" || typeof ind.effective_spread_bps !== "number" || typeof ind.trend_strength_bps !== "number" || typeof ind.cross_asset_correlation_bps !== "number") return false;
+  if (!Array.isArray(candidate.impacted_strategy_assumptions)) return false;
+  for (const a of candidate.impacted_strategy_assumptions) {
+    if (!hasExactKeys(a, ["assumed_condition", "breach_status", "observed_condition", "strategy_id"])) return false;
+    const item = a as Record<string, unknown>;
+    if (!isCanonicalId(item.strategy_id) || typeof item.assumed_condition !== "string" || typeof item.observed_condition !== "string" || !["COMPATIBLE", "ELEVATED_RISK", "ASSUMPTION_VIOLATED"].includes(String(item.breach_status))) return false;
+  }
+  return typeof candidate.model_version === "string" && candidate.model_version.length > 0;
+}
+
+function isFeedSubstitutionParity(value: unknown): value is FeedSubstitutionParity {
+  if (!hasExactKeys(value, [
+    "adjustment_parity_verified",
+    "candidate_provider",
+    "comparison_id",
+    "created_at",
+    "parity_disposition",
+    "parity_schema_version",
+    "primary_provider",
+    "sample_end",
+    "sample_start",
+    "symbol_match_pct",
+    "timestamp_variance_micros_p99",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.parity_schema_version !== 1 || !isCanonicalId(candidate.comparison_id)) return false;
+  if (typeof candidate.primary_provider !== "string" || typeof candidate.candidate_provider !== "string") return false;
+  if (!isUtcTimestamp(candidate.sample_start) || !isUtcTimestamp(candidate.sample_end) || !isUtcTimestamp(candidate.created_at)) return false;
+  if (typeof candidate.symbol_match_pct !== "string" || !isNonNegativeInteger(candidate.timestamp_variance_micros_p99) || typeof candidate.adjustment_parity_verified !== "boolean") return false;
+  return ["QUALIFIED_FOR_SUBSTITUTION", "DEFICIENT_COVERAGE", "TIMESTAMP_DESYNC", "UNRECONCILED_SPLITS"].includes(String(candidate.parity_disposition));
+}
+
+function isExecutionCoachBenchmark(value: unknown): value is ExecutionCoachBenchmark {
+  if (!hasExactKeys(value, [
+    "analysis_id",
+    "arrival_price",
+    "coach_schema_version",
+    "created_at",
+    "execution_grade",
+    "fee_drag_bps",
+    "instrument_id",
+    "market_impact_bps",
+    "order_id",
+    "pre_trade_estimated_cost_bps",
+    "realized_shortfall_bps",
+    "realized_vwap",
+    "slippage_drag_bps",
+    "target_price",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.coach_schema_version !== 1 || !isCanonicalId(candidate.analysis_id) || !isCanonicalId(candidate.order_id) || !isCanonicalId(candidate.instrument_id)) return false;
+  if (!isDecimal(candidate.arrival_price) || !isDecimal(candidate.target_price) || !isDecimal(candidate.realized_vwap)) return false;
+  if (typeof candidate.pre_trade_estimated_cost_bps !== "number" || typeof candidate.realized_shortfall_bps !== "number" || typeof candidate.slippage_drag_bps !== "number" || typeof candidate.market_impact_bps !== "number" || typeof candidate.fee_drag_bps !== "number") return false;
+  if (!["OPTIMAL", "ACCEPTABLE", "ELEVATED_SLIPPAGE", "DEFICIENT_ROUTING"].includes(String(candidate.execution_grade))) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isScenarioLossSimulation(value: unknown): value is ScenarioLossSimulation {
+  if (!hasExactKeys(value, [
+    "account_id",
+    "capital_adequate",
+    "created_at",
+    "estimated_loss_bps",
+    "estimated_loss_usd",
+    "liquidity_haircut_usd",
+    "scenario_name",
+    "shock_assumptions",
+    "simulation_id",
+    "simulation_schema_version",
+    "stressed_margin_utilization_pct",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.simulation_schema_version !== 1 || !isCanonicalId(candidate.simulation_id) || !isCanonicalId(candidate.account_id) || typeof candidate.scenario_name !== "string") return false;
+  if (!hasExactKeys(candidate.shock_assumptions, ["equity_shock_pct", "financing_rate_shock_bps", "spread_expansion_multiplier", "volatility_multiplier"])) return false;
+  const sa = candidate.shock_assumptions as Record<string, unknown>;
+  if (typeof sa.equity_shock_pct !== "string" || typeof sa.volatility_multiplier !== "string" || typeof sa.spread_expansion_multiplier !== "string" || typeof sa.financing_rate_shock_bps !== "number") return false;
+  if (!isDecimal(candidate.estimated_loss_usd) || typeof candidate.estimated_loss_bps !== "number" || !isDecimal(candidate.liquidity_haircut_usd) || typeof candidate.stressed_margin_utilization_pct !== "string" || typeof candidate.capital_adequate !== "boolean") return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isCapitalAllocationPlan(value: unknown): value is CapitalAllocationPlan {
+  if (!hasExactKeys(value, [
+    "allocation_schema_version",
+    "allocations",
+    "approved_by_policy",
+    "cash_reserve_bps",
+    "created_at",
+    "plan_id",
+    "risk_policy_version",
+    "total_capital_usd",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.allocation_schema_version !== 1 || !isCanonicalId(candidate.plan_id) || !isDecimal(candidate.total_capital_usd) || !isNonNegativeInteger(candidate.cash_reserve_bps) || candidate.cash_reserve_bps > 10000) return false;
+  if (!Array.isArray(candidate.allocations) || candidate.allocations.length === 0) return false;
+  for (const al of candidate.allocations) {
+    if (!hasExactKeys(al, ["allocated_capital_usd", "expected_sharpe", "strategy_id", "target_weight_bps"])) return false;
+    const a = al as Record<string, unknown>;
+    if (!isCanonicalId(a.strategy_id) || !isDecimal(a.allocated_capital_usd) || !isNonNegativeInteger(a.target_weight_bps) || a.target_weight_bps > 10000 || typeof a.expected_sharpe !== "string") return false;
+  }
+  return typeof candidate.risk_policy_version === "string" && typeof candidate.approved_by_policy === "boolean" && isUtcTimestamp(candidate.created_at);
+}
+
+function isSandboxInstallationPreview(value: unknown): value is SandboxInstallationPreview {
+  if (!hasExactKeys(value, [
+    "asset_id",
+    "asset_version",
+    "created_at",
+    "declared_permissions",
+    "disposition",
+    "manifest_hash",
+    "preview_id",
+    "preview_schema_version",
+    "resource_caps",
+    "rollback_snapshot_id",
+    "untrusted_capabilities_detected",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.preview_schema_version !== 1 || !isCanonicalId(candidate.preview_id) || !isCanonicalId(candidate.asset_id) || typeof candidate.asset_version !== "string" || !isHash(candidate.manifest_hash)) return false;
+  if (!Array.isArray(candidate.declared_permissions) || !candidate.declared_permissions.every((p) => typeof p === "string")) return false;
+  if (!hasExactKeys(candidate.resource_caps, ["filesystem_isolated", "max_cpu_percent", "max_memory_mb"])) return false;
+  const rc = candidate.resource_caps as Record<string, unknown>;
+  if (!isPositiveInteger(rc.max_memory_mb) || !isPositiveInteger(rc.max_cpu_percent) || typeof rc.filesystem_isolated !== "boolean") return false;
+  if (!isNonNegativeInteger(candidate.untrusted_capabilities_detected) || !isCanonicalId(candidate.rollback_snapshot_id)) return false;
+  if (!["QUALIFIED_FOR_ISOLATED_INSTALL", "PERMISSION_OVERREACH_REJECTED", "TAMPERED_MANIFEST_REJECTED"].includes(String(candidate.disposition))) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isAdapterQualification(value: unknown): value is AdapterQualification {
+  if (!hasExactKeys(value, [
+    "adapter_version",
+    "asset_class",
+    "created_at",
+    "expires_at",
+    "operational_gate_status",
+    "qualification_id",
+    "qualification_schema_version",
+    "reconciliation_pass_rate_pct",
+    "single_writer_fenced",
+    "supported_capabilities",
+    "venue",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.qualification_schema_version !== 1 || !isCanonicalId(candidate.qualification_id) || !isCanonicalId(candidate.venue)) return false;
+  if (!["US_EQUITY", "EQUITY_OPTION", "SPOT_FX", "COMMODITY_FUTURES"].includes(String(candidate.asset_class)) || typeof candidate.adapter_version !== "string") return false;
+  if (!Array.isArray(candidate.supported_capabilities) || candidate.supported_capabilities.length === 0 || !candidate.supported_capabilities.every((c) => typeof c === "string")) return false;
+  if (typeof candidate.single_writer_fenced !== "boolean" || typeof candidate.reconciliation_pass_rate_pct !== "string") return false;
+  if (!["QUALIFIED", "PROVISIONAL", "EXPIRED", "REVOKED"].includes(String(candidate.operational_gate_status))) return false;
+  return isUtcTimestamp(candidate.created_at) && isUtcTimestamp(candidate.expires_at);
 }
 
 

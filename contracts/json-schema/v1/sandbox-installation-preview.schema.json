@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandboxInstallationPreview",
+  "description": "Pre-installation sandbox verification record inspecting dependencies, required permissions, resource limits, and rollback manifests (ASSET-03, ASSET-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "preview_schema_version",
+    "preview_id",
+    "asset_id",
+    "asset_version",
+    "manifest_hash",
+    "declared_permissions",
+    "resource_caps",
+    "untrusted_capabilities_detected",
+    "rollback_snapshot_id",
+    "disposition",
+    "created_at"
+  ],
+  "properties": {
+    "preview_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "preview_id": {
+      "type": "string",
+      "pattern": "^preview\\.[a-z0-9_.-]+$"
+    },
+    "asset_id": { "type": "string" },
+    "asset_version": { "type": "string" },
+    "manifest_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "declared_permissions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "resource_caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_memory_mb", "max_cpu_percent", "filesystem_isolated"],
+      "properties": {
+        "max_memory_mb": { "type": "integer" },
+        "max_cpu_percent": { "type": "integer" },
+        "filesystem_isolated": { "type": "boolean" }
+      }
+    },
+    "untrusted_capabilities_detected": { "type": "integer", "minimum": 0 },
+    "rollback_snapshot_id": { "type": "string" },
+    "disposition": {
+      "type": "string",
+      "enum": ["QUALIFIED_FOR_ISOLATED_INSTALL", "PERMISSION_OVERREACH_REJECTED", "TAMPERED_MANIFEST_REJECTED"]
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

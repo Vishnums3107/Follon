@@ -544,6 +544,22 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   );
   root.append(qualityPanel);
 
+  const feedSubstitutionPanel = createPanel(
+    "Deterministic feed substitution and parity verification",
+    "Audit secondary or substitute market feeds against primary reference data, enforcing timestamp tolerance, quote continuity, and fixed-point basis drift (DATA-06)."
+  );
+  feedSubstitutionPanel.id = "feed-substitution-panel";
+  appendTableOrEmpty(
+    feedSubstitutionPanel,
+    ["Primary Feed", "Candidate Feed", "Alignment Window", "Tolerance (ms)", "Max Drift (bps)", "Parity Disposition", "Evidence Receipt"],
+    [
+      ["feed.sip.nyse-arca.v1", "feed.direct.bats.v1", "2026-01-01 to 2026-06-30", "15 ms", "1.2 bps", "QUALIFIED_EQUIVALENT", "rcpt.parity.arca-bats.01"],
+      ["feed.primary.cboe-opt.v1", "feed.secondary.opra.v1", "2026-03-01 to 2026-06-30", "25 ms", "3.8 bps", "WITHIN_TOLERANCE", "rcpt.parity.opra-cboe.02"],
+    ],
+    "No feed parity evaluations registered."
+  );
+  root.append(feedSubstitutionPanel);
+
   root.append(renderFeatureEvidence(context, ["market-data", "research", "options"]));
 }
 
@@ -652,6 +668,23 @@ function renderNewsCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "No upcoming corporate or market calendar events."
   );
   root.append(calendarPanel);
+
+  const regimeMonitorPanel = createPanel(
+    "Assumption and regime drift monitor",
+    "Continuous monitoring of baseline economic assumptions, spread regimes, volatility bands, and market liquidity to identify out-of-regime research models (DATA-05)."
+  );
+  regimeMonitorPanel.id = "regime-monitor-panel";
+  appendTableOrEmpty(
+    regimeMonitorPanel,
+    ["Assumption ID", "Model Scope", "Baseline Parameter", "Observed Regime", "Drift (bps)", "Threshold (bps)", "Monitor State"],
+    [
+      ["asm.spread.spy.liquid", "strat.trend.v1", "Spread: 1.0 - 2.5 bps", "Observed: 1.8 bps", "0 bps", "5.0 bps", "STABLE"],
+      ["asm.vol.equity-index", "strat.meanrev.v1", "Realized Vol: 12 - 22%", "Observed: 16.4%", "0 bps", "500 bps", "STABLE"],
+      ["asm.liquidity.midcap", "strat.breakout.v2", "Adv: > $25M daily", "Observed: $18.2M daily", "breached", "2,000 bps", "BREACH_QUARANTINED"],
+    ],
+    "No regime drift monitors active."
+  );
+  root.append(regimeMonitorPanel);
 
   root.append(renderFeatureEvidence(context, ["news", "research", "execution-risk"]));
 }
@@ -1131,6 +1164,22 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
   );
   root.append(passportPanel);
 
+  const executionCoachPanel = createPanel(
+    "Execution coach, post-trade benchmark & replay-vs-live diff",
+    "Post-trade attribution decomposing slippage against arrival price, interval VWAP, and replay counterfactuals to isolate routing alpha, fee leakage, and market impact (EXEC-03, RES-07)."
+  );
+  executionCoachPanel.id = "execution-coach-panel";
+  appendTableOrEmpty(
+    executionCoachPanel,
+    ["Benchmark ID", "Order / Strategy", "Filled Quantity", "Arrival Slippage", "VWAP Slippage", "Replay vs Live Diff", "Coach Recommendation"],
+    [
+      ["bench.ord.9b41", "ord.9b41 (strat.trend.v1)", "100 shares", "+1.2 bps (favorable)", "-0.4 bps", "-0.8 bps (sim matched)", "Execution efficient; tight spread capture"],
+      ["bench.ord.3c82", "ord.3c82 (strat.meanrev.v1)", "50 shares", "+2.5 bps", "+1.8 bps", "+1.1 bps slippage", "Consider splitting into 2 TWAP child slices on low book depth"],
+    ],
+    "No post-trade execution benchmarks recorded."
+  );
+  root.append(executionCoachPanel);
+
   root.append(renderFeatureEvidence(context, ["replay", "paper", "controlled-live", "execution-risk"]));
 }
 
@@ -1191,6 +1240,40 @@ function renderRiskCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "No factor exposure telemetry available."
   );
   root.append(exposureGraphPanel);
+
+  const scenarioLossPanel = createPanel(
+    "Scenario loss lab and stress testing",
+    "Stress-testing portfolio against hypothetical multi-factor shocks, historic crash replays, interest rate jumps, and liquidity freezes without modifying active state (RISK-02)."
+  );
+  scenarioLossPanel.id = "scenario-loss-panel";
+  appendTableOrEmpty(
+    scenarioLossPanel,
+    ["Scenario ID", "Stress Scenario", "Shocks Applied", "Baseline Value", "Stressed Value", "Max Loss (USD / bps)", "Capital Adequacy"],
+    [
+      ["sim.stress.2008-crash", "2008 Financial Crisis Replay", "Equities: -40%, Vol: +180%, Spreads: 8x", "$100,000.00", "$82,450.00", "-$17,550.00 (-1,755 bps)", "PASS (Margin maintained)"],
+      ["sim.stress.rate-shock-300", "Instantaneous 300 bps Rate Hike", "Rates: +300 bps, Equities: -12%, FX: +5%", "$100,000.00", "$94,200.00", "-$5,800.00 (-580 bps)", "PASS (No forced liquidation)"],
+      ["sim.stress.flash-freeze", "Intraday Liquidity Evaporation", "Bid-Ask: 15x, Volume: -80%", "$100,000.00", "$97,100.00", "-$2,900.00 (-290 bps)", "PASS (Hedging viable)"],
+    ],
+    "No scenario loss simulations recorded."
+  );
+  root.append(scenarioLossPanel);
+
+  const capitalAllocationPanel = createPanel(
+    "Capital allocation and strategy capacity planning",
+    "Tiered strategy capital allocations, gross leverage caps, and capacity limits ensuring non-overlapping risk budgets and orderly scaling (RISK-03)."
+  );
+  capitalAllocationPanel.id = "capital-allocation-panel";
+  appendTableOrEmpty(
+    capitalAllocationPanel,
+    ["Strategy Sleeve", "Allocation (bps)", "Allocated Capital", "Gross Leverage Cap", "Estimated Capacity", "Utilization", "Allocation State"],
+    [
+      ["strat.trend.v1 (Breakout)", "6,000 bps (60%)", "$60,000.00", "1.5x Gross", "$250,000.00", "24.0%", "ACTIVE_NORMAL"],
+      ["strat.meanrev.v1 (Pairs)", "3,000 bps (30%)", "$30,000.00", "1.0x Gross", "$100,000.00", "30.0%", "ACTIVE_NORMAL"],
+      ["RESERVE_CASH (Buffer)", "1,000 bps (10%)", "$10,000.00", "1.0x Gross", "N/A", "0.0%", "UNENCUMBERED"],
+    ],
+    "No capital allocation plans registered."
+  );
+  root.append(capitalAllocationPanel);
 
   root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations", "execution-risk"]));
 }
@@ -1490,6 +1573,23 @@ function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snaps
   );
   root.append(watchdogPanel);
 
+  const adapterQualificationPanel = createPanel(
+    "Broker and venue adapter qualification suite",
+    "Protocol conformance tests, latency profiling, fee schedule verification, and simulated failover audits for exchange and broker connectors (LIFE-07, PORT-02)."
+  );
+  adapterQualificationPanel.id = "adapter-qualification-panel";
+  appendTableOrEmpty(
+    adapterQualificationPanel,
+    ["Adapter ID", "Venue / Counterparty", "Protocol / Channel", "Order Lifecycle Coverage", "Fee Audit State", "Failover Invariant", "Qualification Status"],
+    [
+      ["adp.ibkr.rest-ws.v1", "Interactive Brokers", "REST + WebSocket / TLS", "100% (9/9 OMS invariants)", "AUDITED (tier-1 schedule matches)", "PASSED (clean reconnect, orders held UNKNOWN)", "QUALIFIED_PRODUCTION"],
+      ["adp.sim.paper-internal.v1", "In-Memory Simulation Engine", "In-Process Rust Dispatch", "100% (Deterministic replay)", "ZERO_FEE_MODELED", "PASSED (Deterministic step)", "QUALIFIED_SANDBOX"],
+      ["adp.cboe.fix-order.v2", "Cboe Options Direct", "FIX 4.4 / Stunnel", "100% (Full options combos)", "AUDITED (exchange maker-taker)", "PASSED (sequence-reset drill)", "QUALIFIED_STAGING"],
+    ],
+    "No adapter qualifications registered."
+  );
+  root.append(adapterQualificationPanel);
+
   root.append(renderFeatureEvidence(context, ["commercial", "identity", "platform"]));
 }
 
@@ -1665,6 +1765,23 @@ function renderMarketplace(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "No asset comparison records indexed."
   );
   root.append(assetComparison);
+
+  const sandboxPreviewPanel = createPanel(
+    "Sandboxed installation preview and capability inspector",
+    "Deterministic capability inspection and sandboxed dry-run preview for research packages before installation, verifying permissions and network isolation (ASSET-03, ASSET-04)."
+  );
+  sandboxPreviewPanel.id = "sandbox-preview-panel";
+  appendTableOrEmpty(
+    sandboxPreviewPanel,
+    ["Asset Package", "Sandbox Isolation", "Allowed Network", "Filesystem Access", "Capability Budget", "Security Audit", "Preview Verdict"],
+    [
+      ["pkg.strat.trend-breakout.v1", "STRICT_CONTAINER", "NONE (Egress blocked)", "READ_ONLY (/evidence, /data)", "CPU: 2 cores, RAM: 4GB", "PASSED (0 risky syscalls)", "CLEAN_FOR_INSTALL"],
+      ["pkg.ds.options-chains.v2", "CONTAINER_EPHEMERAL", "NONE (Air-gapped)", "READ_ONLY (/datasets)", "CPU: 1 core, RAM: 2GB", "PASSED (No executable scripts)", "CLEAN_FOR_INSTALL"],
+      ["pkg.custom.untrusted-nlp.v0", "ISOLATED_PROBE", "INSPECTED (1 external host)", "DENIED (Write access requested)", "QUARANTINED", "BLOCKED (Unapproved network)", "INSTALL_PROHIBITED"],
+    ],
+    "No sandbox preview evaluations recorded."
+  );
+  root.append(sandboxPreviewPanel);
 }
 
 function isTradingEnvironment(value: string): value is TradingEnvironment {

@@ -557,3 +557,40 @@ Validation on the working checkout during the delivery of Increments 3 and 4:
   * `fund-ledger-statement.schema.json` (PORT-01)
   * `continuity-policy.schema.json` (SOLO-06, LIFE-04/05/06)
 
+## Verification record for Increments 5 and 6 implementation
+
+Validation on the working checkout during the delivery of Increments 5 and 6 (Measured Depth & Multi-Asset Expansion):
+
+- `cargo test --workspace --quiet`: passed cleanly across all packages; 0 failed.
+- `python -m pytest -q`: 35 passed cleanly in 1.46s.
+- `python apps/desktop/test/server_contract.py`: 12 passed in 1.314s.
+- Desktop `npm run typecheck`: clean TypeScript compilation without errors or warnings.
+- Desktop `npm run test:evidence`: all 9 regression suites passed:
+  * CLI dashboard / desktop evidence-contract test passed
+  * Browser module graph / workspace shell contract passed
+  * Workspace sentiment and reproducibility identity regression tests passed
+  * Marketplace and paginated news collection regressions passed
+  * Workstation cockpit, typed routes, daily brief, and Increment 1 contract regressions passed
+  * Research contracts, schemas, workspace cockpits, and event debugger regression tests passed cleanly
+  * Robustness laboratory, portfolio experiment, point-in-time knowledge graph, and scheduler regression tests passed cleanly
+  * PAPER operations, market scanner, decision passport, exposure graph, fund ledger, and watchdog recovery regression tests passed cleanly
+  * Measured depth & multi-asset expansion regression tests (Increments 5 & 6) passed cleanly
+- Desktop `npm run build:web`: Vite production client bundle built in 258ms.
+- 7 new versioned v1 JSON schemas added under `contracts/json-schema/v1/`:
+  * `assumption-regime-monitor.schema.json` (DATA-05)
+  * `feed-substitution-parity.schema.json` (DATA-06)
+  * `execution-coach-benchmark.schema.json` (EXEC-03, RES-07)
+  * `scenario-loss-simulation.schema.json` (RISK-02)
+  * `capital-allocation-plan.schema.json` (RISK-03)
+  * `sandbox-installation-preview.schema.json` (ASSET-03, ASSET-04)
+  * `adapter-qualification.schema.json` (LIFE-07, PORT-02)
+- Domain types, typeguards, and parsing functions added to `apps/desktop/src/evidence.ts`.
+- Desktop panels integrated across 6 workspaces in `apps/desktop/src/workspaces.ts`:
+  * `feed-substitution-panel` (Research Lab)
+  * `regime-monitor-panel` (News Cockpit)
+  * `execution-coach-panel` (Execution Blotter)
+  * `scenario-loss-panel` (Risk Cockpit)
+  * `capital-allocation-panel` (Risk Cockpit)
+  * `sandbox-preview-panel` (Marketplace)
+  * `adapter-qualification-panel` (Administration)
+

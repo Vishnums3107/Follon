@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExecutionCoachBenchmark",
+  "description": "Pre-trade cost prediction and post-trade implementation shortfall benchmark analysis comparing arrival, target, and realized execution prices (EXEC-03, RES-07).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "coach_schema_version",
+    "analysis_id",
+    "order_id",
+    "instrument_id",
+    "arrival_price",
+    "target_price",
+    "realized_vwap",
+    "pre_trade_estimated_cost_bps",
+    "realized_shortfall_bps",
+    "slippage_drag_bps",
+    "market_impact_bps",
+    "fee_drag_bps",
+    "execution_grade",
+    "created_at"
+  ],
+  "properties": {
+    "coach_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "analysis_id": {
+      "type": "string",
+      "pattern": "^coach\\.[a-z0-9_.-]+$"
+    },
+    "order_id": { "type": "string" },
+    "instrument_id": { "type": "string" },
+    "arrival_price": { "type": "string" },
+    "target_price": { "type": "string" },
+    "realized_vwap": { "type": "string" },
+    "pre_trade_estimated_cost_bps": { "type": "integer" },
+    "realized_shortfall_bps": { "type": "integer" },
+    "slippage_drag_bps": { "type": "integer" },
+    "market_impact_bps": { "type": "integer" },
+    "fee_drag_bps": { "type": "integer" },
+    "execution_grade": {
+      "type": "string",
+      "enum": ["OPTIMAL", "ACCEPTABLE", "ELEVATED_SLIPPAGE", "DEFICIENT_ROUTING"]
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CapitalAllocationPlan",
+  "description": "Constraint-based portfolio capital allocation plan balancing strategy weights, cash reserves, financing costs, and concentration limits (RISK-03).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "allocation_schema_version",
+    "plan_id",
+    "total_capital_usd",
+    "cash_reserve_bps",
+    "allocations",
+    "risk_policy_version",
+    "approved_by_policy",
+    "created_at"
+  ],
+  "properties": {
+    "allocation_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^alloc-plan\\.[a-z0-9_.-]+$"
+    },
+    "total_capital_usd": { "type": "string" },
+    "cash_reserve_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "allocations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["strategy_id", "allocated_capital_usd", "target_weight_bps", "expected_sharpe"],
+        "properties": {
+          "strategy_id": { "type": "string" },
+          "allocated_capital_usd": { "type": "string" },
+          "target_weight_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "expected_sharpe": { "type": "string" }
+        }
+      }
+    },
+    "risk_policy_version": { "type": "string" },
+    "approved_by_policy": { "type": "boolean" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

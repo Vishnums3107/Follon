@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ScenarioLossSimulation",
+  "description": "Stress-loss and liquidity laboratory simulation modeling correlation breaks, spread widening, financing stress, and liquidation haircuts (RISK-02).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "simulation_schema_version",
+    "simulation_id",
+    "account_id",
+    "scenario_name",
+    "shock_assumptions",
+    "estimated_loss_usd",
+    "estimated_loss_bps",
+    "liquidity_haircut_usd",
+    "stressed_margin_utilization_pct",
+    "capital_adequate",
+    "created_at"
+  ],
+  "properties": {
+    "simulation_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "simulation_id": {
+      "type": "string",
+      "pattern": "^loss-sim\\.[a-z0-9_.-]+$"
+    },
+    "account_id": { "type": "string" },
+    "scenario_name": { "type": "string" },
+    "shock_assumptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["equity_shock_pct", "volatility_multiplier", "spread_expansion_multiplier", "financing_rate_shock_bps"],
+      "properties": {
+        "equity_shock_pct": { "type": "string" },
+        "volatility_multiplier": { "type": "string" },
+        "spread_expansion_multiplier": { "type": "string" },
+        "financing_rate_shock_bps": { "type": "integer" }
+      }
+    },
+    "estimated_loss_usd": { "type": "string" },
+    "estimated_loss_bps": { "type": "integer" },
+    "liquidity_haircut_usd": { "type": "string" },
+    "stressed_margin_utilization_pct": { "type": "string" },
+    "capital_adequate": { "type": "boolean" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}
