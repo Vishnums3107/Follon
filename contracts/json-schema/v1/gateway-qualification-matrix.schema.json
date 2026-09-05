@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GatewayQualificationMatrix",
+  "description": "Granular capability matrix certifying order types, venues, asset classes, and latency bounds per gateway route (DUR-10).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "matrix_schema_version",
+    "matrix_id",
+    "environment",
+    "gateway_id",
+    "qualified_capabilities",
+    "fencing_epoch",
+    "evaluated_at",
+    "expires_at"
+  ],
+  "properties": {
+    "matrix_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "matrix_id": {
+      "type": "string",
+      "pattern": "^gqm\\.[a-z0-9_.-]+$"
+    },
+    "environment": {
+      "type": "string",
+      "enum": ["PAPER", "CONTROLLED_LIVE", "SIMULATION"]
+    },
+    "gateway_id": { "type": "string" },
+    "qualified_capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "capability_id",
+          "asset_class",
+          "qualification_state",
+          "measured_p99_latency_ms",
+          "max_supported_slices",
+          "reconciliation_accuracy_bps"
+        ],
+        "properties": {
+          "capability_id": { "type": "string" },
+          "asset_class": { "type": "string" },
+          "qualification_state": {
+            "type": "string",
+            "enum": ["CERTIFIED", "PROVISIONAL", "REJECTED"]
+          },
+          "measured_p99_latency_ms": { "type": "integer", "minimum": 0 },
+          "max_supported_slices": { "type": "integer", "minimum": 1 },
+          "reconciliation_accuracy_bps": { "type": "integer", "minimum": 0, "maximum": 10000 }
+        }
+      }
+    },
+    "fencing_epoch": { "type": "integer", "minimum": 1 },
+    "evaluated_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" }
+  }
+}

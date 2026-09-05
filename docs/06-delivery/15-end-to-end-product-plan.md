@@ -499,6 +499,46 @@ measurement, operating cost, recovery procedure and UI demonstration. This is
 how the system earns institutional-quality behavior while remaining manageable
 by one person.
 
+### K. Enduring-system differentiators and hardening baseline
+
+The goal is a durable, high-trust personal operating system, not an unsupported
+valuation claim. Its differentiator should be that every useful assertion can
+be traced, replayed, challenged, replaced, and recovered by one operator. The
+following baseline is implemented in this revision and is deliberately narrow:
+
+| Baseline | Observable behavior | Limit that remains explicit |
+| --- | --- | --- |
+| Typed evidence projection | Advanced workspace panels re-validate each declared v1 artifact before rendering it; malformed or missing records render an explicit empty state | A schema alone is not a producer, approval, market-data entitlement, or execution capability |
+| Evidence-integrity ledger view | Invalid event envelopes, duplicate IDs, unresolved or cyclic causation, bounded NDJSON windows, and the global replay-candidate cap appear as projection diagnostics; a truncated window is never labelled a complete trail | A frozen run or a cursor/continuation API is still required for complete long-running replay inspection |
+| Causal replay safety | The source-time presentation timeline is newest-first, while the debugger uses a separate parent-before-child sequence ordered by declared availability (`receive_time`) | Acceptance needs full end-to-end replay fixtures for all event families and fault paths |
+| News availability discipline | Replay advances on receipt/availability time, preserves source time as evidence, and prevents sentiment from preceding its source headline | Provider adapters, rights, deduplication, and revision producers remain separate delivery work |
+| Native command boundary | Browser controls are read-only; the Tauri host reports whether a configured Risk/OMS route exists, and the checked-in host reports unavailable | No gateway authentication, broker transport, PAPER session, or controlled-LIVE activation is provided by this change |
+| Continuous verification | Server-contract, desktop build, evidence, and native command-boundary checks are included in CI | Browser automation, accessibility review, and operational recovery exercises still need execution evidence |
+
+The next differentiators are proposed backlog items. They should be introduced
+only after their contract, producer, projection, failure behavior, test fixture,
+and runbook are delivered together.
+
+| ID | Enduring capability | Solo-operator value | Required contract and acceptance evidence |
+| --- | --- | --- | --- |
+| DUR-01 | Decision provenance graph | Traverse any position, alert, or P&L movement back through fills, routing, risk, strategy, data, news, and configuration | `DecisionReconstruction` with content hashes and availability timestamps; one-click reconstruction must reproduce the frozen trace and disclose gaps |
+| DUR-02 | Counterfactual safety laboratory | Test a proposed rule, feed failure, parameter perturbation, or broker delay without touching working state | `CounterfactualScenario` binds baseline, intervention, seed, engine, and output; no scenario may reuse a production order identity |
+| DUR-03 | Data-rights and semantic-drift ledger | Keep data licenses, provider obligations, schema changes, corporate-action policy, and replacement evidence visible before a feed is swapped | `DataRightsAndSemanticsReceipt`; a provider change blocks promotion until parity, rights, and known semantic differences are reviewed |
+| DUR-04 | Evidence time machine | Render the workstation as it was known at a selected instant, including late arrivals and corrections | Immutable `WorkspaceSnapshotManifest` with an as-of cursor; snapshots are content-addressed and never reinterpreted with newer data |
+| DUR-05 | Attention budget controller | Protect one operator from alert overload by measuring interruption cost, grouping root causes, and escalating only evidence-backed urgent work | `OperatorTask` and `AttentionBudget`; suppression cannot hide critical reconciliation, kill-switch, or stale-data conditions |
+| DUR-06 | Adversarial research gate | Automatically challenge a candidate with leakage probes, data perturbations, parameter neighborhoods, cost shocks, and regime changes | `AdversarialEvaluation`; each failed probe is retained in lineage and blocks a misleading aggregate score |
+| DUR-07 | Reproducible capability capsules | Package a strategy, configuration, dependency lock, dataset rights, evaluator, and replay recipe for clean-machine verification | Signed `StrategyCapsuleManifest` plus isolated verifier; the capsule must either reproduce or report the exact missing dependency/rights boundary |
+| DUR-08 | Recovery game-day compiler | Turn a selected outage or corruption scenario into a bounded drill with checkpoints, expected evidence, rollback, and elapsed-time measurement | `RecoveryDrillResult`; no policy or checklist may be displayed as a passed recovery exercise without this result |
+| DUR-09 | Model-governance sandbox | Compare assistance models for cited factuality, prompt injection resistance, abstention, cost, and latency while denying them trading authority | `ModelEvaluationBenchmark` and `AssistantEvidence`; no model can take a capital-affecting action and every output records uncertainty and disposition |
+| DUR-10 | Gateway qualification matrix | Make each adapter, order type, market, account mode, and recovery behavior separately qualified rather than treating an integration as globally ready | `AdapterQualification` and `GatewayCapability`; unsupported capability combinations fail closed before intent dispatch |
+| DUR-11 | Research-to-capital allocation council | Convert robust, capacity-aware evidence into bounded allocation proposals with explicit uncertainty, correlation, drawdown, and reserve requirements | `CapitalAllocationProposal`; approval remains policy-owned and proposals cannot mutate account capital directly |
+| DUR-12 | Long-horizon compatibility registry | Preserve readers, migrations, schema evolution, and end-of-support dates so retained evidence stays interpretable across runtime upgrades | `CompatibilityMatrix` and versioned readers; every release must read the retained golden corpus or publish a migration and rollback plan |
+
+The implementation order for these differentiators is DUR-01, DUR-04, DUR-10,
+DUR-02, DUR-08, then the research, data, and AI extensions. That order makes
+new intelligence inspectable before it can influence operations, and makes
+operations recoverable before they are expanded.
+
 ## Verification record for the original implementation
 
 Validation on the working checkout during this change:
@@ -506,9 +546,12 @@ Validation on the working checkout during this change:
 - `cargo test --workspace --quiet`: passed; one integration test remained ignored.
 - `python -m pytest -q`: 35 passed under the current root configuration.
 - Desktop `npm run typecheck`, `npm run test:evidence`, and `npm run build:web`:
-  passed during implementation; final reruns recorded in the task report.
-- `python apps/desktop/test/server_contract.py`: updated for renamed pages and
-  Marketplace; 12 tests passed in the independent test pass.
+  passed. The evidence suite includes all 10 Node contract suites.
+- `python apps/desktop/test/server_contract.py`: 16 tests passed, including
+  canonical event-envelope, causation, truncation, capacity, replay-order, and
+  typed-evidence routing.
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml`: 8 native
+  command-boundary tests passed.
 - Persistent DOM-harness regressions cover marketplace category/search,
   pagination, empty states, inspect callbacks, and news row-to-artifact mapping
   after filtering. Signal and strategy-specification identity regressions also
@@ -594,9 +637,12 @@ Validation on the working checkout during the delivery of Increments 5 and 6 (Me
   * `sandbox-preview-panel` (Marketplace)
   * `adapter-qualification-panel` (Administration)
 
-## Verification record for Section G Connected Evidence & Advanced Capabilities
+## Historical verification record for Section G schema and UI regressions
 
-Validation on the working checkout completing the entire end-to-end product plan (Section G Signature Connected Experiences & Advanced Capabilities RES-08, EXEC-04, AI-05, AI-06, ASSET-04, PORT-02):
+This historical record covers schema, parser, and UI-projection regressions for
+Section G (RES-08, EXEC-04, AI-05, AI-06, ASSET-04, PORT-02). It does not
+establish an end-to-end connected workflow, gateway authentication, provider
+integration, recovery readiness, or production acceptance.
 
 - `cargo test --workspace --quiet`: passed cleanly across all packages; 0 failed.
 - `python -m pytest -q`: 35 passed cleanly in 2.61s.
@@ -622,7 +668,7 @@ Validation on the working checkout completing the entire end-to-end product plan
   * `strategy-capsule-manifest.schema.json` (ASSET-04)
   * `multi-asset-expansion-plan.schema.json` (PORT-02)
 - Domain types, typeguards, and parsing functions added to `apps/desktop/src/evidence.ts`.
-- Section G signature connected experiences and capability panels integrated in `apps/desktop/src/workspaces.ts`:
+- Section G panel layouts and typed evidence readers registered in `apps/desktop/src/workspaces.ts`; a panel without a versioned producer renders an explicit unavailable state:
   * `#away-desk-readiness-panel` in Command Center (Experience 5: "Can I safely leave the desk?", SOLO-05, SOLO-06, EXEC-01)
   * `#input-correction-panel` in Research Lab (Experience 4: "What changes if this input is corrected?", DATA-01, DATA-03, Lineage)
   * `#champion-challenger-panel` in Strategy Studio (RES-08)
@@ -635,4 +681,3 @@ Validation on the working checkout completing the entire end-to-end product plan
   * `#operations-assistant-panel` in Administration (AI-05)
   * `#model-evaluation-panel` in Administration (AI-06)
   * `#workspace-rebuild-panel` in Administration (Experience 6: "Rebuild my entire workspace", LIFE-01..03)
-

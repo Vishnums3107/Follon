@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 follon-domain = { path = "../domain" }
 follon-fx = { path = "../fx" }
+sha2 = "0.10.9"
 
 [lib]
 path = "src/lib.rs"

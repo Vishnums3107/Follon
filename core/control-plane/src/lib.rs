@@ -17,8 +17,19 @@ use follon_domain::{
     SentimentVector, Side, TimeInForce,
 };
 use follon_instrument::{InstrumentRegistry, TradingCalendar};
-use follon_news::replay_time_from_unix_ns;
+use follon_news::{
+    replay_availability_time_from_unix_ns, replay_time_from_unix_ns, NlpSentimentEngine,
+};
 use sha2::{Digest, Sha256};
+
+pub mod capsule;
+pub mod provenance;
+
+pub use capsule::{CapsuleExportDisposition, StrategyCapsuleManifest, StrategyCapsuleVerifier};
+pub use provenance::{
+    CausalEdge, CausalNode, DecisionProvenanceGraphBuilder, DecisionReconstruction,
+    ProvenanceIntegrityStatus,
+};
 
 /// Error returned by the deterministic trading kernel.
 #[derive(Debug)]
@@ -1994,8 +2005,15 @@ pub struct ReplayEngine {
     fill_model: DeterministicFillModel,
     portfolios: BTreeMap<(String, String), Portfolio>,
     working_orders: BTreeMap<String, SimulatedWorkingOrder>,
-    news_headline_event_ids: BTreeMap<String, String>,
+    news_headlines: BTreeMap<String, ReplayedNewsHeadline>,
     news_sentiment_event_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReplayedNewsHeadline {
+    event_id: String,
+    source_event_time_ns: u64,
+    available_at_ns: u64,
 }
 
 impl ReplayEngine {
@@ -2026,7 +2044,7 @@ impl ReplayEngine {
             fill_model,
             portfolios: BTreeMap::new(),
             working_orders: BTreeMap::new(),
-            news_headline_event_ids: BTreeMap::new(),
+            news_headlines: BTreeMap::new(),
             news_sentiment_event_ids: BTreeSet::new(),
         })
     }
@@ -2252,21 +2270,34 @@ impl ReplayEngine {
         headline: NewsHeadline,
     ) -> Result<ReplayResult, EngineError> {
         headline.validate()?;
-        if self.news_headline_event_ids.contains_key(&headline.news_id) {
+        if headline.receive_time_ns < headline.event_time_ns {
+            return Err(EngineError(
+                "news headline availability cannot precede its source event time".to_owned(),
+            ));
+        }
+        if self.news_headlines.contains_key(&headline.news_id) {
             return Err(EngineError("duplicate news headline in replay".to_owned()));
         }
-        let event_time = replay_time_from_unix_ns(headline.event_time_ns).map_err(|error| {
-            EngineError(format!(
-                "news headline replay timestamp is invalid: {}",
-                error.0
-            ))
-        })?;
-        self.clock.advance_to(&event_time)?;
+        let source_event_time =
+            replay_time_from_unix_ns(headline.event_time_ns).map_err(|error| {
+                EngineError(format!(
+                    "news headline replay timestamp is invalid: {}",
+                    error.0
+                ))
+            })?;
+        let availability_time = replay_availability_time_from_unix_ns(headline.receive_time_ns)
+            .map_err(|error| {
+                EngineError(format!(
+                    "news headline availability timestamp is invalid: {}",
+                    error.0
+                ))
+            })?;
+        self.clock.advance_to(&availability_time)?;
         let correlation_id = format!("corr-news-{}", headline.news_id);
         let event = self.emit(
             sink,
             EventPayload::NewsHeadline(headline.clone()),
-            &event_time,
+            &source_event_time,
             &correlation_id,
             None,
             "news_ingress",
@@ -2275,8 +2306,14 @@ impl ReplayEngine {
             None,
             None,
         )?;
-        self.news_headline_event_ids
-            .insert(headline.news_id.clone(), event.event_id.clone());
+        self.news_headlines.insert(
+            headline.news_id.clone(),
+            ReplayedNewsHeadline {
+                event_id: event.event_id.clone(),
+                source_event_time_ns: headline.event_time_ns,
+                available_at_ns: headline.receive_time_ns,
+            },
+        );
         strategy.on_news_headline(&headline, self.clock.now())?;
         Ok(ReplayResult {
             events: vec![event],
@@ -2307,28 +2344,41 @@ impl ReplayEngine {
         if self.news_sentiment_event_ids.contains(&sentiment.event_id) {
             return Err(EngineError("duplicate news sentiment in replay".to_owned()));
         }
-        let headline_event_id = self
-            .news_headline_event_ids
+        let headline = self
+            .news_headlines
             .get(&sentiment.causation_news_id)
             .cloned()
             .ok_or_else(|| {
                 EngineError("news sentiment has no persisted headline cause".to_owned())
             })?;
-        let event_time = replay_time_from_unix_ns(sentiment.event_time_ns).map_err(|error| {
-            EngineError(format!(
-                "news sentiment replay timestamp is invalid: {}",
-                error.0
-            ))
-        })?;
-        self.clock.advance_to(&event_time)?;
+        if sentiment.event_time_ns != headline.source_event_time_ns {
+            return Err(EngineError(
+                "news sentiment source event time must match its causation headline".to_owned(),
+            ));
+        }
+        let source_event_time =
+            replay_time_from_unix_ns(sentiment.event_time_ns).map_err(|error| {
+                EngineError(format!(
+                    "news sentiment replay timestamp is invalid: {}",
+                    error.0
+                ))
+            })?;
+        let availability_time = replay_availability_time_from_unix_ns(headline.available_at_ns)
+            .map_err(|error| {
+                EngineError(format!(
+                    "news sentiment availability timestamp is invalid: {}",
+                    error.0
+                ))
+            })?;
+        self.clock.advance_to(&availability_time)?;
         let correlation_id = format!("corr-news-{}", sentiment.causation_news_id);
         let sentiment_event = self.emit(
             sink,
             EventPayload::NewsSentiment(sentiment.clone()),
-            &event_time,
+            &source_event_time,
             &correlation_id,
-            Some(&headline_event_id),
-            "news_classifier",
+            Some(&headline.event_id),
+            NlpSentimentEngine::EVIDENCE_ACTOR,
             "local_fixture",
             Some(account_id),
             None,
@@ -3605,6 +3655,40 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct AvailabilityRecordingStrategy {
+        headline_times: Vec<String>,
+        sentiment_times: Vec<String>,
+    }
+
+    impl Strategy for AvailabilityRecordingStrategy {
+        fn on_bar(
+            &mut self,
+            _bar: &Bar,
+            _replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Ok(None)
+        }
+
+        fn on_news_headline(
+            &mut self,
+            _headline: &NewsHeadline,
+            replay_time: &str,
+        ) -> Result<(), EngineError> {
+            self.headline_times.push(replay_time.to_owned());
+            Ok(())
+        }
+
+        fn on_news_sentiment(
+            &mut self,
+            _sentiment: &SentimentVector,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            self.sentiment_times.push(replay_time.to_owned());
+            Ok(None)
+        }
+    }
+
     fn news_headline() -> NewsHeadline {
         NewsHeadline {
             news_id: "news.fixture.001".to_owned(),
@@ -3721,6 +3805,82 @@ mod tests {
         assert!(first
             .iter()
             .any(|event| event.event_type == "audit.trail.v1"));
+    }
+
+    #[test]
+    fn news_callbacks_wait_for_availability_and_preserve_source_and_model_evidence() {
+        let mut engine = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = AvailabilityRecordingStrategy::default();
+
+        let headline = engine
+            .process_news_headline(&mut store, &mut strategy, news_headline())
+            .expect("headline should be accepted at its availability time");
+        let headline_event = &headline.events[0];
+        assert_eq!(headline_event.event_time, "2026-09-01T11:00:00Z");
+        assert_eq!(headline_event.receive_time, "2026-09-01T11:00:01Z");
+        assert_eq!(strategy.headline_times, vec!["2026-09-01T11:00:01Z"]);
+
+        let sentiment = engine
+            .process_news_sentiment(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                news_sentiment(),
+                bar(),
+                NewsShockContext {
+                    pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+                    current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                    baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+                },
+            )
+            .expect("causally linked sentiment should be accepted");
+        let sentiment_event = &sentiment.events[0];
+        assert_eq!(sentiment_event.event_time, "2026-09-01T11:00:00Z");
+        assert_eq!(sentiment_event.receive_time, "2026-09-01T11:00:01Z");
+        assert_eq!(sentiment_event.actor, NlpSentimentEngine::EVIDENCE_ACTOR);
+        assert_eq!(
+            sentiment_event.causation_id.as_deref(),
+            Some(headline_event.event_id.as_str())
+        );
+        assert_eq!(strategy.sentiment_times, vec!["2026-09-01T11:00:01Z"]);
+    }
+
+    #[test]
+    fn impossible_news_availability_and_inconsistent_sentiment_leave_no_new_evidence() {
+        let mut engine = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = AvailabilityRecordingStrategy::default();
+        let mut impossible = news_headline();
+        impossible.receive_time_ns = impossible.event_time_ns - 1;
+        assert!(engine
+            .process_news_headline(&mut store, &mut strategy, impossible)
+            .is_err());
+        assert!(store.events().is_empty());
+        assert!(strategy.headline_times.is_empty());
+
+        engine
+            .process_news_headline(&mut store, &mut strategy, news_headline())
+            .expect("valid headline");
+        let event_count_before = store.events().len();
+        let mut inconsistent = news_sentiment();
+        inconsistent.event_time_ns += 1;
+        assert!(engine
+            .process_news_sentiment(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                inconsistent,
+                bar(),
+                NewsShockContext {
+                    pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+                    current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                    baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+                },
+            )
+            .is_err());
+        assert_eq!(store.events().len(), event_count_before);
+        assert!(strategy.sentiment_times.is_empty());
     }
 
     #[test]

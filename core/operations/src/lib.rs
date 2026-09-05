@@ -18,6 +18,12 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, Time};
 
+pub mod attention;
+pub mod game_day;
+
+pub use attention::{AttentionBudget, AttentionBudgetController};
+pub use game_day::{GameDayCompiler, InjectedFault, RecoveryDrillResult};
+
 /// Version of the durable operations-journal line contract.
 pub const OPERATIONS_JOURNAL_SCHEMA_VERSION: u32 = 1;
 /// Version of the portable operations-dashboard contract.

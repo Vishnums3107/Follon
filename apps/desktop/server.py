@@ -7,6 +7,7 @@ import base64
 import binascii
 import csv
 import hmac
+import hashlib
 import math
 import mimetypes
 import os
@@ -14,6 +15,7 @@ import re
 import socket
 from collections import deque
 from datetime import UTC, datetime
+from heapq import heappop, heappush
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -67,11 +69,77 @@ IGNORED_EVIDENCE_DIRECTORIES = {
 MAX_INDEXED_EVIDENCE = 2_000
 MAX_WORKSPACE_RECORDS = 1_000
 MAX_RECORDS_PER_ARTIFACT = 250
+MAX_REPLAY_EVENT_CANDIDATES = 10_000
+CANONICAL_EVENT_TYPE = re.compile(r"^([a-z]+\.)+[a-z_]+\.v[1-9][0-9]*$")
+CANONICAL_EVENT_ID = re.compile(r"^[a-z0-9._-]+$")
+CANONICAL_UTC_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
+)
+CANONICAL_EVENT_FIELDS = frozenset({
+    "event_id",
+    "event_type",
+    "schema_version",
+    "event_time",
+    "receive_time",
+    "account_id",
+    "strategy_id",
+    "instrument_id",
+    "correlation_id",
+    "causation_id",
+    "actor",
+    "source",
+    "payload",
+    "software_version",
+    "configuration_version",
+})
 AUTH_FAILURE_LIMIT = 5
 AUTH_FAILURE_WINDOW_SECONDS = 60.0
 MAX_TRACKED_AUTH_CLIENTS = 10_000
 _AUTH_FAILURES: dict[str, deque[float]] = {}
 _AUTH_FAILURES_LOCK = Lock()
+
+# Advanced evidence is intentionally projected only when the artifact declares
+# one of the reviewed v1 schemas.  The browser validates the complete contract
+# again before rendering it; this lightweight registry keeps the read-only
+# projection bounded without treating arbitrary JSON as operational evidence.
+ADVANCED_EVIDENCE_SCHEMAS: tuple[tuple[str, str, str], ...] = (
+    ("hypothesis_schema_version", "research_hypothesis", "research"),
+    ("lineage_schema_version", "experiment_lineage", "research"),
+    ("job_schema_version", "research_job", "research"),
+    ("assistant_evidence_schema_version", "assistant_evidence", "research"),
+    ("evaluation_schema_version", "robustness_evaluation", "research"),
+    ("portfolio_experiment_schema_version", "portfolio_experiment", "research"),
+    ("knowledge_schema_version", "knowledge_snapshot", "news"),
+    ("calendar_schema_version", "event_exposure_calendar", "news"),
+    ("mandate_schema_version", "automation_mandate", "research"),
+    ("passport_schema_version", "order_decision_passport", "execution-risk"),
+    ("exposure_schema_version", "exposure_graph", "execution-risk"),
+    ("ledger_schema_version", "fund_ledger_statement", "accounting"),
+    ("policy_schema_version", "continuity_policy", "operations"),
+    ("regime_schema_version", "assumption_regime_monitor", "research"),
+    ("parity_schema_version", "feed_substitution_parity", "market-data"),
+    ("coach_schema_version", "execution_coach_benchmark", "execution-risk"),
+    ("simulation_schema_version", "scenario_loss_simulation", "execution-risk"),
+    ("allocation_schema_version", "capital_allocation_plan", "execution-risk"),
+    ("preview_schema_version", "sandbox_installation_preview", "research"),
+    ("qualification_schema_version", "adapter_qualification", "platform"),
+    ("champion_challenger_schema_version", "champion_challenger_evaluation", "research"),
+    ("planner_schema_version", "capability_execution_planner", "execution-risk"),
+    ("diagnosis_schema_version", "operations_diagnosis_runbook", "operations"),
+    ("benchmark_schema_version", "model_evaluation_benchmark", "operations"),
+    ("capsule_schema_version", "strategy_capsule_manifest", "research"),
+    ("expansion_schema_version", "multi_asset_expansion_plan", "execution-risk"),
+    ("reconstruction_schema_version", "decision_reconstruction", "execution-risk"),
+    ("scenario_schema_version", "counterfactual_scenario", "research"),
+    ("receipt_schema_version", "data_rights_and_semantics_receipt", "market-data"),
+    ("snapshot_schema_version", "workspace_snapshot_manifest", "operations"),
+    ("budget_schema_version", "attention_budget", "operations"),
+    ("adversarial_schema_version", "adversarial_evaluation", "research"),
+    ("drill_schema_version", "recovery_drill_result", "operations"),
+    ("matrix_schema_version", "gateway_qualification_matrix", "platform"),
+    ("proposal_schema_version", "capital_allocation_proposal", "execution-risk"),
+    ("compatibility_schema_version", "compatibility_matrix", "platform"),
+)
 
 
 def load_auth_password() -> str:
@@ -279,7 +347,7 @@ FEATURES: tuple[dict[str, object], ...] = (
         "title": "Deployable application platform",
         "state": "gated",
         "summary": "Transactional PostgreSQL, gRPC topology, React production bundle, and least-privilege Tauri desktop packaging.",
-        "capabilities": ["Checksum-bound versioned PostgreSQL migrations", "Forced row-level tenant security", "Atomic event plus outbox commit", "Order, execution, position, broker, strategy, configuration, risk, audit, identity, billing, and journal projections", "Concurrent skip-locked delivery", "mTLS-capable gRPC service", "React and Vite browser client", "Tauri v2 native host without privileged web commands"],
+        "capabilities": ["Checksum-bound versioned PostgreSQL migrations", "Forced row-level tenant security", "Atomic event plus outbox commit", "Order, execution, position, broker, strategy, configuration, risk, audit, identity, billing, and journal projections", "Concurrent skip-locked delivery", "mTLS-capable gRPC service", "React and Vite browser client", "Tauri v2 host with a separate native IPC command boundary and no privileged web-origin commands"],
         "boundary": "Production certificates, secret custody, deployment promotion, monitoring, backup drills, and installer signing are operator-controlled.",
         "gate": "Local compilation passes; container and signed-installer runtime acceptance must be recorded on deployment infrastructure.",
         "screens": ["Command Center", "Administration"],
@@ -449,12 +517,16 @@ def scan_evidence() -> tuple[list[dict[str, object]], dict[str, Path]]:
             )
             paths[relative_name] = resolved
             if len(files) >= MAX_INDEXED_EVIDENCE:
-                return sorted(files, key=lambda item: str(item["modified_at"]), reverse=True), paths
-    return sorted(files, key=lambda item: str(item["modified_at"]), reverse=True), paths
+                return sorted(files, key=lambda item: str(item["name"])), paths
+    return sorted(files, key=lambda item: str(item["name"])), paths
 
 
 def list_evidence() -> list[dict[str, object]]:
-    return scan_evidence()[0]
+    return sorted(
+        scan_evidence()[0],
+        key=lambda item: (str(item["modified_at"]), str(item["name"])),
+        reverse=True,
+    )
 
 
 def read_json_artifact(path: Path) -> dict[str, object] | None:
@@ -466,16 +538,26 @@ def read_json_artifact(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
-def read_ndjson_artifact(path: Path) -> list[dict[str, object]]:
-    """Read a bounded prefix of object records without weakening artifact isolation."""
+def read_ndjson_artifact(path: Path) -> tuple[list[dict[str, object]], bool, int]:
+    """Read a bounded prefix and disclose whether an append-only artifact was cut.
+
+    The server must never imply that a bounded sample is the complete event
+    trail.  Prefix semantics keep any in-window causal parent available for a
+    later child; the returned metadata lets the UI state that newer records may
+    exist outside the projection.
+    """
     records: list[dict[str, object]] = []
+    source_record_count = 0
+    truncated = False
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
-                if len(records) >= MAX_RECORDS_PER_ARTIFACT:
-                    break
                 if not line.strip():
                     continue
+                source_record_count += 1
+                if len(records) >= MAX_RECORDS_PER_ARTIFACT:
+                    truncated = True
+                    break
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError:
@@ -483,8 +565,8 @@ def read_ndjson_artifact(path: Path) -> list[dict[str, object]]:
                 if isinstance(value, dict):
                     records.append(value)
     except (OSError, UnicodeDecodeError):
-        return []
-    return records
+        return [], False, 0
+    return records, truncated, source_record_count
 
 
 def summarize_csv(path: Path, metadata: dict[str, object]) -> dict[str, object] | None:
@@ -569,7 +651,159 @@ def latest_dashboard(candidates: list[tuple[str, str, dict[str, object]]]) -> di
     return {"artifact": name, "modified_at": modified_at, "data": payload}
 
 
-def workspace_snapshot() -> dict[str, object]:
+def advanced_evidence_kind(payload: dict[str, object]) -> tuple[str, str] | None:
+    """Return a reviewed advanced-evidence category and feature, if declared."""
+    for schema_field, category, feature in ADVANCED_EVIDENCE_SCHEMAS:
+        if payload.get(schema_field) == 1:
+            return category, feature
+    return None
+
+
+def event_envelope_error(payload: dict[str, object]) -> str | None:
+    """Return the reason a candidate fails the v1 canonical event envelope."""
+    unexpected_fields = sorted(set(payload).difference(CANONICAL_EVENT_FIELDS))
+    if unexpected_fields:
+        return f"unexpected envelope field {unexpected_fields[0]}"
+    missing_fields = sorted(CANONICAL_EVENT_FIELDS.difference(payload))
+    if missing_fields:
+        return f"missing required {missing_fields[0]}"
+
+    schema_version = payload["schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version < 1:
+        return "invalid schema_version"
+
+    for field in ("event_id", "correlation_id"):
+        if not isinstance(payload[field], str) or not CANONICAL_EVENT_ID.fullmatch(payload[field]):
+            return f"missing or invalid {field}"
+    for field in ("account_id", "strategy_id", "instrument_id", "causation_id"):
+        value = payload[field]
+        if value is not None and (not isinstance(value, str) or not CANONICAL_EVENT_ID.fullmatch(value)):
+            return f"invalid {field}"
+
+    if not CANONICAL_EVENT_TYPE.fullmatch(str(payload["event_type"])):
+        return "invalid event_type"
+    for field in ("event_time", "receive_time"):
+        value = payload[field]
+        if not isinstance(value, str) or not CANONICAL_UTC_TIMESTAMP.fullmatch(value):
+            return f"invalid {field}"
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return f"invalid {field}"
+    for field in ("actor", "source", "software_version", "configuration_version"):
+        if not isinstance(payload[field], str) or not payload[field]:
+            return f"missing or invalid {field}"
+    if not isinstance(payload["payload"], dict):
+        return "payload must be an object"
+    return None
+
+
+def is_event_like(payload: dict[str, object]) -> bool:
+    """Avoid quietly treating a partial envelope as a canonical event."""
+    return any(
+        field in payload
+        for field in (
+            "event_id",
+            "event_type",
+            "event_time",
+            "receive_time",
+            "correlation_id",
+            "causation_id",
+            "actor",
+            "source",
+            "software_version",
+            "configuration_version",
+        )
+    )
+
+
+def event_timestamp(record: dict[str, object], field: str) -> datetime:
+    """Read a prevalidated canonical UTC timestamp without lexical ordering."""
+    payload = record.get("data")
+    event = payload if isinstance(payload, dict) else {}
+    event_time = str(event.get(field, ""))
+    return datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+
+
+def replay_event_key(record: dict[str, object]) -> tuple[datetime, int]:
+    """Sort replay by availability (`receive_time`) then retained artifact/line order."""
+    return (
+        event_timestamp(record, "receive_time"),
+        int(record.get("_retained_index", 0)),
+    )
+
+
+def presentation_event_key(record: dict[str, object]) -> tuple[float, int]:
+    """Keep newest source-time evidence first without reversing equal-time append order."""
+    event_time = event_timestamp(record, "event_time")
+    retained_index = int(record.get("_retained_index", 0))
+    return (-event_time.timestamp(), retained_index)
+
+
+def cyclic_event_ids(events: list[dict[str, object]]) -> set[str]:
+    """Find only true causation cycles without recursive depth limits."""
+    events_by_id = {
+        str(record["data"]["event_id"]): record
+        for record in events
+        if isinstance(record.get("data"), dict)
+    }
+    visited: set[str] = set()
+    cycles: set[str] = set()
+    for start_id in events_by_id:
+        if start_id in visited:
+            continue
+        path: list[str] = []
+        path_positions: dict[str, int] = {}
+        current_id = start_id
+        while current_id in events_by_id and current_id not in visited:
+            if current_id in path_positions:
+                cycles.update(path[path_positions[current_id]:])
+                break
+            path_positions[current_id] = len(path)
+            path.append(current_id)
+            current = events_by_id[current_id]["data"]
+            causation_id = current.get("causation_id") if isinstance(current, dict) else None
+            current_id = causation_id if isinstance(causation_id, str) else ""
+        visited.update(path)
+    return cycles
+
+
+def canonical_replay_events(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return a deterministic, causation-respecting order for replay inspection.
+
+    The presentation timeline remains reverse chronological.  The debugger must
+    never step into a child event before an indexed parent when the causation
+    relation is available. The projection has already rejected malformed,
+    duplicate, cyclic, and unresolved-causation input before it reaches this
+    function.
+    """
+    indexed_events = {
+        str(record["data"]["event_id"]): record
+        for record in events
+        if isinstance(record.get("data"), dict)
+    }
+    children_by_parent: dict[str, list[str]] = {}
+    ready: list[tuple[tuple[datetime, int], str]] = []
+    for event_id, record in indexed_events.items():
+        payload = record["data"]
+        causation_id = payload.get("causation_id") if isinstance(payload, dict) else None
+        if isinstance(causation_id, str):
+            children_by_parent.setdefault(causation_id, []).append(event_id)
+        else:
+            heappush(ready, (replay_event_key(record), event_id))
+    ordered: list[dict[str, object]] = []
+    while ready:
+        _, event_id = heappop(ready)
+        record = indexed_events[event_id]
+        ordered.append(record)
+        for child_id in children_by_parent.get(event_id, []):
+            heappush(ready, (replay_event_key(indexed_events[child_id]), child_id))
+    if len(ordered) != len(indexed_events):
+        raise RuntimeError("causal replay projection retained a cycle after validation")
+    return ordered
+
+
+def workspace_snapshot(as_of: str | None = None) -> dict[str, object]:
     """Build the bounded, read-only projection consumed by all operator workspaces."""
     artifacts, evidence_paths = scan_evidence()
     datasets: list[dict[str, object]] = []
@@ -577,10 +811,16 @@ def workspace_snapshot() -> dict[str, object]:
     backtests: list[dict[str, object]] = []
     experiments: list[dict[str, object]] = []
     manifests: list[dict[str, object]] = []
+    event_candidates: list[dict[str, object]] = []
+    omitted_event_candidate_count = 0
     events: list[dict[str, object]] = []
+    invalid_artifact_event_ids: set[tuple[str, str]] = set()
+    projection_diagnostics: list[dict[str, object]] = []
+    event_windows: list[dict[str, object]] = []
     journals: list[dict[str, object]] = []
     commercial: list[dict[str, object]] = []
     execution_evidence: list[dict[str, object]] = []
+    advanced_evidence: list[dict[str, object]] = []
     paper_candidates: list[tuple[str, str, dict[str, object]]] = []
     live_candidates: list[tuple[str, str, dict[str, object]]] = []
     operations_candidates: list[tuple[str, str, dict[str, object]]] = []
@@ -628,7 +868,7 @@ def workspace_snapshot() -> dict[str, object]:
                         "content_sha256": payload.get("parquet_sha256"),
                     }
                 )
-            elif "transaction_cost" in payload or "benchmark_schema_version" in payload:
+            elif ("transaction_cost" in payload or "benchmark_schema_version" in payload) and advanced_evidence_kind(payload) is None:
                 execution_evidence.append(
                     {"artifact": name, "modified_at": metadata["modified_at"], "data": payload}
                 )
@@ -647,23 +887,173 @@ def workspace_snapshot() -> dict[str, object]:
                 )
             elif "manifest_schema_version" in payload:
                 manifests.append({"artifact": name, "modified_at": metadata["modified_at"], "data": payload})
+            else:
+                advanced = advanced_evidence_kind(payload)
+                if advanced is not None:
+                    category, feature = advanced
+                    advanced_evidence.append(
+                        {
+                            "artifact": name,
+                            "modified_at": metadata["modified_at"],
+                            "feature": feature,
+                            "category": category,
+                            "data": payload,
+                        }
+                    )
             continue
         if metadata["format"] != "ndjson":
             continue
-        for record in read_ndjson_artifact(path):
+        records, truncated, source_record_count = read_ndjson_artifact(path)
+        seen_artifact_event_ids: set[str] = set()
+        window_events: list[dict[str, object]] = []
+        saw_event_like = False
+        for record in records:
             enriched = {"artifact": name, "feature": metadata["feature"], "data": record}
-            if "experiment_id" in record and "run_id" in record:
-                experiments.append(enriched)
-            elif "ledger_schema_version" in record and str(record.get("event_type", "")).startswith("commercial."):
+            if "ledger_schema_version" in record and str(record.get("event_type", "")).startswith("commercial."):
                 commercial.append(enriched)
                 journals.append({**enriched, "category": "commercial"})
-            elif "event_id" in record and "event_type" in record and "event_time" in record:
-                events.append(enriched)
+            elif is_event_like(record):
+                saw_event_like = True
+                error = event_envelope_error(record)
+                if error is not None:
+                    projection_diagnostics.append(
+                        {"artifact": name, "code": "INVALID_EVENT_ENVELOPE", "detail": error}
+                    )
+                    continue
+                event_id = str(record["event_id"])
+                if event_id in seen_artifact_event_ids:
+                    invalid_artifact_event_ids.add((name, event_id))
+                    projection_diagnostics.append(
+                        {"artifact": name, "code": "DUPLICATE_EVENT_ID", "detail": f"duplicate event ID {event_id}"}
+                    )
+                    continue
+                seen_artifact_event_ids.add(event_id)
+                window_events.append(record)
+                if len(event_candidates) >= MAX_REPLAY_EVENT_CANDIDATES:
+                    omitted_event_candidate_count += 1
+                    continue
+                enriched["_retained_index"] = len(event_candidates)
+                event_candidates.append(enriched)
+            elif "experiment_id" in record and "run_id" in record:
+                experiments.append(enriched)
             elif "sequence" in record and ("entry_hash" in record or "record_hash" in record):
                 category = "live" if "live" in name.lower() else "paper" if "paper" in name.lower() else "operations"
                 journals.append({**enriched, "category": category})
 
-    events.sort(key=lambda item: str(item["data"].get("event_time", "")), reverse=True)
+        if saw_event_like or window_events or truncated:
+            first_event = window_events[0] if window_events else {}
+            last_event = window_events[-1] if window_events else {}
+            event_windows.append(
+                {
+                    "artifact": name,
+                    "window_kind": "prefix",
+                    "source_record_count_lower_bound": source_record_count,
+                    "retained_record_count": len(records),
+                    "retained_event_count": len(window_events),
+                    "truncated": truncated,
+                    "first_event_id": first_event.get("event_id"),
+                    "first_event_time": first_event.get("event_time"),
+                    "last_event_id": last_event.get("event_id"),
+                    "last_event_time": last_event.get("event_time"),
+                }
+            )
+
+    event_id_counts: dict[str, int] = {}
+    for candidate in event_candidates:
+        payload = candidate["data"]
+        event_id = str(payload["event_id"])
+        event_id_counts[event_id] = event_id_counts.get(event_id, 0) + 1
+    surviving_candidates: list[dict[str, object]] = []
+    for candidate in event_candidates:
+        payload = candidate["data"]
+        event_id = str(payload["event_id"])
+        if (str(candidate["artifact"]), event_id) in invalid_artifact_event_ids:
+            continue
+        if event_id_counts[event_id] > 1:
+            projection_diagnostics.append(
+                {
+                    "artifact": candidate["artifact"],
+                    "code": "DUPLICATE_EVENT_ID",
+                    "detail": f"event ID {event_id} appears in multiple artifacts",
+                }
+            )
+            continue
+        surviving_candidates.append(candidate)
+
+    candidates_by_id = {
+        str(candidate["data"]["event_id"]): candidate
+        for candidate in surviving_candidates
+    }
+    children_by_parent: dict[str, list[str]] = {}
+    rejected_event_ids: set[str] = set()
+    for event_id, candidate in candidates_by_id.items():
+        causation_id = candidate["data"].get("causation_id")
+        if not isinstance(causation_id, str):
+            continue
+        if causation_id not in candidates_by_id:
+            projection_diagnostics.append(
+                {
+                    "artifact": candidate["artifact"],
+                    "code": "UNRESOLVED_CAUSATION",
+                    "detail": f"causation ID {causation_id} was rejected or unavailable",
+                }
+            )
+            rejected_event_ids.add(event_id)
+            continue
+        children_by_parent.setdefault(causation_id, []).append(event_id)
+    for event_id in cyclic_event_ids(surviving_candidates):
+        candidate = candidates_by_id[event_id]
+        projection_diagnostics.append(
+            {
+                "artifact": candidate["artifact"],
+                "code": "CYCLIC_CAUSATION",
+                "detail": f"event ID {event_id} belongs to a causation cycle",
+            }
+        )
+        rejected_event_ids.add(event_id)
+    rejected_queue = deque(rejected_event_ids)
+    while rejected_queue:
+        rejected_parent_id = rejected_queue.popleft()
+        for child_id in children_by_parent.get(rejected_parent_id, []):
+            if child_id in rejected_event_ids:
+                continue
+            child = candidates_by_id[child_id]
+            projection_diagnostics.append(
+                {
+                    "artifact": child["artifact"],
+                    "code": "UNRESOLVED_CAUSATION",
+                    "detail": f"causation ID {rejected_parent_id} was rejected or unavailable",
+                }
+            )
+            rejected_event_ids.add(child_id)
+            rejected_queue.append(child_id)
+    events = [
+        candidate
+        for candidate in surviving_candidates
+        if str(candidate["data"]["event_id"]) not in rejected_event_ids
+    ]
+    if omitted_event_candidate_count > 0:
+        projection_diagnostics.append(
+            {
+                "artifact": "workspace_projection",
+                "code": "EVENT_CANDIDATE_CAP",
+                "detail": (
+                    f"retained {MAX_REPLAY_EVENT_CANDIDATES} canonical event candidates and omitted "
+                    f"at least {omitted_event_candidate_count} additional candidates"
+                ),
+            }
+        )
+
+    replay_events = canonical_replay_events(events)
+    events.sort(key=presentation_event_key)
+    replay_events = [
+        {key: value for key, value in record.items() if key != "_retained_index"}
+        for record in replay_events
+    ]
+    events = [
+        {key: value for key, value in record.items() if key != "_retained_index"}
+        for record in events
+    ]
     journals.sort(
         key=lambda item: (
             str(item["data"].get("occurred_at", "")),
@@ -675,14 +1065,23 @@ def workspace_snapshot() -> dict[str, object]:
     experiments.sort(key=lambda item: str(item["artifact"]), reverse=True)
     manifests.sort(key=lambda item: str(item["modified_at"]), reverse=True)
     execution_evidence.sort(key=lambda item: str(item["modified_at"]), reverse=True)
+    advanced_evidence.sort(key=lambda item: (str(item["modified_at"]), str(item["artifact"])), reverse=True)
+    event_windows.sort(key=lambda item: str(item["artifact"]))
+    projection_diagnostics.sort(key=lambda item: (str(item["artifact"]), str(item["code"]), str(item["detail"])))
 
     feature_counts = {str(feature["id"]): 0 for feature in FEATURES}
     for artifact in artifacts:
         feature = str(artifact["feature"])
         feature_counts[feature] = feature_counts.get(feature, 0) + 1
 
+    if as_of:
+        events = [ev for ev in events if str(ev["data"].get("receive_time", ev["data"].get("event_time", ""))) <= as_of]
+        replay_events = [ev for ev in replay_events if str(ev["data"].get("receive_time", ev["data"].get("event_time", ""))) <= as_of]
+        journals = [j for j in journals if str(j["data"].get("occurred_at", "")) <= as_of]
+
     return {
         "workspace_schema_version": 1,
+        "as_of": as_of,
         "generated_at": datetime.now(UTC).isoformat(),
         "read_only": True,
         "counts": {
@@ -705,11 +1104,102 @@ def workspace_snapshot() -> dict[str, object]:
         "journals": journals[:MAX_WORKSPACE_RECORDS],
         "commercial": commercial[:MAX_WORKSPACE_RECORDS],
         "execution_evidence": execution_evidence[:MAX_WORKSPACE_RECORDS],
+        "advanced_evidence": advanced_evidence[:MAX_WORKSPACE_RECORDS],
+        "replay_events": replay_events[:MAX_WORKSPACE_RECORDS],
+        "event_windows": event_windows[:MAX_WORKSPACE_RECORDS],
+        "event_window": {
+            "window_kind": "causal_prefix",
+            "source_event_count_lower_bound": len(event_candidates) + omitted_event_candidate_count,
+            "retained_event_count": min(len(replay_events), MAX_WORKSPACE_RECORDS),
+            "truncated": any(bool(window["truncated"]) for window in event_windows)
+            or omitted_event_candidate_count > 0
+            or len(replay_events) > MAX_WORKSPACE_RECORDS,
+        },
+        "projection_diagnostics": projection_diagnostics[:MAX_WORKSPACE_RECORDS],
         "paper": latest_dashboard(paper_candidates),
         "live": latest_dashboard(live_candidates),
         "operations": latest_dashboard(operations_candidates),
         "options": latest_dashboard(options_candidates),
         "commercial_artifacts": [artifact for artifact in artifacts if artifact["feature"] == "commercial"],
+    }
+
+
+def build_decision_reconstruction(target_event_id: str) -> dict[str, object] | None:
+    """Build an attributable causal decision provenance graph starting from any event."""
+    snapshot = workspace_snapshot()
+    events_list = snapshot.get("events", [])
+    events_by_id = {
+        str(item["data"]["event_id"]): item["data"]
+        for item in events_list
+        if isinstance(item, dict) and "data" in item and isinstance(item["data"], dict) and "event_id" in item["data"]
+    }
+    if target_event_id not in events_by_id:
+        return None
+
+    target_event = events_by_id[target_event_id]
+    ev_type = str(target_event.get("event_type", ""))
+    entity_type = (
+        "fill" if "fill" in ev_type
+        else "order_intent" if "intent" in ev_type
+        else "risk_rejection" if "risk" in ev_type
+        else "position" if "position" in ev_type
+        else "alert"
+    )
+
+    causal_chain: list[dict[str, object]] = []
+    edges: list[dict[str, str]] = []
+    current_id: str | None = target_event_id
+    visited: set[str] = set()
+    integrity_status = "VERIFIED"
+
+    while current_id:
+        if current_id in visited:
+            integrity_status = "TIMESTAMP_ANOMALY"
+            break
+        visited.add(current_id)
+        event = events_by_id.get(current_id)
+        if not event:
+            integrity_status = "INCOMPLETE_CHAIN"
+            break
+
+        event_time_str = str(event.get("event_time", datetime.now(UTC).isoformat()))
+        receive_time_str = str(event.get("receive_time", event_time_str))
+        if receive_time_str < event_time_str:
+            integrity_status = "TIMESTAMP_ANOMALY"
+
+        content_hash = hashlib.sha256(json.dumps(event, sort_keys=True).encode("utf-8")).hexdigest()
+        causal_chain.append({
+            "node_id": event.get("event_id", current_id),
+            "event_type": event.get("event_type", "unknown"),
+            "actor": event.get("actor", "system"),
+            "event_time": event_time_str,
+            "available_at": receive_time_str,
+            "causation_id": event.get("causation_id"),
+            "content_hash": content_hash,
+            "summary": f"{event.get('event_type')}: {event.get('actor')}",
+        })
+        parent_id = event.get("causation_id")
+        if parent_id and isinstance(parent_id, str):
+            edges.append({
+                "from_node_id": parent_id,
+                "to_node_id": current_id,
+                "relation": "caused",
+            })
+            current_id = parent_id
+        else:
+            current_id = None
+
+    causal_chain.reverse()
+    return {
+        "reconstruction_schema_version": 1,
+        "reconstruction_id": f"recon.{target_event_id.replace('event.', '')}",
+        "target_event_id": target_event_id,
+        "target_entity_type": entity_type,
+        "causal_chain": causal_chain,
+        "edges": edges,
+        "configuration_hash": "cfg-hash-follon-v1",
+        "integrity_status": integrity_status,
+        "verified_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -808,7 +1298,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.write_json(HTTPStatus.OK, FEATURES)
             return
         if path == "/api/v1/workspaces":
-            self.write_json(HTTPStatus.OK, workspace_snapshot())
+            query_params = parse_qs(request.query)
+            as_of_param = query_params.get("as_of", [None])[0]
+            self.write_json(HTTPStatus.OK, workspace_snapshot(as_of=as_of_param))
+            return
+        if path.startswith("/api/v1/reconstruction/"):
+            target_id = path.removeprefix("/api/v1/reconstruction/")
+            recon = build_decision_reconstruction(target_id)
+            if recon is None:
+                self.write_json(HTTPStatus.NOT_FOUND, {"error": f"Event {target_id} not found for reconstruction"})
+            else:
+                self.write_json(HTTPStatus.OK, recon)
             return
         if path == "/api/v1/evidence":
             self.write_json(HTTPStatus.OK, list_evidence())

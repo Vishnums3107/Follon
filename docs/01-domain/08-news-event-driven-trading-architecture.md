@@ -47,6 +47,13 @@ event ID and stores the direct envelope causation link from sentiment to
 headline, intent to sentiment, risk decision to intent, and subsequent OMS,
 fill, portfolio, and audit events.
 
+The local keyword classifier identifies itself as `keyword-finance` version
+`v1`. Derived sentiment envelopes carry the immutable actor stamp
+`news_classifier.keyword-finance-v1`; the payload's source event time and the
+envelope causation ID retain the source evidence link. This is bounded local
+fixture provenance, not a claim that arbitrary external model output has been
+verified.
+
 The Protobuf messages define the same payload values for a future API surface.
 They are not served by the current gRPC service, so there is no advertised news
 RPC endpoint.
@@ -55,18 +62,25 @@ RPC endpoint.
 
 `follon_news::ingest_local_headlines_ndjson` accepts only one schema-valid
 payload per non-empty line and rejects malformed JSON, unknown fields, invalid
-IDs, invalid lowercase hashes, and invalid timestamps. `ReplayNewsFeed` rejects
-duplicate headlines/vectors and orphaned sentiment. Its total ordering is:
+IDs, invalid lowercase hashes, invalid timestamps, and a receipt timestamp
+earlier than the source event. `ReplayNewsFeed` rejects duplicate
+headlines/vectors, orphaned sentiment, and a sentiment whose declared source
+time differs from its causal headline. Its total ordering is:
 
-1. source event time;
+1. availability time: headline receipt time, inherited by its causal sentiment;
 2. declared source label;
 3. source sequence number;
 4. event kind (headline before its sentiment vector);
-5. canonical identity.
+5. source event time;
+6. canonical identity.
 
-The replay clock is derived from the Unix-nanosecond source time without a local
-timezone. Nanosecond ordering stays in the payload and feed key; the clock is
-second precision because that is the Follon envelope contract.
+Source timestamps remain in the payload and envelope event-time evidence. The
+replay clock uses the availability timestamp without a local timezone. Because
+the envelope contract is second precision, a sub-second availability is rounded
+up to the next canonical second before a strategy callback; it is
+never truncated to an earlier instant. Nanosecond ordering remains in the feed
+key, while the ceiling rule prevents a strategy from consuming a headline or
+its derived sentiment before it was available.
 
 ## News shock risk inputs
 

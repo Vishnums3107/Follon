@@ -9,6 +9,13 @@ use std::fmt;
 use follon_domain::{validate_canonical_id, Decimal, Side};
 use follon_fx::{FxPricingSnapshot, FxValueDate};
 
+pub mod allocation;
+
+pub use allocation::{
+    CapitalAllocationCouncil, CapitalAllocationProposal, ProposalStatus,
+    StrategyAllocationRecommendation,
+};
+
 /// Aggregate risk evaluation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RiskError(pub String);

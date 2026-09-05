@@ -99,7 +99,7 @@ pub fn ingest_local_headlines_ndjson(input: &str) -> Result<Vec<NewsHeadline>, N
             receive_time_ns: required_u64(object, "receive_time_ns", index + 1)?,
             entity_tickers,
         };
-        headline.validate()?;
+        validate_headline_availability(&headline)?;
         headlines.push(headline);
     }
     if headlines.is_empty() {
@@ -110,25 +110,59 @@ pub fn ingest_local_headlines_ndjson(input: &str) -> Result<Vec<NewsHeadline>, N
     Ok(headlines)
 }
 
-/// Converts a Unix-nanosecond event time to the canonical replay-clock second.
+/// Converts a Unix-nanosecond source event time to the canonical replay-clock
+/// second.
 ///
 /// Nanosecond order remains in the news payload and feed sort key. The replay
-/// clock is intentionally second-precision, so events occurring in the same
-/// second retain their deterministic payload tie-break ordering.
+/// clock is intentionally second-precision, so this representation is for
+/// source evidence only. Use [`replay_availability_time_from_unix_ns`] before
+/// exposing an item to a strategy.
 pub fn replay_time_from_unix_ns(event_time_ns: u64) -> Result<String, NewsError> {
     if event_time_ns == 0 {
         return Err(NewsError("event_time_ns must be positive".to_owned()));
     }
-    let seconds = event_time_ns / 1_000_000_000;
+    replay_time_from_unix_seconds(event_time_ns / 1_000_000_000, "event_time_ns")
+}
+
+/// Converts a Unix-nanosecond availability time to a replay-clock second
+/// without making the item visible early.
+///
+/// The event envelope only admits whole-second UTC timestamps. A fractional
+/// availability time is therefore rounded up to the next second, rather than
+/// truncated, so the strategy callback cannot observe a headline or derived
+/// sentiment before the fixture says it was available.
+pub fn replay_availability_time_from_unix_ns(
+    availability_time_ns: u64,
+) -> Result<String, NewsError> {
+    if availability_time_ns == 0 {
+        return Err(NewsError(
+            "availability_time_ns must be positive".to_owned(),
+        ));
+    }
+    let seconds = availability_time_ns / 1_000_000_000;
+    let rounded_seconds = if availability_time_ns % 1_000_000_000 == 0 {
+        seconds
+    } else {
+        seconds.checked_add(1).ok_or_else(|| {
+            NewsError("availability_time_ns is outside the replay clock range".to_owned())
+        })?
+    };
+    replay_time_from_unix_seconds(rounded_seconds, "availability_time_ns")
+}
+
+fn replay_time_from_unix_seconds(seconds: u64, timestamp_name: &str) -> Result<String, NewsError> {
     let days = seconds / 86_400;
     let seconds_of_day = seconds % 86_400;
-    let days = i64::try_from(days)
-        .map_err(|_| NewsError("event_time_ns is outside the replay clock range".to_owned()))?;
+    let days = i64::try_from(days).map_err(|_| {
+        NewsError(format!(
+            "{timestamp_name} is outside the replay clock range"
+        ))
+    })?;
     let (year, month, day) = civil_from_days(days);
     if !(0..=9_999).contains(&year) {
-        return Err(NewsError(
-            "event_time_ns is outside the replay clock range".to_owned(),
-        ));
+        return Err(NewsError(format!(
+            "{timestamp_name} is outside the replay clock range"
+        )));
     }
     Ok(format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
@@ -136,6 +170,16 @@ pub fn replay_time_from_unix_ns(event_time_ns: u64) -> Result<String, NewsError>
         (seconds_of_day % 3_600) / 60,
         seconds_of_day % 60
     ))
+}
+
+pub(crate) fn validate_headline_availability(headline: &NewsHeadline) -> Result<(), NewsError> {
+    headline.validate()?;
+    if headline.receive_time_ns < headline.event_time_ns {
+        return Err(NewsError(
+            "news headline availability cannot precede its source event time".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u64, u64) {
@@ -205,7 +249,7 @@ pub enum NewsReplayItem {
 }
 
 impl NewsReplayItem {
-    /// Returns the canonical event timestamp in nanoseconds UTC.
+    /// Returns the source event timestamp in nanoseconds UTC.
     pub fn event_time_ns(&self) -> u64 {
         match self {
             Self::Headline(h) => h.event_time_ns,
@@ -214,13 +258,15 @@ impl NewsReplayItem {
     }
 }
 
-/// Chronologically ordered news event feed for replay backtesting.
+/// Availability-ordered news event feed for replay backtesting.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplayNewsFeed {
     events: Vec<NewsReplayItem>,
     headline_ids: BTreeSet<String>,
     headline_sources: BTreeMap<String, NewsSource>,
     headline_sequences: BTreeMap<String, u64>,
+    headline_event_times: BTreeMap<String, u64>,
+    headline_availability_times: BTreeMap<String, u64>,
     sentiment_ids: BTreeSet<String>,
 }
 
@@ -232,11 +278,13 @@ impl ReplayNewsFeed {
             headline_ids: BTreeSet::new(),
             headline_sources: BTreeMap::new(),
             headline_sequences: BTreeMap::new(),
+            headline_event_times: BTreeMap::new(),
+            headline_availability_times: BTreeMap::new(),
             sentiment_ids: BTreeSet::new(),
         }
     }
 
-    /// Adds a validated item once and preserves canonical replay order.
+    /// Adds a validated item once and preserves canonical availability order.
     ///
     /// A sentiment vector is accepted only after its causative headline has
     /// entered the feed. This forbids an orphaned evidence chain even when a
@@ -244,7 +292,7 @@ impl ReplayNewsFeed {
     pub fn push(&mut self, item: NewsReplayItem) -> Result<(), NewsError> {
         match &item {
             NewsReplayItem::Headline(headline) => {
-                headline.validate()?;
+                validate_headline_availability(headline)?;
                 if !self.headline_ids.insert(headline.news_id.clone()) {
                     return Err(NewsError("duplicate news_id in replay input".to_owned()));
                 }
@@ -252,12 +300,26 @@ impl ReplayNewsFeed {
                     .insert(headline.news_id.clone(), headline.sequence_number);
                 self.headline_sources
                     .insert(headline.news_id.clone(), headline.source);
+                self.headline_event_times
+                    .insert(headline.news_id.clone(), headline.event_time_ns);
+                self.headline_availability_times
+                    .insert(headline.news_id.clone(), headline.receive_time_ns);
             }
             NewsReplayItem::Sentiment(sentiment) => {
                 sentiment.validate()?;
                 if !self.headline_ids.contains(&sentiment.causation_news_id) {
                     return Err(NewsError(
                         "news sentiment has no preceding causation headline".to_owned(),
+                    ));
+                }
+                let headline_event_time = self
+                    .headline_event_times
+                    .get(&sentiment.causation_news_id)
+                    .expect("accepted sentiment has a causation headline");
+                if sentiment.event_time_ns != *headline_event_time {
+                    return Err(NewsError(
+                        "news sentiment source event time must match its causation headline"
+                            .to_owned(),
                     ));
                 }
                 if !self.sentiment_ids.insert(sentiment.event_id.clone()) {
@@ -269,9 +331,18 @@ impl ReplayNewsFeed {
         }
         self.events.push(item);
         self.events.sort_by(|left, right| {
-            replay_item_sort_key(left, &self.headline_sources, &self.headline_sequences).cmp(
-                &replay_item_sort_key(right, &self.headline_sources, &self.headline_sequences),
+            replay_item_sort_key(
+                left,
+                &self.headline_sources,
+                &self.headline_sequences,
+                &self.headline_availability_times,
             )
+            .cmp(&replay_item_sort_key(
+                right,
+                &self.headline_sources,
+                &self.headline_sequences,
+                &self.headline_availability_times,
+            ))
         });
         Ok(())
     }
@@ -286,7 +357,7 @@ impl ReplayNewsFeed {
         classifier: &NlpSentimentEngine,
     ) -> Result<Self, NewsError> {
         headlines.sort_by(|left, right| {
-            (left.event_time_ns, &left.news_id).cmp(&(right.event_time_ns, &right.news_id))
+            headline_replay_sort_key(left).cmp(&headline_replay_sort_key(right))
         });
         let mut feed = Self::new();
         for headline in headlines {
@@ -298,9 +369,27 @@ impl ReplayNewsFeed {
         Ok(feed)
     }
 
-    /// Returns all chronologically sorted events.
+    /// Returns all events sorted by their first safe availability time.
     pub fn events(&self) -> &[NewsReplayItem] {
         &self.events
+    }
+
+    /// Returns when an accepted item can first be exposed during replay.
+    ///
+    /// A sentiment vector inherits the receipt/availability timestamp of its
+    /// causal headline. Its source event timestamp remains on the payload for
+    /// evidence and is deliberately not used for strategy scheduling.
+    pub fn availability_time_ns(&self, item: &NewsReplayItem) -> Option<u64> {
+        match item {
+            NewsReplayItem::Headline(headline) => self
+                .headline_availability_times
+                .get(&headline.news_id)
+                .copied(),
+            NewsReplayItem::Sentiment(sentiment) => self
+                .headline_availability_times
+                .get(&sentiment.causation_news_id)
+                .copied(),
+        }
     }
 
     /// Filters sentiment events targeting a specific instrument ID.
@@ -319,17 +408,21 @@ fn replay_item_sort_key<'a>(
     item: &'a NewsReplayItem,
     headline_sources: &BTreeMap<String, NewsSource>,
     headline_sequences: &BTreeMap<String, u64>,
-) -> (u64, &'static str, u64, u8, &'a str) {
+    headline_availability_times: &BTreeMap<String, u64>,
+) -> (u64, &'static str, u64, u8, u64, &'a str) {
     match item {
         NewsReplayItem::Headline(headline) => (
-            headline.event_time_ns,
+            headline.receive_time_ns,
             headline.source.as_str(),
             headline.sequence_number,
             0,
+            headline.event_time_ns,
             &headline.news_id,
         ),
         NewsReplayItem::Sentiment(sentiment) => (
-            sentiment.event_time_ns,
+            *headline_availability_times
+                .get(&sentiment.causation_news_id)
+                .expect("accepted sentiment has a causation headline"),
             headline_sources
                 .get(&sentiment.causation_news_id)
                 .expect("accepted sentiment has a causation headline")
@@ -338,9 +431,20 @@ fn replay_item_sort_key<'a>(
                 .get(&sentiment.causation_news_id)
                 .expect("accepted sentiment has a causation headline"),
             1,
+            sentiment.event_time_ns,
             &sentiment.event_id,
         ),
     }
+}
+
+fn headline_replay_sort_key(headline: &NewsHeadline) -> (u64, &'static str, u64, u64, &str) {
+    (
+        headline.receive_time_ns,
+        headline.source.as_str(),
+        headline.sequence_number,
+        headline.event_time_ns,
+        &headline.news_id,
+    )
 }
 
 #[cfg(test)]
@@ -458,6 +562,119 @@ mod tests {
         let aapl_events = feed.sentiment_events_for("aapl.us");
         assert_eq!(aapl_events.len(), 1);
         assert_eq!(aapl_events[0].event_id, "sent.002");
+    }
+
+    #[test]
+    fn replay_feed_orders_by_availability_and_inherits_it_for_sentiment() {
+        let early_source_late_arrival = NewsHeadline {
+            news_id: "news.early-source".to_owned(),
+            source: NewsSource::DowJones,
+            headline: "Apple earnings beat".to_owned(),
+            raw_body_hash: "e".repeat(64),
+            sequence_number: 1,
+            event_time_ns: 1_000,
+            receive_time_ns: 5_000,
+            entity_tickers: vec!["aapl.us".to_owned()],
+        };
+        let later_source_early_arrival = NewsHeadline {
+            news_id: "news.later-source".to_owned(),
+            source: NewsSource::DowJones,
+            headline: "Tesla earnings miss".to_owned(),
+            raw_body_hash: "f".repeat(64),
+            sequence_number: 2,
+            event_time_ns: 2_000,
+            receive_time_ns: 3_000,
+            entity_tickers: vec!["tsla.us".to_owned()],
+        };
+        let early_sentiment = SentimentVector {
+            event_id: "sent.early-source.1".to_owned(),
+            causation_news_id: early_source_late_arrival.news_id.clone(),
+            event_time_ns: early_source_late_arrival.event_time_ns,
+            instrument_id: "aapl.us".to_owned(),
+            taxonomy: EventTaxonomy::EarningsRelease,
+            sentiment_polarity_bps: 5_000,
+            confidence_bps: 9_000,
+            novelty_score_bps: 10_000,
+            surprise_magnitude_bps: 250,
+        };
+        let later_sentiment = SentimentVector {
+            event_id: "sent.later-source.1".to_owned(),
+            causation_news_id: later_source_early_arrival.news_id.clone(),
+            event_time_ns: later_source_early_arrival.event_time_ns,
+            instrument_id: "tsla.us".to_owned(),
+            taxonomy: EventTaxonomy::EarningsRelease,
+            sentiment_polarity_bps: -5_000,
+            confidence_bps: 9_000,
+            novelty_score_bps: 10_000,
+            surprise_magnitude_bps: -250,
+        };
+
+        let mut feed = ReplayNewsFeed::new();
+        feed.push(NewsReplayItem::Headline(early_source_late_arrival))
+            .expect("early source headline");
+        feed.push(NewsReplayItem::Headline(later_source_early_arrival))
+            .expect("later source headline");
+        feed.push(NewsReplayItem::Sentiment(early_sentiment))
+            .expect("early source sentiment");
+        feed.push(NewsReplayItem::Sentiment(later_sentiment))
+            .expect("later source sentiment");
+
+        let identities = feed
+            .events()
+            .iter()
+            .map(|item| match item {
+                NewsReplayItem::Headline(headline) => headline.news_id.as_str(),
+                NewsReplayItem::Sentiment(sentiment) => sentiment.event_id.as_str(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                "news.later-source",
+                "sent.later-source.1",
+                "news.early-source",
+                "sent.early-source.1",
+            ]
+        );
+        let availability = feed
+            .events()
+            .iter()
+            .map(|item| {
+                feed.availability_time_ns(item)
+                    .expect("accepted item availability")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(availability, vec![3_000, 3_000, 5_000, 5_000]);
+    }
+
+    #[test]
+    fn replay_availability_rounds_up_and_rejects_impossible_headlines() {
+        assert_eq!(
+            replay_availability_time_from_unix_ns(1_788_260_400_000_000_000).unwrap(),
+            "2026-09-01T11:00:00Z"
+        );
+        assert_eq!(
+            replay_availability_time_from_unix_ns(1_788_260_400_000_000_001).unwrap(),
+            "2026-09-01T11:00:01Z"
+        );
+
+        let impossible = NewsHeadline {
+            news_id: "news.impossible".to_owned(),
+            source: NewsSource::DowJones,
+            headline: "Apple earnings beat".to_owned(),
+            raw_body_hash: "a".repeat(64),
+            sequence_number: 1,
+            event_time_ns: 1_000,
+            receive_time_ns: 999,
+            entity_tickers: vec!["aapl.us".to_owned()],
+        };
+        let mut feed = ReplayNewsFeed::new();
+        let error = feed
+            .push(NewsReplayItem::Headline(impossible))
+            .expect_err("availability before the source event must be rejected");
+        assert!(error
+            .0
+            .contains("availability cannot precede its source event time"));
     }
 
     #[test]

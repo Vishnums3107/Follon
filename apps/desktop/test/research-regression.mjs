@@ -294,6 +294,9 @@ const mockContext = {
   onOpenArtifact: () => {},
 };
 
+// The debugger accepts only the server's canonical causation-respecting view.
+mockSnapshot.replay_events = [...mockSnapshot.events];
+
 // Test Research Lab additions (RES-01, DATA-01)
 const labSummary = new MockElement("div");
 const labCanvas = new MockElement("div");

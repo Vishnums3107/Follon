@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DataRightsAndSemanticsReceipt",
+  "description": "Verification receipt recording market data provider licenses, redistribution entitlements, and corporate-action adjustment semantics (DUR-03).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_schema_version",
+    "receipt_id",
+    "provider_id",
+    "dataset_id",
+    "license_tier",
+    "redistribution_permitted",
+    "corporate_action_policy",
+    "semantic_parity_score_bps",
+    "verified_at",
+    "expires_at"
+  ],
+  "properties": {
+    "receipt_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "receipt_id": {
+      "type": "string",
+      "pattern": "^drsr\\.[a-z0-9_.-]+$"
+    },
+    "provider_id": { "type": "string" },
+    "dataset_id": { "type": "string" },
+    "license_tier": {
+      "type": "string",
+      "enum": ["INTERNAL_RESEARCH_ONLY", "COMMERCIAL_REPLAY", "ENTERPRISE_REDISTRIBUTABLE"]
+    },
+    "redistribution_permitted": { "type": "boolean" },
+    "corporate_action_policy": {
+      "type": "string",
+      "enum": ["RAW_SPLIT_AND_DIVIDEND_ADJUSTED", "RAW_UNADJUSTED", "SPLIT_ADJUSTED_ONLY"]
+    },
+    "semantic_parity_score_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "verified_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" }
+  }
+}

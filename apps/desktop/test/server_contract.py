@@ -324,8 +324,19 @@ class DashboardServerContract(unittest.TestCase):
         (EVIDENCE_ROOT / "events.ndjson").write_text(json.dumps({
             "event_id": "evt-1",
             "event_type": "order.state_changed.v1",
+            "schema_version": 1,
             "event_time": "2026-01-01T00:00:00Z",
+            "receive_time": "2026-01-01T00:00:00Z",
+            "account_id": "acct.paper",
+            "strategy_id": None,
+            "instrument_id": "inst.us_equity.spy",
+            "correlation_id": "corr-1",
+            "causation_id": None,
+            "actor": "oms",
+            "source": "simulator",
             "payload": {"new_state": "ACKNOWLEDGED"},
+            "software_version": "follon-test",
+            "configuration_version": "paper-v1",
         }) + "\n", encoding="utf-8")
         (EVIDENCE_ROOT / "spy.parquet.receipt.json").write_text(json.dumps({
             "storage_receipt_schema_version": 1,
@@ -389,6 +400,210 @@ class DashboardServerContract(unittest.TestCase):
         self.assertEqual(artifacts["tca.json"]["feature"], "execution-risk")
         self.assertEqual(artifacts["model-risk-register.json"]["feature"], "operations")
 
+    def test_workspace_projection_validates_event_envelopes_and_discloses_windows(self) -> None:
+        def event(
+            event_id: str,
+            event_time: str,
+            causation_id: str | None = None,
+            receive_time: str | None = None,
+        ) -> dict[str, object]:
+            return {
+                "event_id": event_id,
+                "event_type": "market.bar.v1",
+                "schema_version": 1,
+                "event_time": event_time,
+                "receive_time": receive_time or event_time,
+                "account_id": None,
+                "strategy_id": None,
+                "instrument_id": "inst.us_equity.spy",
+                "correlation_id": "corr.test",
+                "causation_id": causation_id,
+                "actor": "replay",
+                "source": "fixture",
+                "payload": {"instrument_id": "inst.us_equity.spy"},
+                "software_version": "follon-test",
+                "configuration_version": "replay-fixture-v1",
+            }
+
+        causal = [
+            event("evt.root", "2099-01-01T00:00:00Z"),
+            event("evt.child", "2000-01-01T00:00:00Z", "evt.root"),
+            {"event_id": "evt.invalid", "event_type": "market.bar.v1", "event_time": "2026-01-01T00:00:00Z", "payload": {}},
+        ]
+        (EVIDENCE_ROOT / "causal.ndjson").write_text(
+            "\n".join(json.dumps(record) for record in causal) + "\n",
+            encoding="utf-8",
+        )
+        (EVIDENCE_ROOT / "unseen.ndjson").write_text(
+            json.dumps(event("evt.unseen", "2026-01-01T00:00:00Z", "evt.absent")) + "\n",
+            encoding="utf-8",
+        )
+        (EVIDENCE_ROOT / "a-cross-child.ndjson").write_text(
+            json.dumps(event("evt.cross-child", "2026-01-01T00:00:00Z", "evt.cross-parent")) + "\n",
+            encoding="utf-8",
+        )
+        (EVIDENCE_ROOT / "z-cross-parent.ndjson").write_text(
+            json.dumps(event("evt.cross-parent", "2026-01-01T00:00:01Z")) + "\n",
+            encoding="utf-8",
+        )
+        availability = [
+            event("evt.availability.market", "2026-01-01T00:00:01Z"),
+            event("evt.availability.late", "2026-01-01T00:00:00Z", receive_time="2026-01-01T00:00:02Z"),
+        ]
+        (EVIDENCE_ROOT / "availability.ndjson").write_text(
+            "\n".join(json.dumps(record) for record in availability) + "\n",
+            encoding="utf-8",
+        )
+        ordering = [
+            event("evt.whole-second", "2026-01-01T00:00:00Z"),
+            event("evt.fractional-second", "2026-01-01T00:00:00.500Z"),
+            event("evt.tie.first", "2026-01-01T00:00:02Z"),
+            event("evt.tie.second", "2026-01-01T00:00:02Z"),
+        ]
+        (EVIDENCE_ROOT / "ordering.ndjson").write_text(
+            "\n".join(json.dumps(record) for record in ordering) + "\n",
+            encoding="utf-8",
+        )
+        cycle = [
+            event("evt.cycle.one", "2026-01-01T00:00:03Z", "evt.cycle.two"),
+            event("evt.cycle.two", "2026-01-01T00:00:04Z", "evt.cycle.one"),
+            event("evt.cycle.descendant", "2026-01-01T00:00:05Z", "evt.cycle.one"),
+        ]
+        (EVIDENCE_ROOT / "cycle.ndjson").write_text(
+            "\n".join(json.dumps(record) for record in cycle) + "\n",
+            encoding="utf-8",
+        )
+        duplicate = event("evt.duplicate", "2026-01-01T00:00:00Z")
+        duplicate_child = event("evt.duplicate-child", "2026-01-01T00:00:01Z", "evt.duplicate")
+        (EVIDENCE_ROOT / "duplicate.ndjson").write_text(
+            f"{json.dumps(duplicate)}\n{json.dumps(duplicate)}\n{json.dumps(duplicate_child)}\n",
+            encoding="utf-8",
+        )
+        large = [event(f"evt.window.{index}", f"2026-02-01T00:{index % 60:02d}:00Z")
+                 for index in range(server.MAX_RECORDS_PER_ARTIFACT + 1)]
+        (EVIDENCE_ROOT / "window.ndjson").write_text(
+            "\n".join(json.dumps(record) for record in large) + "\n",
+            encoding="utf-8",
+        )
+
+        snapshot = server.workspace_snapshot()
+        replay_ids = [item["data"]["event_id"] for item in snapshot["replay_events"]]
+        self.assertLess(replay_ids.index("evt.root"), replay_ids.index("evt.child"))
+        self.assertLess(replay_ids.index("evt.cross-parent"), replay_ids.index("evt.cross-child"))
+        self.assertLess(replay_ids.index("evt.availability.market"), replay_ids.index("evt.availability.late"))
+        self.assertLess(replay_ids.index("evt.whole-second"), replay_ids.index("evt.fractional-second"))
+        self.assertLess(replay_ids.index("evt.tie.first"), replay_ids.index("evt.tie.second"))
+        self.assertNotIn("evt.unseen", replay_ids)
+        self.assertNotIn("evt.duplicate", replay_ids)
+        self.assertNotIn("evt.duplicate-child", replay_ids)
+        self.assertNotIn("evt.invalid", replay_ids)
+        self.assertNotIn("evt.cycle.one", replay_ids)
+        self.assertNotIn("evt.cycle.two", replay_ids)
+        self.assertNotIn("evt.cycle.descendant", replay_ids)
+        presentation_ids = [item["data"]["event_id"] for item in snapshot["events"]]
+        self.assertLess(presentation_ids.index("evt.fractional-second"), presentation_ids.index("evt.whole-second"))
+        self.assertLess(presentation_ids.index("evt.tie.first"), presentation_ids.index("evt.tie.second"))
+        diagnostic_codes = {item["code"] for item in snapshot["projection_diagnostics"]}
+        self.assertIn("INVALID_EVENT_ENVELOPE", diagnostic_codes)
+        self.assertIn("UNRESOLVED_CAUSATION", diagnostic_codes)
+        self.assertIn("DUPLICATE_EVENT_ID", diagnostic_codes)
+        self.assertIn("CYCLIC_CAUSATION", diagnostic_codes)
+        window = next(item for item in snapshot["event_windows"] if item["artifact"] == "window.ndjson")
+        self.assertTrue(window["truncated"])
+        self.assertEqual(window["window_kind"], "prefix")
+        self.assertEqual(window["retained_record_count"], server.MAX_RECORDS_PER_ARTIFACT)
+        self.assertEqual(window["source_record_count_lower_bound"], server.MAX_RECORDS_PER_ARTIFACT + 1)
+        self.assertTrue(snapshot["event_window"]["truncated"])
+        self.assertIn("source_event_count_lower_bound", snapshot["event_window"])
+        strict_invalid_envelopes = [
+            ({**event("evt.schema", "2026-01-01T00:00:00Z"), "schema_version": "1"}, "invalid schema_version"),
+            ({key: value for key, value in event("evt.receive", "2026-01-01T00:00:00Z").items() if key != "receive_time"}, "missing required receive_time"),
+            ({**event("evt.account", "2026-01-01T00:00:00Z"), "account_id": "acct/invalid"}, "invalid account_id"),
+            ({**event("evt.extra", "2026-01-01T00:00:00Z"), "unversioned_extra": True}, "unexpected envelope field unversioned_extra"),
+        ]
+        for invalid, expected_error in strict_invalid_envelopes:
+            self.assertEqual(server.event_envelope_error(invalid), expected_error)
+
+    def test_workspace_projection_routes_each_advanced_discriminator_to_typed_evidence(self) -> None:
+        expected_categories = set()
+        for index, (schema_field, category, _) in enumerate(server.ADVANCED_EVIDENCE_SCHEMAS):
+            expected_categories.add(category)
+            (EVIDENCE_ROOT / f"advanced-{index}.json").write_text(
+                json.dumps({schema_field: 1}),
+                encoding="utf-8",
+            )
+
+        snapshot = server.workspace_snapshot()
+        projected_categories = {item["category"] for item in snapshot["advanced_evidence"]}
+        self.assertEqual(projected_categories, expected_categories)
+        self.assertIn(
+            "model_evaluation_benchmark",
+            projected_categories,
+            "model benchmarks must not be mistaken for generic execution evidence",
+        )
+        self.assertFalse(snapshot["execution_evidence"])
+
+    def test_workspace_projection_caps_event_candidates_without_claiming_completeness(self) -> None:
+        def event(event_id: str) -> dict[str, object]:
+            return {
+                "event_id": event_id,
+                "event_type": "market.bar.v1",
+                "schema_version": 1,
+                "event_time": "2026-01-01T00:00:00Z",
+                "receive_time": "2026-01-01T00:00:00Z",
+                "account_id": None,
+                "strategy_id": None,
+                "instrument_id": "inst.us_equity.spy",
+                "correlation_id": "corr.cap",
+                "causation_id": None,
+                "actor": "replay",
+                "source": "fixture",
+                "payload": {},
+                "software_version": "follon-test",
+                "configuration_version": "replay-fixture-v1",
+            }
+
+        original_cap = server.MAX_REPLAY_EVENT_CANDIDATES
+        try:
+            server.MAX_REPLAY_EVENT_CANDIDATES = 2
+            (EVIDENCE_ROOT / "candidate-cap.ndjson").write_text(
+                "\n".join(json.dumps(event(f"evt.cap.{index}")) for index in range(3)) + "\n",
+                encoding="utf-8",
+            )
+            snapshot = server.workspace_snapshot()
+        finally:
+            server.MAX_REPLAY_EVENT_CANDIDATES = original_cap
+
+        self.assertEqual(snapshot["counts"]["events"], 2)
+        self.assertTrue(snapshot["event_window"]["truncated"])
+        self.assertEqual(snapshot["event_window"]["source_event_count_lower_bound"], 3)
+        self.assertIn(
+            "EVENT_CANDIDATE_CAP",
+            {item["code"] for item in snapshot["projection_diagnostics"]},
+        )
+
+    def test_canonical_replay_order_handles_a_long_causal_chain(self) -> None:
+        chain_length = 10_000
+        records = [
+            {
+                "artifact": "long-chain.ndjson",
+                "data": {
+                    "event_id": f"evt.chain.{index}",
+                    "event_time": "2026-01-01T00:00:00Z",
+                    "receive_time": "2026-01-01T00:00:00Z",
+                    "causation_id": None if index == 0 else f"evt.chain.{index - 1}",
+                },
+                "_retained_index": index,
+            }
+            for index in range(chain_length)
+        ]
+
+        ordered = server.canonical_replay_events(list(reversed(records)))
+
+        self.assertEqual(len(ordered), chain_length)
+        self.assertEqual(ordered[0]["data"]["event_id"], "evt.chain.0")
+        self.assertEqual(ordered[-1]["data"]["event_id"], f"evt.chain.{chain_length - 1}")
+
     def test_documented_primary_screens_are_integrated_in_static_shell(self) -> None:
         index_source = INDEX_PATH.read_text(encoding="utf-8")
         source = APP_SHELL_SOURCE_PATH.read_text(encoding="utf-8")
@@ -437,6 +652,72 @@ class DashboardServerContract(unittest.TestCase):
             "renderAdministration", "renderMarketplace", "renderNewsCockpit",
         ):
             self.assertIn(f"function {renderer}", workspace_source)
+
+    def test_workspace_snapshot_filters_events_by_as_of(self) -> None:
+        def envelope(event_id: str, time_str: str) -> dict[str, object]:
+            return {
+                "event_id": event_id,
+                "event_type": "market.bar.v1",
+                "schema_version": 1,
+                "event_time": time_str,
+                "receive_time": time_str,
+                "account_id": None,
+                "strategy_id": None,
+                "instrument_id": "aapl.us",
+                "correlation_id": "corr.1",
+                "causation_id": None,
+                "actor": "market_data",
+                "source": "feed",
+                "payload": {"open": "100.0"},
+                "software_version": "0.1.0",
+                "configuration_version": "cfg.1",
+            }
+        (EVIDENCE_ROOT / "events.ndjson").write_text(
+            f"{json.dumps(envelope('evt.past', '2026-09-01T10:00:00Z'))}\n"
+            f"{json.dumps(envelope('evt.future', '2026-09-01T12:00:00Z'))}\n",
+            encoding="utf-8",
+        )
+        full_snap = server.workspace_snapshot()
+        self.assertEqual(len(full_snap["events"]), 2)
+
+        as_of_snap = server.workspace_snapshot(as_of="2026-09-01T10:30:00Z")
+        self.assertEqual(as_of_snap["as_of"], "2026-09-01T10:30:00Z")
+        self.assertEqual(len(as_of_snap["events"]), 1)
+        self.assertEqual(as_of_snap["events"][0]["data"]["event_id"], "evt.past")
+
+    def test_decision_reconstruction_endpoint(self) -> None:
+        def envelope(event_id: str, time_str: str, causation: str | None = None) -> dict[str, object]:
+            return {
+                "event_id": event_id,
+                "event_type": "execution.fill.v1" if causation else "intent.created.v1",
+                "schema_version": 1,
+                "event_time": time_str,
+                "receive_time": time_str,
+                "account_id": "acct.1",
+                "strategy_id": "strat.1",
+                "instrument_id": "aapl.us",
+                "correlation_id": "corr.1",
+                "causation_id": causation,
+                "actor": "oms",
+                "source": "paper",
+                "payload": {"price": "100.0"},
+                "software_version": "0.1.0",
+                "configuration_version": "cfg.1",
+            }
+        (EVIDENCE_ROOT / "chain.ndjson").write_text(
+            f"{json.dumps(envelope('evt.intent', '2026-09-01T10:00:00Z'))}\n"
+            f"{json.dumps(envelope('evt.fill', '2026-09-01T10:00:01Z', 'evt.intent'))}\n",
+            encoding="utf-8",
+        )
+        recon = server.build_decision_reconstruction("evt.fill")
+        self.assertIsNotNone(recon)
+        self.assertEqual(recon["reconstruction_schema_version"], 1)
+        self.assertEqual(recon["target_event_id"], "evt.fill")
+        self.assertEqual(recon["integrity_status"], "VERIFIED")
+        self.assertEqual(len(recon["causal_chain"]), 2)
+        self.assertEqual(recon["causal_chain"][0]["node_id"], "evt.intent")
+        self.assertEqual(recon["causal_chain"][1]["node_id"], "evt.fill")
+        self.assertEqual(len(recon["edges"]), 1)
 
 
 if __name__ == "__main__":

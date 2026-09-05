@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CounterfactualScenario",
+  "description": "Counterfactual replay experiment simulating interventions on frozen baseline runs without mutating production history (DUR-02).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scenario_schema_version",
+    "scenario_id",
+    "baseline_run_id",
+    "seed",
+    "interventions",
+    "delta_metrics",
+    "divergence_event_id",
+    "created_at"
+  ],
+  "properties": {
+    "scenario_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "scenario_id": {
+      "type": "string",
+      "pattern": "^cf\\.[a-z0-9_.-]+$"
+    },
+    "baseline_run_id": { "type": "string" },
+    "seed": { "type": "integer" },
+    "interventions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["intervention_type", "parameter_name", "baseline_value", "counterfactual_value"],
+        "properties": {
+          "intervention_type": {
+            "type": "string",
+            "enum": ["RISK_COLLAR_ADJUSTMENT", "NETWORK_LATENCY_INJECTION", "DATA_BAR_CORRUPTION", "VOLATILITY_SHOCK"]
+          },
+          "parameter_name": { "type": "string" },
+          "baseline_value": { "type": "string" },
+          "counterfactual_value": { "type": "string" }
+        }
+      }
+    },
+    "delta_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fill_count_delta",
+        "pnl_delta_usd",
+        "max_drawdown_delta_bps",
+        "risk_rejection_count_delta"
+      ],
+      "properties": {
+        "fill_count_delta": { "type": "integer" },
+        "pnl_delta_usd": { "type": "string" },
+        "max_drawdown_delta_bps": { "type": "integer" },
+        "risk_rejection_count_delta": { "type": "integer" }
+      }
+    },
+    "divergence_event_id": { "type": "string" },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

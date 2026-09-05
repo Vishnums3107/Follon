@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RecoveryDrillResult",
+  "description": "Game-day disaster recovery drill result measuring actual RTO, RPO, and reconciliation proof (DUR-08).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "drill_schema_version",
+    "drill_id",
+    "scenario_name",
+    "injected_fault",
+    "measured_rto_seconds",
+    "target_rto_seconds",
+    "measured_rpo_events_lost",
+    "target_rpo_events_lost",
+    "reconciliation_hash_matched",
+    "drill_passed",
+    "executed_at"
+  ],
+  "properties": {
+    "drill_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "drill_id": {
+      "type": "string",
+      "pattern": "^drill\\.[a-z0-9_.-]+$"
+    },
+    "scenario_name": { "type": "string" },
+    "injected_fault": {
+      "type": "string",
+      "enum": [
+        "DISK_PRESSURE_ABRUPT_TERMINATION",
+        "DROPPED_BROKER_EXECUTION_ACK",
+        "CORRUPT_POSTGRES_CHECKPOINT",
+        "SPLIT_BRAIN_HOST_PARTITION"
+      ]
+    },
+    "measured_rto_seconds": { "type": "integer", "minimum": 0 },
+    "target_rto_seconds": { "type": "integer", "minimum": 0 },
+    "measured_rpo_events_lost": { "type": "integer", "minimum": 0 },
+    "target_rpo_events_lost": { "type": "integer", "minimum": 0 },
+    "reconciliation_hash_matched": { "type": "boolean" },
+    "drill_passed": { "type": "boolean" },
+    "executed_at": { "type": "string", "format": "date-time" }
+  }
+}

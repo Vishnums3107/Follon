@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AdversarialEvaluation",
+  "description": "Adversarial research gate challenging strategy candidates with 5 automated stress probes (DUR-06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "adversarial_schema_version",
+    "evaluation_id",
+    "strategy_version",
+    "probes",
+    "composite_robustness_score_bps",
+    "gate_passed",
+    "blocking_failure_reasons",
+    "evaluated_at"
+  ],
+  "properties": {
+    "adversarial_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "evaluation_id": {
+      "type": "string",
+      "pattern": "^adveval\\.[a-z0-9_.-]+$"
+    },
+    "strategy_version": { "type": "string" },
+    "probes": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "probe_name",
+          "probe_description",
+          "passed",
+          "degradation_bps",
+          "threshold_bps"
+        ],
+        "properties": {
+          "probe_name": {
+            "type": "string",
+            "enum": [
+              "LOOKAHEAD_LEAKAGE_PROBE",
+              "PRICE_JITTER_PROBE",
+              "TRANSACTION_COST_SHOCK",
+              "PARAMETER_CLIFF_PROBE",
+              "REGIME_STRESS_PROBE"
+            ]
+          },
+          "probe_description": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "degradation_bps": { "type": "integer" },
+          "threshold_bps": { "type": "integer" }
+        }
+      }
+    },
+    "composite_robustness_score_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "gate_passed": { "type": "boolean" },
+    "blocking_failure_reasons": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "evaluated_at": { "type": "string", "format": "date-time" }
+  }
+}

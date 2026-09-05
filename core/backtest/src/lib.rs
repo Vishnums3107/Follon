@@ -23,6 +23,15 @@ use follon_domain::{
 use follon_market_data::CorporateAction;
 use sha2::{Digest, Sha256};
 
+pub mod adversarial;
+pub mod counterfactual;
+
+pub use adversarial::{AdversarialEvaluation, AdversarialProbeResult, AdversarialResearchGate};
+pub use counterfactual::{
+    CounterfactualDeltaMetrics, CounterfactualEngine, CounterfactualIntervention,
+    CounterfactualInterventionType, CounterfactualScenario,
+};
+
 /// Published cross-runtime provenance fingerprint contract version.
 pub const BACKTEST_PROVENANCE_VERSION: u32 = 2;
 

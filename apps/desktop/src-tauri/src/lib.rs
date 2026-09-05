@@ -9,7 +9,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             trading::submit_order,
             trading::cancel_order,
-            trading::close_position
+            trading::close_position,
+            trading::trading_command_status
         ])
         .run(tauri::generate_context!())
         .expect("Follon desktop runtime failed");

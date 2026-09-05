@@ -267,6 +267,24 @@ const mockSnapshot = {
   commercial_artifacts: [],
 };
 
+mockSnapshot.advanced_evidence = [
+  { artifact: "champion.json", category: "champion_challenger_evaluation", data: validChamp },
+  { artifact: "planner.json", category: "capability_execution_planner", data: validPlanner },
+  { artifact: "diagnosis.json", category: "operations_diagnosis_runbook", data: validDiagnosis },
+  { artifact: "model-evaluation.json", category: "model_evaluation_benchmark", data: validBenchmark },
+  { artifact: "capsule.json", category: "strategy_capsule_manifest", data: validCapsule },
+  { artifact: "expansion.json", category: "multi_asset_expansion_plan", data: validExpansion },
+  {
+    artifact: "invalid-champion.json",
+    category: "champion_challenger_evaluation",
+    data: { ...validChamp, recommendation: "NOT_A_VALID_RECOMMENDATION" },
+  },
+];
+
+function containsText(node, expected) {
+  return node.textContent?.includes(expected) || node.children?.some((child) => containsText(child, expected));
+}
+
 const mockContext = {
   status: null,
   features: [],
@@ -298,6 +316,8 @@ renderWorkspace(stratSummary, stratCanvas, "strategy-studio", mockSnapshot, mock
 
 const champPanel = stratCanvas.children.find((c) => c.id === "champion-challenger-panel");
 assert.ok(champPanel !== undefined, "Champion challenger panel must exist in Strategy Studio");
+assert.ok(containsText(champPanel, validChamp.challenger_strategy_id), "Champion panel must render its typed artifact");
+assert.ok(!containsText(champPanel, "NOT_A_VALID_RECOMMENDATION"), "Malformed advanced evidence must not render");
 
 const invalidPanel = stratCanvas.children.find((c) => c.id === "strategy-invalidation-panel");
 assert.ok(invalidPanel !== undefined, "Strategy invalidation explorer must exist in Strategy Studio");
@@ -309,6 +329,7 @@ renderWorkspace(execSummary, execCanvas, "execution-blotter", mockSnapshot, mock
 
 const execPlanPanel = execCanvas.children.find((c) => c.id === "execution-planner-panel");
 assert.ok(execPlanPanel !== undefined, "Execution planner panel must exist in Execution Blotter");
+assert.ok(containsText(execPlanPanel, validPlanner.plan_id), "Execution planner must render its typed artifact");
 
 // Test Risk Cockpit additions (Experience 3)
 const riskSummary = new MockElement("div");
@@ -325,6 +346,7 @@ renderWorkspace(portSummary, portCanvas, "portfolio", mockSnapshot, mockContext)
 
 const multiAssetPanel = portCanvas.children.find((c) => c.id === "multi-asset-panel");
 assert.ok(multiAssetPanel !== undefined, "Multi-asset lifecycle panel must exist in Portfolio");
+assert.ok(containsText(multiAssetPanel, validExpansion.plan_id), "Multi-asset panel must render its typed artifact");
 
 // Test Replay & Incidents additions (Experience 1)
 const repSummary = new MockElement("div");
@@ -341,6 +363,7 @@ renderWorkspace(marketSummary, marketCanvas, "marketplace", mockSnapshot, mockCo
 
 const capsulePanel = marketCanvas.children.find((c) => c.id === "strategy-capsule-panel");
 assert.ok(capsulePanel !== undefined, "Strategy capsule panel must exist in Marketplace");
+assert.ok(containsText(capsulePanel, validCapsule.capsule_id), "Capsule panel must render its typed artifact");
 
 // Test Administration additions (AI-05, AI-06, Experience 6)
 const adminSummary = new MockElement("div");
@@ -349,9 +372,11 @@ renderWorkspace(adminSummary, adminCanvas, "administration", mockSnapshot, mockC
 
 const opsAssPanel = adminCanvas.children.find((c) => c.id === "operations-assistant-panel");
 assert.ok(opsAssPanel !== undefined, "Operations assistant panel must exist in Administration");
+assert.ok(containsText(opsAssPanel, validDiagnosis.diagnosis_id), "Operations panel must render its typed artifact");
 
 const modelEvalPanel = adminCanvas.children.find((c) => c.id === "model-evaluation-panel");
 assert.ok(modelEvalPanel !== undefined, "Model evaluation benchmark panel must exist in Administration");
+assert.ok(containsText(modelEvalPanel, validBenchmark.model_identifier), "Model evaluation panel must render its typed artifact");
 
 const rebuildPanel = adminCanvas.children.find((c) => c.id === "workspace-rebuild-panel");
 assert.ok(rebuildPanel !== undefined, "Workspace rebuild exercise panel must exist in Administration");

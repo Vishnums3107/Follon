@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkspaceSnapshotManifest",
+  "description": "Immutable content-addressed point-in-time snapshot manifest for evidence time travel (DUR-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "snapshot_schema_version",
+    "manifest_id",
+    "as_of_time",
+    "created_at",
+    "content_hash",
+    "retained_event_count",
+    "source_event_count",
+    "event_window",
+    "active_accounts",
+    "positions_fingerprint",
+    "ledger_balance_fingerprint",
+    "diagnostics"
+  ],
+  "properties": {
+    "snapshot_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "manifest_id": {
+      "type": "string",
+      "pattern": "^snapshot\\.[a-z0-9_.-]+$"
+    },
+    "as_of_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "content_hash": { "type": "string" },
+    "retained_event_count": { "type": "integer", "minimum": 0 },
+    "source_event_count": { "type": "integer", "minimum": 0 },
+    "event_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["window_kind", "first_event_time", "last_event_time"],
+      "properties": {
+        "window_kind": { "type": "string" },
+        "first_event_time": { "type": ["string", "null"] },
+        "last_event_time": { "type": ["string", "null"] }
+      }
+    },
+    "active_accounts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "positions_fingerprint": { "type": "string" },
+    "ledger_balance_fingerprint": { "type": "string" },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact", "code", "detail"],
+        "properties": {
+          "artifact": { "type": "string" },
+          "code": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

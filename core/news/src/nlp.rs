@@ -4,16 +4,35 @@
 //! fixtures and replay evidence. It is not a vendor feed, a trained model, or a
 //! claim of financial-language coverage or latency.
 
-use crate::{EventTaxonomy, NewsError, NewsHeadline, SentimentVector};
+use crate::{
+    validate_headline_availability, EventTaxonomy, NewsError, NewsHeadline, SentimentVector,
+};
 
 /// A financial lexicon & entity-resolution NLP sentiment engine.
 #[derive(Clone, Debug, Default)]
 pub struct NlpSentimentEngine;
 
 impl NlpSentimentEngine {
+    /// Immutable identifier for the bounded local classifier.
+    pub const MODEL_ID: &'static str = "keyword-finance";
+    /// Immutable version for the classifier rules that produced a vector.
+    pub const MODEL_VERSION: &'static str = "v1";
+    /// Immutable actor stamp carried by derived sentiment evidence envelopes.
+    pub const EVIDENCE_ACTOR: &'static str = "news_classifier.keyword-finance-v1";
+
     /// Creates a new in-memory NLP sentiment engine instance.
     pub fn new() -> Self {
         Self
+    }
+
+    /// Returns the stable model identity for replay provenance.
+    pub const fn model_id(&self) -> &'static str {
+        Self::MODEL_ID
+    }
+
+    /// Returns the stable model version for replay provenance.
+    pub const fn model_version(&self) -> &'static str {
+        Self::MODEL_VERSION
     }
 
     /// Extracts deterministic [`SentimentVector`] instances from a normalized headline.
@@ -21,7 +40,7 @@ impl NlpSentimentEngine {
         &self,
         headline: &NewsHeadline,
     ) -> Result<Vec<SentimentVector>, NewsError> {
-        headline.validate()?;
+        validate_headline_availability(headline)?;
 
         let text_lower = headline.headline.to_lowercase();
         let target_instruments = self.resolve_entities(&text_lower, &headline.entity_tickers);
@@ -241,6 +260,8 @@ mod tests {
     #[test]
     fn test_nlp_extracts_earnings_beat() {
         let engine = NlpSentimentEngine::new();
+        assert_eq!(engine.model_id(), "keyword-finance");
+        assert_eq!(engine.model_version(), "v1");
         let headline = NewsHeadline {
             news_id: "news.001".to_owned(),
             source: NewsSource::DowJones,

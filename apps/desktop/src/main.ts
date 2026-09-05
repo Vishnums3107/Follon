@@ -546,6 +546,29 @@ async function openWorkspace(
     button.classList.toggle("workspace-active", button.dataset.workspace === workspace.id);
     button.setAttribute("aria-pressed", String(button.dataset.workspace === workspace.id));
   }
+
+  // Synchronize executive breadcrumbs
+  const bcGroup = document.querySelector<HTMLElement>("#bc-group");
+  const bcWorkspace = document.querySelector<HTMLElement>("#bc-workspace");
+  if (bcGroup) bcGroup.textContent = workspace.group.toUpperCase();
+  if (bcWorkspace) bcWorkspace.textContent = workspace.title.toUpperCase();
+
+  // Synchronize luxury top navbar page tabs
+  const pillarTabs = Array.from(document.querySelectorAll<HTMLElement>("[data-nav-pillar]"));
+  const activePillar =
+    workspace.id === "command-center" ? "dashboard" :
+    ["research-lab", "strategy-studio", "marketplace", "backtest-explorer", "news-cockpit"].includes(workspace.id) ? "research" :
+    workspace.id === "execution-blotter" ? "execution" :
+    workspace.id === "risk-cockpit" ? "risk" :
+    workspace.id === "portfolio" ? "portfolio" :
+    ["replay-incidents", "journal"].includes(workspace.id) ? "replay" : "dashboard";
+
+  for (const tab of pillarTabs) {
+    const isMatching = tab.dataset.navPillar === activePillar;
+    tab.classList.toggle("active", isMatching);
+    tab.classList.toggle("nav-page-tab--active", isMatching);
+  }
+
   const singleFeature = workspace.features.length === 1 ? workspace.features[0] : "all";
   featureFilterSelect.value = singleFeature ?? "all";
   artifactSearchInput.value = "";
@@ -567,7 +590,51 @@ async function openWorkspace(
   }
 }
 
+function startLiveClock(): void {
+  const clock = document.querySelector<HTMLElement>("#live-utc-clock");
+  if (!clock) return;
+  const tick = (): void => {
+    const now = new Date();
+    const iso = now.toISOString().replace("T", " ").replace("Z", " UTC");
+    clock.textContent = iso;
+  };
+  tick();
+  setInterval(tick, 60);
+}
+
+function wirePillarNavigation(): void {
+  const tabs = Array.from(document.querySelectorAll<HTMLElement>("[data-nav-pillar]"));
+  for (const tab of tabs) {
+    tab.addEventListener("click", (event) => {
+      const pillar = tab.dataset.navPillar;
+      if (!pillar) return;
+      if (pillar === "dashboard") {
+        event.preventDefault();
+        void openWorkspace("command-center", { scroll: true, history: true });
+      } else if (pillar === "research") {
+        event.preventDefault();
+        void openWorkspace("research-lab", { scroll: true, history: true });
+      } else if (pillar === "execution") {
+        event.preventDefault();
+        void openWorkspace("execution-blotter", { scroll: true, history: true });
+      } else if (pillar === "risk") {
+        event.preventDefault();
+        void openWorkspace("risk-cockpit", { scroll: true, history: true });
+      } else if (pillar === "portfolio") {
+        event.preventDefault();
+        void openWorkspace("portfolio", { scroll: true, history: true });
+      } else if (pillar === "replay") {
+        event.preventDefault();
+        void openWorkspace("replay-incidents", { scroll: true, history: true });
+      }
+    });
+  }
+}
+
 async function initializeDashboard(): Promise<void> {
+  startLiveClock();
+  wirePillarNavigation();
+
   // Restore persisted artifact search if present
   try {
     const savedSearch = sessionStorage.getItem("follon:artifact_search");

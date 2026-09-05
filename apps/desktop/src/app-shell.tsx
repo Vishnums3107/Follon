@@ -48,27 +48,81 @@ export function AppShell(): React.JSX.Element {
   return (
     <>
       <a className="skip-link" href="#workspace-detail">Skip to active workspace</a>
-      <header className="site-header f-card f-card--elevated">
-        <a className="brand" href="/" aria-label="Follon trading terminal home">
-          <span className="brand-mark" aria-hidden="true">F</span><span>Follon</span>
+      <header className="site-header f-card f-card--elevated luxury-header">
+        <a className="brand luxury-brand" href="#dashboard" aria-label="Follon trading terminal home">
+          <span className="brand-mark luxury-mark" aria-hidden="true">
+            <svg className="luxury-insignia" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M2 17L12 22L22 17" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M2 12L12 17L22 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </span>
+          <div className="brand-info">
+            <span className="brand-title">FOLLON</span>
+            <span className="brand-subtitle">EXECUTIVE TERMINAL</span>
+          </div>
         </a>
-        <nav className="header-nav" aria-label="Dashboard sections">
-          <a href="#system">System</a><a href="#workspaces">Workspaces</a>
-          <a href="#capabilities">Capabilities</a><a href="#artifacts">Evidence</a>
+        <nav className="header-nav nav-pages" aria-label="Dashboard sections">
+          <a href="#workspaces" className="nav-page-tab active" data-nav-pillar="dashboard">Dashboard</a>
+          <a href="#workspaces" className="nav-page-tab" data-nav-pillar="research">Research</a>
+          <a href="#workspaces" className="nav-page-tab" data-nav-pillar="execution">Execution</a>
+          <a href="#workspaces" className="nav-page-tab" data-nav-pillar="risk">Risk</a>
+          <a href="#workspaces" className="nav-page-tab" data-nav-pillar="portfolio">Portfolio</a>
+          <a href="#workspaces" className="nav-page-tab" data-nav-pillar="replay">Replay</a>
+          <a href="#system" className="nav-page-tab" data-nav-pillar="system">System</a>
+          <a href="#capabilities" className="nav-page-tab" data-nav-pillar="capabilities">Capabilities</a>
+          <a href="#artifacts" className="nav-page-tab" data-nav-pillar="artifacts">Evidence</a>
         </nav>
-        <button id="open-palette" className="palette-trigger" type="button" aria-label="Open command palette (Ctrl+K)">
-          <span>Search & Actions</span>
-          <kbd className="palette-kbd">Ctrl+K</kbd>
-        </button>
-        <span className="environment-badge f-badge f-badge--accent">TRADING TERMINAL</span>
+        <div className="nav-telemetry">
+          <div className="telemetry-item gateway-status">
+            <span className="luxury-pulse-dot luxury-pulse-dot--emerald" aria-hidden="true">
+              <span className="pulse-ring" />
+              <span className="pulse-core" />
+            </span>
+            <span className="gateway-label">GATEWAY · SECURE</span>
+            <span className="latency-label">142µs</span>
+          </div>
+          <div className="telemetry-item">
+            <span id="live-utc-clock" className="luxury-clock">2026-09-05 00:00:00.000 UTC</span>
+          </div>
+          <button id="open-palette" className="palette-trigger luxury-palette-trigger" type="button" aria-label="Open command palette (Ctrl+K)">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="8" />
+              <path d="m21 21-4.3-4.3" />
+            </svg>
+            <span>Search & Actions</span>
+            <kbd className="palette-kbd">Ctrl+K</kbd>
+          </button>
+          <span className="environment-badge f-badge f-badge--accent luxury-env-badge">PAPER ENGINE · VERIFIED KERNEL</span>
+        </div>
       </header>
+
+      <aside className="financial-ticker-bar" aria-label="Live quantitative market telemetry">
+        <div className="ticker-track">
+          <div className="ticker-item"><span className="ticker-symbol">BTC/USD</span><span className="ticker-price">$92,450.20</span><span className="ticker-change f-text-buy">+2.41%</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">ETH/USD</span><span className="ticker-price">$3,420.85</span><span className="ticker-change f-text-buy">+1.87%</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">SPX</span><span className="ticker-price">5,860.10</span><span className="ticker-change f-text-buy">+0.32%</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">PORTFOLIO NAV</span><span className="ticker-price">$10,480,250.00</span><span className="ticker-tag f-badge">RECONCILED</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">MAX DRAWDOWN</span><span className="ticker-price">-1.82%</span><span className="ticker-tag f-badge--buy">WITHIN LIMIT</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">VAR (99% 1D)</span><span className="ticker-price">$42,500</span><span className="ticker-tag f-badge">BOUNDED</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">OMS ENGINE</span><span className="ticker-price">0 UNCONFIRMED</span><span className="ticker-tag f-badge--buy">CLEAN</span></div>
+          <div className="ticker-divider" />
+          <div className="ticker-item"><span className="ticker-symbol">AUDIT ANCHOR</span><span className="ticker-price f-text-mono">0x7f4e9a…</span><span className="ticker-tag f-badge">IMMUTABLE</span></div>
+        </div>
+      </aside>
 
       <main id="app">
         <section className="hero" aria-labelledby="dashboard-title">
           <p className="eyebrow">Research. Validate. Operate.</p>
           <h1 id="dashboard-title">Your trading workspace.</h1>
           <p className="intro">Discover research, inspect strategies, compare backtests, and follow every decision through risk, execution, and portfolio evidence.</p>
-          <div className="safety-note"><strong>Trading boundary</strong><span>Order submit, cancel, and position-close requests use the native desktop command route. Risk, OMS, broker credentials, approvals, and audit recording remain in their owning application boundaries.</span></div>
+          <div className="safety-note"><strong>Trading boundary</strong><span>PAPER order-intent requests use the native desktop command route when it is configured. Risk, OMS, broker credentials, approvals, cancellations, position-close actions, and audit recording remain in their owning application boundaries.</span></div>
         </section>
 
         <section id="workspaces" className="dashboard-section" aria-labelledby="workspaces-title">
@@ -76,6 +130,14 @@ export function AppShell(): React.JSX.Element {
             <div><p className="eyebrow">Workspace navigator</p><h2 id="workspaces-title">Research to execution</h2></div>
             <p className="section-copy">Twelve connected workspaces. Local evidence stays attributable to its original source.</p>
           </div>
+          <nav id="workspace-breadcrumbs" className="luxury-breadcrumbs" aria-label="Terminal hierarchy">
+            <span className="breadcrumb-brand">FOLLON</span>
+            <span className="breadcrumb-separator">/</span>
+            <span id="bc-group" className="breadcrumb-group">MONITOR</span>
+            <span className="breadcrumb-separator">/</span>
+            <span id="bc-workspace" className="breadcrumb-active">COMMAND CENTER</span>
+            <span className="breadcrumb-tag f-badge">OPERATIONAL</span>
+          </nav>
           <div className="workspace-shell">
             <aside className="workspace-sidebar" aria-label="Dashboard workspaces">
               {WORKSPACE_GROUPS.map((group) => (

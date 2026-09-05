@@ -511,6 +511,8 @@ name = "follon-market-data"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "serde",
+ "sha2 0.10.9",
  "time",
 ]
 
@@ -576,6 +578,7 @@ version = "0.1.0"
 dependencies = [
  "follon-domain",
  "follon-fx",
+ "sha2 0.10.9",
 ]
 
 [[package]]

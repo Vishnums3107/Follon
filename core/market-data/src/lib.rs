@@ -7,6 +7,12 @@ use follon_domain::{validate_canonical_id, validate_utc_timestamp, Bar, Decimal,
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+pub mod rights;
+
+pub use rights::{
+    CorporateActionPolicy, DataRightsAndSemanticsReceipt, DataRightsLedger, LicenseTier,
+};
+
 /// A normalized trade used solely to construct reproducible historical bars.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trade {

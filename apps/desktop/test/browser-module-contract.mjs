@@ -51,6 +51,7 @@ assert.deepEqual([...visited].sort(), [
 const main = await readFile(resolve(appDirectory, "src", "main.ts"), "utf8");
 const routes = await readFile(resolve(appDirectory, "src", "routes.ts"), "utf8");
 const workspaces = await readFile(resolve(appDirectory, "src", "workspaces.ts"), "utf8");
+const orderTicket = await readFile(resolve(appDirectory, "src", "OrderTicket.tsx"), "utf8");
 const workspaceContracts = new Map([
   ["marketplace", ["Research asset marketplace", "Inspect asset"]],
   ["command-center", ["Daily Operating Brief", "System, broker, strategy, and risk status", "Environment readiness", "Attention queue"]],
@@ -61,7 +62,7 @@ const workspaceContracts = new Map([
   ["execution-blotter", ["Causal execution blotter", "Explainable risk decisions", "Broker lifecycle condition coverage"]],
   ["risk-cockpit", ["Exposure and loss control", "Versioned risk limits", "Alerts and reconciliation"]],
   ["portfolio", ["Positions and realized P&L", "P&L attribution", "Options scenario and book reconciliation"]],
-  ["replay-incidents", ["Event distribution", "Causal replay timeline", "Incident and recovery state"]],
+  ["replay-incidents", ["Event distribution", "Evidence timeline", "Incident and recovery state"]],
   ["journal", ["Chain integrity", "Unified append-only journal", "Details / annotation"]],
   ["administration", ["Commercial ledger", "Deployment and administrative controls", "Privileged-action boundary"]],
 ]);
@@ -94,8 +95,18 @@ assert.match(workspaces, /Details \/ annotation/u);
 assert.match(workspaces, /news\.headline\.v1/u);
 assert.match(workspaces, /snapshot\.events\.filter/u);
 assert.match(workspaces, /Order ticket/u);
-assert.match(workspaces, /cancel_order/u);
-assert.match(workspaces, /close_position/u);
+assert.match(workspaces, /Order-management boundary/u);
+assert.doesNotMatch(workspaces, /Submit declarative PAPER or LIVE/u);
+assert.doesNotMatch(workspaces, /Submit a declarative PAPER or LIVE/u);
+assert.doesNotMatch(workspaces, /window\.confirm/u);
+assert.doesNotMatch(workspaces, /window\.alert/u);
 assert.doesNotMatch(workspaces, /5 Integrated/u);
 assert.doesNotMatch(workspaces, /Apple Reports Record Q3 Earnings/u);
+assert.match(orderTicket, /function isSubmitReceipt/u);
+assert.match(orderTicket, /receipt\.command === "SUBMIT_ORDER"/u);
+assert.match(orderTicket, /handleAccountChange/u);
+const submitHandlerStart = orderTicket.indexOf("const handleSubmit");
+const submitHandler = orderTicket.slice(submitHandlerStart, orderTicket.indexOf("return (", submitHandlerStart));
+assert.doesNotMatch(submitHandler, /clearTicketDraft/u);
+assert.match(submitHandler, /draft remains available until authoritative lifecycle evidence is reviewed/u);
 console.log("Browser module graph / workspace shell contract passed");

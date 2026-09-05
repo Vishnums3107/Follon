@@ -1,7 +1,8 @@
 # Follon trading terminal
 
-This client provides twelve integrated operator workspaces, including active
-order-entry controls for the PAPER and LIVE execution environments. A bounded
+This client provides twelve integrated operator workspaces, including a
+PAPER-only order-intent ticket that remains disabled until a native Risk/OMS
+route is configured. A bounded
 `/api/v1/workspaces` projection combines dataset
 structure, experiments, backtests, manifests, causal events, OMS lifecycle,
 PAPER and controlled-live monitoring, operations risk/attribution, options,
@@ -10,14 +11,15 @@ The operations view exposes risk limits, attribution, alerts, schedules, replay 
 configuration identities, the journal-bound projection fingerprint, and the
 verified journal cursor alongside PAPER
 kill switches, `UNKNOWN` orders, reconciliation incidents, positions, and
-promotion evidence. The desktop supplies order submit, cancel, and position
-close requests through its native command boundary.
+promotion evidence. The desktop exposes only PAPER intent submission.
+Cancellation, position-close, and controlled-LIVE actions remain outside the
+checked-in workstation flow.
 
 React owns the application shell, Vite emits the deployable web bundle, and the
-Tauri v2 host provides the native desktop boundary with privileged custom
-commands. Those commands validate a declarative request before passing it to
-the configured Risk/OMS route; the web bundle does not receive broker
-credentials or adapter access.
+Tauri v2 host provides a separate native desktop command boundary. Its
+PAPER-only command path validates a declarative request before passing it to a
+configured Risk/OMS route; the web bundle does not receive broker credentials
+or adapter access.
 The checked-in host returns an explicit route-unavailable response until that
 gateway is configured, rather than reporting a fictitious trade.
 

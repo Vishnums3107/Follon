@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DecisionReconstruction",
+  "description": "Complete attributable decision provenance graph connecting market events, news, signals, risk checks, routing, executions, and accounting impact (DUR-01).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reconstruction_schema_version",
+    "reconstruction_id",
+    "target_event_id",
+    "target_entity_type",
+    "causal_chain",
+    "edges",
+    "configuration_hash",
+    "integrity_status",
+    "verified_at"
+  ],
+  "properties": {
+    "reconstruction_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "reconstruction_id": {
+      "type": "string",
+      "pattern": "^recon\\.[a-z0-9_.-]+$"
+    },
+    "target_event_id": { "type": "string" },
+    "target_entity_type": {
+      "type": "string",
+      "enum": ["fill", "order_intent", "risk_rejection", "position", "alert"]
+    },
+    "causal_chain": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "event_type",
+          "actor",
+          "event_time",
+          "available_at",
+          "content_hash",
+          "summary"
+        ],
+        "properties": {
+          "node_id": { "type": "string" },
+          "event_type": { "type": "string" },
+          "actor": { "type": "string" },
+          "event_time": { "type": "string", "format": "date-time" },
+          "available_at": { "type": "string", "format": "date-time" },
+          "causation_id": { "type": ["string", "null"] },
+          "content_hash": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_node_id", "to_node_id", "relation"],
+        "properties": {
+          "from_node_id": { "type": "string" },
+          "to_node_id": { "type": "string" },
+          "relation": { "type": "string" }
+        }
+      }
+    },
+    "configuration_hash": { "type": "string" },
+    "integrity_status": {
+      "type": "string",
+      "enum": ["VERIFIED", "INCOMPLETE_CHAIN", "TIMESTAMP_ANOMALY"]
+    },
+    "verified_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -9,6 +9,12 @@ use std::str::FromStr;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+pub mod compatibility;
+
+pub use compatibility::{
+    CompatibilityMatrix, CompatibilityRegistry, SchemaCompatibilityEntry, SchemaMigrationStatus,
+};
+
 /// Fixed decimal precision used by quantities and monetary values.
 pub const DECIMAL_SCALE: i128 = 100_000_000;
 

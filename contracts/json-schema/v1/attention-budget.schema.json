@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AttentionBudget",
+  "description": "Solo-operator attention budget recording cognitive load, alert interruption rates, and duplicate suppression state (DUR-05).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "budget_schema_version",
+    "budget_id",
+    "session_date",
+    "cognitive_load_score_bps",
+    "interruptions_per_hour",
+    "active_alarms_count",
+    "suppressed_duplicates_count",
+    "escalated_critical_tasks",
+    "budget_exhausted",
+    "calculated_at"
+  ],
+  "properties": {
+    "budget_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "budget_id": {
+      "type": "string",
+      "pattern": "^attn\\.[a-z0-9_.-]+$"
+    },
+    "session_date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "cognitive_load_score_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "interruptions_per_hour": { "type": "number", "minimum": 0 },
+    "active_alarms_count": { "type": "integer", "minimum": 0 },
+    "suppressed_duplicates_count": { "type": "integer", "minimum": 0 },
+    "escalated_critical_tasks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "budget_exhausted": { "type": "boolean" },
+    "calculated_at": { "type": "string", "format": "date-time" }
+  }
+}

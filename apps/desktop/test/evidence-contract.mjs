@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseOperationsDashboard, parseOptionsDashboard } from "../dist/evidence.js";
+import { parseEvidenceLog, parseOperationsDashboard, parseOptionsDashboard } from "../dist/evidence.js";
 import { parseWorkspaceSnapshot } from "../dist/workspaces.js";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
@@ -52,6 +52,27 @@ try {
   const impossibleJournal = structuredClone(operationsDashboard);
   impossibleJournal.journal.failure_reason = "verification failed";
   assert.throws(() => parseOperationsDashboard(JSON.stringify(impossibleJournal)));
+
+  const canonicalEvent = {
+    event_id: "evt.fixture.001",
+    event_type: "market.bar.v1",
+    schema_version: 1,
+    event_time: "2026-08-21T00:00:00Z",
+    receive_time: "2026-08-21T00:00:00Z",
+    account_id: null,
+    strategy_id: null,
+    instrument_id: "inst.us_equity.spy",
+    correlation_id: "corr.fixture.001",
+    causation_id: null,
+    actor: "fixture",
+    source: "test",
+    payload: { close: "100.00000000" },
+    software_version: "follon-test",
+    configuration_version: "fixture-v1",
+  };
+  assert.doesNotThrow(() => parseEvidenceLog(`${JSON.stringify(canonicalEvent)}\n`));
+  assert.throws(() => parseEvidenceLog(`${JSON.stringify({ ...canonicalEvent, schema_version: "1" })}\n`));
+  assert.throws(() => parseEvidenceLog(`${JSON.stringify({ ...canonicalEvent, unversioned_extra: true })}\n`));
 
   const validWorkspace = {
     workspace_schema_version: 1,
@@ -102,7 +123,9 @@ try {
   writeFileSync(newsEvidencePath, [
     JSON.stringify({
       event_id: "evt-news-000001", event_type: "news.headline.v1", event_time: "2026-09-01T11:00:00Z",
-      receive_time: "2026-09-01T11:00:00Z", payload: {
+      correlation_id: "corr-news-000001", causation_id: null, actor: "news-ingest", source: "fixture",
+      schema_version: 1, receive_time: "2026-09-01T11:00:00Z", account_id: null, strategy_id: null,
+      instrument_id: "inst.us_equity.spy", software_version: "follon-test", configuration_version: "news-fixture-v1", payload: {
         news_id: "news.fixture.001", source: "DOW_JONES", headline: "Apple reports earnings beat",
         raw_body_hash: "a".repeat(64), sequence_number: 1, event_time_ns: 1788260400000000000,
         receive_time_ns: 1788260400000000001, entity_tickers: ["inst.us_equity.spy"],
@@ -110,7 +133,9 @@ try {
     }),
     JSON.stringify({
       event_id: "evt-news-000002", event_type: "news.sentiment.v1", event_time: "2026-09-01T11:00:00Z",
-      receive_time: "2026-09-01T11:00:00Z", payload: {
+      correlation_id: "corr-news-000001", causation_id: "evt-news-000001", actor: "news-classifier", source: "fixture",
+      schema_version: 1, receive_time: "2026-09-01T11:00:00Z", account_id: null, strategy_id: null,
+      instrument_id: "inst.us_equity.spy", software_version: "follon-test", configuration_version: "news-fixture-v1", payload: {
         event_id: "sent.news.fixture.001.1", causation_news_id: "news.fixture.001", event_time_ns: 1788260400000000000,
         instrument_id: "inst.us_equity.spy", taxonomy: "EARNINGS_RELEASE", sentiment_polarity_bps: 9000,
         confidence_bps: 9000, novelty_score_bps: 10000, surprise_magnitude_bps: 250,

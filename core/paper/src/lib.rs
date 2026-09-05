@@ -24,6 +24,12 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+pub mod qualification;
+
+pub use qualification::{
+    GatewayQualificationError, GatewayQualificationMatrix, QualificationState, QualifiedCapability,
+};
+
 /// Paper-operations construction, adapter, accounting, or reconciliation failure.
 #[derive(Debug)]
 pub struct PaperError(pub String);

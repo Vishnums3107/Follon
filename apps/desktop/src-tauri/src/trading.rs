@@ -100,6 +100,7 @@ impl OrderIntent {
                 "created_at must be canonical second-precision UTC",
             ));
         }
+        require_paper_environment(&self.environment)?;
         Ok(())
     }
 }
@@ -177,6 +178,7 @@ impl CancelOrderIntent {
         ] {
             validate_canonical_id(name, value)?;
         }
+        require_paper_environment(&self.environment)?;
         Ok(())
     }
 }
@@ -214,6 +216,7 @@ impl ClosePositionIntent {
                 "rationale must be non-empty and at most 1024 characters",
             ));
         }
+        require_paper_environment(&self.environment)?;
         Ok(())
     }
 }
@@ -276,23 +279,52 @@ pub trait RiskOmsGateway: Send + Sync {
 #[derive(Clone)]
 pub struct TradingCommandState {
     gateway: Arc<dyn RiskOmsGateway>,
+    route_available: bool,
 }
 
 impl TradingCommandState {
     /// Creates a state object with a concrete application Risk/OMS gateway.
     pub fn with_gateway(gateway: Arc<dyn RiskOmsGateway>) -> Self {
-        Self { gateway }
+        Self {
+            gateway,
+            route_available: true,
+        }
     }
 
     /// Creates a state object which rejects commands until the application
     /// supplies a Risk/OMS route.
     pub fn unavailable() -> Self {
-        Self::with_gateway(Arc::new(UnavailableGateway))
+        Self {
+            gateway: Arc::new(UnavailableGateway),
+            route_available: false,
+        }
     }
 
     fn gateway(&self) -> &dyn RiskOmsGateway {
         self.gateway.as_ref()
     }
+
+    fn route_status(&self) -> TradingCommandRouteStatus {
+        TradingCommandRouteStatus {
+            route_available: self.route_available,
+            message: if self.route_available {
+                "A native PAPER Risk/OMS command route is configured.".to_owned()
+            } else {
+                "The desktop Risk/OMS command route is not configured; no trading action can be sent."
+                    .to_owned()
+            },
+        }
+    }
+}
+
+/// Read-only command-route capability advertised to the desktop UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingCommandRouteStatus {
+    /// Whether the native host has a concrete PAPER Risk/OMS command route.
+    pub route_available: bool,
+    /// A safe, user-displayable explanation of the current boundary.
+    pub message: String,
 }
 
 struct UnavailableGateway;
@@ -338,6 +370,14 @@ pub fn close_position(
     close_position_through(state.gateway(), intent).map_err(|error| error.to_string())
 }
 
+/// Return the native host's read-only Risk/OMS command capability.
+#[tauri::command]
+pub fn trading_command_status(
+    state: State<'_, TradingCommandState>,
+) -> TradingCommandRouteStatus {
+    state.route_status()
+}
+
 fn submit_order_through(gateway: &dyn RiskOmsGateway, intent: OrderIntent) -> CommandResult {
     intent.validate()?;
     gateway.submit_order(intent)
@@ -363,6 +403,8 @@ pub enum TradingCommandError {
     Validation(String),
     /// The desktop host has no application Risk/OMS route configured.
     RouteUnavailable,
+    /// This checked-in desktop boundary accepts PAPER requests only.
+    EnvironmentUnavailable,
 }
 
 impl TradingCommandError {
@@ -377,6 +419,9 @@ impl fmt::Display for TradingCommandError {
             Self::Validation(message) => write!(formatter, "invalid trading command: {message}"),
             Self::RouteUnavailable => formatter.write_str(
                 "the desktop Risk/OMS command route is not configured; no trading action was sent",
+            ),
+            Self::EnvironmentUnavailable => formatter.write_str(
+                "this desktop command boundary accepts PAPER requests only; no trading action was sent",
             ),
         }
     }
@@ -398,6 +443,14 @@ fn validate_canonical_id(name: &str, value: &str) -> Result<(), TradingCommandEr
         )));
     }
     Ok(())
+}
+
+fn require_paper_environment(environment: &ExecutionEnvironment) -> Result<(), TradingCommandError> {
+    if *environment == ExecutionEnvironment::Paper {
+        Ok(())
+    } else {
+        Err(TradingCommandError::EnvironmentUnavailable)
+    }
 }
 
 fn validate_positive_decimal(name: &str, value: &str) -> Result<(), TradingCommandError> {
@@ -442,7 +495,7 @@ fn is_canonical_utc_second(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct RecordingGateway {
@@ -568,6 +621,17 @@ mod tests {
     }
 
     #[test]
+    fn route_status_distinguishes_an_unconfigured_host_from_a_gateway_host() {
+        let unavailable = TradingCommandState::unavailable().route_status();
+        assert!(!unavailable.route_available);
+        assert!(unavailable.message.contains("not configured"));
+
+        let available = TradingCommandState::with_gateway(Arc::new(RecordingGateway::default())).route_status();
+        assert!(available.route_available);
+        assert!(available.message.contains("native PAPER Risk/OMS"));
+    }
+
+    #[test]
     fn cancel_and_close_requests_require_routeable_identity() {
         let gateway = RecordingGateway::default();
         let cancel = CancelOrderIntent {
@@ -594,5 +658,42 @@ mod tests {
             close_position_through(&gateway, close).unwrap().status,
             CommandStatus::PendingPositionClose
         );
+    }
+
+    #[test]
+    fn non_paper_commands_never_reach_a_configured_gateway() {
+        let gateway = RecordingGateway::default();
+        let mut order = valid_intent();
+        order.environment = ExecutionEnvironment::Live;
+        assert_eq!(
+            submit_order_through(&gateway, order).unwrap_err(),
+            TradingCommandError::EnvironmentUnavailable
+        );
+
+        let cancel = CancelOrderIntent {
+            request_id: "request.cancel.live.1".to_owned(),
+            account_id: "account.primary".to_owned(),
+            order_id: "order.1".to_owned(),
+            correlation_id: "correlation.cancel.live.1".to_owned(),
+            environment: ExecutionEnvironment::Live,
+        };
+        assert_eq!(
+            cancel_order_through(&gateway, cancel).unwrap_err(),
+            TradingCommandError::EnvironmentUnavailable
+        );
+
+        let close = ClosePositionIntent {
+            request_id: "request.close.simulation.1".to_owned(),
+            account_id: "account.primary".to_owned(),
+            instrument_id: "inst.us_equity.aapl".to_owned(),
+            correlation_id: "correlation.close.simulation.1".to_owned(),
+            environment: ExecutionEnvironment::Simulation,
+            rationale: "operator close".to_owned(),
+        };
+        assert_eq!(
+            close_position_through(&gateway, close).unwrap_err(),
+            TradingCommandError::EnvironmentUnavailable
+        );
+        assert!(gateway.requests.lock().unwrap().is_empty());
     }
 }
