@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExposureGraph",
+  "description": "Multi-factor, sector, and strategy exposure breakdown reconciling account positions with factor dependencies (RISK-01).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "exposure_schema_version",
+    "graph_id",
+    "account_id",
+    "as_of_time",
+    "gross_exposure",
+    "net_exposure",
+    "factors",
+    "sectors",
+    "top_concentrations",
+    "unreconciled_discrepancy",
+    "created_at"
+  ],
+  "properties": {
+    "exposure_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "graph_id": {
+      "type": "string",
+      "pattern": "^exp-graph\\.[a-z0-9_.-]+$"
+    },
+    "account_id": { "type": "string" },
+    "as_of_time": { "type": "string", "format": "date-time" },
+    "gross_exposure": { "type": "string" },
+    "net_exposure": { "type": "string" },
+    "factors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["factor_name", "loading_bps", "factor_variance_pct"],
+        "properties": {
+          "factor_name": { "type": "string" },
+          "loading_bps": { "type": "integer" },
+          "factor_variance_pct": { "type": "string" }
+        }
+      }
+    },
+    "sectors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sector_name", "exposure_usd", "weight_bps"],
+        "properties": {
+          "sector_name": { "type": "string" },
+          "exposure_usd": { "type": "string" },
+          "weight_bps": { "type": "integer" }
+        }
+      }
+    },
+    "top_concentrations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["instrument_id", "position_value", "portfolio_pct"],
+        "properties": {
+          "instrument_id": { "type": "string" },
+          "position_value": { "type": "string" },
+          "portfolio_pct": { "type": "string" }
+        }
+      }
+    },
+    "unreconciled_discrepancy": { "type": "boolean" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

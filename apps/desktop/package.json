@@ -11,7 +11,7 @@
     "dev": "vite --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
     "build:desktop": "tauri build",
-    "test:evidence": "npm run build && node test/evidence-contract.mjs && node test/browser-module-contract.mjs && node test/workspace-regression.mjs && node test/collections-regression.mjs && node test/workstation-regression.mjs && node test/research-regression.mjs"
+    "test:evidence": "npm run build && node test/evidence-contract.mjs && node test/browser-module-contract.mjs && node test/workspace-regression.mjs && node test/collections-regression.mjs && node test/workstation-regression.mjs && node test/research-regression.mjs && node test/robustness-regression.mjs && node test/paper-operations-regression.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

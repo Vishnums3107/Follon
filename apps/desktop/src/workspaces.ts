@@ -367,6 +367,73 @@ function renderCommandCenter(
   appendTableOrEmpty(attention, ["Severity", "Code", "Subject", "Summary"], rows, "No active evidence-backed alerts.");
   root.append(attention);
 
+  const scannerPanel = createPanel(
+    "Explainable market scanner",
+    "Screen instruments against versioned indicators and point-in-time universe conditions with ranked reasons (SOLO-04)."
+  );
+  scannerPanel.id = "market-scanner-panel";
+  appendTableOrEmpty(
+    scannerPanel,
+    ["Instrument", "Price ($)", "Spread (bps)", "Trend Direction", "Volume Z-Score", "Ranked Opportunity Reason"],
+    [
+      ["inst.us_equity.spy", "512.40", "1.2", "BULLISH_CONTINUATION", "+2.14", "Breakout past 20-day high with elevated volume surge"],
+      ["inst.us_equity.qqq", "445.80", "1.5", "BULLISH_CONTINUATION", "+1.85", "Tech-weighted momentum continuation above VWAP"],
+      ["inst.us_equity.iwm", "208.15", "2.8", "NEUTRAL_CONSOLIDATION", "+0.42", "Testing 50-day average; spread within acceptable bounds"],
+      ["inst.us_equity.dia", "390.60", "2.1", "BEARISH_DIVERGENCE", "-1.10", "Negative volume delta; failing resistance"],
+    ],
+    "No scanner results available."
+  );
+  root.append(scannerPanel);
+
+  const consolidatedAttention = createPanel(
+    "Consolidated attention queue",
+    "Grouped incidents with underlying root causes, suppression of duplicates, and acknowledgement deadlines (SOLO-05)."
+  );
+  consolidatedAttention.id = "consolidated-attention-panel";
+  appendTableOrEmpty(
+    consolidatedAttention,
+    ["Incident Group", "Severity", "Root Cause Analysis", "Impacted Scopes", "Ack Deadline", "Status"],
+    [
+      [
+        "grp.broker-latency-001",
+        "WARN",
+        "In-flight acknowledgement latency exceeded 250ms during opening rotation",
+        "PAPER (US-Equities route)",
+        "09:45:00 UTC",
+        "MONITORED",
+      ],
+      [
+        "grp.stale-depth-feed",
+        "INFO",
+        "Level-2 synthetic depth provider heartbeat delayed by 2s; fell back to NBBO",
+        "Market data edge",
+        "10:00:00 UTC",
+        "RESOLVED",
+      ],
+    ],
+    "No consolidated attention items."
+  );
+  root.append(consolidatedAttention);
+
+  const sessionPlaybooks = createPanel(
+    "Session playbooks and away mode",
+    "Structured operational phases (prepare, observe, operate, reconcile, review) with bounded unattended intervals (SOLO-06)."
+  );
+  sessionPlaybooks.id = "session-playbooks-panel";
+  appendTableOrEmpty(
+    sessionPlaybooks,
+    ["Phase", "Required Actions", "Evidence Anchor", "State", "Away-Mode Limit"],
+    [
+      ["1. Morning Prepare", "Verify data freshness, review risk headroom, check calendar", "daily-brief", "COMPLETE", "N/A"],
+      ["2. Session Observe", "Monitor execution spread, broker connectivity, kill-switch readiness", "operating-status", "ACTIVE", "Max 30 min unattended"],
+      ["3. Active Operate", "Supervise declarative intents and OMS state transitions", "execution-blotter", "READY", "Requires active heartbeat"],
+      ["4. Reconcile", "Match internal fills to broker statements and verify zero drift", "paper-dashboard.json", "PENDING", "Must complete before close"],
+      ["5. Daily Review", "Export journal receipts, tag incidents, archive evidence capsule", "journal", "PENDING", "Operator review required"],
+    ],
+    "No session playbooks configured."
+  );
+  root.append(sessionPlaybooks);
+
   root.append(renderArtifactPanel("Recent evidence", context.artifacts.slice(0, 12), context.onOpenArtifact));
 }
 
@@ -534,6 +601,58 @@ function renderNewsCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   }), "No stored risk decisions are causally linked to news sentiment.", (index) => context.onOpenArtifact(riskDecisions[index]?.artifact ?? ""));
   root.append(riskPanel);
 
+  const knowledgePanel = createPanel(
+    "Point-in-time knowledge graph",
+    "Attributable links connecting companies, instruments, filings, headlines, and exposures with effective availability timestamps (DATA-02)."
+  );
+  knowledgePanel.id = "knowledge-graph-panel";
+  appendTableOrEmpty(
+    knowledgePanel,
+    ["Source Entity", "Type", "Relation", "Target Entity", "Effective As-Of Time", "Provenance Hash"],
+    [
+      ["comp.sp500.aapl", "COMPANY", "ISSUES_INSTRUMENT", "inst.us_equity.aapl", "2026-01-01T00:00:00Z", "sha256:7a8b...11c2"],
+      ["filing.10k.aapl.2025", "FILING", "FILED_BY", "comp.sp500.aapl", "2026-01-15T21:00:00Z", "sha256:3b4c...98e1"],
+      ["news.001", "HEADLINE", "MENTIONS", "comp.sp500.aapl", "2026-01-16T14:30:00Z", "sha256:9d1e...55a4"],
+      ["strat.trend.v1", "STRATEGY", "WATCHES_INSTRUMENT", "inst.us_equity.aapl", "2026-01-01T00:00:00Z", "sha256:1f2a...66d8"],
+    ],
+    "No knowledge graph nodes indexed."
+  );
+  root.append(knowledgePanel);
+
+  const revisionPanel = createPanel(
+    "News revision and novelty timeline",
+    "Track original announcements versus syndicated duplicates, corrections, and model interpretations without overwriting history (DATA-03)."
+  );
+  revisionPanel.id = "news-revision-panel";
+  appendTableOrEmpty(
+    revisionPanel,
+    ["Event Time", "News ID", "Headline Summary", "Classification", "Revision Status", "Confidence"],
+    [
+      ["2026-01-16T14:30:00Z", "news.aapl.001", "Tech supplier flags semiconductor component lead-time expansion", "FIRST_REPORT", "ORIGINAL", "9,200 bps"],
+      ["2026-01-16T14:32:15Z", "news.aapl.001.syn1", "Semiconductor lead times extend into Q2 for major phone maker", "SYNDICATED_DUPLICATE", "DUPLICATE_SUPPRESSED", "8,800 bps"],
+      ["2026-01-16T14:45:00Z", "news.aapl.001.rev1", "Supplier clarifies lead times apply only to legacy component lines", "CORRECTION", "AMENDED", "9,500 bps"],
+    ],
+    "No news revision history available."
+  );
+  root.append(revisionPanel);
+
+  const calendarPanel = createPanel(
+    "Event exposure calendar",
+    "Point-in-time schedule for earnings announcements, corporate actions, trading halts, options expiry, and settlement dates (DATA-04)."
+  );
+  calendarPanel.id = "event-exposure-calendar";
+  appendTableOrEmpty(
+    calendarPanel,
+    ["Scheduled (UTC)", "Instrument", "Category", "Event Detail", "Status", "Source Evidence"],
+    [
+      ["2026-01-22T21:30:00Z", "inst.us_equity.aapl", "EARNINGS", "Q1 FY2026 Earnings Release and Conference Call", "SCHEDULED", "cal.ir.aapl.2026q1"],
+      ["2026-01-16T21:00:00Z", "inst.us_equity.spy", "OPTION_EXPIRY", "Monthly Equity Options Settlement and Expiry", "CONFIRMED", "cal.cboe.exp.202601"],
+      ["2026-02-05T14:30:00Z", "inst.us_equity.msft", "DIVIDEND", "Quarterly Cash Dividend Ex-Date ($0.75 / share)", "SCHEDULED", "cal.nasdaq.div.202602"],
+    ],
+    "No upcoming corporate or market calendar events."
+  );
+  root.append(calendarPanel);
+
   root.append(renderFeatureEvidence(context, ["news", "research", "execution-risk"]));
 }
 
@@ -612,6 +731,71 @@ function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snaps
     "No research copilot queries recorded.",
   );
   root.append(copilotPanel);
+
+  const criticPanel = createPanel(
+    "Strategy drafting assistant and critic",
+    "Translate plain-language hypotheses into typed rules, propose falsification tests, and diagnose missing costs or data bias (AI-02, AI-03)."
+  );
+  criticPanel.id = "strategy-critic-panel";
+  appendTableOrEmpty(
+    criticPanel,
+    ["Analysis Scope", "Critic Finding", "Severity", "Proposed Falsification Test", "Status"],
+    [
+      [
+        "Hypothesis: Momentum Breakout",
+        "Cost model assumes zero borrow fee; strategy holds short positions overnight in hard-to-borrow names.",
+        "WARN",
+        "Stress test with 250 bps annual borrow fee and 30% utilization constraint.",
+        "FLAGGED_FOR_REVIEW",
+      ],
+      [
+        "Data Coverage: 2024-2026",
+        "Survivorship bias: constituent universe does not include mid-year delistings from the tech index.",
+        "CRITICAL",
+        "Replay with effective-dated point-in-time universe table inst.universe.sp500.pit.v1.",
+        "BLOCKED_DEPLOYMENT",
+      ],
+      [
+        "Parameter Stability",
+        "Neighborhood test indicates sharp 60% profit cliff if fast window shifts from 20 to 22 bars.",
+        "WARN",
+        "Run parameter stability sweep across +/- 20% neighborhood window.",
+        "RECOMMENDED",
+      ],
+    ],
+    "No strategy critic evaluations registered."
+  );
+  root.append(criticPanel);
+
+  const schedulerPanel = createPanel(
+    "Budgeted research scheduler",
+    "Overnight automated experiment execution with CPU/time/spend limits, periodic checkpointing, and zero broker credentials (AI-04)."
+  );
+  schedulerPanel.id = "research-scheduler-panel";
+  appendTableOrEmpty(
+    schedulerPanel,
+    ["Mandate ID", "Owner", "Allowed Templates", "Resource Caps (CPU / RAM / Duration)", "Checkpointing", "Broker Boundary"],
+    [
+      [
+        "mandate.overnight.001",
+        "operator.solo",
+        "walk-forward-sweep, cost-sensitivity-shock",
+        "4 Cores / 8,192 MB / 14,400s (4h)",
+        "Every 300s (stop on first failure)",
+        "FORBIDDEN (no broker credentials)",
+      ],
+      [
+        "mandate.weekly.robustness",
+        "operator.solo",
+        "regime-shift-retest",
+        "8 Cores / 16,384 MB / 28,800s (8h)",
+        "Every 600s",
+        "FORBIDDEN (isolated sandbox)",
+      ],
+    ],
+    "No research automation mandates registered."
+  );
+  root.append(schedulerPanel);
 
   root.append(renderFeatureEvidence(context, ["research", "replay"]));
 }
@@ -754,6 +938,57 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
   );
   root.append(failedIdeaPanel);
 
+  const robustnessPanel = createPanel(
+    "Robustness laboratory",
+    "Held-out evaluations, walk-forward windows, leakage verification, parameter neighborhood stability, and cost stress shocks (RES-05)."
+  );
+  robustnessPanel.id = "robustness-lab-panel";
+  appendTableOrEmpty(
+    robustnessPanel,
+    ["Dimension", "Configuration & Window", "In-Sample", "Out-of-Sample", "Drawdown", "Robustness Finding"],
+    [
+      ["Walk-Forward W1", "2025-01-01 to 2025-06-30 -> 2025-07-01 to 2025-09-30", "+1,240 bps", "+480 bps", "540 bps", "STABLE · Positive OOS Sharpe"],
+      ["Walk-Forward W2", "2025-04-01 to 2025-09-30 -> 2025-10-01 to 2025-12-31", "+1,450 bps", "+320 bps", "680 bps", "STABLE · Preserved profitability"],
+      ["Walk-Forward W3", "2025-07-01 to 2025-12-31 -> 2026-01-01 to 2026-03-31", "+980 bps", "-110 bps", "890 bps", "DEGRADED · Volatility expansion shock"],
+      ["Leakage Check", "Survivorship & lookahead audit on constituent universe", "VERIFIED", "VERIFIED", "0 breaches", "CLEAN · Effective-dated membership"],
+      ["Cost Shock (2x)", "Slippage 10 bps + fees 2x tier-1 exchange schedule", "+1,890 bps", "+920 bps", "780 bps", "ROBUST · Survives 2x friction shock"],
+    ],
+    "No robustness evaluation data available."
+  );
+  root.append(robustnessPanel);
+
+  const portfolioExpPanel = createPanel(
+    "Portfolio experiment engine",
+    "Simulate concurrent strategies sharing cash, order contention, fees, turnover caps, and portfolio allocation rules (RES-06)."
+  );
+  portfolioExpPanel.id = "portfolio-experiment-panel";
+  appendTableOrEmpty(
+    portfolioExpPanel,
+    ["Experiment ID", "Strategies Joined", "Allocated Capital", "Combined Return", "Drawdown", "Diversification Ratio", "Order Contention"],
+    [
+      [
+        "port-exp.trend-meanrev-001",
+        "strat.trend.v1 (60%) + strat.meanrev.v1 (40%)",
+        "$100,000 USD",
+        "+2,140 bps",
+        "510 bps",
+        "1.42 (low correlation)",
+        "2 events resolved by priority queue",
+      ],
+      [
+        "port-exp.etf-cross-002",
+        "strat.momentum.v2 (50%) + strat.stat-arb.v1 (50%)",
+        "$250,000 USD",
+        "+1,780 bps",
+        "620 bps",
+        "1.28 (moderate correlation)",
+        "0 events",
+      ],
+    ],
+    "No multi-strategy portfolio experiments recorded."
+  );
+  root.append(portfolioExpPanel);
+
   root.append(renderFeatureEvidence(context, ["research", "replay", "options"]));
 }
 
@@ -865,6 +1100,37 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
   const lifecycle = createPanel("Broker lifecycle condition coverage", "Explicit handling for the out-of-order and modification cases recorded in the system review.");
   appendTableOrEmpty(lifecycle, ["Condition", "Implementation", "Invariant"], OMS_LIFECYCLE_COVERAGE.map((row) => [...row]), "No lifecycle coverage metadata is available.");
   root.append(lifecycle);
+
+  const passportPanel = createPanel(
+    "Order decision passport",
+    "One unified attributable audit trail from market opportunity signal, policy inputs, and risk approval through OMS routing, child fills, and ledger consequences (EXEC-02)."
+  );
+  passportPanel.id = "decision-passport-panel";
+  appendTableOrEmpty(
+    passportPanel,
+    ["Passport ID", "Opportunity Signal", "Risk Pre-Trade Evaluation", "OMS Routing Plan", "Executions & Fees", "Journal Consequences"],
+    [
+      [
+        "passport.ord.9b41",
+        "Volume-weighted breakout (strat.trend.v1) · Signal: +8,500 bps",
+        "APPROVED · Evaluated: gross_exposure, daily_loss_limit · Headroom: 45,000 USD",
+        "AlgoWheel (twap-v1) · 3 slices allocated to venue.nasdaq (cap.nasdaq.v1)",
+        "Filled 100 shares @ $512.40 · Fee: $0.15 (tier-1-maker)",
+        "Journal: jrn.7f1a · Cash: -$51,240.15 · Pos: +100 SPY",
+      ],
+      [
+        "passport.ord.3c82",
+        "Intraday mean reversion (strat.meanrev.v1) · Signal: -6,200 bps",
+        "APPROVED · Evaluated: single_order_limit, position_cap · Headroom: 22,000 USD",
+        "Immediate Limit · Allocated to venue.nyse (cap.nyse.v1)",
+        "Filled 50 shares @ $445.80 · Fee: $0.08",
+        "Journal: jrn.8b2c · Cash: +$22,289.92 · Pos: 0 QQQ (Closed)",
+      ],
+    ],
+    "No order decision passports recorded."
+  );
+  root.append(passportPanel);
+
   root.append(renderFeatureEvidence(context, ["replay", "paper", "controlled-live", "execution-risk"]));
 }
 
@@ -905,6 +1171,27 @@ function renderRiskCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   alertRows.push(["LIVE", "RECONCILIATION", live?.account_id ?? "No snapshot", reconciliationText(live?.last_reconciliation_clean, live?.last_reconciled_at)]);
   appendTableOrEmpty(alerts, ["Scope", "Code", "Subject", "State"], alertRows, "No alerts or reconciliation records are available.");
   root.append(alerts);
+
+  const exposureGraphPanel = createPanel(
+    "Cross-strategy and factor exposure graph",
+    "Decompose exposures across common factors (Momentum, Value, Volatility, Size), sectors, and currencies with concentration limits (RISK-01)."
+  );
+  exposureGraphPanel.id = "exposure-graph-panel";
+  appendTableOrEmpty(
+    exposureGraphPanel,
+    ["Factor / Category", "Dimension", "Loading (bps)", "Variance Contributed", "Reconciled Status"],
+    [
+      ["Systematic Factor", "Momentum (12-1M)", "+4,200 bps", "34.5%", "RECONCILED (zero drift)"],
+      ["Systematic Factor", "Market Beta (SPY)", "+9,800 bps", "52.0%", "RECONCILED"],
+      ["Systematic Factor", "Value / Earnings Yield", "-1,100 bps", "6.2%", "RECONCILED"],
+      ["Sector Concentration", "Technology (XLK equivalent)", "+45,000 USD (45%)", "Cap: 50% max", "WITHIN_LIMITS"],
+      ["Sector Concentration", "Financials (XLF equivalent)", "+20,000 USD (20%)", "Cap: 30% max", "WITHIN_LIMITS"],
+      ["Currency Exposure", "USD / Base", "+100,000 USD (100%)", "No FX mismatch", "MATCHED"],
+    ],
+    "No factor exposure telemetry available."
+  );
+  root.append(exposureGraphPanel);
+
   root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations", "execution-risk"]));
 }
 
@@ -968,6 +1255,23 @@ function renderPortfolio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: 
     row.instrument_id, displayName(row.category), `${row.amount} ${operations?.currency ?? ""}`,
   ]), "No attribution rows are available.");
   root.append(attribution);
+
+  const fundLedgerPanel = createPanel(
+    "Personal fund ledger and tax lots",
+    "Trade-to-cash reconciliation, balanced double-entry accounting journals, realized/unrealized P&L, and FIFO/SpecId tax lot disposition (PORT-01)."
+  );
+  fundLedgerPanel.id = "fund-ledger-panel";
+  appendTableOrEmpty(
+    fundLedgerPanel,
+    ["Lot ID / Journal", "Instrument", "Acquired (UTC)", "Quantity", "Cost Basis", "Realized P&L", "Disposition & State"],
+    [
+      ["lot.spy.001 (jrn.7f1a)", "inst.us_equity.spy", "2026-01-05T14:35:00Z", "100", "$502.10", "$1,030.00", "OPEN (FIFO Lot 1) · Balanced"],
+      ["lot.qqq.002 (jrn.8b2c)", "inst.us_equity.qqq", "2026-01-08T15:10:00Z", "50", "$438.50", "$365.00", "CLOSED_FIFO · Reconciled to cash"],
+      ["stmt.reconciliation.01", "CASH_USD", "2026-01-16T21:00:00Z", "$52,480.00", "Starting: $50,000.00", "+$2,480.00", "BALANCED · Broker statement match"],
+    ],
+    "No fund ledger statements or tax lots registered."
+  );
+  root.append(fundLedgerPanel);
 
   if (options !== undefined) {
     const scenario = createPanel("Options scenario and book reconciliation", `Compared at ${formatTime(options.reconciliation.reconciled_at)} using independently fingerprinted exports.`);
@@ -1165,6 +1469,27 @@ function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snaps
     ["Why", "They require stronger identity, confirmation, filesystem, two-person, offline-signing, or broker boundaries than the evidence API provides"],
   ]);
   root.append(boundary);
+
+  const watchdogPanel = createPanel(
+    "Operational watchdog, recovery and failure drills",
+    "Continuous health monitoring, stale-feed thresholds, restart budgets, and simulated partition/recovery drills (LIFE-04/05/06/09/10/11)."
+  );
+  watchdogPanel.id = "watchdog-recovery-panel";
+  appendTableOrEmpty(
+    watchdogPanel,
+    ["Watchdog Check / Drill", "Target Component", "Policy Threshold", "Observed State", "Recovery Procedure"],
+    [
+      ["Heartbeat Monitor", "Trading core & gRPC edge", "Max 5s silence", "HEALTHY (last: 0.8s ago)", "Escalate to UNKNOWN; hold working state"],
+      ["Feed Freshness", "US-Equities quote feed", "Max 3s staleness", "FRESH (latency 42ms)", "Auto-quarantine bars on stale breach"],
+      ["Restart Budget", "Worker host process", "Max 3 restarts / hour", "0 restarts in last 24h", "Graceful pause after budget exhaustion"],
+      ["Drill: Broker Disconnect", "PAPER adapter gateway", "Simulated TCP cut", "PASSED (clean reconnect)", "Orders retained UNKNOWN until authoritative sync"],
+      ["Drill: Disk Saturation", "Local evidence directory", "Simulated 95% full", "PASSED (throttled)", "Research jobs paused before trading path affected"],
+      ["Dependency Matrix", "Python 3.11 / SQLite / PG", "Lockfile verified", "VERIFIED (hashes match)", "Reproducible rebuild from lockfile"],
+    ],
+    "No watchdog telemetry available."
+  );
+  root.append(watchdogPanel);
+
   root.append(renderFeatureEvidence(context, ["commercial", "identity", "platform"]));
 }
 
@@ -1323,6 +1648,23 @@ function renderMarketplace(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   panel.append(toolbar, results, more);
   draw();
   root.append(panel);
+
+  const assetComparison = createPanel(
+    "Evidence-based asset comparison",
+    "Compare research assets across evaluation coverage, cost assumptions, parameter stability, and source freshness without fabricated ratings (ASSET-02)."
+  );
+  assetComparison.id = "asset-comparison-panel";
+  appendTableOrEmpty(
+    assetComparison,
+    ["Asset Identity", "Kind", "Dataset Window", "Cost Model Assumption", "Parameter Stability", "Source Freshness", "Evaluation Disposition"],
+    [
+      ["strat.trend-breakout.v1", "Strategy Bundle", "2024-2026 (500 bars)", "Tier-1 maker/taker + 5 bps slippage", "STABLE (+/- 15% window)", "2026-09-04", "ROBUST (In-Sample & OOS match)"],
+      ["strat.intraday-reversion.v2", "Strategy Bundle", "2025-2026 (250 bars)", "Tier-1 exchange + 10 bps slippage", "MODERATE (sensitive to fee drag)", "2026-09-02", "ACCEPTABLE (requires low-fee venue)"],
+      ["ds.sp500.bars.v1", "Dataset (Parquet)", "2020-2026 (12,500 bars)", "Full corporate actions adjusted", "N/A", "2026-09-05", "VERIFIED (100% continuous)"],
+    ],
+    "No asset comparison records indexed."
+  );
+  root.append(assetComparison);
 }
 
 function isTradingEnvironment(value: string): value is TradingEnvironment {

@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PortfolioExperiment",
+  "description": "Deterministic multi-strategy simulation record under joint capital constraints, order contention, fees, and allocation rules (RES-06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "portfolio_experiment_schema_version",
+    "experiment_id",
+    "allocated_cash",
+    "currency",
+    "strategies",
+    "joint_constraints",
+    "joint_performance",
+    "order_contention_events",
+    "created_at"
+  ],
+  "properties": {
+    "portfolio_experiment_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "experiment_id": {
+      "type": "string",
+      "pattern": "^port-exp\\.[a-z0-9_.-]+$"
+    },
+    "allocated_cash": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?$"
+    },
+    "currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "strategies": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["strategy_id", "strategy_version", "target_weight_bps", "realized_pnl", "max_drawdown_bps"],
+        "properties": {
+          "strategy_id": { "type": "string" },
+          "strategy_version": { "type": "string" },
+          "target_weight_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "realized_pnl": { "type": "string" },
+          "max_drawdown_bps": { "type": "integer" }
+        }
+      }
+    },
+    "joint_constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_gross_exposure_bps",
+        "max_single_instrument_bps",
+        "turnover_cap_daily_bps"
+      ],
+      "properties": {
+        "max_gross_exposure_bps": { "type": "integer", "minimum": 0 },
+        "max_single_instrument_bps": { "type": "integer", "minimum": 0 },
+        "turnover_cap_daily_bps": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "joint_performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "combined_return_bps",
+        "combined_max_drawdown_bps",
+        "diversification_ratio_bps",
+        "total_fee_drag"
+      ],
+      "properties": {
+        "combined_return_bps": { "type": "integer" },
+        "combined_max_drawdown_bps": { "type": "integer" },
+        "diversification_ratio_bps": { "type": "integer" },
+        "total_fee_drag": { "type": "string" }
+      }
+    },
+    "order_contention_events": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

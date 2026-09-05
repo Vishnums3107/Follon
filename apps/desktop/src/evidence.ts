@@ -355,6 +355,233 @@ export type AssistantEvidence = Readonly<{
   created_at: string;
 }>;
 
+export type RobustnessEvaluation = Readonly<{
+  evaluation_schema_version: 1;
+  evaluation_id: string;
+  strategy_version: string;
+  hypothesis_id: string;
+  walk_forward_windows: ReadonlyArray<Readonly<{
+    window_id: string;
+    in_sample_start: string;
+    in_sample_end: string;
+    out_of_sample_start: string;
+    out_of_sample_end: string;
+    in_sample_return_bps: number;
+    out_of_sample_return_bps: number;
+    max_drawdown_bps: number;
+  }>>;
+  leakage_checks: Readonly<{
+    survivorship_bias_verified: boolean;
+    lookahead_bias_verified: boolean;
+    corporate_action_adjusted: boolean;
+    quarantine_violations: number;
+  }>;
+  parameter_stability: Readonly<{
+    perturbation_percent: number;
+    neighborhood_variance_bps: number;
+    degradation_cliff_detected: boolean;
+  }>;
+  cost_shocks: ReadonlyArray<Readonly<{
+    slippage_multiplier: string;
+    fee_multiplier: string;
+    stressed_return_bps: number;
+  }>>;
+  uncertainty_score_bps: number;
+  disposition: "ROBUST" | "FRAGILE" | "LEAKAGE_DETECTED" | "DEGRADED";
+  created_at: string;
+}>;
+
+export type PortfolioExperiment = Readonly<{
+  portfolio_experiment_schema_version: 1;
+  experiment_id: string;
+  allocated_cash: string;
+  currency: string;
+  strategies: ReadonlyArray<Readonly<{
+    strategy_id: string;
+    strategy_version: string;
+    target_weight_bps: number;
+    realized_pnl: string;
+    max_drawdown_bps: number;
+  }>>;
+  joint_constraints: Readonly<{
+    max_gross_exposure_bps: number;
+    max_single_instrument_bps: number;
+    turnover_cap_daily_bps: number;
+  }>;
+  joint_performance: Readonly<{
+    combined_return_bps: number;
+    combined_max_drawdown_bps: number;
+    diversification_ratio_bps: number;
+    total_fee_drag: string;
+  }>;
+  order_contention_events: number;
+  created_at: string;
+}>;
+
+export type KnowledgeSnapshot = Readonly<{
+  knowledge_schema_version: 1;
+  snapshot_id: string;
+  as_of_time: string;
+  entity_nodes: ReadonlyArray<Readonly<{
+    entity_id: string;
+    entity_type: "COMPANY" | "INSTRUMENT" | "FILING" | "HEADLINE" | "MACRO_EVENT";
+    name: string;
+    identifier: string;
+  }>>;
+  relationships: ReadonlyArray<Readonly<{
+    source_entity_id: string;
+    relation_type: string;
+    target_entity_id: string;
+    effective_time: string;
+    provenance_hash: string;
+  }>>;
+  source_lineage_hashes: readonly string[];
+  created_at: string;
+}>;
+
+export type EventExposureCalendar = Readonly<{
+  calendar_schema_version: 1;
+  calendar_id: string;
+  as_of_time: string;
+  timezone: string;
+  scheduled_events: ReadonlyArray<Readonly<{
+    event_id: string;
+    instrument_id: string;
+    category: "EARNINGS" | "DIVIDEND" | "STOCK_SPLIT" | "TRADING_HALT" | "OPTION_EXPIRY" | "SETTLEMENT";
+    scheduled_time: string;
+    status: "SCHEDULED" | "CONFIRMED" | "CANCELLED" | "COMPLETED";
+    source_evidence: string;
+  }>>;
+  quarantined_events_count: number;
+  created_at: string;
+}>;
+
+export type AutomationMandate = Readonly<{
+  mandate_schema_version: 1;
+  mandate_id: string;
+  owner: string;
+  allowed_tasks: readonly string[];
+  resource_limits: Readonly<{
+    max_cpu_cores: number;
+    max_memory_mb: number;
+    max_duration_seconds: number;
+    max_storage_bytes: number;
+  }>;
+  cancellation_policy: Readonly<{
+    stop_on_first_error: boolean;
+    checkpoint_interval_seconds: number;
+  }>;
+  broker_access_permitted: false;
+  created_at: string;
+  expires_at: string;
+}>;
+
+export type OrderDecisionPassport = Readonly<{
+  passport_schema_version: 1;
+  passport_id: string;
+  intent_id: string;
+  order_id: string;
+  instrument_id: string;
+  signal_attribution: Readonly<{
+    strategy_version: string;
+    model_event_id: string;
+    opportunity_description: string;
+    signal_power_bps: number;
+  }>;
+  risk_evaluation: Readonly<{
+    policy_version: string;
+    approved: boolean;
+    evaluated_limits: readonly string[];
+    headroom_remaining_bps: number;
+  }>;
+  routing_plan: Readonly<{
+    algorithm: string;
+    allocated_slices_count: number;
+    primary_venue: string;
+    capability_version: string;
+  }>;
+  executions: ReadonlyArray<Readonly<{
+    execution_id: string;
+    venue: string;
+    quantity: string;
+    price: string;
+    fee: string;
+    executed_at: string;
+  }>>;
+  accounting_consequences: Readonly<{
+    journal_entry_id: string;
+    realized_pnl: string;
+    cash_delta: string;
+    position_after: string;
+  }>;
+  created_at: string;
+}>;
+
+export type ExposureGraph = Readonly<{
+  exposure_schema_version: 1;
+  graph_id: string;
+  account_id: string;
+  as_of_time: string;
+  gross_exposure: string;
+  net_exposure: string;
+  factors: ReadonlyArray<Readonly<{
+    factor_name: string;
+    loading_bps: number;
+    factor_variance_pct: string;
+  }>>;
+  sectors: ReadonlyArray<Readonly<{
+    sector_name: string;
+    exposure_usd: string;
+    weight_bps: number;
+  }>>;
+  top_concentrations: ReadonlyArray<Readonly<{
+    instrument_id: string;
+    position_value: string;
+    portfolio_pct: string;
+  }>>;
+  unreconciled_discrepancy: boolean;
+  created_at: string;
+}>;
+
+export type FundLedgerStatement = Readonly<{
+  ledger_schema_version: 1;
+  statement_id: string;
+  account_id: string;
+  period_start: string;
+  period_end: string;
+  starting_cash: string;
+  ending_cash: string;
+  realized_pnl: string;
+  unrealized_pnl: string;
+  fee_totals: Readonly<{
+    exchange_fees: string;
+    brokerage_commissions: string;
+    borrow_financing: string;
+  }>;
+  tax_lots: ReadonlyArray<Readonly<{
+    lot_id: string;
+    instrument_id: string;
+    acquired_at: string;
+    quantity: string;
+    cost_basis: string;
+    disposition: "OPEN" | "CLOSED_FIFO" | "CLOSED_SPECID";
+  }>>;
+  balanced: boolean;
+  created_at: string;
+}>;
+
+export type ContinuityPolicy = Readonly<{
+  policy_schema_version: 1;
+  policy_id: string;
+  unattended_interval_minutes: number;
+  heartbeat_interval_seconds: number;
+  max_restarts_per_hour: number;
+  away_mode_permitted: boolean;
+  broker_disconnect_action: "RETAIN_UNKNOWN_AND_ESCALATE" | "CANCEL_LOCAL_WORKING_ONLY" | "HOLD_STATE";
+  feed_stale_threshold_seconds: number;
+  created_at: string;
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -492,6 +719,132 @@ export function parseAssistantEvidence(json: string): AssistantEvidence {
   }
   if (!isAssistantEvidence(value)) {
     throw new Error("Assistant evidence does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a deterministic robustness evaluation record (RES-05). */
+export function parseRobustnessEvaluation(json: string): RobustnessEvaluation {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Robustness evaluation is not valid JSON.");
+  }
+  if (!isRobustnessEvaluation(value)) {
+    throw new Error("Robustness evaluation does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a multi-strategy portfolio experiment record (RES-06). */
+export function parsePortfolioExperiment(json: string): PortfolioExperiment {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Portfolio experiment is not valid JSON.");
+  }
+  if (!isPortfolioExperiment(value)) {
+    throw new Error("Portfolio experiment does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a point-in-time knowledge snapshot (DATA-02). */
+export function parseKnowledgeSnapshot(json: string): KnowledgeSnapshot {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Knowledge snapshot is not valid JSON.");
+  }
+  if (!isKnowledgeSnapshot(value)) {
+    throw new Error("Knowledge snapshot does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a point-in-time event exposure calendar record (DATA-04). */
+export function parseEventExposureCalendar(json: string): EventExposureCalendar {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Event exposure calendar is not valid JSON.");
+  }
+  if (!isEventExposureCalendar(value)) {
+    throw new Error("Event exposure calendar does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a bounded research automation mandate (AI-04). */
+export function parseAutomationMandate(json: string): AutomationMandate {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Automation mandate is not valid JSON.");
+  }
+  if (!isAutomationMandate(value)) {
+    throw new Error("Automation mandate does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an order decision passport linking intent through accounting (EXEC-02). */
+export function parseOrderDecisionPassport(json: string): OrderDecisionPassport {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Order decision passport is not valid JSON.");
+  }
+  if (!isOrderDecisionPassport(value)) {
+    throw new Error("Order decision passport does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a multi-factor cross-strategy exposure graph (RISK-01). */
+export function parseExposureGraph(json: string): ExposureGraph {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Exposure graph is not valid JSON.");
+  }
+  if (!isExposureGraph(value)) {
+    throw new Error("Exposure graph does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an attributable personal fund ledger statement (PORT-01). */
+export function parseFundLedgerStatement(json: string): FundLedgerStatement {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Fund ledger statement is not valid JSON.");
+  }
+  if (!isFundLedgerStatement(value)) {
+    throw new Error("Fund ledger statement does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a solo session continuity and recovery policy (SOLO-06, LIFE-04/05/06). */
+export function parseContinuityPolicy(json: string): ContinuityPolicy {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Continuity policy is not valid JSON.");
+  }
+  if (!isContinuityPolicy(value)) {
+    throw new Error("Continuity policy does not match the v1 evidence contract.");
   }
   return value;
 }
@@ -1524,4 +1877,286 @@ function isAssistantEvidence(value: unknown): value is AssistantEvidence {
   if (typeof candidate.human_disposition !== "string" || !validDisp.includes(candidate.human_disposition)) return false;
   return isUtcTimestamp(candidate.created_at);
 }
+
+function isRobustnessEvaluation(value: unknown): value is RobustnessEvaluation {
+  if (!hasExactKeys(value, [
+    "cost_shocks",
+    "created_at",
+    "disposition",
+    "evaluation_id",
+    "evaluation_schema_version",
+    "hypothesis_id",
+    "leakage_checks",
+    "parameter_stability",
+    "strategy_version",
+    "uncertainty_score_bps",
+    "walk_forward_windows",
+  ])) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.evaluation_schema_version !== 1 || !isCanonicalId(candidate.evaluation_id) || !isCanonicalId(candidate.hypothesis_id) || typeof candidate.strategy_version !== "string") return false;
+  if (!Array.isArray(candidate.walk_forward_windows) || candidate.walk_forward_windows.length === 0) return false;
+  for (const w of candidate.walk_forward_windows) {
+    if (!hasExactKeys(w, [
+      "in_sample_end", "in_sample_return_bps", "in_sample_start",
+      "max_drawdown_bps", "out_of_sample_end", "out_of_sample_return_bps",
+      "out_of_sample_start", "window_id",
+    ])) return false;
+    const window = w as Record<string, unknown>;
+    if (!isCanonicalId(window.window_id) || !isUtcTimestamp(window.in_sample_start) || !isUtcTimestamp(window.in_sample_end) || !isUtcTimestamp(window.out_of_sample_start) || !isUtcTimestamp(window.out_of_sample_end) || typeof window.in_sample_return_bps !== "number" || typeof window.out_of_sample_return_bps !== "number" || typeof window.max_drawdown_bps !== "number") return false;
+  }
+  if (!hasExactKeys(candidate.leakage_checks, [
+    "corporate_action_adjusted", "lookahead_bias_verified", "quarantine_violations", "survivorship_bias_verified",
+  ])) return false;
+  const lk = candidate.leakage_checks as Record<string, unknown>;
+  if (typeof lk.survivorship_bias_verified !== "boolean" || typeof lk.lookahead_bias_verified !== "boolean" || typeof lk.corporate_action_adjusted !== "boolean" || !isNonNegativeInteger(lk.quarantine_violations)) return false;
+  if (!hasExactKeys(candidate.parameter_stability, [
+    "degradation_cliff_detected", "neighborhood_variance_bps", "perturbation_percent",
+  ])) return false;
+  const ps = candidate.parameter_stability as Record<string, unknown>;
+  if (!isNonNegativeInteger(ps.perturbation_percent) || !isNonNegativeInteger(ps.neighborhood_variance_bps) || typeof ps.degradation_cliff_detected !== "boolean") return false;
+  if (!Array.isArray(candidate.cost_shocks)) return false;
+  for (const cs of candidate.cost_shocks) {
+    if (!hasExactKeys(cs, ["fee_multiplier", "slippage_multiplier", "stressed_return_bps"])) return false;
+    const shock = cs as Record<string, unknown>;
+    if (typeof shock.slippage_multiplier !== "string" || typeof shock.fee_multiplier !== "string" || typeof shock.stressed_return_bps !== "number") return false;
+  }
+  if (!isNonNegativeInteger(candidate.uncertainty_score_bps) || candidate.uncertainty_score_bps > 10000) return false;
+  if (!["ROBUST", "FRAGILE", "LEAKAGE_DETECTED", "DEGRADED"].includes(String(candidate.disposition))) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isPortfolioExperiment(value: unknown): value is PortfolioExperiment {
+  if (!hasExactKeys(value, [
+    "allocated_cash",
+    "created_at",
+    "currency",
+    "experiment_id",
+    "joint_constraints",
+    "joint_performance",
+    "order_contention_events",
+    "portfolio_experiment_schema_version",
+    "strategies",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.portfolio_experiment_schema_version !== 1 || !isCanonicalId(candidate.experiment_id)) return false;
+  if (!isDecimal(candidate.allocated_cash) || typeof candidate.currency !== "string" || candidate.currency.length !== 3) return false;
+  if (!Array.isArray(candidate.strategies) || candidate.strategies.length < 2) return false;
+  for (const s of candidate.strategies) {
+    if (!hasExactKeys(s, ["max_drawdown_bps", "realized_pnl", "strategy_id", "strategy_version", "target_weight_bps"])) return false;
+    const strat = s as Record<string, unknown>;
+    if (!isCanonicalId(strat.strategy_id) || typeof strat.strategy_version !== "string" || !isNonNegativeInteger(strat.target_weight_bps) || !isDecimal(strat.realized_pnl) || typeof strat.max_drawdown_bps !== "number") return false;
+  }
+  if (!hasExactKeys(candidate.joint_constraints, ["max_gross_exposure_bps", "max_single_instrument_bps", "turnover_cap_daily_bps"])) return false;
+  const jc = candidate.joint_constraints as Record<string, unknown>;
+  if (!isNonNegativeInteger(jc.max_gross_exposure_bps) || !isNonNegativeInteger(jc.max_single_instrument_bps) || !isNonNegativeInteger(jc.turnover_cap_daily_bps)) return false;
+  if (!hasExactKeys(candidate.joint_performance, ["combined_max_drawdown_bps", "combined_return_bps", "diversification_ratio_bps", "total_fee_drag"])) return false;
+  const jp = candidate.joint_performance as Record<string, unknown>;
+  if (typeof jp.combined_return_bps !== "number" || typeof jp.combined_max_drawdown_bps !== "number" || !isNonNegativeInteger(jp.diversification_ratio_bps) || !isDecimal(jp.total_fee_drag)) return false;
+  if (!isNonNegativeInteger(candidate.order_contention_events)) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isKnowledgeSnapshot(value: unknown): value is KnowledgeSnapshot {
+  if (!hasExactKeys(value, [
+    "as_of_time",
+    "created_at",
+    "entity_nodes",
+    "knowledge_schema_version",
+    "relationships",
+    "snapshot_id",
+    "source_lineage_hashes",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.knowledge_schema_version !== 1 || !isCanonicalId(candidate.snapshot_id)) return false;
+  if (!isUtcTimestamp(candidate.as_of_time) || !isUtcTimestamp(candidate.created_at)) return false;
+  if (!Array.isArray(candidate.entity_nodes) || !Array.isArray(candidate.relationships) || !Array.isArray(candidate.source_lineage_hashes)) return false;
+  for (const n of candidate.entity_nodes) {
+    if (!hasExactKeys(n, ["entity_id", "entity_type", "identifier", "name"])) return false;
+    const node = n as Record<string, unknown>;
+    if (!isCanonicalId(node.entity_id) || !["COMPANY", "INSTRUMENT", "FILING", "HEADLINE", "MACRO_EVENT"].includes(String(node.entity_type)) || typeof node.name !== "string" || typeof node.identifier !== "string") return false;
+  }
+  for (const r of candidate.relationships) {
+    if (!hasExactKeys(r, ["effective_time", "provenance_hash", "relation_type", "source_entity_id", "target_entity_id"])) return false;
+    const rel = r as Record<string, unknown>;
+    if (!isCanonicalId(rel.source_entity_id) || !isCanonicalId(rel.target_entity_id) || typeof rel.relation_type !== "string" || !isUtcTimestamp(rel.effective_time) || !isHash(rel.provenance_hash)) return false;
+  }
+  return candidate.source_lineage_hashes.every(isHash);
+}
+
+function isEventExposureCalendar(value: unknown): value is EventExposureCalendar {
+  if (!hasExactKeys(value, [
+    "as_of_time",
+    "calendar_id",
+    "calendar_schema_version",
+    "created_at",
+    "quarantined_events_count",
+    "scheduled_events",
+    "timezone",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.calendar_schema_version !== 1 || !isCanonicalId(candidate.calendar_id)) return false;
+  if (!isUtcTimestamp(candidate.as_of_time) || !isUtcTimestamp(candidate.created_at) || typeof candidate.timezone !== "string") return false;
+  if (!isNonNegativeInteger(candidate.quarantined_events_count)) return false;
+  if (!Array.isArray(candidate.scheduled_events)) return false;
+  for (const ev of candidate.scheduled_events) {
+    if (!hasExactKeys(ev, ["category", "event_id", "instrument_id", "scheduled_time", "source_evidence", "status"])) return false;
+    const e = ev as Record<string, unknown>;
+    if (!isCanonicalId(e.event_id) || !isCanonicalId(e.instrument_id) || !["EARNINGS", "DIVIDEND", "STOCK_SPLIT", "TRADING_HALT", "OPTION_EXPIRY", "SETTLEMENT"].includes(String(e.category)) || !isUtcTimestamp(e.scheduled_time) || !["SCHEDULED", "CONFIRMED", "CANCELLED", "COMPLETED"].includes(String(e.status)) || typeof e.source_evidence !== "string") return false;
+  }
+  return true;
+}
+
+function isAutomationMandate(value: unknown): value is AutomationMandate {
+  if (!hasExactKeys(value, [
+    "allowed_tasks",
+    "broker_access_permitted",
+    "cancellation_policy",
+    "created_at",
+    "expires_at",
+    "mandate_id",
+    "mandate_schema_version",
+    "owner",
+    "resource_limits",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.mandate_schema_version !== 1 || !isCanonicalId(candidate.mandate_id) || typeof candidate.owner !== "string") return false;
+  if (candidate.broker_access_permitted !== false) return false;
+  if (!Array.isArray(candidate.allowed_tasks) || candidate.allowed_tasks.length === 0 || !candidate.allowed_tasks.every((t) => typeof t === "string")) return false;
+  if (!hasExactKeys(candidate.resource_limits, ["max_cpu_cores", "max_duration_seconds", "max_memory_mb", "max_storage_bytes"])) return false;
+  const rl = candidate.resource_limits as Record<string, unknown>;
+  if (!isPositiveInteger(rl.max_cpu_cores) || !isPositiveInteger(rl.max_memory_mb) || !isPositiveInteger(rl.max_duration_seconds) || !isPositiveInteger(rl.max_storage_bytes)) return false;
+  if (!hasExactKeys(candidate.cancellation_policy, ["checkpoint_interval_seconds", "stop_on_first_error"])) return false;
+  const cp = candidate.cancellation_policy as Record<string, unknown>;
+  if (typeof cp.stop_on_first_error !== "boolean" || !isPositiveInteger(cp.checkpoint_interval_seconds)) return false;
+  return isUtcTimestamp(candidate.created_at) && isUtcTimestamp(candidate.expires_at);
+}
+
+function isOrderDecisionPassport(value: unknown): value is OrderDecisionPassport {
+  if (!hasExactKeys(value, [
+    "accounting_consequences",
+    "created_at",
+    "executions",
+    "instrument_id",
+    "intent_id",
+    "order_id",
+    "passport_id",
+    "passport_schema_version",
+    "risk_evaluation",
+    "routing_plan",
+    "signal_attribution",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.passport_schema_version !== 1 || !isCanonicalId(candidate.passport_id) || !isCanonicalId(candidate.intent_id) || !isCanonicalId(candidate.order_id) || !isCanonicalId(candidate.instrument_id)) return false;
+  if (!hasExactKeys(candidate.signal_attribution, ["model_event_id", "opportunity_description", "signal_power_bps", "strategy_version"])) return false;
+  const sa = candidate.signal_attribution as Record<string, unknown>;
+  if (typeof sa.strategy_version !== "string" || !isCanonicalId(sa.model_event_id) || typeof sa.opportunity_description !== "string" || typeof sa.signal_power_bps !== "number") return false;
+  if (!hasExactKeys(candidate.risk_evaluation, ["approved", "evaluated_limits", "headroom_remaining_bps", "policy_version"])) return false;
+  const re = candidate.risk_evaluation as Record<string, unknown>;
+  if (typeof re.policy_version !== "string" || typeof re.approved !== "boolean" || !Array.isArray(re.evaluated_limits) || typeof re.headroom_remaining_bps !== "number") return false;
+  if (!hasExactKeys(candidate.routing_plan, ["algorithm", "allocated_slices_count", "capability_version", "primary_venue"])) return false;
+  const rp = candidate.routing_plan as Record<string, unknown>;
+  if (typeof rp.algorithm !== "string" || !isPositiveInteger(rp.allocated_slices_count) || !isCanonicalId(rp.primary_venue) || typeof rp.capability_version !== "string") return false;
+  if (!Array.isArray(candidate.executions) || candidate.executions.length === 0) return false;
+  for (const ex of candidate.executions) {
+    if (!hasExactKeys(ex, ["executed_at", "execution_id", "fee", "price", "quantity", "venue"])) return false;
+    const exec = ex as Record<string, unknown>;
+    if (!isCanonicalId(exec.execution_id) || !isCanonicalId(exec.venue) || !isDecimal(exec.quantity) || !isDecimal(exec.price) || !isDecimal(exec.fee) || !isUtcTimestamp(exec.executed_at)) return false;
+  }
+  if (!hasExactKeys(candidate.accounting_consequences, ["cash_delta", "journal_entry_id", "position_after", "realized_pnl"])) return false;
+  const ac = candidate.accounting_consequences as Record<string, unknown>;
+  if (!isCanonicalId(ac.journal_entry_id) || !isDecimal(ac.realized_pnl) || !isDecimal(ac.cash_delta) || !isDecimal(ac.position_after)) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
+function isExposureGraph(value: unknown): value is ExposureGraph {
+  if (!hasExactKeys(value, [
+    "account_id",
+    "as_of_time",
+    "created_at",
+    "exposure_schema_version",
+    "factors",
+    "graph_id",
+    "gross_exposure",
+    "net_exposure",
+    "sectors",
+    "top_concentrations",
+    "unreconciled_discrepancy",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.exposure_schema_version !== 1 || !isCanonicalId(candidate.graph_id) || !isCanonicalId(candidate.account_id)) return false;
+  if (!isUtcTimestamp(candidate.as_of_time) || !isUtcTimestamp(candidate.created_at)) return false;
+  if (!isDecimal(candidate.gross_exposure) || !isDecimal(candidate.net_exposure) || typeof candidate.unreconciled_discrepancy !== "boolean") return false;
+  if (!Array.isArray(candidate.factors) || !Array.isArray(candidate.sectors) || !Array.isArray(candidate.top_concentrations)) return false;
+  for (const f of candidate.factors) {
+    if (!hasExactKeys(f, ["factor_name", "factor_variance_pct", "loading_bps"])) return false;
+    const fac = f as Record<string, unknown>;
+    if (typeof fac.factor_name !== "string" || typeof fac.loading_bps !== "number" || typeof fac.factor_variance_pct !== "string") return false;
+  }
+  for (const s of candidate.sectors) {
+    if (!hasExactKeys(s, ["exposure_usd", "sector_name", "weight_bps"])) return false;
+    const sec = s as Record<string, unknown>;
+    if (typeof sec.sector_name !== "string" || !isDecimal(sec.exposure_usd) || typeof sec.weight_bps !== "number") return false;
+  }
+  for (const c of candidate.top_concentrations) {
+    if (!hasExactKeys(c, ["instrument_id", "portfolio_pct", "position_value"])) return false;
+    const conc = c as Record<string, unknown>;
+    if (!isCanonicalId(conc.instrument_id) || !isDecimal(conc.position_value) || typeof conc.portfolio_pct !== "string") return false;
+  }
+  return true;
+}
+
+function isFundLedgerStatement(value: unknown): value is FundLedgerStatement {
+  if (!hasExactKeys(value, [
+    "account_id",
+    "balanced",
+    "created_at",
+    "ending_cash",
+    "fee_totals",
+    "ledger_schema_version",
+    "period_end",
+    "period_start",
+    "realized_pnl",
+    "starting_cash",
+    "statement_id",
+    "tax_lots",
+    "unrealized_pnl",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.ledger_schema_version !== 1 || !isCanonicalId(candidate.statement_id) || !isCanonicalId(candidate.account_id)) return false;
+  if (!isUtcTimestamp(candidate.period_start) || !isUtcTimestamp(candidate.period_end) || !isUtcTimestamp(candidate.created_at)) return false;
+  if (!isDecimal(candidate.starting_cash) || !isDecimal(candidate.ending_cash) || !isDecimal(candidate.realized_pnl) || !isDecimal(candidate.unrealized_pnl) || typeof candidate.balanced !== "boolean") return false;
+  if (!hasExactKeys(candidate.fee_totals, ["brokerage_commissions", "borrow_financing", "exchange_fees"])) return false;
+  const ft = candidate.fee_totals as Record<string, unknown>;
+  if (!isDecimal(ft.exchange_fees) || !isDecimal(ft.brokerage_commissions) || !isDecimal(ft.borrow_financing)) return false;
+  if (!Array.isArray(candidate.tax_lots)) return false;
+  for (const tl of candidate.tax_lots) {
+    if (!hasExactKeys(tl, ["acquired_at", "cost_basis", "disposition", "instrument_id", "lot_id", "quantity"])) return false;
+    const lot = tl as Record<string, unknown>;
+    if (!isCanonicalId(lot.lot_id) || !isCanonicalId(lot.instrument_id) || !isUtcTimestamp(lot.acquired_at) || !isDecimal(lot.quantity) || !isDecimal(lot.cost_basis) || !["OPEN", "CLOSED_FIFO", "CLOSED_SPECID"].includes(String(lot.disposition))) return false;
+  }
+  return true;
+}
+
+function isContinuityPolicy(value: unknown): value is ContinuityPolicy {
+  if (!hasExactKeys(value, [
+    "away_mode_permitted",
+    "broker_disconnect_action",
+    "created_at",
+    "feed_stale_threshold_seconds",
+    "heartbeat_interval_seconds",
+    "max_restarts_per_hour",
+    "policy_id",
+    "policy_schema_version",
+    "unattended_interval_minutes",
+  ])) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.policy_schema_version !== 1 || !isCanonicalId(candidate.policy_id)) return false;
+  if (!isPositiveInteger(candidate.unattended_interval_minutes) || !isPositiveInteger(candidate.heartbeat_interval_seconds) || !isPositiveInteger(candidate.max_restarts_per_hour) || !isPositiveInteger(candidate.feed_stale_threshold_seconds)) return false;
+  if (typeof candidate.away_mode_permitted !== "boolean") return false;
+  if (!["RETAIN_UNKNOWN_AND_ESCALATE", "CANCEL_LOCAL_WORKING_ONLY", "HOLD_STATE"].includes(String(candidate.broker_disconnect_action))) return false;
+  return isUtcTimestamp(candidate.created_at);
+}
+
 

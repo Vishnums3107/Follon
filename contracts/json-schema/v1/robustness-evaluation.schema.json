@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RobustnessEvaluation",
+  "description": "Deterministic robustness evaluation record covering walk-forward splits, leakage-aware validation, parameter neighborhood stability, and cost stress shocks (RES-05).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evaluation_schema_version",
+    "evaluation_id",
+    "strategy_version",
+    "hypothesis_id",
+    "walk_forward_windows",
+    "leakage_checks",
+    "parameter_stability",
+    "cost_shocks",
+    "uncertainty_score_bps",
+    "disposition",
+    "created_at"
+  ],
+  "properties": {
+    "evaluation_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "evaluation_id": {
+      "type": "string",
+      "pattern": "^eval\\.[a-z0-9_.-]+$"
+    },
+    "strategy_version": {
+      "type": "string"
+    },
+    "hypothesis_id": {
+      "type": "string",
+      "pattern": "^hyp\\.[a-z0-9_.-]+$"
+    },
+    "walk_forward_windows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "window_id",
+          "in_sample_start",
+          "in_sample_end",
+          "out_of_sample_start",
+          "out_of_sample_end",
+          "in_sample_return_bps",
+          "out_of_sample_return_bps",
+          "max_drawdown_bps"
+        ],
+        "properties": {
+          "window_id": { "type": "string" },
+          "in_sample_start": { "type": "string", "format": "date-time" },
+          "in_sample_end": { "type": "string", "format": "date-time" },
+          "out_of_sample_start": { "type": "string", "format": "date-time" },
+          "out_of_sample_end": { "type": "string", "format": "date-time" },
+          "in_sample_return_bps": { "type": "integer" },
+          "out_of_sample_return_bps": { "type": "integer" },
+          "max_drawdown_bps": { "type": "integer" }
+        }
+      }
+    },
+    "leakage_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "survivorship_bias_verified",
+        "lookahead_bias_verified",
+        "corporate_action_adjusted",
+        "quarantine_violations"
+      ],
+      "properties": {
+        "survivorship_bias_verified": { "type": "boolean" },
+        "lookahead_bias_verified": { "type": "boolean" },
+        "corporate_action_adjusted": { "type": "boolean" },
+        "quarantine_violations": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "parameter_stability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "perturbation_percent",
+        "neighborhood_variance_bps",
+        "degradation_cliff_detected"
+      ],
+      "properties": {
+        "perturbation_percent": { "type": "integer", "minimum": 0 },
+        "neighborhood_variance_bps": { "type": "integer", "minimum": 0 },
+        "degradation_cliff_detected": { "type": "boolean" }
+      }
+    },
+    "cost_shocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slippage_multiplier", "fee_multiplier", "stressed_return_bps"],
+        "properties": {
+          "slippage_multiplier": { "type": "string" },
+          "fee_multiplier": { "type": "string" },
+          "stressed_return_bps": { "type": "integer" }
+        }
+      }
+    },
+    "uncertainty_score_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["ROBUST", "FRAGILE", "LEAKAGE_DETECTED", "DEGRADED"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

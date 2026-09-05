@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "KnowledgeSnapshot",
+  "description": "Point-in-time knowledge graph record linking companies, instruments, filings, headlines, and exposures with availability timestamps (DATA-02).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "knowledge_schema_version",
+    "snapshot_id",
+    "as_of_time",
+    "entity_nodes",
+    "relationships",
+    "source_lineage_hashes",
+    "created_at"
+  ],
+  "properties": {
+    "knowledge_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^know\\.[a-z0-9_.-]+$"
+    },
+    "as_of_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "entity_nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entity_id", "entity_type", "name", "identifier"],
+        "properties": {
+          "entity_id": { "type": "string" },
+          "entity_type": { "type": "string", "enum": ["COMPANY", "INSTRUMENT", "FILING", "HEADLINE", "MACRO_EVENT"] },
+          "name": { "type": "string" },
+          "identifier": { "type": "string" }
+        }
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_entity_id", "relation_type", "target_entity_id", "effective_time", "provenance_hash"],
+        "properties": {
+          "source_entity_id": { "type": "string" },
+          "relation_type": { "type": "string" },
+          "target_entity_id": { "type": "string" },
+          "effective_time": { "type": "string", "format": "date-time" },
+          "provenance_hash": { "type": "string" }
+        }
+      }
+    },
+    "source_lineage_hashes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

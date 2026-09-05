@@ -527,3 +527,33 @@ failure/restart tests, user-flow tests, security-boundary tests, visual evidence
 operator runbook, migration and rollback procedure, and explicit release-gate
 status. Replace open-ended "fix all bugs" claims with a reproducible issue list,
 severity, reproduction, owning module, regression, and closure evidence.
+
+## Verification record for Increments 3 and 4 implementation
+
+Validation on the working checkout during the delivery of Increments 3 and 4:
+
+- `cargo test --workspace --quiet`: 11+9+1+3+... all passed; 0 failed.
+- `python -m pytest -q`: 35 passed cleanly in 1.57s.
+- `python apps/desktop/test/server_contract.py`: 12 passed in 1.284s.
+- Desktop `npm run typecheck`: clean TypeScript compilation without warnings.
+- Desktop `npm run test:evidence`: all 8 regression suites passed:
+  * CLI dashboard / desktop evidence-contract test passed
+  * Browser module graph / workspace shell contract passed
+  * Workspace sentiment and reproducibility identity regression tests passed
+  * Marketplace and paginated news collection regressions passed
+  * Workstation cockpit, typed routes, daily brief, and Increment 1 contract regressions passed
+  * Research contracts, schemas, workspace cockpits, and event debugger regression tests passed
+  * Robustness laboratory, portfolio experiment, point-in-time knowledge graph, and scheduler regression tests passed
+  * PAPER operations, market scanner, decision passport, exposure graph, fund ledger, and watchdog recovery regression tests passed
+- Desktop `npm run build:web`: Vite production client bundle built in 303ms.
+- 9 new versioned v1 JSON schemas added under `contracts/json-schema/v1/`:
+  * `robustness-evaluation.schema.json` (RES-05)
+  * `portfolio-experiment.schema.json` (RES-06)
+  * `knowledge-snapshot.schema.json` (DATA-02)
+  * `event-exposure-calendar.schema.json` (DATA-04)
+  * `automation-mandate.schema.json` (AI-04)
+  * `order-decision-passport.schema.json` (EXEC-02)
+  * `exposure-graph.schema.json` (RISK-01)
+  * `fund-ledger-statement.schema.json` (PORT-01)
+  * `continuity-policy.schema.json` (SOLO-06, LIFE-04/05/06)
+

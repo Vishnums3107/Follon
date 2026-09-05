@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ContinuityPolicy",
+  "description": "Continuity policy declaring permitted degraded modes, unattended intervals, restart budgets, escalation paths, and return-to-service criteria (SOLO-06, LIFE-04/05/06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy_schema_version",
+    "policy_id",
+    "unattended_interval_minutes",
+    "heartbeat_interval_seconds",
+    "max_restarts_per_hour",
+    "away_mode_permitted",
+    "broker_disconnect_action",
+    "feed_stale_threshold_seconds",
+    "created_at"
+  ],
+  "properties": {
+    "policy_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "policy_id": {
+      "type": "string",
+      "pattern": "^cont-pol\\.[a-z0-9_.-]+$"
+    },
+    "unattended_interval_minutes": { "type": "integer", "minimum": 5, "maximum": 480 },
+    "heartbeat_interval_seconds": { "type": "integer", "minimum": 1, "maximum": 60 },
+    "max_restarts_per_hour": { "type": "integer", "minimum": 1, "maximum": 10 },
+    "away_mode_permitted": { "type": "boolean" },
+    "broker_disconnect_action": {
+      "type": "string",
+      "enum": ["RETAIN_UNKNOWN_AND_ESCALATE", "CANCEL_LOCAL_WORKING_ONLY", "HOLD_STATE"]
+    },
+    "feed_stale_threshold_seconds": { "type": "integer", "minimum": 1 },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

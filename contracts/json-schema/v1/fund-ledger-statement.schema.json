@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FundLedgerStatement",
+  "description": "Attributable fund ledger statement reconciling trades to cash, tracking tax lots, corporate distributions, and journal balance invariants (PORT-01).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ledger_schema_version",
+    "statement_id",
+    "account_id",
+    "period_start",
+    "period_end",
+    "starting_cash",
+    "ending_cash",
+    "realized_pnl",
+    "unrealized_pnl",
+    "fee_totals",
+    "tax_lots",
+    "balanced",
+    "created_at"
+  ],
+  "properties": {
+    "ledger_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "statement_id": {
+      "type": "string",
+      "pattern": "^stmt\\.[a-z0-9_.-]+$"
+    },
+    "account_id": { "type": "string" },
+    "period_start": { "type": "string", "format": "date-time" },
+    "period_end": { "type": "string", "format": "date-time" },
+    "starting_cash": { "type": "string" },
+    "ending_cash": { "type": "string" },
+    "realized_pnl": { "type": "string" },
+    "unrealized_pnl": { "type": "string" },
+    "fee_totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exchange_fees", "brokerage_commissions", "borrow_financing"],
+      "properties": {
+        "exchange_fees": { "type": "string" },
+        "brokerage_commissions": { "type": "string" },
+        "borrow_financing": { "type": "string" }
+      }
+    },
+    "tax_lots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lot_id", "instrument_id", "acquired_at", "quantity", "cost_basis", "disposition"],
+        "properties": {
+          "lot_id": { "type": "string" },
+          "instrument_id": { "type": "string" },
+          "acquired_at": { "type": "string", "format": "date-time" },
+          "quantity": { "type": "string" },
+          "cost_basis": { "type": "string" },
+          "disposition": { "type": "string", "enum": ["OPEN", "CLOSED_FIFO", "CLOSED_SPECID"] }
+        }
+      }
+    },
+    "balanced": { "type": "boolean" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

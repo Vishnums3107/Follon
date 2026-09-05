@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EventExposureCalendar",
+  "description": "Point-in-time exposure calendar recording scheduled earnings, corporate actions, trading halts, expiry dates, and settlement obligations (DATA-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "calendar_schema_version",
+    "calendar_id",
+    "as_of_time",
+    "timezone",
+    "scheduled_events",
+    "quarantined_events_count",
+    "created_at"
+  ],
+  "properties": {
+    "calendar_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "calendar_id": {
+      "type": "string",
+      "pattern": "^cal\\.[a-z0-9_.-]+$"
+    },
+    "as_of_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "timezone": {
+      "type": "string"
+    },
+    "scheduled_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event_id", "instrument_id", "category", "scheduled_time", "status", "source_evidence"],
+        "properties": {
+          "event_id": { "type": "string" },
+          "instrument_id": { "type": "string" },
+          "category": { "type": "string", "enum": ["EARNINGS", "DIVIDEND", "STOCK_SPLIT", "TRADING_HALT", "OPTION_EXPIRY", "SETTLEMENT"] },
+          "scheduled_time": { "type": "string", "format": "date-time" },
+          "status": { "type": "string", "enum": ["SCHEDULED", "CONFIRMED", "CANCELLED", "COMPLETED"] },
+          "source_evidence": { "type": "string" }
+        }
+      }
+    },
+    "quarantined_events_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
