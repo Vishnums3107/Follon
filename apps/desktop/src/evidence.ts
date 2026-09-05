@@ -702,6 +702,112 @@ export type AdapterQualification = Readonly<{
   expires_at: string;
 }>;
 
+export type ChampionChallengerEvaluation = Readonly<{
+  champion_challenger_schema_version: 1;
+  evaluation_id: string;
+  champion_strategy_id: string;
+  challenger_strategy_id: string;
+  evaluation_window_start: string;
+  evaluation_window_end: string;
+  champion_return_bps: number;
+  challenger_return_bps: number;
+  champion_max_drawdown_bps: number;
+  challenger_max_drawdown_bps: number;
+  information_ratio_diff_bps: number;
+  drift_detected: boolean;
+  recommendation: "RETAIN_CHAMPION" | "PROMOTE_CHALLENGER" | "INITIATE_RETIREMENT_REVIEW" | "CONTINUE_SHADOW_MONITORING";
+  created_at: string;
+}>;
+
+export type CapabilityExecutionPlanner = Readonly<{
+  planner_schema_version: 1;
+  plan_id: string;
+  parent_order_id: string;
+  target_venue: string;
+  algorithm: "TWAP_SLICED" | "VWAP_PARTICIPATION" | "PASSIVE_PEG_QUEUE" | "ICEBERG_DISCRETIONARY";
+  max_volume_participation_pct: string;
+  passive_pegging_offset_bps: number;
+  schedule_slices: ReadonlyArray<Readonly<{
+    slice_sequence: number;
+    planned_release_time: string;
+    allocated_quantity: string;
+    order_kind: string;
+  }>>;
+  supported_capabilities_verified: boolean;
+  disposition: "VALIDATED_FOR_DISPATCH" | "UNSUPPORTED_ORDER_KIND" | "PARTICIPATION_CAP_EXCEEDED" | "VENUE_CAPABILITY_REJECTED";
+  created_at: string;
+}>;
+
+export type OperationsDiagnosisRunbook = Readonly<{
+  diagnosis_schema_version: 1;
+  diagnosis_id: string;
+  incident_id: string;
+  failing_component: string;
+  root_cause_summary: string;
+  cited_evidence_ids: readonly string[];
+  proposed_runbook_steps: ReadonlyArray<Readonly<{
+    step_number: number;
+    action_name: string;
+    target_service: string;
+    command_template: string;
+    is_idempotent: boolean;
+  }>>;
+  idempotency_certified: boolean;
+  trading_path_isolated: boolean;
+  approval_required: "OPERATOR_CONFIRMATION" | "AUTOMATED_IDEMPOTENT" | "ESCALATION_BLOCKED";
+  created_at: string;
+}>;
+
+export type ModelEvaluationBenchmark = Readonly<{
+  benchmark_schema_version: 1;
+  benchmark_id: string;
+  model_identifier: string;
+  evaluation_dataset_id: string;
+  factuality_score_bps: number;
+  citation_precision_bps: number;
+  injection_resistance_score_bps: number;
+  hallucination_rate_bps: number;
+  average_latency_ms: number;
+  token_cost_usd_per_million: string;
+  disposition: "QUALIFIED_FOR_ASSISTANCE" | "UNRELIABLE_CITATION" | "VULNERABLE_TO_INJECTION" | "EXCESSIVE_LATENCY";
+  evaluated_at: string;
+}>;
+
+export type StrategyCapsuleManifest = Readonly<{
+  capsule_schema_version: 1;
+  capsule_id: string;
+  strategy_id: string;
+  strategy_version: string;
+  bundle_sha256: string;
+  configuration_sha256: string;
+  dependency_lockfile_sha256: string;
+  runtime_target: string;
+  evaluation_receipt_id: string;
+  replay_instruction_command: string;
+  export_disposition: "VERIFIED_PORTABLE" | "MISSING_DEPENDENCY_LOCK" | "UNVERIFIED_EVALUATION" | "RESTRICTED_DATASET_RIGHTS";
+  packaged_at: string;
+}>;
+
+export type MultiAssetExpansionPlan = Readonly<{
+  expansion_schema_version: 1;
+  plan_id: string;
+  asset_class: "EQUITY_OPTION" | "SPOT_FX" | "COMMODITY_FUTURES" | "INDEX_FUTURES";
+  underlying_universe: readonly string[];
+  lifecycle_actions: ReadonlyArray<Readonly<{
+    action_id: string;
+    instrument_id: string;
+    action_kind: "OPTION_ROLL" | "OPTION_EXERCISE" | "FUTURES_ROLL" | "FX_SPOT_CONVERSION";
+    target_date: string;
+    contract_quantity: number;
+    estimated_cash_flow_usd: string;
+  }>>;
+  margin_requirement_usd: string;
+  settlement_currency: string;
+  reconciliation_clean: boolean;
+  operational_verdict: "READY_FOR_LIFECYCLE_EXECUTION" | "MARGIN_HEADROOM_BREACH" | "UNRECONCILED_LEG_MISMATCH" | "GATEWAY_DISCONNECTED";
+  created_at: string;
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -1063,6 +1169,90 @@ export function parseAdapterQualification(json: string): AdapterQualification {
   }
   if (!isAdapterQualification(value)) {
     throw new Error("Adapter qualification does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a champion/challenger evaluation and strategy retirement record (RES-08). */
+export function parseChampionChallengerEvaluation(json: string): ChampionChallengerEvaluation {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Champion challenger evaluation is not valid JSON.");
+  }
+  if (!isChampionChallengerEvaluation(value)) {
+    throw new Error("Champion challenger evaluation does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a capability-aware execution planner record (EXEC-04). */
+export function parseCapabilityExecutionPlanner(json: string): CapabilityExecutionPlanner {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Capability execution planner is not valid JSON.");
+  }
+  if (!isCapabilityExecutionPlanner(value)) {
+    throw new Error("Capability execution planner does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an operations diagnosis runbook record (AI-05). */
+export function parseOperationsDiagnosisRunbook(json: string): OperationsDiagnosisRunbook {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Operations diagnosis runbook is not valid JSON.");
+  }
+  if (!isOperationsDiagnosisRunbook(value)) {
+    throw new Error("Operations diagnosis runbook does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a model evaluation and portability benchmark record (AI-06). */
+export function parseModelEvaluationBenchmark(json: string): ModelEvaluationBenchmark {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Model evaluation benchmark is not valid JSON.");
+  }
+  if (!isModelEvaluationBenchmark(value)) {
+    throw new Error("Model evaluation benchmark does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a portable strategy capsule manifest record (ASSET-04). */
+export function parseStrategyCapsuleManifest(json: string): StrategyCapsuleManifest {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Strategy capsule manifest is not valid JSON.");
+  }
+  if (!isStrategyCapsuleManifest(value)) {
+    throw new Error("Strategy capsule manifest does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a multi-asset expansion and lifecycle plan record (PORT-02). */
+export function parseMultiAssetExpansionPlan(json: string): MultiAssetExpansionPlan {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Multi-asset expansion plan is not valid JSON.");
+  }
+  if (!isMultiAssetExpansionPlan(value)) {
+    throw new Error("Multi-asset expansion plan does not match the v1 evidence contract.");
   }
   return value;
 }
@@ -2543,6 +2733,165 @@ function isAdapterQualification(value: unknown): value is AdapterQualification {
   if (typeof candidate.single_writer_fenced !== "boolean" || typeof candidate.reconciliation_pass_rate_pct !== "string") return false;
   if (!["QUALIFIED", "PROVISIONAL", "EXPIRED", "REVOKED"].includes(String(candidate.operational_gate_status))) return false;
   return isUtcTimestamp(candidate.created_at) && isUtcTimestamp(candidate.expires_at);
+}
+
+function isChampionChallengerEvaluation(value: unknown): value is ChampionChallengerEvaluation {
+  if (!hasExactKeys(value, [
+    "challenger_max_drawdown_bps",
+    "challenger_return_bps",
+    "challenger_strategy_id",
+    "champion_challenger_schema_version",
+    "champion_max_drawdown_bps",
+    "champion_return_bps",
+    "champion_strategy_id",
+    "created_at",
+    "drift_detected",
+    "evaluation_id",
+    "evaluation_window_end",
+    "evaluation_window_start",
+    "information_ratio_diff_bps",
+    "recommendation",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.champion_challenger_schema_version !== 1 || !isCanonicalId(c.evaluation_id) || !isCanonicalId(c.champion_strategy_id) || !isCanonicalId(c.challenger_strategy_id)) return false;
+  if (!isUtcTimestamp(c.evaluation_window_start) || !isUtcTimestamp(c.evaluation_window_end) || !isUtcTimestamp(c.created_at)) return false;
+  if (typeof c.champion_return_bps !== "number" || typeof c.challenger_return_bps !== "number" || typeof c.champion_max_drawdown_bps !== "number" || typeof c.challenger_max_drawdown_bps !== "number" || typeof c.information_ratio_diff_bps !== "number" || typeof c.drift_detected !== "boolean") return false;
+  return ["RETAIN_CHAMPION", "PROMOTE_CHALLENGER", "INITIATE_RETIREMENT_REVIEW", "CONTINUE_SHADOW_MONITORING"].includes(String(c.recommendation));
+}
+
+function isCapabilityExecutionPlanner(value: unknown): value is CapabilityExecutionPlanner {
+  if (!hasExactKeys(value, [
+    "algorithm",
+    "created_at",
+    "disposition",
+    "max_volume_participation_pct",
+    "parent_order_id",
+    "passive_pegging_offset_bps",
+    "plan_id",
+    "planner_schema_version",
+    "schedule_slices",
+    "supported_capabilities_verified",
+    "target_venue",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.planner_schema_version !== 1 || !isCanonicalId(c.plan_id) || !isCanonicalId(c.parent_order_id) || !isCanonicalId(c.target_venue)) return false;
+  if (!["TWAP_SLICED", "VWAP_PARTICIPATION", "PASSIVE_PEG_QUEUE", "ICEBERG_DISCRETIONARY"].includes(String(c.algorithm))) return false;
+  if (typeof c.max_volume_participation_pct !== "string" || typeof c.passive_pegging_offset_bps !== "number" || typeof c.supported_capabilities_verified !== "boolean") return false;
+  if (!Array.isArray(c.schedule_slices) || c.schedule_slices.length === 0) return false;
+  for (const s of c.schedule_slices) {
+    if (!hasExactKeys(s, ["allocated_quantity", "order_kind", "planned_release_time", "slice_sequence"])) return false;
+    const slice = s as Record<string, unknown>;
+    if (!isPositiveInteger(slice.slice_sequence) || !isUtcTimestamp(slice.planned_release_time) || !isDecimal(slice.allocated_quantity) || typeof slice.order_kind !== "string") return false;
+  }
+  if (!["VALIDATED_FOR_DISPATCH", "UNSUPPORTED_ORDER_KIND", "PARTICIPATION_CAP_EXCEEDED", "VENUE_CAPABILITY_REJECTED"].includes(String(c.disposition))) return false;
+  return isUtcTimestamp(c.created_at);
+}
+
+function isOperationsDiagnosisRunbook(value: unknown): value is OperationsDiagnosisRunbook {
+  if (!hasExactKeys(value, [
+    "approval_required",
+    "cited_evidence_ids",
+    "created_at",
+    "diagnosis_id",
+    "diagnosis_schema_version",
+    "failing_component",
+    "idempotency_certified",
+    "incident_id",
+    "proposed_runbook_steps",
+    "root_cause_summary",
+    "trading_path_isolated",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.diagnosis_schema_version !== 1 || !isCanonicalId(c.diagnosis_id) || !isCanonicalId(c.incident_id)) return false;
+  if (typeof c.failing_component !== "string" || typeof c.root_cause_summary !== "string" || typeof c.idempotency_certified !== "boolean" || typeof c.trading_path_isolated !== "boolean") return false;
+  if (!Array.isArray(c.cited_evidence_ids) || c.cited_evidence_ids.length === 0 || !c.cited_evidence_ids.every((id) => typeof id === "string")) return false;
+  if (!Array.isArray(c.proposed_runbook_steps) || c.proposed_runbook_steps.length === 0) return false;
+  for (const st of c.proposed_runbook_steps) {
+    if (!hasExactKeys(st, ["action_name", "command_template", "is_idempotent", "step_number", "target_service"])) return false;
+    const step = st as Record<string, unknown>;
+    if (!isPositiveInteger(step.step_number) || typeof step.action_name !== "string" || typeof step.target_service !== "string" || typeof step.command_template !== "string" || typeof step.is_idempotent !== "boolean") return false;
+  }
+  if (!["OPERATOR_CONFIRMATION", "AUTOMATED_IDEMPOTENT", "ESCALATION_BLOCKED"].includes(String(c.approval_required))) return false;
+  return isUtcTimestamp(c.created_at);
+}
+
+function isModelEvaluationBenchmark(value: unknown): value is ModelEvaluationBenchmark {
+  if (!hasExactKeys(value, [
+    "average_latency_ms",
+    "benchmark_id",
+    "benchmark_schema_version",
+    "citation_precision_bps",
+    "disposition",
+    "evaluated_at",
+    "evaluation_dataset_id",
+    "factuality_score_bps",
+    "hallucination_rate_bps",
+    "injection_resistance_score_bps",
+    "model_identifier",
+    "token_cost_usd_per_million",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.benchmark_schema_version !== 1 || !isCanonicalId(c.benchmark_id) || typeof c.model_identifier !== "string" || !isCanonicalId(c.evaluation_dataset_id)) return false;
+  if (!isNonNegativeInteger(c.factuality_score_bps) || c.factuality_score_bps > 10000) return false;
+  if (!isNonNegativeInteger(c.citation_precision_bps) || c.citation_precision_bps > 10000) return false;
+  if (!isNonNegativeInteger(c.injection_resistance_score_bps) || c.injection_resistance_score_bps > 10000) return false;
+  if (!isNonNegativeInteger(c.hallucination_rate_bps) || c.hallucination_rate_bps > 10000) return false;
+  if (!isNonNegativeInteger(c.average_latency_ms) || typeof c.token_cost_usd_per_million !== "string") return false;
+  if (!["QUALIFIED_FOR_ASSISTANCE", "UNRELIABLE_CITATION", "VULNERABLE_TO_INJECTION", "EXCESSIVE_LATENCY"].includes(String(c.disposition))) return false;
+  return isUtcTimestamp(c.evaluated_at);
+}
+
+function isStrategyCapsuleManifest(value: unknown): value is StrategyCapsuleManifest {
+  if (!hasExactKeys(value, [
+    "bundle_sha256",
+    "capsule_id",
+    "capsule_schema_version",
+    "configuration_sha256",
+    "dependency_lockfile_sha256",
+    "evaluation_receipt_id",
+    "export_disposition",
+    "packaged_at",
+    "replay_instruction_command",
+    "runtime_target",
+    "strategy_id",
+    "strategy_version",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.capsule_schema_version !== 1 || !isCanonicalId(c.capsule_id) || !isCanonicalId(c.strategy_id) || typeof c.strategy_version !== "string") return false;
+  if (!isHash(c.bundle_sha256) || !isHash(c.configuration_sha256) || !isHash(c.dependency_lockfile_sha256)) return false;
+  if (typeof c.runtime_target !== "string" || !isCanonicalId(c.evaluation_receipt_id) || typeof c.replay_instruction_command !== "string") return false;
+  if (!["VERIFIED_PORTABLE", "MISSING_DEPENDENCY_LOCK", "UNVERIFIED_EVALUATION", "RESTRICTED_DATASET_RIGHTS"].includes(String(c.export_disposition))) return false;
+  return isUtcTimestamp(c.packaged_at);
+}
+
+function isMultiAssetExpansionPlan(value: unknown): value is MultiAssetExpansionPlan {
+  if (!hasExactKeys(value, [
+    "asset_class",
+    "created_at",
+    "expansion_schema_version",
+    "lifecycle_actions",
+    "margin_requirement_usd",
+    "operational_verdict",
+    "plan_id",
+    "reconciliation_clean",
+    "settlement_currency",
+    "underlying_universe",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.expansion_schema_version !== 1 || !isCanonicalId(c.plan_id)) return false;
+  if (!["EQUITY_OPTION", "SPOT_FX", "COMMODITY_FUTURES", "INDEX_FUTURES"].includes(String(c.asset_class))) return false;
+  if (!Array.isArray(c.underlying_universe) || c.underlying_universe.length === 0 || !c.underlying_universe.every((u) => typeof u === "string")) return false;
+  if (!Array.isArray(c.lifecycle_actions) || c.lifecycle_actions.length === 0) return false;
+  for (const a of c.lifecycle_actions) {
+    if (!hasExactKeys(a, ["action_id", "action_kind", "contract_quantity", "estimated_cash_flow_usd", "instrument_id", "target_date"])) return false;
+    const act = a as Record<string, unknown>;
+    if (!isCanonicalId(act.action_id) || !isCanonicalId(act.instrument_id)) return false;
+    if (!["OPTION_ROLL", "OPTION_EXERCISE", "FUTURES_ROLL", "FX_SPOT_CONVERSION"].includes(String(act.action_kind))) return false;
+    if (!isUtcTimestamp(act.target_date) || !isPositiveInteger(act.contract_quantity) || !isDecimal(act.estimated_cash_flow_usd)) return false;
+  }
+  if (!isDecimal(c.margin_requirement_usd) || typeof c.settlement_currency !== "string" || typeof c.reconciliation_clean !== "boolean") return false;
+  if (!["READY_FOR_LIFECYCLE_EXECUTION", "MARGIN_HEADROOM_BREACH", "UNRECONCILED_LEG_MISMATCH", "GATEWAY_DISCONNECTED"].includes(String(c.operational_verdict))) return false;
+  return isUtcTimestamp(c.created_at);
 }
 
 

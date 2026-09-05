@@ -594,3 +594,45 @@ Validation on the working checkout during the delivery of Increments 5 and 6 (Me
   * `sandbox-preview-panel` (Marketplace)
   * `adapter-qualification-panel` (Administration)
 
+## Verification record for Section G Connected Evidence & Advanced Capabilities
+
+Validation on the working checkout completing the entire end-to-end product plan (Section G Signature Connected Experiences & Advanced Capabilities RES-08, EXEC-04, AI-05, AI-06, ASSET-04, PORT-02):
+
+- `cargo test --workspace --quiet`: passed cleanly across all packages; 0 failed.
+- `python -m pytest -q`: 35 passed cleanly in 2.61s.
+- `python apps/desktop/test/server_contract.py`: 12 passed in 1.252s.
+- Desktop `npm run typecheck`: clean TypeScript compilation without errors or warnings.
+- Desktop `npm run test:evidence`: all 10 regression suites passed:
+  * CLI dashboard / desktop evidence-contract test passed
+  * Browser module graph / workspace shell contract passed
+  * Workspace sentiment and reproducibility identity regression tests passed
+  * Marketplace and paginated news collection regressions passed
+  * Workstation cockpit, typed routes, daily brief, and Increment 1 contract regressions passed
+  * Research contracts, schemas, workspace cockpits, and event debugger regression tests passed cleanly
+  * Robustness laboratory, portfolio experiment, point-in-time knowledge graph, and scheduler regression tests passed cleanly
+  * PAPER operations, market scanner, decision passport, exposure graph, fund ledger, and watchdog recovery regression tests passed cleanly
+  * Measured depth & multi-asset expansion regression tests (Increments 5 & 6) passed cleanly
+  * Connected evidence & advanced capabilities regression tests passed cleanly
+- Desktop `npm run build:web`: Vite production client bundle built in 260ms.
+- 6 new versioned v1 JSON schemas added under `contracts/json-schema/v1/`:
+  * `champion-challenger-evaluation.schema.json` (RES-08)
+  * `capability-execution-planner.schema.json` (EXEC-04)
+  * `operations-diagnosis-runbook.schema.json` (AI-05)
+  * `model-evaluation-benchmark.schema.json` (AI-06)
+  * `strategy-capsule-manifest.schema.json` (ASSET-04)
+  * `multi-asset-expansion-plan.schema.json` (PORT-02)
+- Domain types, typeguards, and parsing functions added to `apps/desktop/src/evidence.ts`.
+- Section G signature connected experiences and capability panels integrated in `apps/desktop/src/workspaces.ts`:
+  * `#away-desk-readiness-panel` in Command Center (Experience 5: "Can I safely leave the desk?", SOLO-05, SOLO-06, EXEC-01)
+  * `#input-correction-panel` in Research Lab (Experience 4: "What changes if this input is corrected?", DATA-01, DATA-03, Lineage)
+  * `#champion-challenger-panel` in Strategy Studio (RES-08)
+  * `#strategy-invalidation-panel` in Strategy Studio (Experience 2: "Show what would invalidate this strategy?", RES-01/04/05/08, AI-03)
+  * `#execution-planner-panel` in Execution Blotter (EXEC-04)
+  * `#joint-correlation-panel` in Risk Cockpit (Experience 3: "Why are these different strategies losing together?", RES-06, DATA-05, RISK-01)
+  * `#multi-asset-panel` in Portfolio (PORT-02: Options/FX/Futures roll & settlement planning)
+  * `#explain-moment-panel` in Replay & Incidents (Experience 1: "Explain this moment", SOLO-01, RES-03, DATA-02, EXEC-02)
+  * `#strategy-capsule-panel` in Marketplace (ASSET-04)
+  * `#operations-assistant-panel` in Administration (AI-05)
+  * `#model-evaluation-panel` in Administration (AI-06)
+  * `#workspace-rebuild-panel` in Administration (Experience 6: "Rebuild my entire workspace", LIFE-01..03)
+

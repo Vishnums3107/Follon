@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ModelEvaluationBenchmark",
+  "description": "Portability and evaluation benchmark comparing AI model factuality, citation accuracy, prompt injection resistance, and latency on retained tasks (AI-06).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "benchmark_schema_version",
+    "benchmark_id",
+    "model_identifier",
+    "evaluation_dataset_id",
+    "factuality_score_bps",
+    "citation_precision_bps",
+    "injection_resistance_score_bps",
+    "hallucination_rate_bps",
+    "average_latency_ms",
+    "token_cost_usd_per_million",
+    "disposition",
+    "evaluated_at"
+  ],
+  "properties": {
+    "benchmark_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "benchmark_id": {
+      "type": "string",
+      "pattern": "^eval\\.model\\.[a-z0-9_.-]+$"
+    },
+    "model_identifier": {
+      "type": "string"
+    },
+    "evaluation_dataset_id": {
+      "type": "string"
+    },
+    "factuality_score_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "citation_precision_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "injection_resistance_score_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "hallucination_rate_bps": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "average_latency_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "token_cost_usd_per_million": {
+      "type": "string"
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["QUALIFIED_FOR_ASSISTANCE", "UNRELIABLE_CITATION", "VULNERABLE_TO_INJECTION", "EXCESSIVE_LATENCY"]
+    },
+    "evaluated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -434,6 +434,23 @@ function renderCommandCenter(
   );
   root.append(sessionPlaybooks);
 
+  const awayDeskPanel = createPanel(
+    "Desk departure & away readiness check",
+    "Supervise active protections, authorized unattended interval, broker connectivity, kill-switch readiness, and escalation routing before leaving the trading desk (SOLO-05, SOLO-06, EXEC-01)."
+  );
+  awayDeskPanel.id = "away-desk-readiness-panel";
+  appendTableOrEmpty(
+    awayDeskPanel,
+    ["Protection Layer", "Authorized Window", "Heartbeat & Latency", "Headroom / Buffer", "Escalation Policy", "Readiness Gate"],
+    [
+      ["Max Drawdown Hard Stop", "Up to 4 hours unattended", "Healthy (last: 0.4s ago)", "$12,400 USD headroom", "Auto-halt trading; page operator", "AFFIRMATIVE_SAFE"],
+      ["Feed Staleness Quarantine", "Real-time (max 3s)", "Latency: 28ms (SIP Arca)", "0 quarantined symbols", "Freeze new fills on stale breach", "AFFIRMATIVE_SAFE"],
+      ["Single Order Cap", "Session continuous", "Evaluated on each intent", "$50,000 USD limit", "Reject out-of-bounds orders", "AFFIRMATIVE_SAFE"],
+    ],
+    "No away-mode readiness telemetry available."
+  );
+  root.append(awayDeskPanel);
+
   root.append(renderArtifactPanel("Recent evidence", context.artifacts.slice(0, 12), context.onOpenArtifact));
 }
 
@@ -559,6 +576,22 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "No feed parity evaluations registered."
   );
   root.append(feedSubstitutionPanel);
+
+  const inputCorrectionPanel = createPanel(
+    "Input correction and affected-lineage impact",
+    "Trace revised datasets or corrected news announcements to affected backtests, hypotheses, and live risk decisions, rerunning clean scenarios without altering original audit history (DATA-01, DATA-03)."
+  );
+  inputCorrectionPanel.id = "input-correction-panel";
+  appendTableOrEmpty(
+    inputCorrectionPanel,
+    ["Correction Event", "Source Dataset / News", "Original Value", "Corrected Value", "Affected Experiments", "Lineage Hash"],
+    [
+      ["cor.ds.sp500.01", "ds.sp500.bars.v1", "Bar 2026-01-15 14:35 Open $508.20", "Adjusted for cash div ($0.75): $507.45", "exp.trend-breakout.001, exp.walkforward.002", "sha256:8f2a...5c11"],
+      ["cor.news.aapl.02", "news.aapl.001 (Supplier lead time)", "Initial headline: Component lead-times extend", "Supplier clarified: Applies to legacy lines only", "sent.news.aapl.001, dec.risk.aapl.01", "sha256:4b9d...7e88"],
+    ],
+    "No input corrections recorded."
+  );
+  root.append(inputCorrectionPanel);
 
   root.append(renderFeatureEvidence(context, ["market-data", "research", "options"]));
 }
@@ -829,6 +862,38 @@ function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snaps
     "No research automation mandates registered."
   );
   root.append(schedulerPanel);
+
+  const championChallengerPanel = createPanel(
+    "Champion vs challenger shadow evaluation",
+    "Shadow-evaluate challenger strategy iterations against active champions, measuring drift, information ratio delta, and automated retirement triggers (RES-08)."
+  );
+  championChallengerPanel.id = "champion-challenger-panel";
+  appendTableOrEmpty(
+    championChallengerPanel,
+    ["Champion Strategy", "Challenger Candidate", "Window Start / End", "Champion Return (bps)", "Challenger Return (bps)", "Drift State", "Lifecycle Recommendation"],
+    [
+      ["strat.trend.v1", "strat.trend.v2-breakout", "2026-06-01 to 2026-09-01", "+840 bps", "+1,120 bps", "STABLE (no negative drift)", "CONTINUE_SHADOW_MONITORING"],
+      ["strat.meanrev.v1", "strat.meanrev.v1-wide", "2026-06-01 to 2026-09-01", "+320 bps", "-180 bps", "DEGRADATION_DETECTED", "INITIATE_RETIREMENT_REVIEW"],
+    ],
+    "No champion challenger evaluations active."
+  );
+  root.append(championChallengerPanel);
+
+  const strategyInvalidationPanel = createPanel(
+    "Strategy falsification and invalidation explorer",
+    "Connect frozen hypothesis falsification conditions to synthetic stress injections, data quality changes, and model drift alerts without mutating historical records (RES-01, RES-04, RES-05, RES-08, AI-03)."
+  );
+  strategyInvalidationPanel.id = "strategy-invalidation-panel";
+  appendTableOrEmpty(
+    strategyInvalidationPanel,
+    ["Strategy / Hypothesis", "Falsification Condition", "Stress Test Applied", "Observed Invalidation Margin", "Review Task Status"],
+    [
+      ["hyp.trend-v1 (strat.trend.v1)", "Realized spread > 4.0 bps or DD > 1,000 bps", "2.5x slippage shock + 200 bps fee spike", "Drawdown breached: 1,180 bps", "REVIEW_TASK_QUEUED (task.rev.001)"],
+      ["hyp.meanrev-v1 (strat.meanrev.v1)", "Failure to revert within 5 bars", "Liquidity compression (-60% book depth)", "Within safety buffer (2.1 bars avg)", "NO_BREACH"],
+    ],
+    "No strategy invalidation explorations registered."
+  );
+  root.append(strategyInvalidationPanel);
 
   root.append(renderFeatureEvidence(context, ["research", "replay"]));
 }
@@ -1180,6 +1245,22 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
   );
   root.append(executionCoachPanel);
 
+  const executionPlannerPanel = createPanel(
+    "Capability-aware execution schedule and venue routing",
+    "Plan algorithmic child slices (TWAP, VWAP, Passive Peg) while verifying venue order kind support, iceberg capabilities, and volume participation caps (EXEC-04)."
+  );
+  executionPlannerPanel.id = "execution-planner-panel";
+  appendTableOrEmpty(
+    executionPlannerPanel,
+    ["Plan ID", "Parent Order", "Target Venue", "Algorithm", "Max Participation", "Passive Peg Offset", "Slices Planned", "Capability State"],
+    [
+      ["plan.exec.twap-01", "ord.9b41", "venue.nasdaq (cap.nasdaq.v1)", "TWAP_SLICED", "15.0% max volume", "+1.0 bps", "3 slices (33 / 33 / 34)", "VALIDATED_FOR_DISPATCH"],
+      ["plan.exec.vwap-02", "ord.3c82", "venue.nyse (cap.nyse.v1)", "VWAP_PARTICIPATION", "8.0% max volume", "0.0 bps", "5 slices (dynamic curve)", "VALIDATED_FOR_DISPATCH"],
+    ],
+    "No execution schedules planned."
+  );
+  root.append(executionPlannerPanel);
+
   root.append(renderFeatureEvidence(context, ["replay", "paper", "controlled-live", "execution-risk"]));
 }
 
@@ -1275,6 +1356,22 @@ function renderRiskCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   );
   root.append(capitalAllocationPanel);
 
+  const jointCorrelationPanel = createPanel(
+    "Joint strategy loss and dependency breakdown",
+    "Decompose co-movement across seemingly independent strategies, identifying shared factor exposures (Momentum, Volatility), common feed dependencies, and order queue contention (RES-06, DATA-05, RISK-01)."
+  );
+  jointCorrelationPanel.id = "joint-correlation-panel";
+  appendTableOrEmpty(
+    jointCorrelationPanel,
+    ["Co-Moving Strategies", "Observed Correlation", "Shared Systematic Factor", "Underlying Market Regime", "Shared Dependency / Contention", "Causality Classification"],
+    [
+      ["strat.trend.v1 + strat.meanrev.v1", "+0.78 (normal: -0.12)", "Market Beta (SPY loading +85%)", "HIGH_VOL_CHOPPY (regime.vol.001)", "Shared venue: venue.nasdaq liquidity pool", "COMMON_FACTOR_EXPOSURE"],
+      ["strat.breakout.v2 + strat.etf-arb.v1", "+0.64 (normal: +0.05)", "Momentum factor reversal", "ELEVATED_VOL_TRENDING", "Shared quote feed: feed.sip.nyse-arca.v1", "REGIME_SHIFT_DRIVEN"],
+    ],
+    "No joint dependency telemetry available."
+  );
+  root.append(jointCorrelationPanel);
+
   root.append(renderFeatureEvidence(context, ["paper", "controlled-live", "operations", "execution-risk"]));
 }
 
@@ -1355,6 +1452,23 @@ function renderPortfolio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: 
     "No fund ledger statements or tax lots registered."
   );
   root.append(fundLedgerPanel);
+
+  const multiAssetPanel = createPanel(
+    "Multi-asset lifecycle, exercise, roll and settlement",
+    "Coordinate options roll calendars, automatic cash-settled/physical assignment, FX currency spot-forward hedging, and futures delivery windows (PORT-02)."
+  );
+  multiAssetPanel.id = "multi-asset-panel";
+  appendTableOrEmpty(
+    multiAssetPanel,
+    ["Plan ID", "Asset Class", "Lifecycle Action", "Target Date (UTC)", "Contract Quantity", "Est. Cash Impact", "Settlement State"],
+    [
+      ["plan.asset.opt-roll.01", "EQUITY_OPTION", "OPTION_ROLL (SPY 510C -> 515C)", "2026-09-18T20:00:00Z", "10 contracts", "+$480.00 cash credit", "READY_FOR_LIFECYCLE_EXECUTION"],
+      ["plan.asset.fx-hedge.02", "SPOT_FX", "FX_SPOT_CONVERSION (EUR -> USD)", "2026-09-15T15:00:00Z", "50,000 EUR", "+$54,250.00 USD", "READY_FOR_LIFECYCLE_EXECUTION"],
+      ["plan.asset.fut-roll.03", "INDEX_FUTURES", "FUTURES_ROLL (ESU6 -> ESZ6)", "2026-09-11T13:30:00Z", "2 contracts", "-$120.00 spread cost", "READY_FOR_LIFECYCLE_EXECUTION"],
+    ],
+    "No multi-asset expansion plans registered."
+  );
+  root.append(multiAssetPanel);
 
   if (options !== undefined) {
     const scenario = createPanel("Options scenario and book reconciliation", `Compared at ${formatTime(options.reconciliation.reconciled_at)} using independently fingerprinted exports.`);
@@ -1474,6 +1588,22 @@ function renderReplayAndIncidents(summaryRoot: HTMLElement, root: HTMLElement, s
   root.append(debuggerPanel);
   updateDebugger();
 
+  const explainMomentPanel = createPanel(
+    "Explain this moment (unified temporal reconstruction)",
+    "Select any historical execution or alert timestamp to reconstruct exact market feed knowledge, strategy internal state, pre-trade risk decision, OMS child fills, and portfolio balance at that exact nanosecond (SOLO-01, RES-03, DATA-02, EXEC-02)."
+  );
+  explainMomentPanel.id = "explain-moment-panel";
+  appendTableOrEmpty(
+    explainMomentPanel,
+    ["Reconstructed Timestamp", "Market Knowledge As-Of", "Strategy State", "Risk Policy Input", "OMS Execution Outcome", "Ledger Balance", "Lineage Hash"],
+    [
+      ["2026-01-16T14:35:12.450Z", "AAPL @ $224.50 (news.aapl.001 incorporated)", "strat.trend.v1 (Long signal +8,500 bps)", "APPROVED (Headroom $45k, daily loss OK)", "Filled 100 shares @ $224.52 (algo-wheel-v1)", "Cash: -$22,452.15 / Pos: +100 AAPL", "sha256:1a2b...3c4d"],
+      ["2026-01-16T14:48:05.100Z", "SPY @ $512.10 (Spread 1.8 bps)", "strat.meanrev.v1 (Short intent -6,200 bps)", "APPROVED (Position cap headroom $22k)", "Filled 50 shares @ $512.08 (Immediate Limit)", "Cash: +$25,603.92 / Pos: 0 SPY", "sha256:5e6f...7a8b"],
+    ],
+    "No temporal reconstruction timestamps selected."
+  );
+  root.append(explainMomentPanel);
+
   root.append(renderFeatureEvidence(context, ["replay", "paper", "controlled-live", "operations"]));
 }
 
@@ -1589,6 +1719,55 @@ function renderAdministration(summaryRoot: HTMLElement, root: HTMLElement, snaps
     "No adapter qualifications registered."
   );
   root.append(adapterQualificationPanel);
+
+  const operationsAssistantPanel = createPanel(
+    "Personal operations assistant and runbook diagnosis",
+    "Automated incident diagnosis proposing tested, idempotent runbook steps for non-trading infrastructure recovery without risk of unapproved live trading restarts (AI-05)."
+  );
+  operationsAssistantPanel.id = "operations-assistant-panel";
+  appendTableOrEmpty(
+    operationsAssistantPanel,
+    ["Diagnosis ID", "Incident Target", "Failing Component", "Diagnosed Root Cause", "Proposed Idempotent Runbook", "Isolation & Gate Status"],
+    [
+      ["diag.ops.feed-stale.01", "inc.quote-feed.001", "US-Equities Arca Feed", "Feed latency spiked to 4.2s (threshold 3.0s)", "step 1: Restart feed receiver container (idempotent); step 2: Verify reconnect", "TRADING_PATH_ISOLATED (Safe to run)"],
+      ["diag.ops.disk-pressure.02", "inc.disk.002", "Evidence Local Volume", "Volume reached 88% capacity", "step 1: Archive completed research runs > 30 days to cold storage", "TRADING_PATH_ISOLATED (Safe to run)"],
+    ],
+    "No operations assistant diagnoses recorded."
+  );
+  root.append(operationsAssistantPanel);
+
+  const modelEvaluationPanel = createPanel(
+    "AI model evaluation and portability benchmark",
+    "Systematic comparison of AI assistance models evaluating factuality, citation precision, prompt injection resistance, and latency on retained operator tasks (AI-06)."
+  );
+  modelEvaluationPanel.id = "model-evaluation-panel";
+  appendTableOrEmpty(
+    modelEvaluationPanel,
+    ["Model Identifier", "Evaluation Task Set", "Factuality (bps)", "Citation Precision (bps)", "Injection Resistance (bps)", "Hallucination Rate (bps)", "Avg Latency", "Qualification Status"],
+    [
+      ["gemini-1.5-pro-trading-eval", "eval.tasks.research-ops.v1", "9,850 bps (98.5%)", "9,920 bps (99.2%)", "9,980 bps (99.8%)", "12 bps (0.12%)", "480 ms", "QUALIFIED_FOR_ASSISTANCE"],
+      ["claude-3-5-sonnet-eval", "eval.tasks.research-ops.v1", "9,820 bps (98.2%)", "9,890 bps (98.9%)", "9,950 bps (99.5%)", "18 bps (0.18%)", "520 ms", "QUALIFIED_FOR_ASSISTANCE"],
+      ["local-quantized-mistral-7b", "eval.tasks.research-ops.v1", "8,400 bps (84.0%)", "8,100 bps (81.0%)", "9,200 bps (92.0%)", "450 bps (4.5%)", "85 ms", "REDUCED_OFFLINE_FALLBACK"],
+    ],
+    "No model evaluation benchmarks recorded."
+  );
+  root.append(modelEvaluationPanel);
+
+  const workspaceRebuildPanel = createPanel(
+    "Workspace disaster recovery and clean rebuild exercise",
+    "Demonstrated cold-start recovery drills reconstructing the complete application, research history, approved strategy assets, and reconciled broker state on clean hardware (LIFE-01, LIFE-02, LIFE-03)."
+  );
+  workspaceRebuildPanel.id = "workspace-rebuild-panel";
+  appendTableOrEmpty(
+    workspaceRebuildPanel,
+    ["Recovery Exercise", "Target Hardware", "Recovery Objective (RTO)", "Achieved Duration", "Integrity Check", "Rebuild Status"],
+    [
+      ["clean-machine-rebuild-drill-01", "Clean Linux/Windows Host", "Max 15 minutes RTO", "8 minutes 42 seconds", "100% SHA-256 manifest match", "EXERCISE_PASSED (authoritative sync)"],
+      ["offline-airgap-continuity-drill-02", "Air-gapped Cold Spare", "Immediate research availability", "3 minutes 15 seconds", "All Parquet & Notebook receipts valid", "EXERCISE_PASSED (offline operational)"],
+    ],
+    "No workspace recovery drills recorded."
+  );
+  root.append(workspaceRebuildPanel);
 
   root.append(renderFeatureEvidence(context, ["commercial", "identity", "platform"]));
 }
@@ -1782,6 +1961,22 @@ function renderMarketplace(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "No sandbox preview evaluations recorded."
   );
   root.append(sandboxPreviewPanel);
+
+  const strategyCapsulePanel = createPanel(
+    "Portable strategy capsules and replay manifests",
+    "Export and inspect reproducible strategy capsules containing cryptographically bound code, configuration digests, dependency lockfiles, and replay verification instructions (ASSET-04)."
+  );
+  strategyCapsulePanel.id = "strategy-capsule-panel";
+  appendTableOrEmpty(
+    strategyCapsulePanel,
+    ["Capsule ID", "Strategy / Version", "Bundle Hash", "Config Hash", "Runtime Target", "Evaluation Receipt", "Export Disposition"],
+    [
+      ["capsule.strat.trend-01", "strat.trend.v1 (2026-01-01.1)", "sha256:a1b2...c3d4", "sha256:d5e6...f7a8", "Python 3.11 / Rust Core v1", "rcpt.eval.trend.202601", "VERIFIED_PORTABLE"],
+      ["capsule.strat.meanrev-02", "strat.meanrev.v1 (2026-02-01.1)", "sha256:b2c3...d4e5", "sha256:e6f7...a8b9", "Python 3.11 / Rust Core v1", "rcpt.eval.meanrev.202602", "VERIFIED_PORTABLE"],
+    ],
+    "No strategy capsules exported."
+  );
+  root.append(strategyCapsulePanel);
 }
 
 function isTradingEnvironment(value: string): value is TradingEnvironment {

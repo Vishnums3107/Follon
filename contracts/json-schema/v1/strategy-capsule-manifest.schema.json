@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StrategyCapsuleManifest",
+  "description": "Portable strategy capsule packaging signed code, configuration, dependency lockfiles, evaluation receipts, and replay verification instructions (ASSET-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capsule_schema_version",
+    "capsule_id",
+    "strategy_id",
+    "strategy_version",
+    "bundle_sha256",
+    "configuration_sha256",
+    "dependency_lockfile_sha256",
+    "runtime_target",
+    "evaluation_receipt_id",
+    "replay_instruction_command",
+    "export_disposition",
+    "packaged_at"
+  ],
+  "properties": {
+    "capsule_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "capsule_id": {
+      "type": "string",
+      "pattern": "^capsule\\.[a-z0-9_.-]+$"
+    },
+    "strategy_id": {
+      "type": "string"
+    },
+    "strategy_version": {
+      "type": "string"
+    },
+    "bundle_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "configuration_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "dependency_lockfile_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "runtime_target": {
+      "type": "string"
+    },
+    "evaluation_receipt_id": {
+      "type": "string"
+    },
+    "replay_instruction_command": {
+      "type": "string"
+    },
+    "export_disposition": {
+      "type": "string",
+      "enum": ["VERIFIED_PORTABLE", "MISSING_DEPENDENCY_LOCK", "UNVERIFIED_EVALUATION", "RESTRICTED_DATASET_RIGHTS"]
+    },
+    "packaged_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

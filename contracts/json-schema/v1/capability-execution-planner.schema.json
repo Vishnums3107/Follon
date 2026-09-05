@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CapabilityExecutionPlanner",
+  "description": "Capability-aware execution schedule and routing plan enforcing venue order kind support, participation limits, passive pegging, and atomic combination rules (EXEC-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "planner_schema_version",
+    "plan_id",
+    "parent_order_id",
+    "target_venue",
+    "algorithm",
+    "max_volume_participation_pct",
+    "passive_pegging_offset_bps",
+    "schedule_slices",
+    "supported_capabilities_verified",
+    "disposition",
+    "created_at"
+  ],
+  "properties": {
+    "planner_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^plan\\.exec\\.[a-z0-9_.-]+$"
+    },
+    "parent_order_id": {
+      "type": "string"
+    },
+    "target_venue": {
+      "type": "string"
+    },
+    "algorithm": {
+      "type": "string",
+      "enum": ["TWAP_SLICED", "VWAP_PARTICIPATION", "PASSIVE_PEG_QUEUE", "ICEBERG_DISCRETIONARY"]
+    },
+    "max_volume_participation_pct": {
+      "type": "string"
+    },
+    "passive_pegging_offset_bps": {
+      "type": "integer"
+    },
+    "schedule_slices": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slice_sequence", "planned_release_time", "allocated_quantity", "order_kind"],
+        "properties": {
+          "slice_sequence": { "type": "integer", "minimum": 1 },
+          "planned_release_time": { "type": "string", "format": "date-time" },
+          "allocated_quantity": { "type": "string" },
+          "order_kind": { "type": "string" }
+        }
+      }
+    },
+    "supported_capabilities_verified": {
+      "type": "boolean"
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["VALIDATED_FOR_DISPATCH", "UNSUPPORTED_ORDER_KIND", "PARTICIPATION_CAP_EXCEEDED", "VENUE_CAPABILITY_REJECTED"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

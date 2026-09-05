@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MultiAssetExpansionPlan",
+  "description": "Multi-asset operational lifecycle plan governing options exercise/assignment, roll calendars, FX spot-forward settlement, and futures physical-to-cash delivery (PORT-02).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "expansion_schema_version",
+    "plan_id",
+    "asset_class",
+    "underlying_universe",
+    "lifecycle_actions",
+    "margin_requirement_usd",
+    "settlement_currency",
+    "reconciliation_clean",
+    "operational_verdict",
+    "created_at"
+  ],
+  "properties": {
+    "expansion_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^plan\\.asset\\.[a-z0-9_.-]+$"
+    },
+    "asset_class": {
+      "type": "string",
+      "enum": ["EQUITY_OPTION", "SPOT_FX", "COMMODITY_FUTURES", "INDEX_FUTURES"]
+    },
+    "underlying_universe": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "lifecycle_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action_id", "instrument_id", "action_kind", "target_date", "contract_quantity", "estimated_cash_flow_usd"],
+        "properties": {
+          "action_id": { "type": "string" },
+          "instrument_id": { "type": "string" },
+          "action_kind": { "type": "string", "enum": ["OPTION_ROLL", "OPTION_EXERCISE", "FUTURES_ROLL", "FX_SPOT_CONVERSION"] },
+          "target_date": { "type": "string", "format": "date-time" },
+          "contract_quantity": { "type": "integer" },
+          "estimated_cash_flow_usd": { "type": "string" }
+        }
+      }
+    },
+    "margin_requirement_usd": {
+      "type": "string"
+    },
+    "settlement_currency": {
+      "type": "string"
+    },
+    "reconciliation_clean": {
+      "type": "boolean"
+    },
+    "operational_verdict": {
+      "type": "string",
+      "enum": ["READY_FOR_LIFECYCLE_EXECUTION", "MARGIN_HEADROOM_BREACH", "UNRECONCILED_LEG_MISMATCH", "GATEWAY_DISCONNECTED"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
