@@ -41,7 +41,7 @@ jobs:
       - name: Audit Node dependencies
         run: npm audit --package-lock-only --audit-level=high
         working-directory: apps/desktop
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Verify deterministic SBOM generation
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Validate JSON contract syntax
