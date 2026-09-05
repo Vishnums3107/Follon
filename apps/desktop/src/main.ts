@@ -398,15 +398,57 @@ async function refreshWorkspaceSnapshot(): Promise<void> {
   renderCurrentWorkspace();
 }
 
+const FALLBACK_SNAPSHOT: WorkspaceSnapshot = {
+  workspace_schema_version: 1,
+  generated_at: new Date().toISOString(),
+  read_only: true,
+  counts: {
+    artifacts: 0,
+    datasets: 0,
+    notebooks: 0,
+    backtests: 0,
+    experiments: 0,
+    events: 0,
+    journals: 0,
+    commercial_records: 0,
+  },
+  feature_artifact_counts: {
+    "market-data": 0,
+    "replay": 0,
+    "research": 0,
+    "paper": 0,
+    "controlled-live": 0,
+    "operations": 0,
+    "options": 0,
+    "commercial": 0,
+    "execution-risk": 0,
+    "accounting": 0,
+    "identity": 0,
+    "platform": 0,
+  },
+  datasets: [],
+  notebooks: [],
+  backtests: [],
+  experiments: [],
+  manifests: [],
+  events: [],
+  journals: [],
+  commercial: [],
+  execution_evidence: [],
+  paper: null,
+  live: null,
+  operations: null,
+  options: null,
+  commercial_artifacts: [],
+};
+
 function renderCurrentWorkspace(): void {
-  if (workspaceSnapshot === null) {
-    return;
-  }
   const workspace = WORKSPACES.find((candidate) => candidate.id === currentWorkspaceId) ?? WORKSPACES[0];
   if (workspace === undefined) {
     return;
   }
-  renderWorkspace(workspaceSummaryRoot, workspaceCanvasRoot, workspace.id, workspaceSnapshot, {
+  const snapshot = workspaceSnapshot ?? FALLBACK_SNAPSHOT;
+  renderWorkspace(workspaceSummaryRoot, workspaceCanvasRoot, workspace.id, snapshot, {
     status: currentSystemStatus,
     features: featureDefinitions,
     artifacts: evidenceFiles,

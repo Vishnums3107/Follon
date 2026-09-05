@@ -23,8 +23,20 @@ from time import monotonic
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import urlopen
 
-STATIC_ROOT = Path(os.environ.get("FOLLON_DASHBOARD_STATIC_ROOT", "/srv/follon")).resolve()
-EVIDENCE_ROOT = Path(os.environ.get("FOLLON_EVIDENCE_ROOT", "/var/follon")).resolve()
+_DEFAULT_STATIC = Path(__file__).resolve().parent / "web-dist"
+_DEFAULT_EVIDENCE = Path(__file__).resolve().parents[2] / "var"
+STATIC_ROOT = Path(
+    os.environ.get(
+        "FOLLON_DASHBOARD_STATIC_ROOT",
+        str(_DEFAULT_STATIC if _DEFAULT_STATIC.is_dir() else "/srv/follon"),
+    )
+).resolve()
+EVIDENCE_ROOT = Path(
+    os.environ.get(
+        "FOLLON_EVIDENCE_ROOT",
+        str(_DEFAULT_EVIDENCE if _DEFAULT_EVIDENCE.is_dir() else "/var/follon"),
+    )
+).resolve()
 HOST = os.environ.get("FOLLON_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FOLLON_DASHBOARD_PORT", "8080"))
 MODE = os.environ.get("FOLLON_DASHBOARD_MODE", "development")

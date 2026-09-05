@@ -192,6 +192,151 @@ export class CommandPalette {
       onSelect: () => this.options.onRefreshEvidence(),
     });
 
+    // Signature Connected Experiences & Advanced Capabilities
+    items.push({
+      id: "act-away-desk",
+      title: "Can I Safely Leave the Desk?",
+      category: "Action",
+      subtitle: "Away-desk readiness check, kill-switch status & escalation policy (SOLO-05/06, EXEC-01)",
+      badge: "Experience 5",
+      onSelect: () => {
+        this.options.onOpenWorkspace("command-center");
+        setTimeout(() => document.querySelector("#away-desk-readiness-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-explain-moment",
+      title: "Explain This Moment",
+      category: "Action",
+      subtitle: "Unified temporal reconstruction across market, strategy, risk, OMS & ledger (SOLO-01, RES-03)",
+      badge: "Experience 1",
+      onSelect: () => {
+        this.options.onOpenWorkspace("replay-incidents");
+        setTimeout(() => document.querySelector("#explain-moment-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-strategy-invalidation",
+      title: "Show What Would Invalidate This Strategy",
+      category: "Action",
+      subtitle: "Strategy falsification conditions and synthetic stress injection explorer (RES-01/04/05/08, AI-03)",
+      badge: "Experience 2",
+      onSelect: () => {
+        this.options.onOpenWorkspace("strategy-studio");
+        setTimeout(() => document.querySelector("#strategy-invalidation-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-joint-correlation",
+      title: "Why Are These Strategies Losing Together?",
+      category: "Action",
+      subtitle: "Joint strategy loss, co-movement, and common factor dependency breakdown (RES-06, DATA-05, RISK-01)",
+      badge: "Experience 3",
+      onSelect: () => {
+        this.options.onOpenWorkspace("risk-cockpit");
+        setTimeout(() => document.querySelector("#joint-correlation-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-input-correction",
+      title: "What Changes If This Input Is Corrected?",
+      category: "Action",
+      subtitle: "Trace revised datasets or corrected news to affected experiments and decisions (DATA-01/03)",
+      badge: "Experience 4",
+      onSelect: () => {
+        this.options.onOpenWorkspace("research-lab");
+        setTimeout(() => document.querySelector("#input-correction-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-workspace-rebuild",
+      title: "Rebuild My Entire Workspace",
+      category: "Action",
+      subtitle: "Cold-start disaster recovery drills reconstructing application, research & state (LIFE-01..03)",
+      badge: "Experience 6",
+      onSelect: () => {
+        this.options.onOpenWorkspace("administration");
+        setTimeout(() => document.querySelector("#workspace-rebuild-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-champion-challenger",
+      title: "Champion vs Challenger Shadow Evaluation",
+      category: "Action",
+      subtitle: "Shadow-evaluate challenger iterations against champions with automated retirement (RES-08)",
+      badge: "RES-08",
+      onSelect: () => {
+        this.options.onOpenWorkspace("strategy-studio");
+        setTimeout(() => document.querySelector("#champion-challenger-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-execution-planner",
+      title: "Capability-Aware Execution Planner",
+      category: "Action",
+      subtitle: "Plan algorithmic child slices (TWAP, VWAP, Peg) with venue capability verification (EXEC-04)",
+      badge: "EXEC-04",
+      onSelect: () => {
+        this.options.onOpenWorkspace("execution-blotter");
+        setTimeout(() => document.querySelector("#execution-planner-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-ops-assistant",
+      title: "Operations Diagnosis Assistant & Runbooks",
+      category: "Action",
+      subtitle: "Synthesize root-cause diagnosis and parameterized remediation runbooks (AI-05)",
+      badge: "AI-05",
+      onSelect: () => {
+        this.options.onOpenWorkspace("administration");
+        setTimeout(() => document.querySelector("#operations-assistant-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-model-eval",
+      title: "AI Model Evaluation Console",
+      category: "Action",
+      subtitle: "Benchmark reasoning latency, determinism, token cost & hallucination rates (AI-06)",
+      badge: "AI-06",
+      onSelect: () => {
+        this.options.onOpenWorkspace("administration");
+        setTimeout(() => document.querySelector("#model-evaluation-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-strategy-capsules",
+      title: "Portable Strategy Capsules",
+      category: "Action",
+      subtitle: "Export and inspect self-contained reproducible strategy capsules and manifests (ASSET-04)",
+      badge: "ASSET-04",
+      onSelect: () => {
+        this.options.onOpenWorkspace("marketplace");
+        setTimeout(() => document.querySelector("#strategy-capsule-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
+    items.push({
+      id: "act-multi-asset",
+      title: "Multi-Asset Roll & Settlement Lifecycle",
+      category: "Action",
+      subtitle: "Coordinate options rolls, cash/physical assignment, FX hedging, and futures delivery (PORT-02)",
+      badge: "PORT-02",
+      onSelect: () => {
+        this.options.onOpenWorkspace("portfolio");
+        setTimeout(() => document.querySelector("#multi-asset-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+      },
+    });
+
     // 3. Artifacts
     const artifacts = this.options.getArtifacts();
     for (const art of artifacts.slice(0, 30)) {
