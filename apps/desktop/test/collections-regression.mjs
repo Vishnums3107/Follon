@@ -26,7 +26,11 @@ class Element {
   }
   get rows() { return this.children; }
 }
-globalThis.document = { createElement: (tag) => new Element(tag) };
+globalThis.document = {
+  createElement: (tag) => new Element(tag),
+  createElementNS: (_ns, tag) => new Element(tag),
+  createTextNode: (text) => ({ textContent: text }),
+};
 globalThis.Option = class extends Element {
   constructor(text, value) { super("option"); this.textContent = text; this.value = value; }
 };

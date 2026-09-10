@@ -1,0 +1,4 @@
+type,currency_or_instrument,value
+CASH,USD,3200
+POSITION,inst.us_equity.spy,50
+POSITION,inst.us_equity.msft,15

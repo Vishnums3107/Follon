@@ -13,6 +13,7 @@ follon-control-plane = { path = "../../core/control-plane" }
 follon-commercial = { path = "../../core/commercial" }
 follon-domain = { path = "../../core/domain" }
 follon-execution = { path = "../../core/execution" }
+follon-fx = { path = "../../core/fx" }
 follon-instrument = { path = "../../core/instrument" }
 follon-live = { path = "../../core/live" }
 follon-market-data = { path = "../../core/market-data" }
@@ -54,6 +55,10 @@ path = "src/operations.rs"
 [[bin]]
 name = "follon-options"
 path = "src/options.rs"
+
+[[bin]]
+name = "follon-fx"
+path = "src/fx.rs"
 
 [[bin]]
 name = "follon-admin"

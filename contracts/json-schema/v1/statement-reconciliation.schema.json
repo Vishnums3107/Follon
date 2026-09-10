@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/statement-reconciliation.schema.json",
+  "title": "Follon Broker Statement Reconciliation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["statement_reconciliation_schema_version", "account_id", "as_of", "clean", "configuration_content_hash", "statement_csv_hash", "incident_count", "incidents"],
+  "properties": {
+    "statement_reconciliation_schema_version": { "const": 1 },
+    "account_id": { "$ref": "#/$defs/canonicalId" },
+    "as_of": { "$ref": "#/$defs/utc" },
+    "clean": { "type": "boolean" },
+    "configuration_content_hash": { "$ref": "#/$defs/sha256" },
+    "statement_csv_hash": { "$ref": "#/$defs/sha256" },
+    "incident_count": { "type": "integer", "minimum": 0 },
+    "incidents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/incident" }
+    }
+  },
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "incident": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["incident_kind", "currency", "internal_balance", "broker_balance"],
+          "properties": {
+            "incident_kind": { "const": "CASH_MISMATCH" },
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+            "internal_balance": { "$ref": "#/$defs/decimal" },
+            "broker_balance": { "$ref": "#/$defs/decimal" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["incident_kind", "instrument_id", "internal_quantity", "broker_quantity"],
+          "properties": {
+            "incident_kind": { "const": "POSITION_MISMATCH" },
+            "instrument_id": { "$ref": "#/$defs/canonicalId" },
+            "internal_quantity": { "$ref": "#/$defs/decimal" },
+            "broker_quantity": { "$ref": "#/$defs/decimal" }
+          }
+        }
+      ]
+    }
+  }
+}

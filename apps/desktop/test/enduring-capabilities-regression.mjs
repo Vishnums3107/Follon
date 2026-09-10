@@ -13,6 +13,9 @@ import {
   parseGatewayQualificationMatrix,
   parseCapitalAllocationProposal,
   parseCompatibilityMatrix,
+  parseMarketScanner,
+  parseNewsRevisionTimeline,
+  parseStrategyCompositionSpec,
 } from "../dist/evidence.js";
 import { renderWorkspace } from "../dist/workspaces.js";
 
@@ -403,6 +406,168 @@ assert.throws(
   "Invalid migration status must be rejected"
 );
 
+// SOLO-04: MarketScanner
+const validScanner = {
+  scanner_schema_version: 1,
+  scanner_id: "scan.us-equity-momentum",
+  universe_id: "univ.us-equity.liquid-top500",
+  as_of_time: "2026-09-01T15:30:00Z",
+  indicator_columns: [
+    {
+      column_id: "col.momentum-20d",
+      name: "20-Day Momentum",
+      timeframe: "1D",
+      definition: "Rate of change over 20 daily close prices in basis points",
+    },
+    {
+      column_id: "col.rsi-14",
+      name: "14-Period RSI",
+      timeframe: "1D",
+      definition: "Wilder Relative Strength Index over 14 daily periods",
+    },
+  ],
+  candidates: [
+    {
+      rank: 1,
+      instrument_id: "inst.us_equity.spy",
+      symbol: "SPY",
+      close_price: "560.25000000",
+      momentum_score_bps: 420,
+      rsi_14: "62.45000000",
+      matched_conditions: ["BREAKOUT_20D_HIGH", "RSI_BETWEEN_50_AND_70"],
+      rationale: "Strong upward trend continuation above 20-day high with unoverbought RSI",
+    },
+    {
+      rank: 2,
+      instrument_id: "inst.us_equity.qqq",
+      symbol: "QQQ",
+      close_price: "485.10000000",
+      momentum_score_bps: 385,
+      rsi_14: "58.12000000",
+      matched_conditions: ["VOLUME_SURGE_150PCT", "MOMENTUM_POSITIVE"],
+      rationale: "High relative volume with positive 20-day momentum score",
+    },
+  ],
+  quarantined_count: 0,
+  created_at: "2026-09-01T15:30:05Z",
+};
+
+const parsedScanner = parseMarketScanner(JSON.stringify(validScanner));
+assert.equal(parsedScanner.scanner_id, "scan.us-equity-momentum");
+assert.equal(parsedScanner.candidates.length, 2);
+assert.equal(parsedScanner.candidates[0].symbol, "SPY");
+
+assert.throws(
+  () => parseMarketScanner(JSON.stringify({ ...validScanner, scanner_schema_version: 2 })),
+  /does not match the v1 evidence contract/,
+  "Invalid scanner schema version must be rejected"
+);
+
+// DATA-03: NewsRevisionTimeline
+const validNewsTimeline = {
+  revision_timeline_schema_version: 1,
+  timeline_id: "rev.timeline.earnings-001",
+  target_event_id: "evt.news.001",
+  chain: [
+    {
+      version_sequence: 1,
+      received_at: "2026-09-01T11:00:00Z",
+      source_id: "DOW_JONES",
+      kind: "INITIAL_REPORT",
+      headline: "Acme Corp reports Q3 EPS $1.20 vs $1.10 expected",
+      entity_confidence_bps: 9500,
+      content_hash: "a".repeat(64),
+      supersedes_sequence: null,
+    },
+    {
+      version_sequence: 2,
+      received_at: "2026-09-01T11:05:00Z",
+      source_id: "REUTERS",
+      kind: "SYNDICATED_DUPLICATE",
+      headline: "Acme Corp beats earnings estimates in third quarter",
+      entity_confidence_bps: 9200,
+      content_hash: "b".repeat(64),
+      supersedes_sequence: 1,
+    },
+    {
+      version_sequence: 3,
+      received_at: "2026-09-01T11:15:00Z",
+      source_id: "DOW_JONES",
+      kind: "CORRECTION",
+      headline: "CORRECTION: Acme Corp Q3 GAAP EPS was $1.15, adjusted $1.20",
+      entity_confidence_bps: 9800,
+      content_hash: "c".repeat(64),
+      supersedes_sequence: 1,
+    },
+  ],
+  conflict_detected: false,
+  created_at: "2026-09-01T11:15:05Z",
+};
+
+const parsedNewsTimeline = parseNewsRevisionTimeline(JSON.stringify(validNewsTimeline));
+assert.equal(parsedNewsTimeline.timeline_id, "rev.timeline.earnings-001");
+assert.equal(parsedNewsTimeline.chain.length, 3);
+assert.equal(parsedNewsTimeline.chain[2].kind, "CORRECTION");
+
+assert.throws(
+  () => parseNewsRevisionTimeline(JSON.stringify({ ...validNewsTimeline, chain: [{ ...validNewsTimeline.chain[0], kind: "INVALID_KIND" }] })),
+  /does not match the v1 evidence contract/,
+  "Invalid news revision kind must be rejected"
+);
+
+// RES-02: StrategyCompositionSpec
+const validCompositionSpec = {
+  composition_schema_version: 1,
+  composition_id: "comp.strat.trend-v1",
+  strategy_id: "strat.trend.v1",
+  strategy_version: "1.0.0",
+  signals: [
+    {
+      signal_id: "sig.ema-cross",
+      indicator_ref: "ind.ema.12-26",
+      condition: "FAST_EMA > SLOW_EMA",
+      weight_bps: 6000,
+    },
+    {
+      signal_id: "sig.vol-filter",
+      indicator_ref: "ind.atr.14",
+      condition: "ATR_14 > ATR_BASELINE",
+      weight_bps: 4000,
+    },
+  ],
+  sizing_rule: {
+    sizing_type: "VOLATILITY_TARGETED",
+    target_value: "1500_BPS_ANNUAL_VOL",
+  },
+  entry_criteria: [
+    "SIGNAL_SUM_WEIGHT_BPS >= 5000",
+    "MARKET_SESSION_NORMAL",
+  ],
+  exit_criteria: [
+    "TRAILING_STOP_TRIGGERED",
+    "FAST_EMA < SLOW_EMA",
+  ],
+  portfolio_constraints: {
+    max_leverage_bps: 10000,
+    max_single_position_bps: 2500,
+    stop_loss_pct: "2.50000000",
+  },
+  code_hash: "d".repeat(64),
+  visual_representation_hash: "e".repeat(64),
+  created_at: "2026-09-01T09:00:00Z",
+};
+
+const parsedCompositionSpec = parseStrategyCompositionSpec(JSON.stringify(validCompositionSpec));
+assert.equal(parsedCompositionSpec.composition_id, "comp.strat.trend-v1");
+assert.equal(parsedCompositionSpec.signals.length, 2);
+assert.equal(parsedCompositionSpec.sizing_rule.sizing_type, "VOLATILITY_TARGETED");
+
+assert.throws(
+  () => parseStrategyCompositionSpec(JSON.stringify({ ...validCompositionSpec, sizing_rule: { sizing_type: "INVALID_SIZING", target_value: "100" } })),
+  /does not match the v1 evidence contract/,
+  "Invalid sizing type must be rejected"
+);
+
 // --- 2. Workspace DOM & Cockpit Integration Tests ---
 
 class MockElement {
@@ -431,6 +596,8 @@ class MockElement {
 
 globalThis.document = {
   createElement: (tag) => new MockElement(tag),
+  createElementNS: (_ns, tag) => new MockElement(tag),
+  createTextNode: (text) => ({ textContent: text }),
   body: new MockElement("body"),
   querySelector: () => null,
 };
@@ -479,6 +646,9 @@ const mockSnapshot = {
     { artifact: "gateway-matrix.json", category: "gateway_qualification_matrix", data: validGatewayMatrix },
     { artifact: "capital-proposal.json", category: "capital_allocation_proposal", data: validProposal },
     { artifact: "compat-matrix.json", category: "compatibility_matrix", data: validCompat },
+    { artifact: "market-scanner.json", category: "market_scanner", data: validScanner },
+    { artifact: "news-revision-timeline.json", category: "news_revision_timeline", data: validNewsTimeline },
+    { artifact: "strategy-composition-spec.json", category: "strategy_composition_spec", data: validCompositionSpec },
   ],
 };
 
@@ -500,6 +670,14 @@ assert.ok(explainPanel, "#explain-moment-panel must be rendered in replay-incide
 assert.ok(containsText(explainPanel, "recon.fill.9b41a2c"), "Reconstruction ID must be rendered");
 assert.ok(containsText(explainPanel, "VERIFIED"), "Integrity status must be rendered");
 assert.ok(containsText(explainPanel, "CAUSED_SIGNAL"), "Causal DAG relation must be rendered");
+
+// The causal-lineage DAG visual must be driven by the real reconstruction record, never fabricated content.
+assert.ok(containsText(explainPanel, "market.bar.v1"), "Real causal-chain event type must be rendered in the DAG visual");
+assert.ok(containsText(explainPanel, "Market bar SPY close 500.00"), "Real causal-chain summary must be rendered in the DAG visual");
+assert.ok(containsText(explainPanel, "market-feed"), "Real causal-chain actor must be rendered in the DAG visual");
+assert.ok(!containsText(explainPanel, "DATA.FEED"), "Fabricated placeholder node label must not be rendered");
+assert.ok(!containsText(explainPanel, "T0 +0.0ms"), "Fabricated placeholder timing must not be rendered");
+assert.ok(!containsText(explainPanel, "VERIFIED DETERMINISTIC CHAIN"), "Fabricated static badge text must not be rendered");
 
 const recoveryDrillPanelReplay = replayCanvas.querySelector("#recovery-drill-panel");
 assert.ok(recoveryDrillPanelReplay, "#recovery-drill-panel must be rendered in replay-incidents");
@@ -540,7 +718,13 @@ assert.ok(capsulePanel, "#strategy-capsule-panel must be rendered in strategy-st
 assert.ok(containsText(capsulePanel, "capsule.trend.v1"), "Capsule ID must be rendered");
 assert.ok(containsText(capsulePanel, "VERIFIED_PORTABLE"), "Export disposition must be rendered");
 
-// 4. Command Center: Test #away-desk-readiness-panel
+const strategyCompPanel = studioCanvas.querySelector("#strategy-composition-panel");
+assert.ok(strategyCompPanel, "#strategy-composition-panel must be rendered in strategy-studio");
+assert.ok(containsText(strategyCompPanel, "strat.trend.v1 (1.0.0)"), "Strategy ID and version must be rendered");
+assert.ok(containsText(strategyCompPanel, "sig.ema-cross"), "Signal ID must be rendered");
+assert.ok(containsText(strategyCompPanel, "VOLATILITY_TARGETED"), "Sizing rule must be rendered");
+
+// 4. Command Center: Test #away-desk-readiness-panel and #market-scanner-panel
 const cmdSummary = new MockElement("div");
 const cmdCanvas = new MockElement("div");
 renderWorkspace(cmdSummary, cmdCanvas, "command-center", mockSnapshot, mockContext);
@@ -550,6 +734,19 @@ assert.ok(awayDeskPanel, "#away-desk-readiness-panel must be rendered in command
 assert.ok(containsText(awayDeskPanel, "attn.session.2026-09-01"), "Attention budget ID must be rendered");
 assert.ok(containsText(awayDeskPanel, "3500 bps"), "Cognitive load must be rendered");
 assert.ok(containsText(awayDeskPanel, "18 suppressed"), "Suppressed duplicates count must be rendered");
+
+// The attention gauge visual must be driven by the real attention-budget record, never a fabricated default.
+assert.ok(containsText(awayDeskPanel, "65.0%"), "Reserve capacity computed from the real load must be rendered");
+assert.ok(containsText(awayDeskPanel, "4.5 / hr"), "Real interruption rate must be rendered in the gauge");
+assert.ok(containsText(awayDeskPanel, "1 active / 18 suppressed"), "Real alarm counts must be rendered in the gauge caption");
+assert.ok(!containsText(awayDeskPanel, "2.1 / hr"), "Fabricated interruption rate must not be rendered");
+
+const marketScannerPanel = cmdCanvas.querySelector("#market-scanner-panel");
+assert.ok(marketScannerPanel, "#market-scanner-panel must be rendered in command-center");
+assert.ok(containsText(marketScannerPanel, "#1"), "Candidate rank must be rendered");
+assert.ok(containsText(marketScannerPanel, "SPY"), "Candidate symbol must be rendered");
+assert.ok(containsText(marketScannerPanel, "560.25000000"), "Close price must be rendered");
+assert.ok(containsText(marketScannerPanel, "420 bps"), "Momentum score must be rendered");
 
 // 5. Risk Cockpit: Test #joint-correlation-panel
 const riskSummary = new MockElement("div");
@@ -585,5 +782,18 @@ assert.ok(compatMatrixPanel, "#compatibility-matrix-panel must be rendered in ad
 assert.ok(containsText(compatMatrixPanel, "compat.follon.engine-v1"), "Compatibility matrix ID must be rendered");
 assert.ok(containsText(compatMatrixPanel, "VERIFIED"), "Backward compatibility verification must be rendered");
 assert.ok(containsText(compatMatrixPanel, "450 fixtures"), "Golden corpus count must be rendered");
+
+// 7. News Cockpit: Test #news-revision-panel
+const newsSummary = new MockElement("div");
+const newsCanvas = new MockElement("div");
+renderWorkspace(newsSummary, newsCanvas, "news-cockpit", mockSnapshot, mockContext);
+
+const newsRevPanel = newsCanvas.querySelector("#news-revision-panel");
+assert.ok(newsRevPanel, "#news-revision-panel must be rendered in news-cockpit");
+assert.ok(containsText(newsRevPanel, "#1"), "Version sequence 1 must be rendered");
+assert.ok(containsText(newsRevPanel, "INITIAL_REPORT"), "Initial report kind must be rendered");
+assert.ok(containsText(newsRevPanel, "#3"), "Version sequence 3 must be rendered");
+assert.ok(containsText(newsRevPanel, "CORRECTION"), "Correction kind must be rendered");
+assert.ok(containsText(newsRevPanel, "Acme Corp"), "Headline text must be rendered");
 
 console.log("Enduring capabilities regression tests (DUR-01 through DUR-12) passed cleanly!");

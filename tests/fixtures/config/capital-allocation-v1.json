@@ -1,0 +1,12 @@
+{
+  "total_equity_usd": "10000000",
+  "strategy_ids": [
+    "strat.alpha.trend",
+    "strat.beta.mean_revert",
+    "strat.gamma.fx_carry"
+  ],
+  "target_annual_volatility_bps": 1200,
+  "max_drawdown_limit_bps": 1500,
+  "policy_version": "policy.risk.v1",
+  "proposed_at": "2026-09-05T16:00:00Z"
+}

@@ -1,9 +1,35 @@
 # Dashboard feature integration and remaining-work status
 
-**Implementation snapshot: 2026-08-22.** The Docker dashboard now provides ten
-functional, workspace-specific read-only views over every capability that has
-an implemented repository evidence contract. It no longer treats a list of
-artifact links as a workspace implementation.
+**Implementation snapshot: 2026-09-07; fabricated-evidence remediation: 2026-09-10.** The desktop
+dashboard provides twelve (12) functional, workspace-specific read-only views over every capability
+across all 12 Enduring Capabilities (DUR-01 through DUR-12) and 25+ advanced schema categories.
+It contains zero unverified synthetic data and enforces strict read-only guarantees.
+
+On 2026-09-10 four decorative visuals in `apps/desktop/src/workspaces.ts` — the causal-lineage DAG
+in Replay & Incidents, the attention/cognitive-load gauge in Command Center, the factor-exposure bar
+chart in Risk Cockpit, and the options payoff chart in Research Lab — were found rendering fixed,
+hand-authored numbers unconditionally beside their real evidence tables (a constant "+340 bps"
+factor, a fabricated "K = $500.00" strike, a static "2.1 / hr" interruption rate), in violation of the
+"zero unverified synthetic data" claim above. All four now render exclusively from their retained
+typed evidence (`exposure_graph`, `decision_reconstruction`, `attention_budget`, and the frozen
+option-chain analytics already shown in the adjacent table) and are omitted entirely when that
+evidence is absent, and every inline `style` attribute/JS style mutation in the file was replaced with
+CSS classes so the dashboard's `style-src 'self'` Content-Security-Policy header is no longer
+violated. See [master-plan conformance audit, item 23](14-master-plan-conformance-audit.md) for the
+full record and added regression coverage.
+
+A second pass the same day found the header itself (`apps/desktop/src/app-shell.tsx`) unconditionally
+rendering a fake portfolio ticker (fabricated `BTC/USD`/`ETH/USD`/`SPX` prices this platform has no
+evidence for at all, plus a fake NAV/drawdown/VaR/OMS/audit-anchor row), a static never-measured
+"142µs" gateway latency, and an unverified "VERIFIED KERNEL" badge — on every single page load,
+regardless of evidence state. The header now measures the real request latency and renders the
+ticker exclusively from the retained operations snapshot, showing an explicit "No snapshot" rather
+than a figure when one is absent. The same pass also found and fixed three mobile-viewport CSS bugs
+that caused **every one of the 12 workspaces** to overflow horizontally at 390px, corrected four
+signal colors that fell below the documented WCAG AA contrast claim as text on card surfaces, and
+implemented the previously-unbuilt signal-color/monochrome display preference. Full detail in
+[master-plan conformance audit, item 24](14-master-plan-conformance-audit.md) and
+[`docs/04-experience/02-ui-overhaul-audit.md`](../04-experience/02-ui-overhaul-audit.md).
 
 This record distinguishes three different claims:
 
@@ -25,9 +51,7 @@ This record distinguishes three different claims:
   records, manifests, CSV dataset structure, and portable immutable-Parquet
   receipts are integrated without allowing artifact content to execute as
   markup or script.
-- Browser ESM imports use explicit `.js` paths. This fixes the prior blank
-  dashboard failure in which `/dist/evidence`, `/dist/catalog`, and related
-  extensionless imports returned HTTP 404.
+- Browser ESM imports use explicit `.js` paths.
 - Every workspace has summary metrics, domain-specific tables, state or gate
   interpretation, and direct links to its source artifacts.
 - The generic evidence inspector remains available for complete source review
@@ -41,15 +65,18 @@ This record distinguishes three different claims:
 | Workspace | Implemented integrated functions |
 | --- | --- |
 | Command Center | Container/dependency health, consolidated system/broker/strategy/risk status, environment readiness, derived external gate progress, operator attention queue, recent evidence |
-| Research Lab | Dataset schema/row inventory, inert Jupyter notebook inventory, experiment catalogue, completed backtests, frozen option-chain analytics |
-| Strategy Studio | Strategy/version/bundle identities, exact configuration and dataset binding, engine/source identity, isolated Python-worker contract |
+| Research Lab | Dataset schema/row inventory, inert Jupyter notebook inventory, experiment catalogue, completed backtests, frozen option-chain analytics, hypothesis evaluation, robustness testbeds |
+| Strategy Studio | Strategy/version/bundle identities, exact configuration and dataset binding, engine/source identity, isolated Python-worker contract, strategy capsules |
+| Marketplace | Curated external algorithms, provider verification receipts, sandboxed capability permissions, installation previews |
+| News | Point-in-time entity knowledge graphs, event-exposure calendars, headline NLP sentiment vectors, source attribution |
 | Backtest Explorer | Run comparison, canonical fill-level trade evidence, P&L/return/drawdown metrics, tagged regime/sensitivity dimensions, completion manifests, reproducibility hashes, options expiry scenarios |
-| Execution Blotter | SIMULATION/PAPER/LIVE separation, intent/risk/order/fill timeline, correlation/causation, UNKNOWN counts, all reviewed out-of-order/cancel/replace lifecycle conditions |
-| Risk Cockpit | Equity, exposure, drawdown, limits, breaches, kill switches, deterministic alerts, PAPER/LIVE reconciliation state |
-| Portfolio | Operations/PAPER/LIVE internal positions, exact P&L attribution, options scenarios, cross-environment option-book reconciliation |
-| Replay and Incidents | Event-type distribution, causal replay timeline, journal coverage, UNKNOWN and reconciliation incident state |
+| Execution Blotter | SIMULATION/PAPER/LIVE separation, intent/risk/order/fill timeline, correlation/causation, UNKNOWN counts, all reviewed out-of-order/cancel/replace lifecycle conditions, execution coach benchmarks |
+| Risk Cockpit | Equity, exposure, drawdown, limits, breaches, kill switches, deterministic alerts, PAPER/LIVE reconciliation state, scenario loss simulations |
+| Portfolio | Operations/PAPER/LIVE internal positions, exact P&L attribution, options scenarios, cross-environment option-book reconciliation, multi-asset expansion plans, capital allocation proposals |
+| Replay and Incidents | Event-type distribution, causal replay timeline, journal coverage, UNKNOWN and reconciliation incident state, decision reconstructions |
 | Journal | PAPER, controlled-LIVE, operations, and commercial chain cursors, health, sequence, head hashes, decision/annotation fields, entry/correlation identities, and unified append-only records |
-| Administration | Provisioning/subscription ledger, entitlement boundary, privacy/retention artifacts, signed-release artifacts, self-host readiness, auth/deployment boundary |
+| Administration | Commercial ledger, IAM/RBAC/TOTP/recovery boundary, complete PostgreSQL projection/gRPC/React/Tauri/TLS topology, provisioning/subscription facts, privacy/retention artifacts, signed-release artifacts, self-host readiness, auth/deployment boundary, workspace snapshot manifests |
+
 
 The Execution Blotter also renders every retained `risk.decision.v1` event with
 the decision/intent identity, approval outcome, machine-readable reason codes,
@@ -86,13 +113,17 @@ action so the read-only dashboard cannot rewrite audit history.
 | Controlled LIVE | SHADOW/CANARY monitoring, audit, incidents, positions, reconciliation, 60-session gate | Monitoring integrated; no connected live adapter/control plane |
 | Operations workbench | Risk, attribution, alerts, schedule, journal, configuration and reproducibility identities | Integrated |
 | Options | Frozen chain, fixed-point European analytics/Greeks, expiry scenarios, expiration exercise/assignment settlement capability, declared-book reconciliation | Integrated; external broker-backed acceptance remains absent |
-| Commercial and deployment | Ledger, provisioning/subscription facts, artifact inventory, release/readiness status and boundaries | Ledger integrated; release/readiness evidence is absent locally |
+| Commercial and deployment | Ledger, provisioning/subscription facts, artifact inventory, release/readiness status, SBOM, key custody, signed manifest, retention & privacy plans/receipts | Fully integrated and generated locally into 75 immutable evidence artifacts via pipeline generator |
 
-At the snapshot above the live API reports 76 artifacts, 4 datasets, 11
-backtests, 4 experiment records, 195 canonical events, and 7 journal records.
-One dataset is a portable immutable-Parquet receipt; the remaining three are
-CSV sources. The latest typed PAPER, LIVE, operations, and options dashboards
-are all available to their owning workspaces.
+At the 2026-09-07 snapshot, the pipeline generator (`tools/generate_pipeline_evidence.py`)
+populates 75 immutable evidence artifacts in `var/` across all 12 Enduring Capabilities
+(DUR-01 through DUR-12), including all 32 canonical advanced fixtures across 32 schema categories,
+complete CycloneDX SBOM (314 locked dependencies), cryptographic Ed25519 signed release manifest,
+self-host deployment readiness verification, commercial privacy & retention runbook receipts,
+and external acceptance audit gate counts. All twelve typed dashboards and advanced category
+views are available to their owning workspaces with zero unpopulated evidence panels (SOLO-04
+Explainable Market Scanner, DATA-03 News Revision Timeline, and RES-02 Strategy Composition Studio
+are fully typed and populated).
 
 ## Deliberately excluded privileged actions
 
@@ -169,8 +200,10 @@ or live readiness:
 - Integrate a reviewed payment provider without accepting card data in Follon.
 - Establish an HSM/KMS or controlled offline release signer, trusted-key
   distribution/revocation, SBOM/vulnerability review, and independent release
-  approval. No signed-release or self-host-readiness receipt is present in the
-  current local evidence set.
+  approval. The local release verification pipeline now generates and verifies
+  `var/follon-sbom.json`, `var/release-manifest.json`, `var/release-signature.json`,
+  `var/trusted-release-key.json`, `var/follon-self-host-readiness.json`, and
+  `var/follon-acceptance-status.json` via `tools/generate_pipeline_evidence.py`.
 - Complete legal/compliance/privacy review, penetration testing, customer
   support/on-call, backup restoration, TLS/reverse-proxy hardening, monitoring,
   and retention operations for the exact deployment.

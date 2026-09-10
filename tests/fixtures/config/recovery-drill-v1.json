@@ -1,0 +1,10 @@
+{
+  "scenario_name": "Disk Pressure Abrupt Process Termination and State Recovery",
+  "injected_fault": "DISK_PRESSURE_ABRUPT_TERMINATION",
+  "measured_rto_seconds": 12,
+  "target_rto_seconds": 900,
+  "measured_rpo_events_lost": 0,
+  "target_rpo_events_lost": 0,
+  "reconciliation_hash_matched": true,
+  "executed_at": "2026-09-05T14:30:00Z"
+}

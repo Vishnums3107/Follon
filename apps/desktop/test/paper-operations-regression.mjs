@@ -195,6 +195,8 @@ class MockElement {
 
 globalThis.document = {
   createElement: (tag) => new MockElement(tag),
+  createElementNS: (_ns, tag) => new MockElement(tag),
+  createTextNode: (text) => ({ textContent: text }),
   body: new MockElement("body"),
   querySelector: () => null,
 };
@@ -206,6 +208,11 @@ globalThis.Option = class extends MockElement {
     this.value = value;
   }
 };
+
+function containsText(node, expected) {
+  if (!node) return false;
+  return node.textContent?.includes(expected) || node.children?.some((child) => containsText(child, expected));
+}
 
 const mockSnapshot = {
   workspace_schema_version: 1,
@@ -227,6 +234,9 @@ const mockSnapshot = {
   operations: null,
   options: null,
   commercial_artifacts: [],
+  advanced_evidence: [
+    { artifact: "exposure-graph.json", category: "exposure_graph", data: validExposure },
+  ],
 };
 
 const mockContext = {
@@ -266,6 +276,15 @@ renderWorkspace(riskSummary, riskCanvas, "risk-cockpit", mockSnapshot, mockConte
 
 const exposureGraphPanel = riskCanvas.children.find((c) => c.id === "exposure-graph-panel");
 assert.ok(exposureGraphPanel !== undefined, "Exposure graph panel must exist in Risk Cockpit");
+
+// The factor-exposure bar chart must be driven by the real exposure-graph record, never fabricated placeholder factors.
+assert.ok(containsText(exposureGraphPanel, "Momentum (12-1M)"), "Real factor name must be rendered in the bar chart");
+assert.ok(containsText(exposureGraphPanel, "+4200 bps (34.5%)"), "Real factor loading must be rendered in the bar chart");
+assert.ok(containsText(exposureGraphPanel, "+9800 bps (52.0%)"), "Real factor loading must be rendered in the bar chart");
+assert.ok(containsText(exposureGraphPanel, "RECONCILED"), "Real reconciliation status must be rendered in the bar chart");
+assert.ok(!containsText(exposureGraphPanel, "Momentum (MOM)"), "Fabricated placeholder factor name must not be rendered");
+assert.ok(!containsText(exposureGraphPanel, "+340 bps"), "Fabricated placeholder factor value must not be rendered");
+assert.ok(!containsText(exposureGraphPanel, "ZERO-BIASED HEDGE MODEL"), "Fabricated static badge text must not be rendered");
 
 // Test Portfolio additions (PORT-01)
 const portSummary = new MockElement("div");

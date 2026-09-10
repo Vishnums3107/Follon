@@ -75,12 +75,12 @@ export function AppShell(): React.JSX.Element {
         </nav>
         <div className="nav-telemetry">
           <div className="telemetry-item gateway-status">
-            <span className="luxury-pulse-dot luxury-pulse-dot--emerald" aria-hidden="true">
+            <span id="gateway-pulse-dot" className="luxury-pulse-dot luxury-pulse-dot--amber" aria-hidden="true">
               <span className="pulse-ring" />
               <span className="pulse-core" />
             </span>
-            <span className="gateway-label">GATEWAY · SECURE</span>
-            <span className="latency-label">142µs</span>
+            <span id="gateway-label" className="gateway-label">GATEWAY · CHECKING</span>
+            <span id="gateway-latency" className="latency-label">— ms</span>
           </div>
           <div className="telemetry-item">
             <span id="live-utc-clock" className="luxury-clock">2026-09-05 00:00:00.000 UTC</span>
@@ -93,27 +93,28 @@ export function AppShell(): React.JSX.Element {
             <span>Search & Actions</span>
             <kbd className="palette-kbd">Ctrl+K</kbd>
           </button>
-          <span className="environment-badge f-badge f-badge--accent luxury-env-badge">PAPER ENGINE · VERIFIED KERNEL</span>
+          <span id="environment-badge" className="environment-badge f-badge f-badge--accent luxury-env-badge">LOADING · READ-ONLY</span>
+          <button
+            id="signal-mode-toggle"
+            className="f-btn f-btn--ghost signal-mode-toggle"
+            type="button"
+            aria-pressed="false"
+            aria-label="Toggle monochrome display for buy/sell signal colors"
+          >
+            <span aria-hidden="true">◐</span> <span id="signal-mode-label">Color signals</span>
+          </button>
         </div>
       </header>
 
-      <aside className="financial-ticker-bar" aria-label="Live quantitative market telemetry">
+      <aside className="financial-ticker-bar" aria-label="Live portfolio and audit telemetry from the local operations snapshot">
         <div className="ticker-track">
-          <div className="ticker-item"><span className="ticker-symbol">BTC/USD</span><span className="ticker-price">$92,450.20</span><span className="ticker-change f-text-buy">+2.41%</span></div>
+          <div className="ticker-item"><span className="ticker-symbol">PORTFOLIO NAV</span><span id="ticker-nav" className="ticker-price">No snapshot</span><span id="ticker-nav-tag" className="ticker-tag f-badge">—</span></div>
           <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">ETH/USD</span><span className="ticker-price">$3,420.85</span><span className="ticker-change f-text-buy">+1.87%</span></div>
+          <div className="ticker-item"><span className="ticker-symbol">MAX DRAWDOWN</span><span id="ticker-drawdown" className="ticker-price">No snapshot</span><span id="ticker-drawdown-tag" className="ticker-tag f-badge">—</span></div>
           <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">SPX</span><span className="ticker-price">5,860.10</span><span className="ticker-change f-text-buy">+0.32%</span></div>
+          <div className="ticker-item"><span className="ticker-symbol">OMS ENGINE</span><span id="ticker-oms" className="ticker-price">No snapshot</span><span id="ticker-oms-tag" className="ticker-tag f-badge">—</span></div>
           <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">PORTFOLIO NAV</span><span className="ticker-price">$10,480,250.00</span><span className="ticker-tag f-badge">RECONCILED</span></div>
-          <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">MAX DRAWDOWN</span><span className="ticker-price">-1.82%</span><span className="ticker-tag f-badge--buy">WITHIN LIMIT</span></div>
-          <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">VAR (99% 1D)</span><span className="ticker-price">$42,500</span><span className="ticker-tag f-badge">BOUNDED</span></div>
-          <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">OMS ENGINE</span><span className="ticker-price">0 UNCONFIRMED</span><span className="ticker-tag f-badge--buy">CLEAN</span></div>
-          <div className="ticker-divider" />
-          <div className="ticker-item"><span className="ticker-symbol">AUDIT ANCHOR</span><span className="ticker-price f-text-mono">0x7f4e9a…</span><span className="ticker-tag f-badge">IMMUTABLE</span></div>
+          <div className="ticker-item"><span className="ticker-symbol">AUDIT ANCHOR</span><span id="ticker-audit" className="ticker-price f-text-mono">No snapshot</span><span id="ticker-audit-tag" className="ticker-tag f-badge">—</span></div>
         </div>
       </aside>
 

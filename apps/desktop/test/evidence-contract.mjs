@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseEvidenceLog, parseOperationsDashboard, parseOptionsDashboard } from "../dist/evidence.js";
+import {
+  parseEvidenceLog,
+  parseFxPricingDashboard,
+  parseOperationsDashboard,
+  parseOptionsDashboard,
+  parseStatementReconciliation,
+} from "../dist/evidence.js";
 import { parseWorkspaceSnapshot } from "../dist/workspaces.js";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
@@ -52,6 +58,45 @@ try {
   const impossibleJournal = structuredClone(operationsDashboard);
   impossibleJournal.journal.failure_reason = "verification failed";
   assert.throws(() => parseOperationsDashboard(JSON.stringify(impossibleJournal)));
+
+  const fxPricingDashboardPath = join(temporaryDirectory, "fx-pricing-dashboard.json");
+  const statementReconciliationPath = join(temporaryDirectory, "statement-reconciliation.json");
+
+  runCargo([
+    "run", "-q", "-p", "follon-cli", "--bin", "follon-fx", "--",
+    "price", "tests/fixtures/config/fx-v1.json", fxPricingDashboardPath,
+    "--as-of", "2026-09-05T12:00:00Z",
+  ]);
+  runCargo([
+    "run", "-q", "-p", "follon-cli", "--bin", "follon-operations", "--",
+    "reconcile-statement", "tests/fixtures/config/operations-v1.json",
+    "tests/fixtures/broker-statement-v1.csv", statementReconciliationPath,
+  ]);
+
+  const fxPricingDashboard = parseFxPricingDashboard(readFileSync(fxPricingDashboardPath, "utf8"));
+  const statementReconciliation = parseStatementReconciliation(readFileSync(statementReconciliationPath, "utf8"));
+
+  assert.equal(fxPricingDashboard.fx_pricing_schema_version, 1);
+  assert.equal(fxPricingDashboard.evaluations.length, 6);
+  assert.equal(fxPricingDashboard.evaluations[0].fresh, true);
+  assert.equal(statementReconciliation.clean, true);
+  assert.equal(statementReconciliation.incident_count, 0);
+
+  const invalidFxSchema = structuredClone(fxPricingDashboard);
+  invalidFxSchema.fx_pricing_schema_version = 2;
+  assert.throws(() => parseFxPricingDashboard(JSON.stringify(invalidFxSchema)));
+
+  const tamperedFxEvaluation = structuredClone(fxPricingDashboard);
+  tamperedFxEvaluation.evaluations[0].midpoint = "invalid-decimal";
+  assert.throws(() => parseFxPricingDashboard(JSON.stringify(tamperedFxEvaluation)));
+
+  const invalidStatementSchema = structuredClone(statementReconciliation);
+  invalidStatementSchema.statement_reconciliation_schema_version = 2;
+  assert.throws(() => parseStatementReconciliation(JSON.stringify(invalidStatementSchema)));
+
+  const tamperedStatementHash = structuredClone(statementReconciliation);
+  tamperedStatementHash.statement_csv_hash = "not-a-hash";
+  assert.throws(() => parseStatementReconciliation(JSON.stringify(tamperedStatementHash)));
 
   const canonicalEvent = {
     event_id: "evt.fixture.001",

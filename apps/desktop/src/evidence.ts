@@ -577,6 +577,69 @@ export type FundLedgerStatement = Readonly<{
   created_at: string;
 }>;
 
+export type FxPricingEvaluation = Readonly<{
+  age_seconds: number;
+  ask: string;
+  bid: string;
+  fresh: boolean;
+  instrument_id: string;
+  midpoint: string;
+  pair: string;
+  product: string;
+  query_id: string;
+  received_at: string;
+  snapshot_id: string;
+  source_id: string;
+  source_sequence: number;
+  source_time: string;
+  spread_bps: string;
+  value_date: string;
+}>;
+
+export type FxPricingSnapshotRecord = Readonly<{
+  canonical_record: string;
+  instrument_id: string;
+  pair: string;
+  product: string;
+  received_at: string;
+  reference_version: string;
+  snapshot_id: string;
+  source_id: string;
+  source_sequence: number;
+  source_time: string;
+}>;
+
+export type FxPricingDashboard = Readonly<{
+  fx_pricing_schema_version: 1;
+  as_of: string;
+  configuration_content_hash: string;
+  evaluations: ReadonlyArray<FxPricingEvaluation>;
+  max_age_seconds: number;
+  snapshot_count: number;
+  snapshots: ReadonlyArray<FxPricingSnapshotRecord>;
+}>;
+
+export type StatementIncident = Readonly<{
+  incident_kind: "CASH_MISMATCH" | "POSITION_MISMATCH";
+  broker_balance?: string;
+  currency?: string;
+  internal_balance?: string;
+  broker_quantity?: string;
+  instrument_id?: string;
+  internal_quantity?: string;
+}>;
+
+export type StatementReconciliation = Readonly<{
+  statement_reconciliation_schema_version: 1;
+  account_id: string;
+  as_of: string;
+  clean: boolean;
+  configuration_content_hash: string;
+  incident_count: number;
+  incidents: ReadonlyArray<StatementIncident>;
+  statement_csv_hash: string;
+}>;
+
 export type ContinuityPolicy = Readonly<{
   policy_schema_version: 1;
   policy_id: string;
@@ -1008,6 +1071,88 @@ export type CompatibilityMatrix = Readonly<{
   verified_at: string;
 }>;
 
+export type MarketScannerCandidate = Readonly<{
+  rank: number;
+  instrument_id: string;
+  symbol: string;
+  close_price: string;
+  momentum_score_bps: number;
+  rsi_14: string;
+  matched_conditions: readonly string[];
+  rationale: string;
+}>;
+
+export type MarketScannerIndicator = Readonly<{
+  column_id: string;
+  name: string;
+  timeframe: string;
+  definition: string;
+}>;
+
+export type MarketScanner = Readonly<{
+  scanner_schema_version: 1;
+  scanner_id: string;
+  universe_id: string;
+  as_of_time: string;
+  indicator_columns: readonly MarketScannerIndicator[];
+  candidates: readonly MarketScannerCandidate[];
+  quarantined_count: number;
+  created_at: string;
+}>;
+
+export type NewsRevisionEntry = Readonly<{
+  version_sequence: number;
+  received_at: string;
+  source_id: string;
+  kind: "INITIAL_REPORT" | "SYNDICATED_DUPLICATE" | "CORRECTION" | "EDITORIAL_REVISION" | "MODEL_INTERPRETATION";
+  headline: string;
+  entity_confidence_bps: number;
+  content_hash: string;
+  supersedes_sequence: number | null;
+}>;
+
+export type NewsRevisionTimeline = Readonly<{
+  revision_timeline_schema_version: 1;
+  timeline_id: string;
+  target_event_id: string;
+  chain: readonly NewsRevisionEntry[];
+  conflict_detected: boolean;
+  created_at: string;
+}>;
+
+export type StrategyCompositionSignal = Readonly<{
+  signal_id: string;
+  indicator_ref: string;
+  condition: string;
+  weight_bps: number;
+}>;
+
+export type StrategyCompositionSizing = Readonly<{
+  sizing_type: "FIXED_CAPITAL" | "VOLATILITY_TARGETED" | "RISK_PARITY" | "KELLY_FRACTION";
+  target_value: string;
+}>;
+
+export type StrategyCompositionPortfolioConstraints = Readonly<{
+  max_leverage_bps: number;
+  max_single_position_bps: number;
+  stop_loss_pct: string;
+}>;
+
+export type StrategyCompositionSpec = Readonly<{
+  composition_schema_version: 1;
+  composition_id: string;
+  strategy_id: string;
+  strategy_version: string;
+  signals: readonly StrategyCompositionSignal[];
+  sizing_rule: StrategyCompositionSizing;
+  entry_criteria: readonly string[];
+  exit_criteria: readonly string[];
+  portfolio_constraints: StrategyCompositionPortfolioConstraints;
+  code_hash: string;
+  visual_representation_hash: string;
+  created_at: string;
+}>;
+
 /** Parses and validates canonical NDJSON before it is shown as evidence. */
 export function parseEvidenceLog(ndjson: string): EvidenceEvent[] {
   const eventIds = new Set<string>();
@@ -1373,6 +1518,34 @@ export function parseAdapterQualification(json: string): AdapterQualification {
   return value;
 }
 
+/** Parses a deterministic FX pricing dashboard (v1). */
+export function parseFxPricingDashboard(json: string): FxPricingDashboard {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("FX pricing dashboard is not valid JSON.");
+  }
+  if (!isFxPricingDashboard(value)) {
+    throw new Error("FX pricing dashboard does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a broker statement reconciliation artifact (v1). */
+export function parseStatementReconciliation(json: string): StatementReconciliation {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Statement reconciliation is not valid JSON.");
+  }
+  if (!isStatementReconciliation(value)) {
+    throw new Error("Statement reconciliation does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
 /** Parses a champion/challenger evaluation and strategy retirement record (RES-08). */
 export function parseChampionChallengerEvaluation(json: string): ChampionChallengerEvaluation {
   let value: unknown;
@@ -1593,6 +1766,48 @@ export function parseCompatibilityMatrix(json: string): CompatibilityMatrix {
   }
   if (!isCompatibilityMatrix(value)) {
     throw new Error("Compatibility matrix does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses an explainable market scanner result record (SOLO-04). */
+export function parseMarketScanner(json: string): MarketScanner {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Market scanner is not valid JSON.");
+  }
+  if (!isMarketScanner(value)) {
+    throw new Error("Market scanner does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a news revision and novelty timeline record (DATA-03). */
+export function parseNewsRevisionTimeline(json: string): NewsRevisionTimeline {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("News revision timeline is not valid JSON.");
+  }
+  if (!isNewsRevisionTimeline(value)) {
+    throw new Error("News revision timeline does not match the v1 evidence contract.");
+  }
+  return value;
+}
+
+/** Parses a strategy composition specification record (RES-02). */
+export function parseStrategyCompositionSpec(json: string): StrategyCompositionSpec {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    throw new Error("Strategy composition specification is not valid JSON.");
+  }
+  if (!isStrategyCompositionSpec(value)) {
+    throw new Error("Strategy composition specification does not match the v1 evidence contract.");
   }
   return value;
 }
@@ -3536,4 +3751,206 @@ function isCompatibilityMatrix(value: unknown): value is CompatibilityMatrix {
   }
   return true;
 }
+
+function isFxPricingDashboard(value: unknown): value is FxPricingDashboard {
+  if (!hasExactKeys(value, [
+    "as_of",
+    "configuration_content_hash",
+    "evaluations",
+    "fx_pricing_schema_version",
+    "max_age_seconds",
+    "snapshot_count",
+    "snapshots",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.fx_pricing_schema_version !== 1 || !isUtcTimestamp(c.as_of)) return false;
+  if (!isHash(c.configuration_content_hash)) return false;
+  if (!isNonNegativeInteger(c.max_age_seconds) || !isNonNegativeInteger(c.snapshot_count)) return false;
+  if (!Array.isArray(c.evaluations) || !Array.isArray(c.snapshots)) return false;
+  for (const e of c.evaluations) {
+    if (!hasExactKeys(e, [
+      "age_seconds",
+      "ask",
+      "bid",
+      "fresh",
+      "instrument_id",
+      "midpoint",
+      "pair",
+      "product",
+      "query_id",
+      "received_at",
+      "snapshot_id",
+      "source_id",
+      "source_sequence",
+      "source_time",
+      "spread_bps",
+      "value_date",
+    ])) return false;
+    const ev = e as Record<string, unknown>;
+    if (!isCanonicalId(ev.query_id) || !isCanonicalId(ev.instrument_id) || !isCanonicalId(ev.snapshot_id) || !isCanonicalId(ev.source_id)) return false;
+    if (typeof ev.product !== "string" || typeof ev.pair !== "string" || typeof ev.value_date !== "string") return false;
+    if (!isDecimal(ev.midpoint) || !isDecimal(ev.bid) || !isDecimal(ev.ask) || !isDecimal(ev.spread_bps)) return false;
+    if (!isUtcTimestamp(ev.source_time) || !isUtcTimestamp(ev.received_at)) return false;
+    if (typeof ev.fresh !== "boolean" || typeof ev.age_seconds !== "number" || typeof ev.source_sequence !== "number") return false;
+  }
+  for (const s of c.snapshots) {
+    if (!hasExactKeys(s, [
+      "canonical_record",
+      "instrument_id",
+      "pair",
+      "product",
+      "received_at",
+      "reference_version",
+      "snapshot_id",
+      "source_id",
+      "source_sequence",
+      "source_time",
+    ])) return false;
+    const sn = s as Record<string, unknown>;
+    if (!isCanonicalId(sn.snapshot_id) || !isCanonicalId(sn.instrument_id) || !isCanonicalId(sn.source_id)) return false;
+    if (typeof sn.canonical_record !== "string" || typeof sn.pair !== "string" || typeof sn.product !== "string" || typeof sn.reference_version !== "string") return false;
+    if (!isUtcTimestamp(sn.source_time) || !isUtcTimestamp(sn.received_at) || typeof sn.source_sequence !== "number") return false;
+  }
+  return true;
+}
+
+function isStatementReconciliation(value: unknown): value is StatementReconciliation {
+  if (!hasExactKeys(value, [
+    "account_id",
+    "as_of",
+    "clean",
+    "configuration_content_hash",
+    "incident_count",
+    "incidents",
+    "statement_csv_hash",
+    "statement_reconciliation_schema_version",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.statement_reconciliation_schema_version !== 1 || !isCanonicalId(c.account_id)) return false;
+  if (!isUtcTimestamp(c.as_of) || typeof c.clean !== "boolean") return false;
+  if (!isHash(c.configuration_content_hash) || !isHash(c.statement_csv_hash)) return false;
+  if (!isNonNegativeInteger(c.incident_count) || !Array.isArray(c.incidents)) return false;
+  for (const inc of c.incidents) {
+    const item = inc as Record<string, unknown>;
+    if (item.incident_kind === "CASH_MISMATCH") {
+      if (!hasExactKeys(item, ["broker_balance", "currency", "incident_kind", "internal_balance"])) return false;
+      const cur = String(item.currency);
+      if (cur.length !== 3 || !isDecimal(item.internal_balance) || !isDecimal(item.broker_balance)) return false;
+    } else if (item.incident_kind === "POSITION_MISMATCH") {
+      if (!hasExactKeys(item, ["broker_quantity", "incident_kind", "instrument_id", "internal_quantity"])) return false;
+      if (!isCanonicalId(item.instrument_id) || !isDecimal(item.internal_quantity) || !isDecimal(item.broker_quantity)) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isMarketScanner(value: unknown): value is MarketScanner {
+  if (!hasExactKeys(value, [
+    "as_of_time",
+    "candidates",
+    "created_at",
+    "indicator_columns",
+    "quarantined_count",
+    "scanner_id",
+    "scanner_schema_version",
+    "universe_id",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.scanner_schema_version !== 1 || !isCanonicalId(c.scanner_id) || typeof c.universe_id !== "string") return false;
+  if (!isUtcTimestamp(c.as_of_time) || !isUtcTimestamp(c.created_at) || !isNonNegativeInteger(c.quarantined_count)) return false;
+  if (!Array.isArray(c.indicator_columns) || c.indicator_columns.length === 0 || !Array.isArray(c.candidates)) return false;
+  for (const col of c.indicator_columns) {
+    if (!hasExactKeys(col, ["column_id", "definition", "name", "timeframe"])) return false;
+    const cl = col as Record<string, unknown>;
+    if (typeof cl.column_id !== "string" || typeof cl.name !== "string" || typeof cl.timeframe !== "string" || typeof cl.definition !== "string") return false;
+  }
+  for (const cand of c.candidates) {
+    if (!hasExactKeys(cand, [
+      "close_price",
+      "instrument_id",
+      "matched_conditions",
+      "momentum_score_bps",
+      "rank",
+      "rationale",
+      "rsi_14",
+      "symbol",
+    ])) return false;
+    const cd = cand as Record<string, unknown>;
+    if (!isPositiveInteger(cd.rank) || !isCanonicalId(cd.instrument_id) || typeof cd.symbol !== "string") return false;
+    if (!isDecimal(cd.close_price) || !Number.isSafeInteger(cd.momentum_score_bps) || !isDecimal(cd.rsi_14)) return false;
+    if (!Array.isArray(cd.matched_conditions) || typeof cd.rationale !== "string") return false;
+  }
+  return true;
+}
+
+function isNewsRevisionTimeline(value: unknown): value is NewsRevisionTimeline {
+  if (!hasExactKeys(value, [
+    "chain",
+    "conflict_detected",
+    "created_at",
+    "revision_timeline_schema_version",
+    "target_event_id",
+    "timeline_id",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.revision_timeline_schema_version !== 1 || !isCanonicalId(c.timeline_id) || typeof c.target_event_id !== "string") return false;
+  if (typeof c.conflict_detected !== "boolean" || !isUtcTimestamp(c.created_at) || !Array.isArray(c.chain) || c.chain.length === 0) return false;
+  for (const item of c.chain) {
+    if (!hasExactKeys(item, [
+      "content_hash",
+      "entity_confidence_bps",
+      "headline",
+      "kind",
+      "received_at",
+      "source_id",
+      "supersedes_sequence",
+      "version_sequence",
+    ])) return false;
+    const entry = item as Record<string, unknown>;
+    if (!isPositiveInteger(entry.version_sequence) || !isUtcTimestamp(entry.received_at) || typeof entry.source_id !== "string") return false;
+    if (!["INITIAL_REPORT", "SYNDICATED_DUPLICATE", "CORRECTION", "EDITORIAL_REVISION", "MODEL_INTERPRETATION"].includes(String(entry.kind))) return false;
+    if (typeof entry.headline !== "string" || !isNonNegativeInteger(entry.entity_confidence_bps) || entry.entity_confidence_bps > 10000) return false;
+    if (!isHash(entry.content_hash)) return false;
+    if (entry.supersedes_sequence !== null && !isPositiveInteger(entry.supersedes_sequence)) return false;
+  }
+  return true;
+}
+
+function isStrategyCompositionSpec(value: unknown): value is StrategyCompositionSpec {
+  if (!hasExactKeys(value, [
+    "code_hash",
+    "composition_id",
+    "composition_schema_version",
+    "created_at",
+    "entry_criteria",
+    "exit_criteria",
+    "portfolio_constraints",
+    "signals",
+    "sizing_rule",
+    "strategy_id",
+    "strategy_version",
+    "visual_representation_hash",
+  ])) return false;
+  const c = value as Record<string, unknown>;
+  if (c.composition_schema_version !== 1 || !isCanonicalId(c.composition_id) || !isCanonicalId(c.strategy_id)) return false;
+  if (typeof c.strategy_version !== "string" || !isUtcTimestamp(c.created_at)) return false;
+  if (!isHash(c.code_hash) || !isHash(c.visual_representation_hash)) return false;
+  if (!Array.isArray(c.signals) || c.signals.length === 0 || !Array.isArray(c.entry_criteria) || !Array.isArray(c.exit_criteria)) return false;
+  for (const sig of c.signals) {
+    if (!hasExactKeys(sig, ["condition", "indicator_ref", "signal_id", "weight_bps"])) return false;
+    const s = sig as Record<string, unknown>;
+    if (!isCanonicalId(s.signal_id) || typeof s.indicator_ref !== "string" || typeof s.condition !== "string" || !isNonNegativeInteger(s.weight_bps)) return false;
+  }
+  if (!hasExactKeys(c.sizing_rule, ["sizing_type", "target_value"])) return false;
+  const sr = c.sizing_rule as Record<string, unknown>;
+  if (!["FIXED_CAPITAL", "VOLATILITY_TARGETED", "RISK_PARITY", "KELLY_FRACTION"].includes(String(sr.sizing_type)) || typeof sr.target_value !== "string") return false;
+  if (!hasExactKeys(c.portfolio_constraints, ["max_leverage_bps", "max_single_position_bps", "stop_loss_pct"])) return false;
+  const pc = c.portfolio_constraints as Record<string, unknown>;
+  if (!isNonNegativeInteger(pc.max_leverage_bps) || !isNonNegativeInteger(pc.max_single_position_bps) || typeof pc.stop_loss_pct !== "string") return false;
+  return true;
+}
+
+
 

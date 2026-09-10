@@ -139,6 +139,9 @@ ADVANCED_EVIDENCE_SCHEMAS: tuple[tuple[str, str, str], ...] = (
     ("matrix_schema_version", "gateway_qualification_matrix", "platform"),
     ("proposal_schema_version", "capital_allocation_proposal", "execution-risk"),
     ("compatibility_schema_version", "compatibility_matrix", "platform"),
+    ("scanner_schema_version", "market_scanner", "command-center"),
+    ("revision_timeline_schema_version", "news_revision_timeline", "news"),
+    ("composition_schema_version", "strategy_composition_spec", "research"),
 )
 
 

@@ -129,6 +129,10 @@ pub struct LiveRiskPolicy {
     pub max_realized_loss: Decimal,
     /// Maximum age of the exact market observation at decision time.
     pub max_market_data_age_seconds: u64,
+    /// Maximum order submissions permitted within `order_rate_window_seconds`.
+    pub max_order_rate: u32,
+    /// Rolling window, in seconds, over which `max_order_rate` is enforced.
+    pub order_rate_window_seconds: u64,
 }
 
 impl LiveRiskPolicy {
@@ -148,6 +152,8 @@ impl LiveRiskPolicy {
             || self.max_position_quantity <= Decimal::ZERO
             || self.max_realized_loss < Decimal::ZERO
             || self.max_market_data_age_seconds == 0
+            || self.max_order_rate == 0
+            || self.order_rate_window_seconds == 0
         {
             return Err(LiveError("invalid controlled-live risk policy".to_owned()));
         }
@@ -2423,6 +2429,22 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             Side::Buy => current_position.checked_add(intent.quantity)?,
             Side::Sell => current_position.checked_sub(intent.quantity)?,
         };
+        let rate_window_start =
+            decision_at - time::Duration::seconds(self.policy.order_rate_window_seconds as i64);
+        let recent_order_count =
+            self.orders
+                .values()
+                .try_fold(0u32, |count, order| -> Result<u32, LiveError> {
+                    let created_at = OffsetDateTime::parse(&order.oms.intent.created_at, &Rfc3339)
+                        .map_err(|error| LiveError(error.to_string()))?;
+                    Ok(
+                        if created_at > rate_window_start && created_at <= decision_at {
+                            count + 1
+                        } else {
+                            count
+                        },
+                    )
+                })?;
         let mut reasons = self.kill_switches.rejection_reasons(intent);
         if intent.quantity > self.policy.max_order_quantity {
             reasons.push("MAX_ORDER_QUANTITY_EXCEEDED".to_owned());
@@ -2432,6 +2454,16 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
         if requested_price_deviation_bps > self.policy.max_price_deviation_bps {
             reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
+        }
+        if self.orders.values().any(|order| {
+            order.working()
+                && order.oms.intent.instrument_id == intent.instrument_id
+                && order.oms.intent.side != intent.side
+        }) {
+            reasons.push("SELF_TRADE_RISK".to_owned());
+        }
+        if recent_order_count >= self.policy.max_order_rate {
+            reasons.push("MAX_ORDER_RATE_EXCEEDED".to_owned());
         }
         if !shadow && estimated_notional > self.policy.canary_max_order_notional {
             reasons.push("CANARY_NOTIONAL_EXCEEDED".to_owned());
@@ -2489,7 +2521,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             reasons.push("APPROVED".to_owned());
         }
         let evaluated_limits = format!(
-            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
             self.policy.max_order_quantity,
             self.policy.max_order_notional,
             self.policy.max_price_deviation_bps,
@@ -2499,6 +2531,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             self.policy.max_position_quantity,
             self.policy.max_realized_loss,
             self.policy.max_market_data_age_seconds,
+            self.policy.max_order_rate,
+            self.policy.order_rate_window_seconds,
+            recent_order_count,
             market.instrument_id,
             market.mark_price,
             market.observed_at,
@@ -3873,6 +3908,8 @@ mod tests {
             max_position_quantity: amount("10"),
             max_realized_loss: amount("100"),
             max_market_data_age_seconds: 60,
+            max_order_rate: 20,
+            order_rate_window_seconds: 60,
         }
     }
 
@@ -4212,6 +4249,180 @@ mod tests {
             .evaluated_limits
             .contains("requested_price_deviation_bps=1000.00000000"));
         assert_eq!(service.broker_mut().submitted, 0);
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn controlled_live_self_trade_risk_rejects_an_opposite_side_canary_order() {
+        let path = journal_path("self-trade");
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        let buy_intent = intent("LIVE", "intent.live.self-trade.buy");
+        let mut buy_approval = approval_for(&service, &buy_intent);
+        buy_approval.approval_id = "approval.live.self-trade.buy".to_owned();
+        service
+            .register_approval(
+                buy_approval,
+                "2026-01-02T14:30:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let buy_outcome = service
+            .submit_canary_intent(
+                buy_intent,
+                market(),
+                "approval.live.self-trade.buy",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            buy_outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+
+        let mut sell_intent = intent("LIVE", "intent.live.self-trade.sell");
+        sell_intent.side = Side::Sell;
+        let mut sell_approval = approval_for(&service, &sell_intent);
+        sell_approval.approval_id = "approval.live.self-trade.sell".to_owned();
+        service
+            .register_approval(
+                sell_approval,
+                "2026-01-02T14:30:01Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let sell_outcome = service
+            .submit_canary_intent(
+                sell_intent,
+                market(),
+                "approval.live.self-trade.sell",
+                "2026-01-02T14:30:01Z",
+                "operator.requester.001",
+            )
+            .expect("risk evaluation completes");
+        let LiveSubmitOutcome::RiskRejected { decision } = sell_outcome else {
+            panic!("an opposite-side order against a resting order must be rejected");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"SELF_TRADE_RISK".to_owned()));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn controlled_live_order_rate_limit_rejects_submissions_beyond_the_configured_window() {
+        let path = journal_path("order-rate");
+        let account = account();
+        let mut rate_limited_policy = policy();
+        rate_limited_policy.max_order_rate = 2;
+        rate_limited_policy.canary_max_orders = 10;
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(
+            LiveRunMode::Canary,
+            &account,
+            &rate_limited_policy,
+            &switches,
+        );
+        let mut service = LiveTradingService::open_durable(
+            account,
+            rate_limited_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+
+        let first_intent = intent("LIVE", "intent.live.rate.001");
+        let mut first_approval = approval_for(&service, &first_intent);
+        first_approval.approval_id = "approval.live.rate.001".to_owned();
+        service
+            .register_approval(
+                first_approval,
+                "2026-01-02T14:30:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let first = service
+            .submit_canary_intent(
+                first_intent,
+                market(),
+                "approval.live.rate.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("first submission");
+        assert!(matches!(first, LiveSubmitOutcome::CanaryOrder { .. }));
+
+        let second_intent = intent("LIVE", "intent.live.rate.002");
+        let mut second_approval = approval_for(&service, &second_intent);
+        second_approval.approval_id = "approval.live.rate.002".to_owned();
+        service
+            .register_approval(
+                second_approval,
+                "2026-01-02T14:30:01Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let second = service
+            .submit_canary_intent(
+                second_intent,
+                market(),
+                "approval.live.rate.002",
+                "2026-01-02T14:30:01Z",
+                "operator.requester.001",
+            )
+            .expect("second submission");
+        assert!(matches!(second, LiveSubmitOutcome::CanaryOrder { .. }));
+
+        let third_intent = intent("LIVE", "intent.live.rate.003");
+        let mut third_approval = approval_for(&service, &third_intent);
+        third_approval.approval_id = "approval.live.rate.003".to_owned();
+        service
+            .register_approval(
+                third_approval,
+                "2026-01-02T14:30:02Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let third = service
+            .submit_canary_intent(
+                third_intent,
+                market(),
+                "approval.live.rate.003",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("third evaluation completes");
+        let LiveSubmitOutcome::RiskRejected { decision } = third else {
+            panic!("a submission beyond the configured order rate must be rejected");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_ORDER_RATE_EXCEEDED".to_owned()));
+        assert!(decision.evaluated_limits.contains("recent_order_count=2"));
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");
     }

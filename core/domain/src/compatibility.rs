@@ -80,8 +80,14 @@ impl CompatibilityMatrix {
         }
         json.push_str("],");
 
-        json.push_str(&format!("\"backward_compatibility_verified\":{},", self.backward_compatibility_verified));
-        json.push_str(&format!("\"golden_corpus_size\":{},", self.golden_corpus_size));
+        json.push_str(&format!(
+            "\"backward_compatibility_verified\":{},",
+            self.backward_compatibility_verified
+        ));
+        json.push_str(&format!(
+            "\"golden_corpus_size\":{},",
+            self.golden_corpus_size
+        ));
         json.push_str(&format!("\"verified_at\":\"{}\"", self.verified_at));
         json.push('}');
         json
@@ -119,14 +125,33 @@ impl CompatibilityRegistry {
         });
     }
 
-    /// Validates backward compatibility against the golden historical corpus.
+    /// Certifies backward compatibility from an already-executed golden-corpus
+    /// verification. The caller must supply the exact number of historical
+    /// corpus records that were read (`golden_corpus_size`) and the exact
+    /// number of those records that independently parsed and validated
+    /// against a real reader (`corpus_records_verified`); this function never
+    /// assumes success and never invents a corpus size. Compatibility is
+    /// certified only when every read record verified.
     pub fn verify_corpus(
         &self,
         golden_corpus_size: u32,
+        corpus_records_verified: u32,
         verified_at: &str,
     ) -> Result<CompatibilityMatrix, DomainError> {
         if self.entries.is_empty() {
-            return Err(DomainError("compatibility registry cannot be empty".to_owned()));
+            return Err(DomainError(
+                "compatibility registry cannot be empty".to_owned(),
+            ));
+        }
+        if golden_corpus_size == 0 {
+            return Err(DomainError(
+                "compatibility verification requires a non-empty golden corpus".to_owned(),
+            ));
+        }
+        if corpus_records_verified > golden_corpus_size {
+            return Err(DomainError(
+                "verified record count cannot exceed the golden corpus size".to_owned(),
+            ));
         }
 
         let matrix_id = format!("compat.{}.v1", self.engine_version.replace('.', "-"));
@@ -136,7 +161,7 @@ impl CompatibilityRegistry {
             matrix_id,
             engine_version: self.engine_version.clone(),
             registered_schemas: self.entries.clone(),
-            backward_compatibility_verified: true,
+            backward_compatibility_verified: corpus_records_verified == golden_corpus_size,
             golden_corpus_size,
             verified_at: verified_at.to_owned(),
         })
@@ -154,7 +179,9 @@ mod tests {
         registry.register("order-intent", 1, 1, SchemaMigrationStatus::Current);
         registry.register("market-bar", 1, 1, SchemaMigrationStatus::Current);
 
-        let matrix = registry.verify_corpus(1_000, "2026-09-01T12:00:00Z").unwrap();
+        let matrix = registry
+            .verify_corpus(1_000, 1_000, "2026-09-01T12:00:00Z")
+            .unwrap();
         assert_eq!(matrix.compatibility_schema_version, 1);
         assert!(matrix.backward_compatibility_verified);
         assert_eq!(matrix.registered_schemas.len(), 3);
@@ -162,5 +189,33 @@ mod tests {
         let json = matrix.to_json();
         assert!(json.contains("\"schema_name\":\"event-envelope\""));
         assert!(json.contains("\"backward_compatibility_verified\":true"));
+    }
+
+    #[test]
+    fn a_partially_verified_corpus_is_reported_as_not_backward_compatible() {
+        let mut registry = CompatibilityRegistry::new("0.1.0");
+        registry.register("event-envelope", 1, 1, SchemaMigrationStatus::Current);
+
+        let matrix = registry
+            .verify_corpus(10, 7, "2026-09-10T12:00:00Z")
+            .unwrap();
+        assert!(!matrix.backward_compatibility_verified);
+        assert_eq!(matrix.golden_corpus_size, 10);
+        assert!(matrix
+            .to_json()
+            .contains("\"backward_compatibility_verified\":false"));
+    }
+
+    #[test]
+    fn an_empty_corpus_and_an_overcounted_verification_are_refused() {
+        let mut registry = CompatibilityRegistry::new("0.1.0");
+        registry.register("event-envelope", 1, 1, SchemaMigrationStatus::Current);
+
+        assert!(registry
+            .verify_corpus(0, 0, "2026-09-10T12:00:00Z")
+            .is_err());
+        assert!(registry
+            .verify_corpus(5, 6, "2026-09-10T12:00:00Z")
+            .is_err());
     }
 }

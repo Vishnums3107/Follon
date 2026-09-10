@@ -157,13 +157,9 @@ mod tests {
             packaged_at: "2026-09-01T12:00:00Z".to_owned(),
         };
 
-        let disposition = StrategyCapsuleVerifier::verify_capsule_payload(
-            &manifest,
-            bundle,
-            cfg,
-            Some(lock),
-        )
-        .unwrap();
+        let disposition =
+            StrategyCapsuleVerifier::verify_capsule_payload(&manifest, bundle, cfg, Some(lock))
+                .unwrap();
 
         assert_eq!(disposition, CapsuleExportDisposition::VerifiedPortable);
         let json = manifest.to_json();

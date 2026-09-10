@@ -394,6 +394,7 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-execution",
+ "follon-fx",
  "follon-instrument",
  "follon-live",
  "follon-market-data",

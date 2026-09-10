@@ -93,9 +93,18 @@ impl DecisionReconstruction {
     pub fn to_json(&self) -> String {
         let mut json = String::from("{");
         json.push_str("\"reconstruction_schema_version\":1,");
-        json.push_str(&format!("\"reconstruction_id\":\"{}\",", self.reconstruction_id));
-        json.push_str(&format!("\"target_event_id\":\"{}\",", self.target_event_id));
-        json.push_str(&format!("\"target_entity_type\":\"{}\",", self.target_entity_type));
+        json.push_str(&format!(
+            "\"reconstruction_id\":\"{}\",",
+            self.reconstruction_id
+        ));
+        json.push_str(&format!(
+            "\"target_event_id\":\"{}\",",
+            self.target_event_id
+        ));
+        json.push_str(&format!(
+            "\"target_entity_type\":\"{}\",",
+            self.target_entity_type
+        ));
 
         // causal_chain
         json.push_str("\"causal_chain\":[");
@@ -134,8 +143,14 @@ impl DecisionReconstruction {
         }
         json.push_str("],");
 
-        json.push_str(&format!("\"configuration_hash\":\"{}\",", self.configuration_hash));
-        json.push_str(&format!("\"integrity_status\":\"{}\",", self.integrity_status.as_str()));
+        json.push_str(&format!(
+            "\"configuration_hash\":\"{}\",",
+            self.configuration_hash
+        ));
+        json.push_str(&format!(
+            "\"integrity_status\":\"{}\",",
+            self.integrity_status.as_str()
+        ));
         json.push_str(&format!("\"verified_at\":\"{}\"", self.verified_at));
         json.push('}');
         json
@@ -164,10 +179,12 @@ impl<'a> DecisionProvenanceGraphBuilder<'a> {
         configuration_hash: &str,
         verified_at: &str,
     ) -> Result<DecisionReconstruction, EngineError> {
-        let target_event = self
-            .events_by_id
-            .get(target_event_id)
-            .ok_or_else(|| EngineError(format!("target event {} not found in store", target_event_id)))?;
+        let target_event = self.events_by_id.get(target_event_id).ok_or_else(|| {
+            EngineError(format!(
+                "target event {} not found in store",
+                target_event_id
+            ))
+        })?;
 
         let target_entity_type = match target_event.event_type.as_str() {
             "execution.fill.v1" => "fill",
@@ -330,6 +347,9 @@ mod tests {
             .reconstruct("evt.2", "cfg_hash_abc", "2026-09-01T10:05:00Z")
             .unwrap();
 
-        assert_eq!(recon.integrity_status, ProvenanceIntegrityStatus::IncompleteChain);
+        assert_eq!(
+            recon.integrity_status,
+            ProvenanceIntegrityStatus::IncompleteChain
+        );
     }
 }

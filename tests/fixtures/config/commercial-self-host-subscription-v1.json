@@ -1,0 +1,12 @@
+{
+  "commercial_subscription_schema_version": 1,
+  "subscription_id": "subscription.hosted.001",
+  "tenant_id": "tenant.hosted",
+  "plan": "SELF_HOSTED",
+  "status": "PAID",
+  "effective_at": "2026-09-07T12:00:00Z",
+  "expires_at": "2027-09-07T12:00:00Z",
+  "payment_provider": "stripe",
+  "external_customer_ref": "customer.hosted.001",
+  "payment_evidence_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

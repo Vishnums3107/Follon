@@ -1,0 +1,42 @@
+{
+  "matrix_id": "gqm.ibkr.paper.v1",
+  "environment": "PAPER",
+  "gateway_id": "gateway.ibkr.paper",
+  "fencing_epoch": 1,
+  "evaluated_at": "2026-09-05T12:00:00Z",
+  "expires_at": "2026-10-05T12:00:00Z",
+  "qualified_capabilities": [
+    {
+      "capability_id": "order.limit",
+      "asset_class": "US_EQUITY",
+      "qualification_state": "CERTIFIED",
+      "measured_p99_latency_ms": 12,
+      "max_supported_slices": 10,
+      "reconciliation_accuracy_bps": 10000
+    },
+    {
+      "capability_id": "order.market",
+      "asset_class": "US_EQUITY",
+      "qualification_state": "CERTIFIED",
+      "measured_p99_latency_ms": 8,
+      "max_supported_slices": 1,
+      "reconciliation_accuracy_bps": 10000
+    },
+    {
+      "capability_id": "order.bracket",
+      "asset_class": "US_EQUITY",
+      "qualification_state": "PROVISIONAL",
+      "measured_p99_latency_ms": 45,
+      "max_supported_slices": 3,
+      "reconciliation_accuracy_bps": 9950
+    },
+    {
+      "capability_id": "order.limit",
+      "asset_class": "EQUITY_OPTION",
+      "qualification_state": "REJECTED",
+      "measured_p99_latency_ms": 999,
+      "max_supported_slices": 1,
+      "reconciliation_accuracy_bps": 0
+    }
+  ]
+}
