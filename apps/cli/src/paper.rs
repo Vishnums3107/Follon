@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use follon_cli::write_immutable;
-use follon_domain::{validate_canonical_id, Decimal};
+use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
 use follon_paper::{
     IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerRegistry,
     PaperBrokerRoute, PaperRiskPolicy, PaperTradingService,
@@ -55,6 +55,8 @@ struct PaperRiskDocument {
     max_position_quantity: String,
     max_realized_loss: String,
     max_market_data_age_seconds: u64,
+    max_order_rate: u32,
+    order_rate_window_seconds: u64,
 }
 
 struct CommandArguments {
@@ -70,7 +72,13 @@ enum KillSwitchAction {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments = parse_arguments(env::args().skip(1).collect())?;
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if let Some(subcommand) = raw_args.first() {
+        if subcommand == "gateway-matrix" {
+            return run_gateway_matrix(&raw_args[1..]);
+        }
+    }
+    let arguments = parse_arguments(raw_args)?;
     if arguments.kill_switch_action.is_some() && arguments.output_path.exists() {
         return Err(
             "a kill-switch action requires a new immutable dashboard output path; refusing to change state before evidence can be published"
@@ -101,6 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_quantity: decimal(&configuration.risk.max_position_quantity)?,
         max_realized_loss: decimal(&configuration.risk.max_realized_loss)?,
         max_market_data_age_seconds: configuration.risk.max_market_data_age_seconds,
+        max_order_rate: configuration.risk.max_order_rate,
+        order_rate_window_seconds: configuration.risk.order_rate_window_seconds,
     };
     let mut brokers = PaperBrokerRegistry::new();
     if schema_version == 1 {
@@ -295,6 +305,74 @@ fn decimal(value: &str) -> Result<Decimal, follon_domain::DecimalError> {
     Decimal::from_str(value)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayMatrixConfigDocument {
+    #[serde(default = "default_schema_version")]
+    matrix_schema_version: u32,
+    matrix_id: String,
+    environment: String,
+    gateway_id: String,
+    fencing_epoch: u64,
+    evaluated_at: String,
+    expires_at: String,
+    qualified_capabilities: Vec<follon_paper::QualifiedCapability>,
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+fn run_gateway_matrix(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.is_empty() || arguments.len() > 2 {
+        return Err("usage: follon-paper-status gateway-matrix <config.json> [output.json]".into());
+    }
+    let input_path = PathBuf::from(&arguments[0]);
+    let output_path = arguments
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("var/gateway-matrix.json"));
+
+    let content = fs::read_to_string(&input_path)?;
+    let doc: GatewayMatrixConfigDocument = serde_json::from_str(&content)?;
+    if doc.matrix_schema_version != 1 {
+        return Err("matrix_schema_version must be 1".into());
+    }
+    validate_canonical_id("matrix_id", &doc.matrix_id)?;
+    if !["PAPER", "CONTROLLED_LIVE", "SIMULATION"].contains(&doc.environment.as_str()) {
+        return Err("environment must be PAPER, CONTROLLED_LIVE, or SIMULATION".into());
+    }
+    if doc.fencing_epoch == 0 {
+        return Err("fencing_epoch must be at least 1".into());
+    }
+    if doc.qualified_capabilities.is_empty() {
+        return Err("qualified_capabilities must contain at least one capability".into());
+    }
+    validate_utc_timestamp("evaluated_at", &doc.evaluated_at)?;
+    validate_utc_timestamp("expires_at", &doc.expires_at)?;
+
+    let matrix = follon_paper::GatewayQualificationMatrix {
+        matrix_schema_version: 1,
+        matrix_id: doc.matrix_id,
+        environment: doc.environment,
+        gateway_id: doc.gateway_id,
+        qualified_capabilities: doc.qualified_capabilities,
+        fencing_epoch: doc.fencing_epoch,
+        evaluated_at: doc.evaluated_at,
+        expires_at: doc.expires_at,
+    };
+
+    let json = serde_json::to_string_pretty(&matrix)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_immutable(&output_path, &json)?;
+    eprintln!("gateway qualification matrix: {}", output_path.display());
+    eprintln!("matrix id: {}", matrix.matrix_id);
+    eprintln!("capabilities: {}", matrix.qualified_capabilities.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +415,25 @@ mod tests {
         fs::write(&invalid_route_path, invalid_route).unwrap();
         assert!(load_configuration(&invalid_route_path).is_err());
         let _ = fs::remove_file(&invalid_route_path);
+    }
+
+    #[test]
+    fn gateway_matrix_subcommand_processes_fixture_and_emits_valid_json() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/gateway-matrix-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-gateway-matrix-test-{}.json",
+            std::process::id()
+        ));
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_gateway_matrix(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("\"matrix_schema_version\": 1"));
+        assert!(content.contains("\"gqm.ibkr.paper.v1\""));
+        assert!(content.contains("\"CERTIFIED\""));
+        let _ = std::fs::remove_file(&output_path);
     }
 }

@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MarketScanner",
+  "description": "Explainable market scanner screening instruments against versioned indicators, event conditions, and point-in-time universe membership with ranked reasons (SOLO-04).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scanner_schema_version",
+    "scanner_id",
+    "universe_id",
+    "as_of_time",
+    "indicator_columns",
+    "candidates",
+    "quarantined_count",
+    "created_at"
+  ],
+  "properties": {
+    "scanner_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "scanner_id": {
+      "type": "string",
+      "pattern": "^scan\\.[a-z0-9_.-]+$"
+    },
+    "universe_id": {
+      "type": "string"
+    },
+    "as_of_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "indicator_columns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["column_id", "name", "timeframe", "definition"],
+        "properties": {
+          "column_id": { "type": "string" },
+          "name": { "type": "string" },
+          "timeframe": { "type": "string" },
+          "definition": { "type": "string" }
+        }
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rank",
+          "instrument_id",
+          "symbol",
+          "close_price",
+          "momentum_score_bps",
+          "rsi_14",
+          "matched_conditions",
+          "rationale"
+        ],
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 },
+          "instrument_id": { "type": "string" },
+          "symbol": { "type": "string" },
+          "close_price": { "type": "string" },
+          "momentum_score_bps": { "type": "integer" },
+          "rsi_14": { "type": "string" },
+          "matched_conditions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "rationale": { "type": "string" }
+        }
+      }
+    },
+    "quarantined_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

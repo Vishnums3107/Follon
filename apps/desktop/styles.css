@@ -12,11 +12,14 @@
   --color-text-secondary: #A3A8B4;
   --color-text-muted: #9CA3B2;
 
-  /* Accents & Signals */
-  --color-accent: #3B82F6;
+  /* Accents & Signals. Lightened from the original palette (2026-09-10) so each
+     token still clears WCAG AA 4.5:1 as foreground text against every card
+     surface (--color-surface-1/2), not only against --color-bg-base; the
+     visual-design-system contrast table previously verified bg-base alone. */
+  --color-accent: #478AF7;
   --color-accent-hover: #60A5FA;
-  --color-signal-buy: #3F8E4D;
-  --color-signal-sell: #E94F37;
+  --color-signal-buy: #469E56;
+  --color-signal-sell: #EB5D47;
   --color-border: #2C353F;
   --color-border-hover: #4B5563;
 
@@ -27,7 +30,7 @@
   --color-cyan-glow: rgba(0, 210, 255, 0.35);
   --color-emerald: #00E676;
   --color-emerald-glow: rgba(0, 230, 118, 0.35);
-  --color-ruby: #FF3366;
+  --color-ruby: #FF4070;
   --color-ruby-glow: rgba(255, 51, 102, 0.35);
   --color-obsidian: #08090C;
   --color-glass-surface: rgba(19, 21, 26, 0.85);
@@ -92,6 +95,20 @@ a:hover { color: var(--color-accent-hover); }
 .f-text-muted { color: var(--color-text-muted); }
 .f-text-buy { color: var(--color-signal-buy); }
 .f-text-sell { color: var(--color-signal-sell); }
+/* A directional glyph always accompanies the signal color (WCAG 1.4.1: color is
+   never the only cue) so meaning survives colorblindness and the monochrome
+   display preference below. */
+.f-text-buy::before { content: "▲ "; font-weight: 700; }
+.f-text-sell::before { content: "▼ "; font-weight: 700; }
+
+/* Monochrome display preference, toggled by #signal-mode-toggle and persisted
+   in localStorage (docs/04-experience/04-visual-design-system.md §Signal vs.
+   Monochrome Display Rules). The glyph above already carries the direction, so
+   this only removes the green/red hue for colorblind or high-glare displays. */
+html[data-signal-mode="mono"] .f-text-buy,
+html[data-signal-mode="mono"] .f-text-sell {
+  color: var(--color-text-primary);
+}
 
 /* Cards */
 .f-card {
@@ -161,6 +178,16 @@ a:hover { color: var(--color-accent-hover); }
 }
 .f-btn--ghost:hover:not(:disabled) {
   background: var(--color-surface-2);
+}
+.signal-mode-toggle {
+  gap: 4px;
+  font-size: 0.75rem;
+  padding: var(--space-1) var(--space-3);
+  border-color: var(--color-border);
+}
+.signal-mode-toggle[aria-pressed="true"] {
+  border-color: var(--color-cyan);
+  color: var(--color-cyan);
 }
 
 /* Badges */
@@ -640,7 +667,13 @@ footer { margin-bottom: var(--space-4); padding: var(--space-5); text-align: cen
 /* Mobile (max 768px) */
 @media (max-width: 768px) {
   .site-header, #app, footer { width: calc(100% - var(--space-4)); }
-  .header-nav { display: none; }
+  /* .header-nav.nav-pages beats the unconditional .nav-pages{display:flex} rule
+     below on specificity alone, so this hide rule applies regardless of the
+     two rules' source order (a plain .header-nav selector previously lost that
+     tie and never actually hid the pillar nav on narrow viewports). */
+  .site-header .header-nav.nav-pages { display: none; }
+  .site-header { flex-wrap: wrap; row-gap: var(--space-2); }
+  .nav-telemetry { flex-wrap: wrap; margin-left: 0; row-gap: var(--space-2); }
   .hero h1 { font-size: 2.25rem; }
 
   .workspace-sidebar { grid-template-columns: repeat(2, 1fr); }
@@ -676,8 +709,24 @@ footer { margin-bottom: var(--space-4); padding: var(--space-5); text-align: cen
     padding: var(--space-1) 0;
     border: none;
     display: flex;
-    justify-content: space-between;
-    align-items: center;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    /* .f-table td sets white-space:nowrap for the desktop scrollable table;
+       reset it here so a long cell value wraps inside the card instead of
+       forcing the whole page wider than the viewport. */
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+  }
+  /* Every cell carries a data-label (its column header) for exactly this view. */
+  .f-table tbody td::before, .workspace-panel td::before {
+    content: attr(data-label);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-muted);
   }
 }
 
@@ -1448,5 +1497,82 @@ footer { margin-bottom: var(--space-4); padding: var(--space-5); text-align: cen
   font-size: 0.75rem;
   text-align: right;
 }
+
+/* CSP-safe layout helpers for the SVG visualizers above (style-src disallows
+   inline style attributes, so dynamic emphasis is expressed as classes). */
+.f-btn--sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+.dag-header-left { display: flex; align-items: center; gap: 8px; }
+.dag-header-badge { font-size: 0.6875rem; }
+.dag-header-badge--verified { color: var(--color-gold); }
+.dag-header-badge--warn { color: var(--color-ruby); }
+.gauge-metric-card { padding: 10px 14px; }
+.gauge-metric-label { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--color-text-muted); }
+.gauge-metric-value { font-size: 16px; font-weight: 700; }
+.gauge-metric-value--emerald { color: var(--color-emerald); }
+.gauge-metric-value--cyan { color: var(--color-cyan); }
+.gauge-metric-caption { color: var(--color-text-muted); font-size: 10px; }
+.factor-header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.factor-header-label { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-cyan); text-transform: uppercase; }
+.factor-header-badge { font-size: 0.6875rem; color: var(--color-text-muted); font-family: var(--font-mono); }
+.options-payoff-container { margin: var(--space-4) 0; padding: var(--space-4); background: radial-gradient(ellipse at bottom, rgba(20, 24, 34, 0.7) 0%, rgba(13, 14, 18, 0.9) 100%); }
+.options-payoff-header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.options-payoff-header-label { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-gold); text-transform: uppercase; }
+.options-payoff-header-badge { font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-cyan); }
+.options-payoff-svg { width: 100%; height: 110px; display: block; }
+.options-payoff-caption { margin-top: var(--space-2); font-size: 0.75rem; color: var(--color-text-muted); font-family: var(--font-mono); }
+
+/* Discrete width buckets for the factor-exposure bar fill (0-50% of the
+   half-track). A continuous inline width would violate the style-src CSP. */
+.f-bar-w-0 { width: 0%; }
+.f-bar-w-1 { width: 1%; }
+.f-bar-w-2 { width: 2%; }
+.f-bar-w-3 { width: 3%; }
+.f-bar-w-4 { width: 4%; }
+.f-bar-w-5 { width: 5%; }
+.f-bar-w-6 { width: 6%; }
+.f-bar-w-7 { width: 7%; }
+.f-bar-w-8 { width: 8%; }
+.f-bar-w-9 { width: 9%; }
+.f-bar-w-10 { width: 10%; }
+.f-bar-w-11 { width: 11%; }
+.f-bar-w-12 { width: 12%; }
+.f-bar-w-13 { width: 13%; }
+.f-bar-w-14 { width: 14%; }
+.f-bar-w-15 { width: 15%; }
+.f-bar-w-16 { width: 16%; }
+.f-bar-w-17 { width: 17%; }
+.f-bar-w-18 { width: 18%; }
+.f-bar-w-19 { width: 19%; }
+.f-bar-w-20 { width: 20%; }
+.f-bar-w-21 { width: 21%; }
+.f-bar-w-22 { width: 22%; }
+.f-bar-w-23 { width: 23%; }
+.f-bar-w-24 { width: 24%; }
+.f-bar-w-25 { width: 25%; }
+.f-bar-w-26 { width: 26%; }
+.f-bar-w-27 { width: 27%; }
+.f-bar-w-28 { width: 28%; }
+.f-bar-w-29 { width: 29%; }
+.f-bar-w-30 { width: 30%; }
+.f-bar-w-31 { width: 31%; }
+.f-bar-w-32 { width: 32%; }
+.f-bar-w-33 { width: 33%; }
+.f-bar-w-34 { width: 34%; }
+.f-bar-w-35 { width: 35%; }
+.f-bar-w-36 { width: 36%; }
+.f-bar-w-37 { width: 37%; }
+.f-bar-w-38 { width: 38%; }
+.f-bar-w-39 { width: 39%; }
+.f-bar-w-40 { width: 40%; }
+.f-bar-w-41 { width: 41%; }
+.f-bar-w-42 { width: 42%; }
+.f-bar-w-43 { width: 43%; }
+.f-bar-w-44 { width: 44%; }
+.f-bar-w-45 { width: 45%; }
+.f-bar-w-46 { width: 46%; }
+.f-bar-w-47 { width: 47%; }
+.f-bar-w-48 { width: 48%; }
+.f-bar-w-49 { width: 49%; }
+.f-bar-w-50 { width: 50%; }
 
 

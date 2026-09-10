@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NewsRevisionTimeline",
+  "description": "News revision and novelty timeline distinguishing initial reports, syndicated duplicates, editorial corrections, and model interpretations without overwriting historical records (DATA-03).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "revision_timeline_schema_version",
+    "timeline_id",
+    "target_event_id",
+    "chain",
+    "conflict_detected",
+    "created_at"
+  ],
+  "properties": {
+    "revision_timeline_schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "timeline_id": {
+      "type": "string",
+      "pattern": "^rev\\.timeline\\.[a-z0-9_.-]+$"
+    },
+    "target_event_id": {
+      "type": "string"
+    },
+    "chain": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version_sequence",
+          "received_at",
+          "source_id",
+          "kind",
+          "headline",
+          "entity_confidence_bps",
+          "content_hash",
+          "supersedes_sequence"
+        ],
+        "properties": {
+          "version_sequence": { "type": "integer", "minimum": 1 },
+          "received_at": { "type": "string", "format": "date-time" },
+          "source_id": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "INITIAL_REPORT",
+              "SYNDICATED_DUPLICATE",
+              "CORRECTION",
+              "EDITORIAL_REVISION",
+              "MODEL_INTERPRETATION"
+            ]
+          },
+          "headline": { "type": "string" },
+          "entity_confidence_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+          "content_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "supersedes_sequence": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "conflict_detected": {
+      "type": "boolean"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

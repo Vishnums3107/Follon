@@ -122,7 +122,13 @@ struct BenchmarkInput {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (input_path, output_path) = parse_arguments(env::args().skip(1).collect())?;
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if let Some(subcommand) = raw_args.first() {
+        if subcommand == "capital-proposal" {
+            return run_capital_proposal(&raw_args[1..]);
+        }
+    }
+    let (input_path, output_path) = parse_arguments(raw_args)?;
     let source = fs::read(&input_path)?;
     if source.is_empty() || source.len() > 5 * 1024 * 1024 {
         return Err("risk benchmark input must be between 1 byte and 5 MiB".into());
@@ -346,6 +352,53 @@ fn publish(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>
     write_immutable(path, contents)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapitalProposalConfigDocument {
+    total_equity_usd: String,
+    strategy_ids: Vec<String>,
+    target_annual_volatility_bps: u32,
+    max_drawdown_limit_bps: u32,
+    policy_version: String,
+    proposed_at: String,
+}
+
+fn run_capital_proposal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.is_empty() || arguments.len() > 2 {
+        return Err(
+            "usage: follon-risk-benchmark capital-proposal <config.json> [output.json]".into(),
+        );
+    }
+    let input_path = PathBuf::from(&arguments[0]);
+    let output_path = arguments
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("var/capital-proposal.json"));
+
+    let content = fs::read_to_string(&input_path)?;
+    let doc: CapitalProposalConfigDocument = serde_json::from_str(&content)?;
+    validate_utc_timestamp("proposed_at", &doc.proposed_at)?;
+
+    let total_equity = Decimal::from_str(&doc.total_equity_usd)?;
+    let strategy_id_refs: Vec<&str> = doc.strategy_ids.iter().map(String::as_str).collect();
+
+    let proposal = follon_risk::CapitalAllocationCouncil::build_erc_proposal(
+        total_equity,
+        &strategy_id_refs,
+        doc.target_annual_volatility_bps,
+        doc.max_drawdown_limit_bps,
+        &doc.policy_version,
+        &doc.proposed_at,
+    )?;
+
+    let json = proposal.to_json();
+    publish(&output_path, &json)?;
+    eprintln!("capital allocation proposal: {}", output_path.display());
+    eprintln!("proposal id: {}", proposal.proposal_id);
+    eprintln!("allocations: {}", proposal.allocations.len());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +460,25 @@ mod tests {
             },
         })
         .is_err());
+    }
+
+    #[test]
+    fn capital_proposal_subcommand_processes_fixture_and_emits_valid_json() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/capital-allocation-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-capital-proposal-test-{}.json",
+            std::process::id()
+        ));
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_capital_proposal(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("\"proposal_schema_version\":1"));
+        assert!(content.contains("\"strat.alpha.trend\""));
+        assert!(content.contains("\"proposal_status\":\"RECOMMENDED\""));
+        let _ = std::fs::remove_file(&output_path);
     }
 }

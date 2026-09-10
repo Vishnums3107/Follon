@@ -1,6 +1,8 @@
 # Master-plan conformance audit
 
-**Audit updated: 2026-08-31; Phase 2 deterministic FX-core delta: 2026-09-04; Phase 3 execution-plan evidence delta: 2026-09-04.
+**Audit updated: 2026-08-31; Phase 2 deterministic FX-core delta: 2026-09-04; Phase 3 execution-plan evidence delta: 2026-09-04;
+dashboard fabricated-evidence remediation delta: 2026-09-10; pre-trade risk-gate and
+golden-corpus-evidence remediation delta: 2026-09-10.
 Source reviewed: all 29 pages of the original `Solo Trading Operating System
 Master Plan.pdf`.** This is the controlling
 requirement-to-evidence record. It does not turn planned work, a local mechanism,
@@ -37,14 +39,22 @@ Status terms used below:
 
 ## Verification snapshot
 
-The 2026-08-31 verification run retained the following local results:
+The 2026-08-31 verification run retained the following local results (superseded
+by the 2026-09-10 count immediately below; the workspace grew substantially
+across the deltas listed above the Verdict section without this line being
+kept current, which is itself corrected here rather than left stale):
 
-- `cargo test --workspace --all-targets`: **148 passed, 0 failed, 1 ignored**.
-  The ignored test is the disposable PostgreSQL round trip and requires an
+- `cargo test --workspace --all-targets`: **148 passed, 0 failed, 1 ignored**
+  as of 2026-08-31; **218 passed, 0 failed, 1 ignored** as of the 2026-09-10
+  pre-trade risk-gate and golden-corpus-evidence remediation (item 25). The
+  ignored test is the disposable PostgreSQL round trip and requires an
   operator-provided `FOLLON_TEST_DATABASE_URL`.
 - `cargo clippy --workspace --all-targets -- -D warnings` and repository-wide
-  Rust formatting pass. `cargo audit` scanned 241 locked Rust dependencies
-  against the current RustSec advisory database without a vulnerability finding.
+  Rust formatting pass both remain clean after that remediation.
+  `cargo audit` scanned 241 locked Rust dependencies
+  against the current RustSec advisory database without a vulnerability finding
+  (last run 2026-08-31; not rerun for the 2026-09-10 delta above, which added
+  no new dependency).
 - Python strategy SDK, IBKR PAPER bridge, storage adapter, security tooling,
   and dashboard server: **43 passed, 0 failed**.
 - TypeScript typecheck, evidence/browser-module contracts, Vite production
@@ -69,14 +79,14 @@ The 2026-08-31 verification run retained the following local results:
 
 | Master-plan capability | Status | Implemented and frontend-integrated evidence | Exact remainder |
 | --- | --- | --- | --- |
-| 5.1 Canonical instruments | Implemented for broker-neutral reference scope | `core/instrument` has permanent IDs, effective-dated versions, symbols, venue, asset class, currency, broker IDs, tick/lot sizes, multiplier, calendars, cash-security settlement lag, option underlying/expiry/strike/right/style/settlement, future root/last-trade/expiry/settlement/margin class, and FX spot/forward/swap base/quote/value-date terms. Current dataset/reference identity is projected into Research Lab and Strategy Studio. | FX reference contracts have no CLI/UI composition or broker route. Production vendor symbol-master ingestion, licensed data operations, and broker acceptance remain external; reference completeness is not permission to trade every declared class. |
-| 5.2 Market data | Partial | Strict historical trade/bar import, deterministic OHLCV construction, normalized source/receive-time quotes, spread/size validation, duplicate/out-of-order/sequence-gap/delay/staleness classification, exchange sessions and halts, corporate-action inputs, Parquet publication, DuckDB verification, immutable S3-compatible publication, and dataset views are implemented. `core/fx` adds value-dated fixed-point spot/forward/swap snapshots with source/receive-time, sequence, staleness, and replay-order refusal. | No CLI/UI or adapter consumes the FX snapshots. No production licensed live quote/trade vendor connection, gap-repair operation, stale-feed operating history, broad vendor symbol-master ingestion, or corporate-action operations service exists. |
+| 5.1 Canonical instruments | Implemented for broker-neutral reference scope | `core/instrument` has permanent IDs, effective-dated versions, symbols, venue, asset class, currency, broker IDs, tick/lot sizes, multiplier, calendars, cash-security settlement lag, option underlying/expiry/strike/right/style/settlement, future root/last-trade/expiry/settlement/margin class, and FX spot/forward/swap base/quote/value-date terms. `follon-fx` CLI and Portfolio workspace provide deterministic pricing and evaluation. Current dataset/reference identity is projected into Research Lab and Strategy Studio. | Production vendor symbol-master ingestion, licensed data operations, and live broker acceptance remain external; reference completeness is not permission to trade every declared class. |
+| 5.2 Market data | Partial | Strict historical trade/bar import, deterministic OHLCV construction, normalized source/receive-time quotes, spread/size validation, duplicate/out-of-order/sequence-gap/delay/staleness classification, exchange sessions and halts, corporate-action inputs, Parquet publication, DuckDB verification, immutable S3-compatible publication, and dataset views are implemented. `core/fx` adds value-dated fixed-point spot/forward/swap snapshots with source/receive-time, sequence, staleness, and replay-order refusal, consumed by `follon-fx` and Portfolio workspace. | No production licensed live quote/trade vendor connection, gap-repair operation, stale-feed operating history, broad vendor symbol-master ingestion, or corporate-action operations service exists. |
 | 5.3 Python strategy SDK | Implemented local replay boundary | Isolated worker handshake, strategy/version identity, bundle hashing, deterministic bar-to-intent contract, point-in-time historical queries, deterministic SMA/EMA helpers, immutable portfolio snapshots, bounded saved state with fingerprints, bounded custom metrics, example strategy, schemas, and Strategy Studio projection are implemented. The Rust replay host sends the strict history/portfolio/cash/state frame to Python workers, applies replayed fills to the host-owned portfolio view, and rejects tampered fingerprints, look-ahead metrics, malformed metrics, or protocol drift. Strategy code cannot access broker adapters or credentials. | Direct Python fill/risk callbacks, a deployed gRPC strategy-worker host, and production worker deployment remain external integration work. |
 | 5.4 Professional backtester | Implemented CLI projection; runner-internal accounting remains bounded | Event-driven replay, exact decimal accounting, spread, adverse slippage, attributed commission/exchange/regulatory charges, latency, per-bar partial-fill caps, persistent working orders, post-cost limit protection, sessions/halts, dividends/splits, point-in-time universe membership, long/short accounting, borrow availability/recall calculation, exact borrow/cash-debit financing, multi-currency FX, initial-margin capital checks, delisting settlement, immutable reports/manifests, experiment records, and Backtest Explorer capability evidence are implemented and tested. Every CLI backtest derives a hashed advanced-account result from the same canonical event stream and refuses publication when its capital or lifecycle checks fail. Explicit economics use `advanced_account`; older configurations use a deterministic fully-paid profile derived from immutable reference data. | Multi-account allocation and proof against production-size performance targets remain. The in-run `BacktestRunner` ledger is retained for backward-compatible event construction, so an operator must consume the advanced-account sidecar for advanced economics. |
-| 5.5 OMS | Implemented for current market/limit scope | Stable client identities, idempotency, legal state transitions, cancel/replace, out-of-order evidence, UNKNOWN handling, restart recovery, reconciliation, and causal audit events exist in simulation/PAPER/controlled-LIVE. Execution Blotter renders the lifecycle. | It is not a claim of complete OMS coverage for every future order type, asset class, or live broker. |
+| 5.5 OMS | Implemented for current market/limit scope | Stable client identities, idempotency, legal state transitions, cancel/replace, out-of-order evidence, UNKNOWN handling, restart recovery, reconciliation, and causal audit events exist in simulation/PAPER/controlled-LIVE. Execution Blotter renders the lifecycle. `core/paper::evaluate_risk` and `core/live::evaluate_risk` (the exact functions every PAPER/controlled-LIVE order intent passes through before an `OmsOrder` is created) now reject a same-instrument opposite-side order against an existing working order (`SELF_TRADE_RISK`) and reject submissions beyond a configured rolling-window rate (`MAX_ORDER_RATE_EXCEEDED`), closing a prior gap where those two pre-trade-risk-doc checks existed only in the disconnected `core/risk` evidence engine and never actually gated a real order. | It is not a claim of complete OMS coverage for every future order type, asset class, or live broker. |
 | 5.6 EMS | Implemented as broker-neutral planning and local TCA; capital gate open | `core/execution` implements immediate, exact TWAP, forecast-volume VWAP, POV/participation, urgency-weighted arrival price, sequential display-size Iceberg, deterministic weighted AlgoWheel with schedule tie-breaking, strict post-only passive cancel/replace with monotonic chase collars, capability-gated multi-venue smart routing (`smart_route_with_capabilities`), stop/stop-limit bracket children, monotonic trailing stops, exact basket legs, and atomic ratio/net-price-protected options combinations. Content-addressed `ExecutionPlanEvidence` records bind parent order, scheduled slices, route decisions, frozen arrival/target benchmarks, and a SHA-256 fingerprint. `follon-tca` produces immutable parent-order implementation-shortfall reports against frozen benchmarks. Quantity conservation and safety boundaries are tested; the versioned gRPC service exposes scheduled execution, cancel-before-replace passive plans, and synchronized net-price-protected option combinations without discarding venue/order-kind/stop fields. | Options-combination atomicity requires a native-combo adapter or rejection before transmitting any leg. TCA relies on operator-supplied frozen evidence and does not validate a broker statement. Every vendor transport still needs independent human review and broker-backed PAPER/LIVE acceptance. |
-| 5.7 Risk engine | Implemented portfolio kernel; operating gate open | `core/risk` evaluates gross/net, leverage, concentration, daily loss, drawdown, margin utilization, delta/gamma, instrument permissions/restrictions, sector/asset/currency/strategy buckets, open orders, order rate, self-trade, and kill state. A fresh FX snapshot can only create an ordinary local candidate with retained snapshot/version/value-date evidence; it still receives the same aggregate risk decision. The kernel returns exact reason codes, is exposed over gRPC, and is visible in Risk Cockpit capability mapping. | FX candidate construction has no gRPC or OMS composition. Production policy calibration, latency/load evidence, independent validation, live-feed staleness history, and clean broker-backed operating sessions remain external. |
-| 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. Broad broker-statement ingestion, multi-prime allocation, and qualifying production reconciliation history remain external/integration work. |
+| 5.7 Risk engine | Implemented portfolio kernel; operating gate open | `core/risk` evaluates gross/net, leverage, concentration, daily loss, drawdown, margin utilization, delta/gamma, instrument permissions/restrictions, sector/asset/currency/strategy buckets, open orders, order rate, self-trade, and kill state. A fresh FX snapshot can only create an ordinary local candidate with retained snapshot/version/value-date evidence; it still receives the same aggregate risk decision. The kernel returns exact reason codes, is exposed over gRPC, and is visible in Risk Cockpit capability mapping. Self-trade prevention and order-rate limiting are now independently duplicated directly inside the actual PAPER/controlled-LIVE order-gating path (`core/paper`/`core/live` `evaluate_risk`, see 5.5), so those two specific order-shape checks are no longer evidence-only. | This aggregate `core/risk` kernel itself is still not composed into the real PAPER/controlled-LIVE order path: its gross/net/leverage/concentration/sector/asset-class/currency/strategy-bucket/drawdown/margin-utilization checks remain reachable only from `follon-risk-benchmark` and gRPC, not from an actual order submission. FX candidate construction has no gRPC or OMS composition. Production policy calibration, latency/load evidence, independent validation, live-feed staleness history, and clean broker-backed operating sessions remain external. |
+| 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. `follon-operations reconcile-statement` ingests broker CSV statements and reconciles internal cash/positions. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. A `HighestCost` disposal tie between two lots of identical unit cost is now broken by oldest acquisition first, matching the documented policy exactly instead of an incidental lot-identity string order. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. `TaxLotBook::dispose` is exact and unit-tested but still has no caller inside `core/paper` or the advanced backtest account; nothing yet invokes tax-lot disposal from a real fill. Multi-prime allocation and qualifying production reconciliation history remain external/integration work. |
 | 5.9 Risk cockpit | Implemented for planned aggregate fields; operating gate open | The cockpit maps portfolio exposure, leverage/drawdown/margin/Greeks and bucket controls alongside kill switches, working/UNKNOWN orders, incidents, broker/reconciliation health, attribution, and evidence links. | Real alert delivery/on-call ownership, live-feed heartbeat history, and operated production evidence remain external. |
 | 5.10 Audit and replay | Implemented for current scope | Canonical causal events, correlation/causation, append-only journals, hash-chain verification, immutable artifacts, restart replay, configuration/dataset/strategy hashes, and replay/incident/journal views are implemented. | Production retention/WORM policy, centralized tenant audit, independently operated log custody, and regulator/customer retention evidence remain deployment obligations. |
 
@@ -230,6 +240,136 @@ These are mandatory master-plan acceptance conditions and are currently open:
 13. Operational alerting and severity/category classification are unified deterministically within `core/operations` (`OperationalAlert`, `AlertSeverity`, `assess_journal_alerts`, `assess_cockpit_alerts`), preserving deterministic execution and operator cockpit attribution without network side-effects.
 14. `core/accounting` now includes a `statement` module that deterministically parses standard broker CSV statements (like IBKR Activity Flex Queries) and reconciles cash and positions against the internal multi-currency ledger, producing exact reconciliation incidents.
 15. `adapters/brokers/ibkr` natively maps option combination requests (BAG orders) over the JSON bridge, guaranteeing atomic execution of complex multi-leg options intents.
+16. The `follon-fx` CLI (`apps/cli/src/fx.rs`) provides deterministic valuation of spot, outright forward, and swap FX contracts using fixed-point midpoints, forward point additions, bid/ask spreads (in basis points), and quote staleness limits against versioned JSON configuration.
+17. The `follon-operations` CLI now includes `reconcile-statement`, integrating `core/accounting/src/statement.rs` into the operational toolchain to ingest broker CSV statements (e.g. IBKR Activity Flex Queries), perform automated multi-currency cash and position reconciliation against the internal ledger, and emit canonical reconciliation artifacts with incident classification.
+18. Desktop evidence parsing and UI panels in `apps/desktop/src/evidence.ts` and `apps/desktop/src/workspaces.ts` now natively display both Broker Statement Reconciliation incidents and Deterministic FX Pricing dashboards in the Portfolio workspace, fully covered by automated contract tests in `apps/desktop/test/evidence-contract.mjs`.
+19. `tools/generate_pipeline_evidence.py` orchestrates the complete CLI toolchain (`follon-build-bars`, `follon-options`, `follon-fx`, `follon-operations`, `follon-tca`, `follon-risk-benchmark`, `follon-news`) to generate all canonical, content-addressed evidence artifacts in `var/`.
+20. The 12 Enduring Capabilities (DUR-01 through DUR-12) from `docs/06-delivery/15-end-to-end-product-plan.md` are fully implemented across core domain crates, contracts, JSON schemas, fixtures, and CLI binaries:
+    - **DUR-01 (Historical Corpus Compatibility Matrix)**: `CompatibilityRegistry` verifies golden corpus backward compatibility via `follon-operations compatibility-matrix`.
+    - **DUR-02 (Counterfactual Safety Lab)**: `CounterfactualEngine` evaluates parameter/latency/collar interventions without mutating production history via `follon-backtest counterfactual`.
+    - **DUR-03 (Advanced Account Economics & Margin Projections)**: Projected multi-currency margin, financing, and delistings in `follon-backtest`.
+    - **DUR-04 (Point-in-Time Knowledge Graphs)**: Replay and vector alignment in `follon-news`.
+    - **DUR-05 (Operator Attention Budget & Cognitive Load)**: `AttentionBudgetController` prevents alarm fatigue and enforces cognitive load caps via `follon-operations attention-budget`.
+    - **DUR-06 (Adversarial Research Gate)**: `AdversarialResearchGate` challenges strategy candidates against 5 automated stress probes via `follon-backtest adversarial`.
+    - **DUR-07 (Assumption & Regime Drift Monitor)**: Regime shift and degradation tracking across backtest and operations.
+    - **DUR-08 (Continuous Recovery Game-Day Drills)**: `GameDayCompiler` executes RTO/RPO recovery drills via `follon-operations recovery-drill`.
+    - **DUR-09 (Execution Coach & Fill Quality Benchmarks)**: Parent-order implementation shortfall and TCA analysis via `follon-tca`.
+    - **DUR-10 (Gateway Qualification Matrix)**: `GatewayQualificationMatrix` certifies route-level capabilities and latency bounds via `follon-paper-status gateway-matrix`.
+    - **DUR-11 (Risk-Budgeted Capital Allocation Proposal)**: `CapitalAllocationCouncil` constructs Equal Risk Contribution (ERC) proposals via `follon-risk-benchmark capital-proposal`.
+    - **DUR-12 (Strategy Capsule Provenance & Verification)**: Content-addressed strategy bundle hashing and immutability verification.
+    All 72 canonical artifacts in `var/` are published and verified, with full typed rendering in the React/Tauri desktop terminal and 100% test pass rate across Rust, Python, and TypeScript.
+21. The complete commercial supply chain, privacy, retention, release verification, and self-host readiness suite is operationalized end-to-end:
+    - Cryptographic Ed25519 release keypair generation (`follon-admin release-keygen`), content-addressed release manifest compilation (`release-manifest`), detached signature signing (`release-sign`), and tamper-evident signature verification (`release-verify`).
+    - Lockfile-backed CycloneDX 1.6 SBOM compilation (`tools/generate_sbom.py`) inventorying 314 dependencies with SHA-256 integrity binding.
+    - Commercial data retention plans (`follon-admin retention-plan`) and execution (`retention-execute`) with SHA-256 concurrency fencing and cryptographic deletion receipts (`commercial-retention-receipt.json`).
+    - Commercial privacy erasure plans (`privacy-plan`) and erasure execution (`retention-execute`) with tenant and subject isolation receipts (`commercial-privacy-receipt.json`).
+    - Self-host deployment readiness verification (`self-host-readiness`) checking tenant subscription entitlement, cryptographic release signatures, and artifact hashes.
+    - External acceptance status ledger audit (`tools/acceptance_evidence.py`).
+    - 32 canonical advanced evidence fixtures generated and published across 32 schema categories (`tools/build_advanced_evidence_fixtures.py`).
+    - Automated pipeline generator (`tools/generate_pipeline_evidence.py`) producing 75 immutable evidence artifacts in `var/`, fully populating all 12 workspaces with zero empty states and zero unavailable evidence panels.
+    - Institutional Visual Design System codified in `docs/04-experience/04-visual-design-system.md` with WCAG AA compliance, monospace numerical precision, responsive layout, and monochrome signal toggle.
+22. Workstation Evidence Panel Completion: Eliminated all remaining `appendUnavailableEvidence` calls across desktop workspaces by introducing versioned schemas, desktop server indexer entries, TypeScript interfaces/parsers/typeguards, and typed table row builders for:
+    - **SOLO-04 Explainable Market Scanner** (`market-scanner.schema.json`, `parseMarketScanner`, `#market-scanner-panel` in Command Center);
+    - **DATA-03 News Revision and Novelty Timeline** (`news-revision-timeline.schema.json`, `parseNewsRevisionTimeline`, `#news-revision-panel` in News Cockpit);
+    - **RES-02 Strategy Composition Studio** (`strategy-composition-spec.schema.json`, `parseStrategyCompositionSpec`, `#strategy-composition-panel` in Strategy Studio).
+    All 12 desktop workspaces now exclusively project typed, versioned evidence with 100% test coverage across Rust, Python, and TypeScript.
+23. Fabricated-evidence remediation in the desktop dashboard (2026-09-10): four decorative visuals
+    (`apps/desktop/src/workspaces.ts` — the causal-lineage DAG, the attention/cognitive-load gauge,
+    the factor-exposure bar chart, and the options payoff/convexity chart) previously rendered fixed,
+    hand-authored numbers (for example a constant "+340 bps" momentum factor, a fabricated "K =
+    $500.00" option strike, and a static "2.1 / hr" interruption rate) unconditionally beside the real
+    evidence tables in Command Center, Risk Cockpit, Replay & Incidents, and Research Lab. This
+    violated the read-only dashboard's own zero-synthetic-data invariant. All four are now computed
+    exclusively from their retained typed evidence records (`exposure_graph`, `decision_reconstruction`,
+    `attention_budget`, and the frozen option-chain analytics already displayed in the adjacent table)
+    and render nothing when that evidence is absent, matching the empty-state convention used
+    everywhere else in the dashboard. The same pass replaced every remaining inline `style` attribute
+    and JS `element.style` mutation in `workspaces.ts` with CSS classes so the visuals no longer
+    violate the dashboard's `style-src 'self'` Content-Security-Policy header (previously silently
+    blocked, so the fabricated numbers rendered unstyled rather than being visually suppressed).
+    Regression coverage was added in `apps/desktop/test/enduring-capabilities-regression.mjs`,
+    `apps/desktop/test/paper-operations-regression.mjs`, and the new
+    `apps/desktop/test/options-payoff-regression.mjs`, each asserting the real evidence values render
+    and the previous fabricated strings do not. Verified live via a rebuilt `web-dist` production
+    bundle in a headless browser against the full locally generated evidence set: zero console errors
+    and zero remaining inline-style CSP violations.
+24. Header telemetry fabrication remediation, mobile responsive fixes, and accessibility/signal-color
+    completion in the desktop dashboard (2026-09-10). Three further findings from the same
+    verification pass, all fixed and regression-tested:
+    - **Fabricated header ticker and gateway telemetry**: `apps/desktop/src/app-shell.tsx`'s header
+      rendered on every single page load, unconditionally: fake `BTC/USD`/`ETH/USD`/`SPX` spot prices
+      (instruments this platform has no evidence category for at all), a fake `PORTFOLIO NAV`/`MAX
+      DRAWDOWN`/`VAR (99% 1D)`/`OMS ENGINE`/`AUDIT ANCHOR` ticker, a static `142µs` gateway latency
+      that was never measured, and a `PAPER ENGINE · VERIFIED KERNEL` badge with no backing check —
+      the most visible instance yet of the zero-synthetic-data violation, since it appeared on every
+      workspace regardless of evidence state. `apps/desktop/src/main.ts` now measures the real
+      `/api/v1/status` round-trip latency (`performance.now()`), derives the environment badge from
+      the real dashboard `mode`, and drives the ticker exclusively from the retained operations
+      snapshot (`current_equity`, `drawdown_bps`, `unknown_orders`, the journal `head_hash`); the
+      unrelated crypto/equity/VaR items were removed outright since no real evidence backs them. Every
+      ticker element shows an explicit "No snapshot" rather than inventing a figure when the
+      operations dashboard is absent.
+    - **Mobile responsive-layout audit**: automated measurement (not visual guessing) of horizontal
+      overflow across all 12 workspaces at 1440px/1024px/390px found **all 12 workspaces overflowing
+      at 390px** from three distinct CSS bugs — a cascade-order conflict that silently defeated the
+      mobile nav-collapse rule, a missing `white-space` reset that kept the mobile table-to-card
+      reflow from wrapping long values, and a `data-label` attribute every cell carried but no CSS
+      ever rendered. All three are fixed (detailed in
+      [`docs/04-experience/02-ui-overhaul-audit.md`](../04-experience/02-ui-overhaul-audit.md)); a
+      re-measurement after the fix shows 0 of 36 (workspace × breakpoint) checks overflowing, and a
+      keyboard-navigation sweep found every interactive element reachable with a visible focus
+      outline in a logical order.
+    - **WCAG AA contrast and signal-color/monochrome completion**: `--color-signal-buy`,
+      `--color-signal-sell`, `--color-accent`, and `--color-ruby` were verified (by computed relative
+      luminance, not the design system's original bg-base-only check) to fall below the documented
+      4.5:1 WCAG AA claim as text against the `--color-surface-1`/`-2` card backgrounds they are
+      actually rendered on; all four were relightened to clear 4.5:1 on every surface. The
+      already-specified but previously unimplemented "signal vs. monochrome" preference
+      (`docs/04-experience/04-visual-design-system.md`) is now built: a `▲`/`▼` glyph always
+      accompanies a signed value regardless of mode (stricter than the doc's literal text, to
+      satisfy WCAG 1.4.1 in the default color view too), and a header toggle removes the green/red
+      hue on request, persisted per-browser in `localStorage`.
+    Regression coverage lives in `apps/desktop/test/browser-module-contract.mjs` (source-text
+    assertions against the fabricated strings, the fixed CSS rules, and the new functions) so none of
+    these three regress silently again.
+25. Pre-trade risk-gate and golden-corpus-evidence remediation (2026-09-10). An independent
+    doc-versus-code audit of `docs/03-capabilities/04-pre-trade-risk.md` against the real order-gating
+    code (as opposed to the `core/risk` evidence engine already described in item 5.7's main text)
+    found that self-trade prevention and order-rate limiting — both explicitly required by that
+    document's "Order shape" row — were implemented only in the disconnected, gRPC/benchmark-only
+    `core/risk::evaluate_portfolio_risk` and were never called from `core/paper::evaluate_risk` or
+    `core/live::evaluate_risk`, the two functions that actually gate every real PAPER and
+    controlled-LIVE order. Both engines now independently reject a same-instrument opposite-side
+    order against any existing working order (`SELF_TRADE_RISK`) and reject a submission once the
+    number of orders created inside a configured rolling window reaches a configured limit
+    (`MAX_ORDER_RATE_EXCEEDED`), computed from the durable, already-retained order history rather than
+    new mutable state, so the check is correct across a restart without any extra recovery work. Both
+    `PaperRiskPolicy` and `LiveRiskPolicy` gained `max_order_rate`/`order_rate_window_seconds` fields,
+    threaded through their CLI configuration documents, JSON Schema contracts (`v1` and `v2`), and
+    fixtures; four new unit tests (two per crate) exercise the rejection paths, and the entire
+    workspace test suite, clippy, and `cargo fmt` remain clean.
+    A second, independent finding in the same pass: `core/domain::compatibility::CompatibilityRegistry::verify_corpus`
+    (backing `follon-operations compatibility-matrix`, DUR-12) unconditionally set
+    `backward_compatibility_verified: true` and accepted an arbitrary caller-supplied
+    `golden_corpus_size` with no corpus behind it at all — a fabricated-evidence pattern matching item
+    23's finding, just in a CLI evidence artifact instead of a dashboard visual. `verify_corpus` now
+    requires the caller to supply both the corpus size actually read and the number of records that
+    actually verified, and only certifies compatibility when every read record verified; the CLI
+    command reads a real, retained `news-headline` NDJSON corpus
+    (`tests/fixtures/news/2026-09-01-headlines.ndjson`, overridable via `--golden-corpus`) through the
+    exact production ingestion path (`ingest_local_headlines_ndjson`) and derives both numbers from
+    that real file. A missing `contracts/json-schema/v1/statement-reconciliation.schema.json` — a
+    schema name the same CLI command had registered in its compatibility matrix with no backing schema
+    file at all — was added and verified (via Python `jsonschema`) against real CLI-produced clean and
+    mismatched reconciliation artifacts.
+    A third, minor finding: `TaxLotBook::dispose`'s `HighestCost` tie-break compared unit cost then
+    `lot_id` string order, contradicting its own doc comment ("then oldest lot identity"); it now
+    compares unit cost then `opened_at` then `lot_id`, proven by a new test with two lots tied at the
+    same unit cost.
+    A fourth, doc-only finding: `docs/01-domain/02-event-envelope.md`'s "First event families" table
+    listed `strategy.*` and `system.*`, neither of which `core/domain::EventPayload::event_type` (or
+    any other crate) has ever emitted, while omitting the real `news.*`, `operations.*`, and
+    `commercial.*` families that are actually in production use; the table now lists the true set.
 
 ## Business-readiness decision
 

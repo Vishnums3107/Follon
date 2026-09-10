@@ -29,4 +29,10 @@ Every significant trading operation is recorded as an immutable event. The envel
 
 ## First event families
 
-`market.*`, `strategy.*`, `intent.*`, `risk.*`, `order.*`, `execution.*`, `portfolio.*`, `audit.*`, and `system.*`.
+`market.*`, `intent.*`, `risk.*`, `order.*`, `execution.*`, `portfolio.*`, `audit.*`, `news.*`,
+`operations.*`, and `commercial.*` (`core/domain::EventPayload::event_type`, `core/operations`, and
+`core/commercial` are the exact producers). Neither `strategy.*` nor `system.*` is ever produced
+today; a strategy is identified through the `strategy_id` field on other events rather than through
+its own event family, and no dedicated `system.*` event type exists yet. Do not add a new family
+without also adding it here and to the compatibility registry (`follon-operations
+compatibility-matrix`).

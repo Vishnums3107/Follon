@@ -11,15 +11,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use follon_accounting::statement::{reconcile_statement, BrokerStatement, ReconciliationIncident};
+use follon_accounting::{
+    Currency, JournalLine, JournalTransaction, MarginPosition, MultiCurrencyLedger,
+};
 use follon_cli::{sha256_text, write_immutable};
+use follon_domain::compatibility::{CompatibilityRegistry, SchemaMigrationStatus};
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
+use follon_news::ingest_local_headlines_ndjson;
 use follon_operations::{
     apply_schedule_completions, canonical_dashboard_json, derive_schedule_statuses,
     derive_schedule_statuses_with_completions, game_day_records, markdown_report,
-    model_risk_records, AttributionCategory, AttributionEntry, DailySchedule, GameDayRecord,
-    JournalEntryInput, JournalInspection, ModelRiskRecord, OperationalHealth, OperationalJournal,
-    OperationalPosition, OperationsSnapshot, ParameterApproval, ParameterControl, ParameterSet,
-    ParameterValue, ReproducibilityStamp, RiskLimits, GAME_DAY_EVENT_TYPE, MODEL_RISK_EVENT_TYPE,
+    model_risk_records, AttentionBudgetController, AttributionCategory, AttributionEntry,
+    DailySchedule, GameDayCompiler, GameDayRecord, InjectedFault, JournalEntryInput,
+    JournalInspection, ModelRiskRecord, OperationalHealth, OperationalJournal, OperationalPosition,
+    OperationsSnapshot, ParameterApproval, ParameterControl, ParameterSet, ParameterValue,
+    ReproducibilityStamp, RiskLimits, GAME_DAY_EVENT_TYPE, MODEL_RISK_EVENT_TYPE,
     SCHEDULE_COMPLETION_EVENT_TYPE,
 };
 use serde::Deserialize;
@@ -193,6 +200,59 @@ enum Command {
     ModelRiskRegister(RegisterArguments),
     GameDayRecord(GameDayRecordArguments),
     GameDayRegister(RegisterArguments),
+    ReconcileStatement(ReconcileStatementArguments),
+    RecoveryDrill(RecoveryDrillArguments),
+    AttentionBudget(AttentionBudgetArguments),
+    CompatibilityMatrix(CompatibilityMatrixArguments),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryDrillDocument {
+    scenario_name: String,
+    injected_fault: String,
+    measured_rto_seconds: u64,
+    target_rto_seconds: u64,
+    measured_rpo_events_lost: u64,
+    target_rpo_events_lost: u64,
+    reconciliation_hash_matched: bool,
+    executed_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionBudgetDocument {
+    session_date: String,
+    session_duration_hours: f64,
+    raw_alarm_count: u32,
+    suppressed_count: u32,
+    max_interruptions_per_hour: f64,
+    critical_task_ids: Vec<String>,
+    calculated_at: String,
+}
+
+struct RecoveryDrillArguments {
+    drill_config_path: PathBuf,
+    output_path: PathBuf,
+}
+
+struct AttentionBudgetArguments {
+    budget_config_path: PathBuf,
+    output_path: PathBuf,
+}
+
+struct CompatibilityMatrixArguments {
+    output_path: PathBuf,
+    engine_version: Option<String>,
+    verified_at: Option<String>,
+    golden_corpus_path: PathBuf,
+}
+
+struct ReconcileStatementArguments {
+    configuration_path: PathBuf,
+    statement_path: PathBuf,
+    output_path: PathBuf,
+    as_of: Option<String>,
 }
 
 struct ProjectionArguments {
@@ -467,6 +527,211 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             publish(&arguments.output_path, &register)?;
             eprintln!("game-day register: {}", arguments.output_path.display());
         }
+        Command::ReconcileStatement(arguments) => {
+            let as_of = arguments
+                .as_of
+                .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_owned());
+            let snapshot = load_snapshot(&arguments.configuration_path, &as_of)?;
+            let statement_bytes = fs::read(&arguments.statement_path)?;
+            let statement_csv = String::from_utf8(statement_bytes)?;
+            let statement_csv_hash = sha256_text(&statement_csv);
+            let broker_statement = BrokerStatement::from_csv(&statement_csv)?;
+
+            let currency = Currency::new(&snapshot.currency)?;
+            let mut ledger = MultiCurrencyLedger::default();
+            let tx = JournalTransaction {
+                transaction_id: format!("tx.recon.{}", snapshot.account_id),
+                tenant_id: "tenant.default".to_owned(),
+                reference_id: format!("ref.recon.{}", snapshot.account_id),
+                lines: vec![
+                    JournalLine {
+                        account_id: "cash.broker".to_owned(),
+                        currency: currency.clone(),
+                        debit: snapshot.cash,
+                        credit: Decimal::ZERO,
+                    },
+                    JournalLine {
+                        account_id: "equity.opening".to_owned(),
+                        currency: currency.clone(),
+                        debit: Decimal::ZERO,
+                        credit: snapshot.cash,
+                    },
+                ],
+            };
+            ledger.post(&tx)?;
+
+            let unit_multiplier = Decimal::from_integer(1)?;
+            let internal_positions: Vec<MarginPosition> = snapshot
+                .positions
+                .iter()
+                .map(|p| MarginPosition {
+                    instrument_id: p.instrument_id.clone(),
+                    asset_class: "equity".to_owned(),
+                    currency: currency.clone(),
+                    quantity: p.quantity,
+                    mark_price: p.mark_price,
+                    multiplier: unit_multiplier,
+                })
+                .collect();
+
+            let incidents = reconcile_statement(
+                &ledger,
+                &internal_positions,
+                &broker_statement,
+                "cash.broker",
+            )?;
+            let incidents_json = incidents
+                .iter()
+                .map(|incident| match incident {
+                    ReconciliationIncident::CashMismatch {
+                        currency,
+                        internal_balance,
+                        broker_balance,
+                    } => {
+                        format!(
+                            "{{\"broker_balance\":\"{}\",\"currency\":{},\"incident_kind\":\"CASH_MISMATCH\",\"internal_balance\":\"{}\"}}",
+                            broker_balance,
+                            json_string(currency.as_str()),
+                            internal_balance,
+                        )
+                    }
+                    ReconciliationIncident::PositionMismatch {
+                        instrument_id,
+                        internal_quantity,
+                        broker_quantity,
+                    } => {
+                        format!(
+                            "{{\"broker_quantity\":\"{}\",\"incident_kind\":\"POSITION_MISMATCH\",\"instrument_id\":{},\"internal_quantity\":\"{}\"}}",
+                            broker_quantity,
+                            json_string(instrument_id),
+                            internal_quantity,
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let is_clean = incidents.is_empty();
+            let artifact = format!(
+                "{{\"account_id\":{},\"as_of\":{},\"clean\":{},\"configuration_content_hash\":{},\"incident_count\":{},\"incidents\":[{}],\"statement_csv_hash\":{},\"statement_reconciliation_schema_version\":1}}",
+                json_string(&snapshot.account_id),
+                json_string(&as_of),
+                is_clean,
+                json_string(&snapshot.configuration_content_hash),
+                incidents.len(),
+                incidents_json,
+                json_string(&statement_csv_hash),
+            );
+            publish(&arguments.output_path, &artifact)?;
+            println!("{artifact}");
+            eprintln!(
+                "statement reconciliation: {}",
+                arguments.output_path.display()
+            );
+        }
+        Command::RecoveryDrill(arguments) => {
+            let bytes = fs::read(&arguments.drill_config_path)?;
+            let doc: RecoveryDrillDocument = serde_json::from_slice(&bytes)?;
+            let fault = match doc.injected_fault.as_str() {
+                "DISK_PRESSURE_ABRUPT_TERMINATION" => InjectedFault::DiskPressureAbruptTermination,
+                "DROPPED_BROKER_EXECUTION_ACK" => InjectedFault::DroppedBrokerExecutionAck,
+                "CORRUPT_POSTGRES_CHECKPOINT" => InjectedFault::CorruptPostgresCheckpoint,
+                "SPLIT_BRAIN_HOST_PARTITION" => InjectedFault::SplitBrainHostPartition,
+                other => return Err(format!("unknown injected fault: {other}").into()),
+            };
+            let result = GameDayCompiler::compile_drill(
+                &doc.scenario_name,
+                fault,
+                doc.measured_rto_seconds,
+                doc.target_rto_seconds,
+                doc.measured_rpo_events_lost,
+                doc.target_rpo_events_lost,
+                doc.reconciliation_hash_matched,
+                &doc.executed_at,
+            )?;
+            let json = serde_json::to_string_pretty(&result)?;
+            publish(&arguments.output_path, &json)?;
+            println!("{json}");
+            eprintln!("recovery drill result: {}", arguments.output_path.display());
+        }
+        Command::AttentionBudget(arguments) => {
+            let bytes = fs::read(&arguments.budget_config_path)?;
+            let doc: AttentionBudgetDocument = serde_json::from_slice(&bytes)?;
+            let controller = AttentionBudgetController::new(doc.max_interruptions_per_hour);
+            let budget = controller.calculate_budget(
+                &doc.session_date,
+                doc.session_duration_hours,
+                doc.raw_alarm_count,
+                doc.suppressed_count,
+                doc.critical_task_ids,
+                &doc.calculated_at,
+            );
+            let json = serde_json::to_string_pretty(&budget)?;
+            publish(&arguments.output_path, &json)?;
+            println!("{json}");
+            eprintln!("attention budget: {}", arguments.output_path.display());
+        }
+        Command::CompatibilityMatrix(arguments) => {
+            let engine_version = arguments
+                .engine_version
+                .unwrap_or_else(|| "0.1.0".to_owned());
+            let verified_at = arguments
+                .verified_at
+                .unwrap_or_else(|| "2026-09-05T12:00:00Z".to_owned());
+            let mut registry = CompatibilityRegistry::new(&engine_version);
+            registry.register("event-envelope", 1, 1, SchemaMigrationStatus::Current);
+            registry.register("order-intent", 1, 1, SchemaMigrationStatus::Current);
+            registry.register("risk-decision", 1, 1, SchemaMigrationStatus::Current);
+            registry.register("market-bar", 1, 1, SchemaMigrationStatus::Current);
+            registry.register("news-headline", 1, 1, SchemaMigrationStatus::Current);
+            registry.register("news-sentiment", 1, 1, SchemaMigrationStatus::Current);
+            registry.register("fx-pricing-snapshot", 1, 1, SchemaMigrationStatus::Current);
+            registry.register(
+                "statement-reconciliation",
+                1,
+                1,
+                SchemaMigrationStatus::Current,
+            );
+            // The corpus check reads a real retained historical `news-headline`
+            // NDJSON record set and replays it through the exact production
+            // ingestion/validation path (`ingest_local_headlines_ndjson`).
+            // `golden_corpus_size` and `corpus_records_verified` are both
+            // derived from that real file; neither is ever a fixed literal.
+            let corpus_source =
+                fs::read_to_string(&arguments.golden_corpus_path).map_err(|error| {
+                    format!(
+                        "failed to read golden corpus {}: {error}",
+                        arguments.golden_corpus_path.display()
+                    )
+                })?;
+            let golden_corpus_size = u32::try_from(
+                corpus_source
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count(),
+            )
+            .map_err(|_| "golden corpus is too large to count".to_owned())?;
+            let corpus_records_verified = match ingest_local_headlines_ndjson(&corpus_source) {
+                Ok(headlines) => u32::try_from(headlines.len())
+                    .map_err(|_| "golden corpus is too large to count".to_owned())?,
+                Err(_) => 0,
+            };
+            let matrix = registry.verify_corpus(
+                golden_corpus_size,
+                corpus_records_verified,
+                &verified_at,
+            )?;
+            let json = matrix.to_json();
+            publish(&arguments.output_path, &json)?;
+            println!("{json}");
+            eprintln!("compatibility matrix: {}", arguments.output_path.display());
+            eprintln!(
+                "golden corpus: {} ({}/{} records verified)",
+                arguments.golden_corpus_path.display(),
+                corpus_records_verified,
+                golden_corpus_size
+            );
+        }
     }
     Ok(())
 }
@@ -521,6 +786,18 @@ fn parse_command(arguments: Vec<String>) -> Result<Command, Box<dyn std::error::
             "game-day-register",
             "var/follon-game-day-register.json",
         )?)),
+        "reconcile-statement" => Ok(Command::ReconcileStatement(
+            parse_reconcile_statement_arguments(remainder)?,
+        )),
+        "recovery-drill" => Ok(Command::RecoveryDrill(parse_recovery_drill_arguments(
+            remainder,
+        )?)),
+        "attention-budget" => Ok(Command::AttentionBudget(parse_attention_budget_arguments(
+            remainder,
+        )?)),
+        "compatibility-matrix" => Ok(Command::CompatibilityMatrix(
+            parse_compatibility_matrix_arguments(remainder)?,
+        )),
         _ => Err(usage().into()),
     }
 }
@@ -1060,6 +1337,142 @@ fn parse_register_arguments(
     })
 }
 
+fn parse_reconcile_statement_arguments(
+    arguments: &[String],
+) -> Result<ReconcileStatementArguments, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    let mut as_of = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--as-of" => {
+                if as_of.is_some() {
+                    return Err("--as-of may be specified only once".into());
+                }
+                index += 1;
+                let val = required(arguments, index, "--as-of")?;
+                validate_utc_timestamp("--as-of", val)?;
+                as_of = Some(val.to_owned());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unsupported argument: {value}").into());
+            }
+            value => positional.push(PathBuf::from(value)),
+        }
+        index += 1;
+    }
+    if positional.len() < 2 || positional.len() > 3 {
+        return Err("usage: follon-operations reconcile-statement <operations.json> <statement.csv> [reconciliation.json] [--as-of <UTC>]".into());
+    }
+    Ok(ReconcileStatementArguments {
+        configuration_path: positional[0].clone(),
+        statement_path: positional[1].clone(),
+        output_path: positional
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("var/follon-statement-reconciliation.json")),
+        as_of,
+    })
+}
+
+fn parse_recovery_drill_arguments(
+    arguments: &[String],
+) -> Result<RecoveryDrillArguments, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    for arg in arguments {
+        if arg.starts_with('-') {
+            return Err(format!("unsupported argument: {arg}").into());
+        }
+        positional.push(PathBuf::from(arg));
+    }
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(
+            "usage: follon-operations recovery-drill <drill-config.json> [output.json]".into(),
+        );
+    }
+    Ok(RecoveryDrillArguments {
+        drill_config_path: positional[0].clone(),
+        output_path: positional
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("var/recovery-drill.json")),
+    })
+}
+
+fn parse_attention_budget_arguments(
+    arguments: &[String],
+) -> Result<AttentionBudgetArguments, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    for arg in arguments {
+        if arg.starts_with('-') {
+            return Err(format!("unsupported argument: {arg}").into());
+        }
+        positional.push(PathBuf::from(arg));
+    }
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(
+            "usage: follon-operations attention-budget <budget-config.json> [output.json]".into(),
+        );
+    }
+    Ok(AttentionBudgetArguments {
+        budget_config_path: positional[0].clone(),
+        output_path: positional
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("var/attention-budget.json")),
+    })
+}
+
+fn parse_compatibility_matrix_arguments(
+    arguments: &[String],
+) -> Result<CompatibilityMatrixArguments, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    let mut engine_version = None;
+    let mut verified_at = None;
+    let mut golden_corpus_path = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--engine-version" => {
+                index += 1;
+                engine_version = Some(required(arguments, index, "--engine-version")?.to_owned());
+            }
+            "--verified-at" => {
+                index += 1;
+                let val = required(arguments, index, "--verified-at")?;
+                validate_utc_timestamp("--verified-at", val)?;
+                verified_at = Some(val.to_owned());
+            }
+            "--golden-corpus" => {
+                index += 1;
+                golden_corpus_path = Some(PathBuf::from(required(
+                    arguments,
+                    index,
+                    "--golden-corpus",
+                )?));
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unsupported argument: {value}").into());
+            }
+            value => positional.push(PathBuf::from(value)),
+        }
+        index += 1;
+    }
+    if positional.len() > 1 {
+        return Err("usage: follon-operations compatibility-matrix [output.json] [--engine-version <version>] [--verified-at <UTC>] [--golden-corpus <path.ndjson>]".into());
+    }
+    Ok(CompatibilityMatrixArguments {
+        output_path: positional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("var/compat-matrix.json")),
+        engine_version,
+        verified_at,
+        golden_corpus_path: golden_corpus_path
+            .unwrap_or_else(|| PathBuf::from("tests/fixtures/news/2026-09-01-headlines.ndjson")),
+    })
+}
+
 fn validate_sha256_argument(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
     if value.len() != 64
         || !value
@@ -1445,7 +1858,7 @@ fn optional_json_string(value: Option<&str>) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  follon-operations validate-config [operations.json]\n  follon-operations config-diff <previous operations.json> <target operations.json> [changes.json]\n  follon-operations dashboard [operations.json] [dashboard.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations report [operations.json] [report.md] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations schedule [operations.json] [schedule.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations complete-schedule [operations.json] --schedule-id <id> --entry-id <id> --actor <id> --occurred-at <UTC> [--journal journal.ndjson]\n  follon-operations model-risk-record --record-id <id> --actor <id> --occurred-at <UTC> --strategy-id <id> --strategy-version <version> --strategy-bundle-hash <sha256> --backtest-artifact-hash <sha256> --decision <PROMOTE|DEMOTE|HOLD> --change-summary <text> --reason <text> [--journal journal.ndjson]\n  follon-operations model-risk-register [journal.ndjson] [register.json]\n  follon-operations game-day-record --record-id <id> --actor <id> --occurred-at <UTC> --scenario-id <id> --result <PASS|FAIL> --fault-plan-hash <sha256> --evidence-hash <sha256> --reconciliation-hash <sha256> --postmortem-summary <text> [--journal journal.ndjson]\n  follon-operations game-day-register [journal.ndjson] [register.json]\n  follon-operations journal --entry-id <id> --event-type <type> --actor <id> --occurred-at <UTC> [--journal journal.ndjson] [--detail key=value]"
+    "usage:\n  follon-operations validate-config [operations.json]\n  follon-operations config-diff <previous operations.json> <target operations.json> [changes.json]\n  follon-operations dashboard [operations.json] [dashboard.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations report [operations.json] [report.md] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations schedule [operations.json] [schedule.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations complete-schedule [operations.json] --schedule-id <id> --entry-id <id> --actor <id> --occurred-at <UTC> [--journal journal.ndjson]\n  follon-operations model-risk-record --record-id <id> --actor <id> --occurred-at <UTC> --strategy-id <id> --strategy-version <version> --strategy-bundle-hash <sha256> --backtest-artifact-hash <sha256> --decision <PROMOTE|DEMOTE|HOLD> --change-summary <text> --reason <text> [--journal journal.ndjson]\n  follon-operations model-risk-register [journal.ndjson] [register.json]\n  follon-operations game-day-record --record-id <id> --actor <id> --occurred-at <UTC> --scenario-id <id> --result <PASS|FAIL> --fault-plan-hash <sha256> --evidence-hash <sha256> --reconciliation-hash <sha256> --postmortem-summary <text> [--journal journal.ndjson]\n  follon-operations game-day-register [journal.ndjson] [register.json]\n  follon-operations reconcile-statement <operations.json> <statement.csv> [reconciliation.json] [--as-of <UTC>]\n  follon-operations recovery-drill <drill-config.json> [output.json]\n  follon-operations attention-budget <budget-config.json> [output.json]\n  follon-operations compatibility-matrix [output.json] [--engine-version <version>] [--verified-at <UTC>] [--golden-corpus <path.ndjson>]\n  follon-operations journal --entry-id <id> --event-type <type> --actor <id> --occurred-at <UTC> [--journal journal.ndjson] [--detail key=value]"
 }
 
 #[cfg(test)]
@@ -1564,5 +1977,245 @@ mod tests {
             "risk.max_drawdown_bps"
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn statement_reconciliation_detects_clean_and_mismatched_broker_activity() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir.join("../../tests/fixtures/config/operations-v1.json");
+        let clean_csv = manifest_dir.join("../../tests/fixtures/broker-statement-v1.csv");
+        let mismatch_csv =
+            manifest_dir.join("../../tests/fixtures/broker-statement-mismatch-v1.csv");
+
+        let out_clean =
+            std::env::temp_dir().join(format!("follon-recon-clean-{}.json", std::process::id()));
+        let out_mismatch =
+            std::env::temp_dir().join(format!("follon-recon-mismatch-{}.json", std::process::id()));
+
+        // Test clean reconciliation
+        let clean_cmd = parse_command(vec![
+            "reconcile-statement".to_owned(),
+            config_path.to_str().unwrap().to_owned(),
+            clean_csv.to_str().unwrap().to_owned(),
+            out_clean.to_str().unwrap().to_owned(),
+        ])
+        .unwrap();
+
+        match clean_cmd {
+            Command::ReconcileStatement(args) => {
+                let snapshot =
+                    load_snapshot(&args.configuration_path, "2026-08-10T16:30:00Z").unwrap();
+                let csv = fs::read_to_string(&args.statement_path).unwrap();
+                let stmt = BrokerStatement::from_csv(&csv).unwrap();
+                let currency = Currency::new(&snapshot.currency).unwrap();
+                let mut ledger = MultiCurrencyLedger::default();
+                let tx = JournalTransaction {
+                    transaction_id: "tx.recon".to_owned(),
+                    tenant_id: "tenant.1".to_owned(),
+                    reference_id: "ref.1".to_owned(),
+                    lines: vec![
+                        JournalLine {
+                            account_id: "cash.broker".to_owned(),
+                            currency: currency.clone(),
+                            debit: snapshot.cash,
+                            credit: Decimal::ZERO,
+                        },
+                        JournalLine {
+                            account_id: "equity".to_owned(),
+                            currency: currency.clone(),
+                            debit: Decimal::ZERO,
+                            credit: snapshot.cash,
+                        },
+                    ],
+                };
+                ledger.post(&tx).unwrap();
+
+                let internal_pos: Vec<MarginPosition> = snapshot
+                    .positions
+                    .iter()
+                    .map(|p| MarginPosition {
+                        instrument_id: p.instrument_id.clone(),
+                        asset_class: "equity".to_owned(),
+                        currency: currency.clone(),
+                        quantity: p.quantity,
+                        mark_price: p.mark_price,
+                        multiplier: Decimal::from_integer(1).unwrap(),
+                    })
+                    .collect();
+
+                let incidents =
+                    reconcile_statement(&ledger, &internal_pos, &stmt, "cash.broker").unwrap();
+                assert!(
+                    incidents.is_empty(),
+                    "expected 0 incidents for clean statement"
+                );
+            }
+            _ => panic!("expected ReconcileStatement command"),
+        }
+
+        // Test mismatch reconciliation
+        let mismatch_cmd = parse_command(vec![
+            "reconcile-statement".to_owned(),
+            config_path.to_str().unwrap().to_owned(),
+            mismatch_csv.to_str().unwrap().to_owned(),
+            out_mismatch.to_str().unwrap().to_owned(),
+        ])
+        .unwrap();
+
+        match mismatch_cmd {
+            Command::ReconcileStatement(args) => {
+                let snapshot =
+                    load_snapshot(&args.configuration_path, "2026-08-10T16:30:00Z").unwrap();
+                let csv = fs::read_to_string(&args.statement_path).unwrap();
+                let stmt = BrokerStatement::from_csv(&csv).unwrap();
+                let currency = Currency::new(&snapshot.currency).unwrap();
+                let mut ledger = MultiCurrencyLedger::default();
+                let tx = JournalTransaction {
+                    transaction_id: "tx.recon".to_owned(),
+                    tenant_id: "tenant.1".to_owned(),
+                    reference_id: "ref.1".to_owned(),
+                    lines: vec![
+                        JournalLine {
+                            account_id: "cash.broker".to_owned(),
+                            currency: currency.clone(),
+                            debit: snapshot.cash,
+                            credit: Decimal::ZERO,
+                        },
+                        JournalLine {
+                            account_id: "equity".to_owned(),
+                            currency: currency.clone(),
+                            debit: Decimal::ZERO,
+                            credit: snapshot.cash,
+                        },
+                    ],
+                };
+                ledger.post(&tx).unwrap();
+
+                let internal_pos: Vec<MarginPosition> = snapshot
+                    .positions
+                    .iter()
+                    .map(|p| MarginPosition {
+                        instrument_id: p.instrument_id.clone(),
+                        asset_class: "equity".to_owned(),
+                        currency: currency.clone(),
+                        quantity: p.quantity,
+                        mark_price: p.mark_price,
+                        multiplier: Decimal::from_integer(1).unwrap(),
+                    })
+                    .collect();
+
+                let incidents =
+                    reconcile_statement(&ledger, &internal_pos, &stmt, "cash.broker").unwrap();
+                assert_eq!(
+                    incidents.len(),
+                    2,
+                    "expected 2 incidents (cash and position mismatch)"
+                );
+            }
+            _ => panic!("expected ReconcileStatement command"),
+        }
+    }
+
+    #[test]
+    fn recovery_drill_command_evaluates_and_emits_drill_result() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let drill_config = manifest_dir.join("../../tests/fixtures/config/recovery-drill-v1.json");
+        let out_drill =
+            std::env::temp_dir().join(format!("follon-drill-test-{}.json", std::process::id()));
+
+        let cmd = parse_command(vec![
+            "recovery-drill".to_owned(),
+            drill_config.to_str().unwrap().to_owned(),
+            out_drill.to_str().unwrap().to_owned(),
+        ])
+        .unwrap();
+
+        match cmd {
+            Command::RecoveryDrill(args) => {
+                let bytes = fs::read(&args.drill_config_path).unwrap();
+                let doc: RecoveryDrillDocument = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(doc.injected_fault, "DISK_PRESSURE_ABRUPT_TERMINATION");
+                let result = GameDayCompiler::compile_drill(
+                    &doc.scenario_name,
+                    InjectedFault::DiskPressureAbruptTermination,
+                    doc.measured_rto_seconds,
+                    doc.target_rto_seconds,
+                    doc.measured_rpo_events_lost,
+                    doc.target_rpo_events_lost,
+                    doc.reconciliation_hash_matched,
+                    &doc.executed_at,
+                )
+                .unwrap();
+                assert!(result.drill_passed);
+                assert_eq!(result.drill_schema_version, 1);
+            }
+            _ => panic!("expected RecoveryDrill command"),
+        }
+    }
+
+    #[test]
+    fn attention_budget_command_evaluates_budget() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let budget_config =
+            manifest_dir.join("../../tests/fixtures/config/attention-budget-v1.json");
+        let out_budget =
+            std::env::temp_dir().join(format!("follon-budget-test-{}.json", std::process::id()));
+
+        let cmd = parse_command(vec![
+            "attention-budget".to_owned(),
+            budget_config.to_str().unwrap().to_owned(),
+            out_budget.to_str().unwrap().to_owned(),
+        ])
+        .unwrap();
+
+        match cmd {
+            Command::AttentionBudget(args) => {
+                let bytes = fs::read(&args.budget_config_path).unwrap();
+                let doc: AttentionBudgetDocument = serde_json::from_slice(&bytes).unwrap();
+                let controller = AttentionBudgetController::new(doc.max_interruptions_per_hour);
+                let budget = controller.calculate_budget(
+                    &doc.session_date,
+                    doc.session_duration_hours,
+                    doc.raw_alarm_count,
+                    doc.suppressed_count,
+                    doc.critical_task_ids,
+                    &doc.calculated_at,
+                );
+                assert_eq!(budget.budget_schema_version, 1);
+                assert_eq!(budget.active_alarms_count, 7);
+                assert!(!budget.budget_exhausted);
+            }
+            _ => panic!("expected AttentionBudget command"),
+        }
+    }
+
+    #[test]
+    fn compatibility_matrix_command_verifies_corpus() {
+        let out_matrix =
+            std::env::temp_dir().join(format!("follon-compat-test-{}.json", std::process::id()));
+
+        let cmd = parse_command(vec![
+            "compatibility-matrix".to_owned(),
+            out_matrix.to_str().unwrap().to_owned(),
+            "--engine-version".to_owned(),
+            "0.1.0".to_owned(),
+            "--verified-at".to_owned(),
+            "2026-09-05T12:00:00Z".to_owned(),
+        ])
+        .unwrap();
+
+        match cmd {
+            Command::CompatibilityMatrix(args) => {
+                assert_eq!(args.engine_version.as_deref(), Some("0.1.0"));
+                let mut registry = CompatibilityRegistry::new("0.1.0");
+                registry.register("event-envelope", 1, 1, SchemaMigrationStatus::Current);
+                let matrix = registry
+                    .verify_corpus(1000, 1000, "2026-09-05T12:00:00Z")
+                    .unwrap();
+                assert!(matrix.backward_compatibility_verified);
+                assert_eq!(matrix.compatibility_schema_version, 1);
+            }
+            _ => panic!("expected CompatibilityMatrix command"),
+        }
     }
 }

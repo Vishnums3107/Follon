@@ -1,6 +1,10 @@
 import {
+  AttentionBudget,
+  DecisionReconstruction,
+  ExposureGraph,
   LiveMonitoringDashboard,
   OperationsDashboard,
+  OptionAnalyticsEvidence,
   OptionsDashboard,
   PaperDashboard,
   parseAdapterQualification,
@@ -24,11 +28,14 @@ import {
   parseExposureGraph,
   parseFeedSubstitutionParity,
   parseFundLedgerStatement,
+  parseFxPricingDashboard,
   parseGatewayQualificationMatrix,
   parseKnowledgeSnapshot,
   parseLiveMonitoringDashboard,
+  parseMarketScanner,
   parseModelEvaluationBenchmark,
   parseMultiAssetExpansionPlan,
+  parseNewsRevisionTimeline,
   parseOperationsDiagnosisRunbook,
   parseOrderDecisionPassport,
   parseOperationsDashboard,
@@ -41,7 +48,9 @@ import {
   parseRobustnessEvaluation,
   parseSandboxInstallationPreview,
   parseScenarioLossSimulation,
+  parseStatementReconciliation,
   parseStrategyCapsuleManifest,
+  parseStrategyCompositionSpec,
   parseWorkspaceSnapshotManifest,
 } from "./evidence.js";
 import { FeatureDefinition, SystemStatus } from "./catalog.js";
@@ -428,7 +437,25 @@ function renderCommandCenter(
     "Screen instruments against versioned indicators and point-in-time universe conditions with ranked reasons (SOLO-04)."
   );
   scannerPanel.id = "market-scanner-panel";
-  appendUnavailableEvidence(scannerPanel, "No versioned market-scanner result is published. Scanner output will appear only after its evidence contract and producer are available.");
+  appendAdvancedEvidenceRows(
+    scannerPanel,
+    snapshot,
+    context,
+    "market_scanner",
+    parseMarketScanner,
+    ["Rank", "Symbol / Instrument", "Close Price", "Momentum (bps)", "RSI (14)", "Matched Conditions", "Rationale"],
+    (scanner) =>
+      scanner.candidates.map((cand) => [
+        `#${cand.rank}`,
+        `${cand.symbol} (${cand.instrument_id})`,
+        cand.close_price,
+        `${cand.momentum_score_bps} bps`,
+        cand.rsi_14,
+        cand.matched_conditions.join(", "),
+        cand.rationale,
+      ]),
+    "No typed market-scanner candidate records are published."
+  );
   root.append(scannerPanel);
 
   const consolidatedAttention = createPanel(
@@ -509,13 +536,9 @@ function renderCommandCenter(
     ]],
     "No typed attention budget is published."
   );
-  const attnEvidence = snapshot.advanced_evidence?.find((item) => item.category === "attention_budget");
-  let cognitiveLoadBps = 2450;
-  if (attnEvidence && typeof attnEvidence.data === "object" && attnEvidence.data !== null && "cognitive_load_score_bps" in attnEvidence.data) {
-    const raw = (attnEvidence.data as { cognitive_load_score_bps: unknown }).cognitive_load_score_bps;
-    if (typeof raw === "number") cognitiveLoadBps = raw;
-  }
-  awayDeskPanel.append(renderAttentionGauge(cognitiveLoadBps));
+  const attentionBudget = typedAdvancedEvidence(snapshot, "attention_budget", parseAttentionBudget)[0]?.data;
+  const attentionGauge = renderAttentionGauge(attentionBudget);
+  if (attentionGauge !== undefined) awayDeskPanel.append(attentionGauge);
   root.append(awayDeskPanel);
 
   root.append(renderArtifactPanel("Recent evidence", context.artifacts.slice(0, 12), context.onOpenArtifact));
@@ -681,7 +704,8 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "No typed counterfactual replay scenario is published."
   );
   root.append(counterfactualPanel);
-  root.append(renderOptionsPayoffVisualizer());
+  const payoffVisualizer = renderOptionsPayoffVisualizer(options);
+  if (payoffVisualizer !== undefined) root.append(payoffVisualizer);
 
   root.append(renderFeatureEvidence(context, ["market-data", "research", "options"]));
 }
@@ -772,7 +796,26 @@ function renderNewsCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     "Track original announcements versus syndicated duplicates, corrections, and model interpretations without overwriting history (DATA-03)."
   );
   revisionPanel.id = "news-revision-panel";
-  appendUnavailableEvidence(revisionPanel, "No versioned news-revision artifact is published. Headline events are preserved above, but duplicate or correction status is not inferred by this workspace.");
+  appendAdvancedEvidenceRows(
+    revisionPanel,
+    snapshot,
+    context,
+    "news_revision_timeline",
+    parseNewsRevisionTimeline,
+    ["Seq", "Received Time", "Source", "Kind", "Headline", "Entity Confidence", "Supersedes Seq", "Hash"],
+    (timeline) =>
+      timeline.chain.map((entry) => [
+        `#${entry.version_sequence}`,
+        entry.received_at,
+        entry.source_id,
+        entry.kind,
+        entry.headline,
+        `${entry.entity_confidence_bps} bps`,
+        entry.supersedes_sequence !== null ? `#${entry.supersedes_sequence}` : "None",
+        shortHash(entry.content_hash),
+      ]),
+    "No typed news-revision timeline records are published."
+  );
   root.append(revisionPanel);
 
   const calendarPanel = createPanel(
@@ -855,7 +898,26 @@ function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snaps
     "Declarative signals, sizing rules, entry/exit criteria, and portfolio constraints; code and visual views share one versioned spec (RES-02)."
   );
   compositionPanel.id = "strategy-composition-panel";
-  appendUnavailableEvidence(compositionPanel, "No versioned strategy-composition specification is published. Existing strategy identities are shown above; visual composition is unavailable until its contract producer exists.");
+  appendAdvancedEvidenceRows(
+    compositionPanel,
+    snapshot,
+    context,
+    "strategy_composition_spec",
+    parseStrategyCompositionSpec,
+    ["Strategy ID / Version", "Signal Criteria", "Sizing Rule", "Entry Criteria", "Exit Criteria", "Portfolio Constraints", "Code & Visual Hashes"],
+    (spec) => [
+      [
+        `${spec.strategy_id} (${spec.strategy_version})`,
+        spec.signals.map((s) => `${s.signal_id}: ${s.condition} (weight ${s.weight_bps} bps)`).join(" | "),
+        `${spec.sizing_rule.sizing_type} (${spec.sizing_rule.target_value})`,
+        spec.entry_criteria.join(", "),
+        spec.exit_criteria.join(", "),
+        `Max Lev: ${spec.portfolio_constraints.max_leverage_bps} bps | Max Pos: ${spec.portfolio_constraints.max_single_position_bps} bps | Stop: ${spec.portfolio_constraints.stop_loss_pct}`,
+        `Code: ${shortHash(spec.code_hash)} | Visual: ${shortHash(spec.visual_representation_hash)}`,
+      ],
+    ],
+    "No typed strategy composition specifications are published."
+  );
   root.append(compositionPanel);
 
   const copilotPanel = createPanel(
@@ -1453,7 +1515,9 @@ function renderRiskCockpit(summaryRoot: HTMLElement, root: HTMLElement, snapshot
     ],
     "No typed exposure graph is published."
   );
-  exposureGraphPanel.append(renderFactorExposureBars());
+  const exposureGraph = typedAdvancedEvidence(snapshot, "exposure_graph", parseExposureGraph)[0]?.data;
+  const factorBars = renderFactorExposureBars(exposureGraph);
+  if (factorBars !== undefined) exposureGraphPanel.append(factorBars);
   root.append(exposureGraphPanel);
 
   const scenarioLossPanel = createPanel(
@@ -1616,6 +1680,64 @@ function renderPortfolio(summaryRoot: HTMLElement, root: HTMLElement, snapshot: 
     "No typed multi-asset expansion plan is published."
   );
   root.append(multiAssetPanel);
+
+  const statementReconPanel = createPanel(
+    "Broker statement reconciliation",
+    "Independent verification of broker cash balances and held positions against internal multi-currency ledger (PORT-01, OPS-04)."
+  );
+  statementReconPanel.id = "statement-recon-panel";
+  appendAdvancedEvidenceRows(
+    statementReconPanel,
+    snapshot,
+    context,
+    "statement_reconciliation",
+    parseStatementReconciliation,
+    ["Account ID", "As-Of (UTC)", "Verdict", "Incidents", "Statement Hash", "Details"],
+    (recon) => [
+      [
+        recon.account_id,
+        recon.as_of,
+        recon.clean ? "CLEAN" : "INCIDENTS DETECTED",
+        String(recon.incident_count),
+        recon.statement_csv_hash.slice(0, 16) + "...",
+        recon.incidents.length === 0
+          ? "All balances and positions verified"
+          : recon.incidents.map((i) => i.incident_kind === "CASH_MISMATCH"
+              ? `Cash diff: internal ${i.internal_balance} ${i.currency} vs broker ${i.broker_balance}`
+              : `Position diff on ${i.instrument_id}: internal ${i.internal_quantity} vs broker ${i.broker_quantity}`
+            ).join("; "),
+      ]
+    ],
+    "No broker statement reconciliation artifact is published."
+  );
+  root.append(statementReconPanel);
+
+  const fxPricingPanel = createPanel(
+    "Deterministic FX valuation and snapshots",
+    "Fresh spot, forward, and swap midpoints, bid/ask spreads, and source sequences (FX-01, DATA-07)."
+  );
+  fxPricingPanel.id = "fx-pricing-panel";
+  appendAdvancedEvidenceRows(
+    fxPricingPanel,
+    snapshot,
+    context,
+    "fx_pricing_dashboard",
+    parseFxPricingDashboard,
+    ["Query ID", "Pair", "Product", "Value Date", "Midpoint", "Bid / Ask", "Spread (bps)", "Age", "Status"],
+    (fx) => fx.evaluations.map((e) => [
+      e.query_id,
+      e.pair,
+      e.product,
+      e.value_date,
+      e.midpoint,
+      `${e.bid} / ${e.ask}`,
+      e.spread_bps,
+      `${e.age_seconds}s`,
+      e.fresh ? "FRESH" : "STALE",
+    ]),
+    "No FX pricing dashboard artifact is published."
+  );
+  root.append(fxPricingPanel);
 
   if (options !== undefined) {
     const scenario = createPanel("Options scenario and book reconciliation", `Compared at ${formatTime(options.reconciliation.reconciled_at)} using independently fingerprinted exports.`);
@@ -1780,7 +1902,9 @@ function renderReplayAndIncidents(summaryRoot: HTMLElement, root: HTMLElement, s
     ]],
     "No typed decision provenance reconstruction is published."
   );
-  explainMomentPanel.append(renderCausalDagVisualizer());
+  const decisionReconstruction = typedAdvancedEvidence(snapshot, "decision_reconstruction", parseDecisionReconstruction)[0]?.data;
+  const causalDag = renderCausalDagVisualizer(decisionReconstruction);
+  if (causalDag !== undefined) explainMomentPanel.append(causalDag);
   root.append(explainMomentPanel);
 
   const recoveryDrillPanel = createPanel(
@@ -2158,208 +2282,303 @@ function appendDefinition(parent: HTMLElement, values: ReadonlyArray<readonly [s
   parent.append(list);
 }
 
-function renderCausalDagVisualizer(): HTMLElement {
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Readonly<Record<string, string>>): SVGElementTagNameMap[K] {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+  return el;
+}
+
+function truncateText(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
+}
+
+/** Renders only a real, retained decision-reconstruction causal chain; absent evidence yields no visual. */
+function renderCausalDagVisualizer(recon: DecisionReconstruction | undefined): HTMLElement | undefined {
+  if (recon === undefined || recon.causal_chain.length === 0) return undefined;
+  const boxWidth = 130;
+  const boxHeight = 70;
+  const stepX = 170;
+  const startX = 35;
+  const boxY = 55;
+  const nodes = recon.causal_chain;
+  const svgWidth = Math.max(400, startX * 2 + (nodes.length - 1) * stepX + boxWidth);
+  const accentColors = ["#00D2FF", "#00E676", "#D4AF37"];
+  const verified = recon.integrity_status === "VERIFIED";
+
   const wrap = document.createElement("div");
   wrap.className = "causal-dag-container";
-  wrap.innerHTML = `
-    <div class="causal-dag-title">
-      <span style="display:flex;align-items:center;gap:8px;">
-        <span class="luxury-pulse-dot luxury-pulse-dot--cyan" aria-hidden="true"><span class="pulse-ring"></span><span class="pulse-core"></span></span>
-        Interactive Causal Lineage DAG (Temporal Provenance)
-      </span>
-      <span style="color:var(--color-gold);font-size:0.6875rem;">VERIFIED DETERMINISTIC CHAIN</span>
-    </div>
-    <svg class="dag-svg" viewBox="0 0 920 180" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <linearGradient id="dagGlow" x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stop-color="#00D2FF" stop-opacity="0.3" />
-          <stop offset="50%" stop-color="#00E676" stop-opacity="0.8" />
-          <stop offset="100%" stop-color="#D4AF37" stop-opacity="0.9" />
-        </linearGradient>
-      </defs>
-      <path d="M 125 90 C 160 90, 165 90, 200 90" stroke="url(#dagGlow)" stroke-width="2.5" fill="none" stroke-dasharray="4 2" class="dag-link-pulse" />
-      <path d="M 285 90 C 320 90, 325 90, 360 90" stroke="url(#dagGlow)" stroke-width="2.5" fill="none" stroke-dasharray="4 2" class="dag-link-pulse" />
-      <path d="M 445 90 C 480 90, 485 90, 520 90" stroke="url(#dagGlow)" stroke-width="2.5" fill="none" stroke-dasharray="4 2" class="dag-link-pulse" />
-      <path d="M 605 90 C 640 90, 645 90, 680 90" stroke="url(#dagGlow)" stroke-width="2.5" fill="none" stroke-dasharray="4 2" class="dag-link-pulse" />
-      <path d="M 765 90 C 800 90, 805 90, 840 90" stroke="url(#dagGlow)" stroke-width="2.5" fill="none" stroke-dasharray="4 2" class="dag-link-pulse" />
 
-      <g transform="translate(35, 55)">
-        <rect width="90" height="70" rx="8" fill="#13161C" stroke="#2C353F" stroke-width="1.2"/>
-        <circle cx="16" cy="20" r="4" fill="#00D2FF"/>
-        <text x="26" y="24" fill="#A3A8B4" font-size="10" font-family="'JetBrains Mono', monospace">DATA.FEED</text>
-        <text x="12" y="44" fill="#FFFFFF" font-size="11" font-weight="600" font-family="'Inter', sans-serif">Market Bar</text>
-        <text x="12" y="60" fill="#00E676" font-size="9" font-family="'JetBrains Mono', monospace">T0 +0.0ms</text>
-      </g>
-      <g transform="translate(195, 55)">
-        <rect width="90" height="70" rx="8" fill="#13161C" stroke="#00D2FF" stroke-width="1.5"/>
-        <circle cx="16" cy="20" r="4" fill="#00E676"/>
-        <text x="26" y="24" fill="#A3A8B4" font-size="10" font-family="'JetBrains Mono', monospace">SIGNAL.V1</text>
-        <text x="12" y="44" fill="#FFFFFF" font-size="11" font-weight="600" font-family="'Inter', sans-serif">Alpha Score</text>
-        <text x="12" y="60" fill="#00E676" font-size="9" font-family="'JetBrains Mono', monospace">+0.042ms</text>
-      </g>
-      <g transform="translate(355, 55)">
-        <rect width="90" height="70" rx="8" fill="#13161C" stroke="#2C353F" stroke-width="1.2"/>
-        <circle cx="16" cy="20" r="4" fill="#D4AF37"/>
-        <text x="26" y="24" fill="#A3A8B4" font-size="10" font-family="'JetBrains Mono', monospace">STRAT.ENG</text>
-        <text x="12" y="44" fill="#FFFFFF" font-size="11" font-weight="600" font-family="'Inter', sans-serif">Trend Model</text>
-        <text x="12" y="60" fill="#00E676" font-size="9" font-family="'JetBrains Mono', monospace">+0.088ms</text>
-      </g>
-      <g transform="translate(515, 55)">
-        <rect width="90" height="70" rx="8" fill="#13161C" stroke="#00E676" stroke-width="1.5"/>
-        <circle cx="16" cy="20" r="4" fill="#00E676"/>
-        <text x="26" y="24" fill="#A3A8B4" font-size="10" font-family="'JetBrains Mono', monospace">RISK.GATE</text>
-        <text x="12" y="44" fill="#FFFFFF" font-size="11" font-weight="600" font-family="'Inter', sans-serif">14 Checks OK</text>
-        <text x="12" y="60" fill="#00E676" font-size="9" font-family="'JetBrains Mono', monospace">+0.114ms</text>
-      </g>
-      <g transform="translate(675, 55)">
-        <rect width="90" height="70" rx="8" fill="#13161C" stroke="#2C353F" stroke-width="1.2"/>
-        <circle cx="16" cy="20" r="4" fill="#00D2FF"/>
-        <text x="26" y="24" fill="#A3A8B4" font-size="10" font-family="'JetBrains Mono', monospace">OMS.EXEC</text>
-        <text x="12" y="44" fill="#FFFFFF" font-size="11" font-weight="600" font-family="'Inter', sans-serif">Paper Fill</text>
-        <text x="12" y="60" fill="#00E676" font-size="9" font-family="'JetBrains Mono', monospace">+0.142ms</text>
-      </g>
-      <g transform="translate(835, 55)">
-        <rect width="80" height="70" rx="8" fill="#13161C" stroke="#D4AF37" stroke-width="1.5"/>
-        <circle cx="16" cy="20" r="4" fill="#D4AF37"/>
-        <text x="26" y="24" fill="#D4AF37" font-size="9" font-family="'JetBrains Mono', monospace">LEDGER</text>
-        <text x="10" y="44" fill="#FFFFFF" font-size="11" font-weight="600" font-family="'Inter', sans-serif">Sha256 Head</text>
-        <text x="10" y="60" fill="#D4AF37" font-size="9" font-family="'JetBrains Mono', monospace">IMMUTABLE</text>
-      </g>
-    </svg>
-  `;
+  const title = document.createElement("div");
+  title.className = "causal-dag-title";
+  const titleLeft = document.createElement("span");
+  titleLeft.className = "dag-header-left";
+  const titleIcon = document.createElement("span");
+  titleIcon.innerHTML = `<span class="luxury-pulse-dot luxury-pulse-dot--cyan" aria-hidden="true"><span class="pulse-ring"></span><span class="pulse-core"></span></span>`;
+  const titleText = document.createElement("span");
+  titleText.textContent = "Interactive Causal Lineage DAG (Temporal Provenance)";
+  titleLeft.append(titleIcon, titleText);
+  const titleBadge = document.createElement("span");
+  titleBadge.className = `dag-header-badge dag-header-badge--${verified ? "verified" : "warn"}`;
+  titleBadge.textContent = recon.integrity_status.replace(/_/g, " ");
+  title.append(titleLeft, titleBadge);
+  wrap.append(title);
+
+  const svg = svgEl("svg", { class: "dag-svg", viewBox: `0 0 ${svgWidth} 180` });
+  const defs = svgEl("defs", {});
+  const gradient = svgEl("linearGradient", { id: "dagGlow", x1: "0%", y1: "0%", x2: "100%", y2: "0%" });
+  for (const [offset, color, opacity] of [["0%", "#00D2FF", "0.3"], ["50%", "#00E676", "0.8"], ["100%", "#D4AF37", "0.9"]] as const) {
+    gradient.append(svgEl("stop", { offset, "stop-color": color, "stop-opacity": opacity }));
+  }
+  defs.append(gradient);
+  svg.append(defs);
+
+  const edgeSet = new Set(recon.edges.map((edge) => `${edge.from_node_id}->${edge.to_node_id}`));
+  for (let i = 0; i < nodes.length - 1; i++) {
+    if (!edgeSet.has(`${nodes[i].node_id}->${nodes[i + 1].node_id}`)) continue;
+    const x1 = startX + i * stepX + boxWidth;
+    const x2 = startX + (i + 1) * stepX;
+    svg.append(svgEl("path", {
+      d: `M ${x1} 90 C ${x1 + 35} 90, ${x2 - 35} 90, ${x2} 90`,
+      stroke: "url(#dagGlow)", "stroke-width": "2.5", fill: "none", "stroke-dasharray": "4 2", class: "dag-link-pulse",
+    }));
+  }
+
+  nodes.forEach((node, index) => {
+    const x = startX + index * stepX;
+    const accent = accentColors[index % accentColors.length];
+    const g = svgEl("g", { transform: `translate(${x}, ${boxY})` });
+    g.append(svgEl("rect", { width: String(boxWidth), height: String(boxHeight), rx: "8", fill: "#13161C", stroke: accent, "stroke-width": "1.2" }));
+    g.append(svgEl("circle", { cx: "16", cy: "20", r: "4", fill: accent }));
+    const typeText = svgEl("text", { x: "26", y: "24", fill: "#A3A8B4", "font-size": "10", "font-family": "'JetBrains Mono', monospace" });
+    typeText.textContent = truncateText(node.event_type, 16);
+    g.append(typeText);
+    const summaryText = svgEl("text", { x: "12", y: "44", fill: "#FFFFFF", "font-size": "11", "font-weight": "600", "font-family": "'Inter', sans-serif" });
+    summaryText.textContent = truncateText(node.summary, 18);
+    g.append(summaryText);
+    const actorText = svgEl("text", { x: "12", y: "60", fill: accent, "font-size": "9", "font-family": "'JetBrains Mono', monospace" });
+    actorText.textContent = truncateText(node.actor, 20);
+    g.append(actorText);
+    const tooltip = svgEl("title", {});
+    tooltip.textContent = `${node.node_id} · ${node.event_time}`;
+    g.append(tooltip);
+    svg.append(g);
+  });
+
+  wrap.append(svg);
   return wrap;
 }
 
-function renderAttentionGauge(cognitiveLoadBps: number = 2450): HTMLElement {
+/** Renders only a real, retained attention-budget record; absent evidence yields no visual. */
+function renderAttentionGauge(budget: AttentionBudget | undefined): HTMLElement | undefined {
+  if (budget === undefined) return undefined;
+  const loadPct = Math.min(100, Math.max(0, budget.cognitive_load_score_bps / 100));
+  const reservePct = (100 - loadPct).toFixed(1);
+  const dashoffset = (235.6 * (1 - loadPct / 100)).toFixed(1);
+
   const wrap = document.createElement("div");
   wrap.className = "attention-gauge-container";
-  const loadPct = Math.min(100, Math.max(0, cognitiveLoadBps / 100));
-  const dashoffset = (235.6 * (1 - loadPct / 100)).toFixed(1);
-  wrap.innerHTML = `
-    <div class="gauge-svg-wrap">
-      <svg class="gauge-svg" viewBox="0 0 200 130">
-        <defs>
-          <linearGradient id="gaugeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stop-color="#00E676" />
-            <stop offset="60%" stop-color="#00D2FF" />
-            <stop offset="100%" stop-color="#FF3366" />
-          </linearGradient>
-        </defs>
-        <path d="M 25 115 A 75 75 0 0 1 175 115" fill="none" stroke="#22252B" stroke-width="14" stroke-linecap="round" />
-        <path d="M 25 115 A 75 75 0 0 1 175 115" fill="none" stroke="url(#gaugeGradient)" stroke-width="14" stroke-linecap="round"
-              stroke-dasharray="235.6" stroke-dashoffset="${dashoffset}" />
-        <text x="100" y="85" class="gauge-center-text" fill="#FFFFFF" font-family="'JetBrains Mono', monospace" font-size="22" font-weight="700">${loadPct.toFixed(1)}%</text>
-        <text x="100" y="105" class="gauge-center-text" fill="#A3A8B4" font-family="'Inter', sans-serif" font-size="9" font-weight="600" letter-spacing="0.08em">LOAD (NOMINAL)</text>
-      </svg>
-    </div>
-    <div class="gauge-metric-cluster">
-      <div class="metric-card" style="padding:10px 14px;">
-        <span style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--color-text-muted);">
-          <span class="luxury-pulse-dot luxury-pulse-dot--emerald"><span class="pulse-ring"></span><span class="pulse-core"></span></span>
-          RESERVE CAPACITY
-        </span>
-        <span class="f-text-mono" style="font-size:16px;font-weight:700;color:var(--color-emerald);">${(100 - loadPct).toFixed(1)}%</span>
-        <small style="color:var(--color-text-muted);font-size:10px;">Attentive margin</small>
-      </div>
-      <div class="metric-card" style="padding:10px 14px;">
-        <span style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--color-text-muted);">
-          <span class="luxury-pulse-dot luxury-pulse-dot--cyan"><span class="pulse-ring"></span><span class="pulse-core"></span></span>
-          INTERRUPTIONS
-        </span>
-        <span class="f-text-mono" style="font-size:16px;font-weight:700;color:var(--color-cyan);">2.1 / hr</span>
-        <small style="color:var(--color-text-muted);font-size:10px;">Alarm deduplication active</small>
-      </div>
-    </div>
-  `;
-  return wrap;
-}
-
-function renderFactorExposureBars(): HTMLElement {
-  const wrap = document.createElement("div");
-  wrap.className = "factor-exposure-container";
-  wrap.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-      <span style="display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:0.75rem;color:var(--color-cyan);text-transform:uppercase;">
-        <span class="luxury-pulse-dot luxury-pulse-dot--emerald"><span class="pulse-ring"></span><span class="pulse-core"></span></span>
-        Factor Decomposition & Variance Contribution
-      </span>
-      <span style="font-size:0.6875rem;color:var(--color-text-muted);font-family:var(--font-mono);">ZERO-BIASED HEDGE MODEL</span>
-    </div>
-    <div class="factor-bar-row">
-      <span class="factor-name">Momentum (MOM)</span>
-      <div class="factor-track-wrap">
-        <div class="factor-zero-line"></div>
-        <div class="factor-bar-fill factor-bar-fill--positive" style="width: 34%;"></div>
-      </div>
-      <span class="factor-val f-text-buy">+340 bps (24.2%)</span>
-    </div>
-    <div class="factor-bar-row">
-      <span class="factor-name">Value (HML)</span>
-      <div class="factor-track-wrap">
-        <div class="factor-zero-line"></div>
-        <div class="factor-bar-fill factor-bar-fill--negative" style="width: 12%;"></div>
-      </div>
-      <span class="factor-val f-text-sell">-120 bps (8.5%)</span>
-    </div>
-    <div class="factor-bar-row">
-      <span class="factor-name">Volatility (VOL)</span>
-      <div class="factor-track-wrap">
-        <div class="factor-zero-line"></div>
-        <div class="factor-bar-fill factor-bar-fill--negative" style="width: 28%;"></div>
-      </div>
-      <span class="factor-val f-text-sell">-280 bps (19.8%)</span>
-    </div>
-    <div class="factor-bar-row">
-      <span class="factor-name">Size (SMB)</span>
-      <div class="factor-track-wrap">
-        <div class="factor-zero-line"></div>
-        <div class="factor-bar-fill factor-bar-fill--positive" style="width: 15%;"></div>
-      </div>
-      <span class="factor-val f-text-buy">+150 bps (10.6%)</span>
-    </div>
-    <div class="factor-bar-row">
-      <span class="factor-name">Quality (QMJ)</span>
-      <div class="factor-track-wrap">
-        <div class="factor-zero-line"></div>
-        <div class="factor-bar-fill factor-bar-fill--positive" style="width: 41%;"></div>
-      </div>
-      <span class="factor-val f-text-buy">+410 bps (29.1%)</span>
-    </div>
-  `;
-  return wrap;
-}
-
-function renderOptionsPayoffVisualizer(): HTMLElement {
-  const wrap = document.createElement("div");
-  wrap.className = "options-payoff-container f-card";
-  wrap.style.margin = "var(--space-4) 0";
-  wrap.style.padding = "var(--space-4)";
-  wrap.style.background = "radial-gradient(ellipse at bottom, rgba(20, 24, 34, 0.7) 0%, rgba(13, 14, 18, 0.9) 100%)";
-  wrap.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-      <span style="display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:0.75rem;color:var(--color-gold);text-transform:uppercase;">
-        <span class="luxury-pulse-dot luxury-pulse-dot--gold"><span class="pulse-ring"></span><span class="pulse-core"></span></span>
-        Deterministic Options Payoff & Convexity Profile
-      </span>
-      <span style="font-family:var(--font-mono);font-size:0.6875rem;color:var(--color-cyan);">STRADDLE DELTA-NEUTRAL</span>
-    </div>
-    <svg style="width:100%;height:110px;display:block;" viewBox="0 0 600 110" xmlns="http://www.w3.org/2000/svg">
+  const svgWrap = document.createElement("div");
+  svgWrap.className = "gauge-svg-wrap";
+  svgWrap.innerHTML = `
+    <svg class="gauge-svg" viewBox="0 0 200 130">
       <defs>
-        <linearGradient id="payoffFill" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stop-color="#00E676" stop-opacity="0.25"/>
-          <stop offset="100%" stop-color="#00E676" stop-opacity="0"/>
+        <linearGradient id="gaugeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="#00E676" />
+          <stop offset="60%" stop-color="#00D2FF" />
+          <stop offset="100%" stop-color="#FF3366" />
         </linearGradient>
       </defs>
-      <line x1="20" y1="65" x2="580" y2="65" stroke="rgba(255,255,255,0.15)" stroke-dasharray="3 3"/>
-      <text x="585" y="68" fill="#A3A8B4" font-size="9" font-family="'JetBrains Mono', monospace">0 PnL</text>
-      <line x1="300" y1="10" x2="300" y2="90" stroke="rgba(212,175,55,0.4)" stroke-dasharray="2 2"/>
-      <text x="304" y="25" fill="#D4AF37" font-size="9" font-family="'JetBrains Mono', monospace">K = $500.00</text>
-      <path d="M 40 15 L 200 65 L 300 85 L 400 65 L 560 15" fill="none" stroke="#00E676" stroke-width="2.5"/>
-      <path d="M 40 15 L 200 65 L 300 85 L 400 65 L 560 15 L 560 100 L 40 100 Z" fill="url(#payoffFill)"/>
-      <circle cx="300" cy="85" r="5" fill="#D4AF37"/>
-      <circle cx="300" cy="85" r="9" fill="none" stroke="#D4AF37" stroke-width="1.2" opacity="0.6"/>
+      <path d="M 25 115 A 75 75 0 0 1 175 115" fill="none" stroke="#22252B" stroke-width="14" stroke-linecap="round" />
+      <path d="M 25 115 A 75 75 0 0 1 175 115" fill="none" stroke="url(#gaugeGradient)" stroke-width="14" stroke-linecap="round"
+            stroke-dasharray="235.6" stroke-dashoffset="${dashoffset}" />
+      <text x="100" y="85" class="gauge-center-text" fill="#FFFFFF" font-family="'JetBrains Mono', monospace" font-size="22" font-weight="700">${loadPct.toFixed(1)}%</text>
+      <text x="100" y="105" class="gauge-center-text" fill="#A3A8B4" font-family="'Inter', sans-serif" font-size="9" font-weight="600" letter-spacing="0.08em">LOAD (${budget.budget_exhausted ? "EXHAUSTED" : "NOMINAL"})</text>
     </svg>
   `;
+  wrap.append(svgWrap);
+
+  const cluster = document.createElement("div");
+  cluster.className = "gauge-metric-cluster";
+
+  const reserveCard = document.createElement("div");
+  reserveCard.className = "metric-card gauge-metric-card";
+  reserveCard.innerHTML = `<span class="gauge-metric-label"><span class="luxury-pulse-dot luxury-pulse-dot--emerald"><span class="pulse-ring"></span><span class="pulse-core"></span></span>RESERVE CAPACITY</span>`;
+  const reserveValue = document.createElement("span");
+  reserveValue.className = "f-text-mono gauge-metric-value gauge-metric-value--emerald";
+  reserveValue.textContent = `${reservePct}%`;
+  const reserveCaption = document.createElement("small");
+  reserveCaption.className = "gauge-metric-caption";
+  reserveCaption.textContent = "Attentive margin";
+  reserveCard.append(reserveValue, reserveCaption);
+
+  const interruptCard = document.createElement("div");
+  interruptCard.className = "metric-card gauge-metric-card";
+  interruptCard.innerHTML = `<span class="gauge-metric-label"><span class="luxury-pulse-dot luxury-pulse-dot--cyan"><span class="pulse-ring"></span><span class="pulse-core"></span></span>INTERRUPTIONS</span>`;
+  const interruptValue = document.createElement("span");
+  interruptValue.className = "f-text-mono gauge-metric-value gauge-metric-value--cyan";
+  interruptValue.textContent = `${budget.interruptions_per_hour} / hr`;
+  const interruptCaption = document.createElement("small");
+  interruptCaption.className = "gauge-metric-caption";
+  interruptCaption.textContent = `${budget.active_alarms_count} active / ${budget.suppressed_duplicates_count} suppressed`;
+  interruptCard.append(interruptValue, interruptCaption);
+
+  cluster.append(reserveCard, interruptCard);
+  wrap.append(cluster);
+  return wrap;
+}
+
+/** Renders only a real, retained exposure graph; absent evidence yields no visual. */
+function renderFactorExposureBars(graph: ExposureGraph | undefined): HTMLElement | undefined {
+  if (graph === undefined || graph.factors.length === 0) return undefined;
+  const maxAbsBps = Math.max(...graph.factors.map((factor) => Math.abs(factor.loading_bps)), 1);
+
+  const wrap = document.createElement("div");
+  wrap.className = "factor-exposure-container";
+
+  const header = document.createElement("div");
+  header.className = "factor-header-row";
+  const headerLabel = document.createElement("span");
+  headerLabel.className = "factor-header-label";
+  const headerIcon = document.createElement("span");
+  headerIcon.innerHTML = `<span class="luxury-pulse-dot luxury-pulse-dot--emerald"><span class="pulse-ring"></span><span class="pulse-core"></span></span>`;
+  const headerText = document.createElement("span");
+  headerText.textContent = "Factor Decomposition & Variance Contribution";
+  headerLabel.append(headerIcon, headerText);
+  const headerBadge = document.createElement("span");
+  headerBadge.className = "factor-header-badge";
+  headerBadge.textContent = graph.unreconciled_discrepancy ? "UNRECONCILED DISCREPANCY" : "RECONCILED";
+  header.append(headerLabel, headerBadge);
+  wrap.append(header);
+
+  for (const factor of graph.factors) {
+    const positive = factor.loading_bps >= 0;
+    const widthBucket = Math.round((Math.abs(factor.loading_bps) / maxAbsBps) * 50);
+
+    const row = document.createElement("div");
+    row.className = "factor-bar-row";
+    const name = document.createElement("span");
+    name.className = "factor-name";
+    name.textContent = factor.factor_name;
+    row.append(name);
+
+    const track = document.createElement("div");
+    track.className = "factor-track-wrap";
+    const zero = document.createElement("div");
+    zero.className = "factor-zero-line";
+    track.append(zero);
+    const fill = document.createElement("div");
+    fill.className = `factor-bar-fill factor-bar-fill--${positive ? "positive" : "negative"} f-bar-w-${widthBucket}`;
+    track.append(fill);
+    row.append(track);
+
+    const value = document.createElement("span");
+    value.className = `factor-val ${positive ? "f-text-buy" : "f-text-sell"}`;
+    value.textContent = `${positive ? "+" : ""}${factor.loading_bps} bps (${factor.factor_variance_pct})`;
+    row.append(value);
+
+    wrap.append(row);
+  }
+  return wrap;
+}
+
+type PayoffLeg = Readonly<{ right: "CALL" | "PUT"; strike: number; premium: number }>;
+
+/** Renders a payoff/convexity sketch computed only from real, retained frozen option-chain analytics. */
+function renderOptionsPayoffVisualizer(options: OptionsDashboard | undefined): HTMLElement | undefined {
+  if (options === undefined || options.analytics.length === 0) return undefined;
+  const mark = Number(options.chain.underlying_mark);
+  if (!Number.isFinite(mark)) return undefined;
+
+  const toLeg = (item: OptionAnalyticsEvidence): PayoffLeg | undefined => {
+    const strike = Number(item.strike);
+    const premium = Number(item.market_premium);
+    if (!Number.isFinite(strike) || !Number.isFinite(premium)) return undefined;
+    return { right: item.right, strike, premium };
+  };
+  const nearestToMark = (candidates: readonly PayoffLeg[]): PayoffLeg | undefined =>
+    candidates.reduce<PayoffLeg | undefined>((best, leg) => (best === undefined || Math.abs(leg.strike - mark) < Math.abs(best.strike - mark) ? leg : best), undefined);
+
+  const legs = (["CALL", "PUT"] as const)
+    .map((right) => nearestToMark(options.analytics.filter((item) => item.right === right).map(toLeg).filter((leg): leg is PayoffLeg => leg !== undefined)))
+    .filter((leg): leg is PayoffLeg => leg !== undefined);
+  if (legs.length === 0) return undefined;
+
+  const totalPremium = legs.reduce((sum, leg) => sum + leg.premium, 0);
+  const payoffAt = (spot: number): number =>
+    legs.reduce((sum, leg) => sum + (leg.right === "CALL" ? Math.max(0, spot - leg.strike) : Math.max(0, leg.strike - spot)), 0) - totalPremium;
+
+  const strikes = legs.map((leg) => leg.strike);
+  const low = Math.min(mark, ...strikes) * 0.7;
+  const high = Math.max(mark, ...strikes) * 1.3;
+  const sampleCount = 40;
+  const samples = Array.from({ length: sampleCount + 1 }, (_, i) => {
+    const spot = low + ((high - low) * i) / sampleCount;
+    return { spot, value: payoffAt(spot) };
+  });
+  const values = samples.map((sample) => sample.value);
+  const minVal = Math.min(...values, 0);
+  const maxVal = Math.max(...values, 0);
+  const valueRange = maxVal - minVal || 1;
+
+  const chartLeft = 40, chartRight = 560, chartTop = 15, chartBottom = 95;
+  const toX = (spot: number) => chartLeft + ((spot - low) / (high - low)) * (chartRight - chartLeft);
+  const toY = (value: number) => chartBottom - ((value - minVal) / valueRange) * (chartBottom - chartTop);
+  const zeroY = toY(0);
+  const pathD = samples.map((sample, i) => `${i === 0 ? "M" : "L"} ${toX(sample.spot).toFixed(1)} ${toY(sample.value).toFixed(1)}`).join(" ");
+  const fillD = `${pathD} L ${toX(high).toFixed(1)} ${chartBottom} L ${toX(low).toFixed(1)} ${chartBottom} Z`;
+  const legLabel = legs.map((leg) => `${leg.right} K=${leg.strike.toFixed(2)}`).join(" + ");
+
+  const wrap = document.createElement("div");
+  wrap.className = "options-payoff-container f-card";
+
+  const header = document.createElement("div");
+  header.className = "options-payoff-header-row";
+  const headerLabel = document.createElement("span");
+  headerLabel.className = "options-payoff-header-label";
+  const headerIcon = document.createElement("span");
+  headerIcon.innerHTML = `<span class="luxury-pulse-dot luxury-pulse-dot--gold"><span class="pulse-ring"></span><span class="pulse-core"></span></span>`;
+  const headerText = document.createElement("span");
+  headerText.textContent = "Deterministic Options Payoff & Convexity Profile";
+  headerLabel.append(headerIcon, headerText);
+  const headerBadge = document.createElement("span");
+  headerBadge.className = "options-payoff-header-badge";
+  headerBadge.textContent = `${options.chain.underlying_instrument_id} @ ${options.chain.underlying_mark}`;
+  header.append(headerLabel, headerBadge);
+  wrap.append(header);
+
+  const svg = svgEl("svg", { class: "options-payoff-svg", viewBox: "0 0 600 110" });
+  const defs = svgEl("defs", {});
+  const gradient = svgEl("linearGradient", { id: "payoffFill", x1: "0%", y1: "0%", x2: "0%", y2: "100%" });
+  gradient.append(svgEl("stop", { offset: "0%", "stop-color": "#00E676", "stop-opacity": "0.25" }));
+  gradient.append(svgEl("stop", { offset: "100%", "stop-color": "#00E676", "stop-opacity": "0" }));
+  defs.append(gradient);
+  svg.append(defs);
+
+  svg.append(svgEl("line", { x1: "20", y1: zeroY.toFixed(1), x2: "580", y2: zeroY.toFixed(1), stroke: "rgba(255,255,255,0.15)", "stroke-dasharray": "3 3" }));
+  const zeroLabel = svgEl("text", { x: "585", y: (zeroY + 3).toFixed(1), fill: "#A3A8B4", "font-size": "9", "font-family": "'JetBrains Mono', monospace" });
+  zeroLabel.textContent = "0 PnL";
+  svg.append(zeroLabel);
+
+  legs.forEach((leg, index) => {
+    const x = toX(leg.strike);
+    svg.append(svgEl("line", { x1: x.toFixed(1), y1: "10", x2: x.toFixed(1), y2: "90", stroke: "rgba(212,175,55,0.4)", "stroke-dasharray": "2 2" }));
+    const strikeLabel = svgEl("text", { x: (x + 4).toFixed(1), y: String(25 + index * 11), fill: "#D4AF37", "font-size": "9", "font-family": "'JetBrains Mono', monospace" });
+    strikeLabel.textContent = `${leg.right} K = ${leg.strike.toFixed(2)}`;
+    svg.append(strikeLabel);
+    svg.append(svgEl("circle", { cx: x.toFixed(1), cy: toY(payoffAt(leg.strike)).toFixed(1), r: "4", fill: "#D4AF37" }));
+  });
+
+  svg.append(svgEl("path", { d: fillD, fill: "url(#payoffFill)" }));
+  svg.append(svgEl("path", { d: pathD, fill: "none", stroke: "#00E676", "stroke-width": "2.5" }));
+  wrap.append(svg);
+
+  const caption = document.createElement("p");
+  caption.className = "options-payoff-caption";
+  caption.textContent = `${legLabel}; combined premium ${totalPremium.toFixed(2)} ${options.chain.currency}; expiry payoff swept ${low.toFixed(2)}–${high.toFixed(2)} ${options.chain.currency}.`;
+  wrap.append(caption);
+
   return wrap;
 }
 
@@ -2581,10 +2800,8 @@ function appendTableOrEmpty(
         const cell = document.createElement("td");
         if (!action.showIf || action.showIf(values, index)) {
           const btn = document.createElement("button");
-          btn.className = "f-btn";
+          btn.className = "f-btn f-btn--sm";
           btn.textContent = action.label;
-          btn.style.padding = "0.25rem 0.5rem";
-          btn.style.fontSize = "0.75rem";
           btn.onclick = (e) => {
             e.stopPropagation();
             action.onClick(index);

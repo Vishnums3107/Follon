@@ -1,0 +1,27 @@
+{
+  "scenario_id": "cf.latency-shock.001",
+  "baseline_run_id": "run.spy-trend.20260901",
+  "seed": 42,
+  "divergence_event_id": "evt.bar.spy.001",
+  "created_at": "2026-09-05T14:45:00Z",
+  "interventions": [
+    {
+      "intervention_type": "NETWORK_LATENCY_INJECTION",
+      "parameter_name": "gateway_latency_ms",
+      "baseline_value": "5",
+      "counterfactual_value": "150"
+    },
+    {
+      "intervention_type": "RISK_COLLAR_ADJUSTMENT",
+      "parameter_name": "price_collar_bps",
+      "baseline_value": "500",
+      "counterfactual_value": "200"
+    }
+  ],
+  "delta_metrics": {
+    "fill_count_delta": -4,
+    "pnl_delta_usd": "-420.50000000",
+    "max_drawdown_delta_bps": 85,
+    "risk_rejection_count_delta": 2
+  }
+}

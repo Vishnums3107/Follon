@@ -57,6 +57,7 @@ decision changes.
 - [UX and primary screens](04-experience/01-ux-and-primary-screens.md)
 - [UI overhaul audit — preflight](04-experience/02-ui-overhaul-audit.md) — current desktop UI architecture, design constraints, and baseline-capture gate.
 - [UI overhaul task list](04-experience/03-ui-overhaul-task-list.md) — visible redesign sequence and verification checklist.
+- [Visual design system](04-experience/04-visual-design-system.md) — palette, typography, layout tokens, accessibility, and institutional aesthetic rules.
 
 ### 05-quality-security — reliability, testing, security, compliance
 - [Reliability and testing](05-quality-security/01-reliability-and-testing.md)

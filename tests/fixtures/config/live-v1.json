@@ -21,7 +21,9 @@
     "max_open_orders": 2,
     "max_position_quantity": "10",
     "max_realized_loss": "100",
-    "max_market_data_age_seconds": 60
+    "max_market_data_age_seconds": 60,
+    "max_order_rate": 20,
+    "order_rate_window_seconds": 60
   },
   "kill_switch_version": "live-kills-v1",
   "activation": {

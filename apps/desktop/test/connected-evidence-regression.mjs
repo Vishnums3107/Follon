@@ -234,6 +234,8 @@ class MockElement {
 
 globalThis.document = {
   createElement: (tag) => new MockElement(tag),
+  createElementNS: (_ns, tag) => new MockElement(tag),
+  createTextNode: (text) => ({ textContent: text }),
   body: new MockElement("body"),
   querySelector: () => null,
 };

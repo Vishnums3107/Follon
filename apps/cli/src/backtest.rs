@@ -9,9 +9,12 @@ use std::str::FromStr;
 
 use follon_accounting::{Currency, FxBook, FxQuote, MarginPolicy, MarginRate};
 use follon_backtest::{
-    AdvancedBacktestAccount, AdvancedBacktestReport, AdvancedInstrumentTerms, BacktestCapitalCheck,
-    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec, DatasetManifest,
-    ExperimentRecord, FileExperimentStore,
+    AdvancedBacktestAccount, AdvancedBacktestReport, AdvancedInstrumentTerms,
+    AdversarialProbeResult, AdversarialResearchGate, BacktestCapitalCheck,
+    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec,
+    CounterfactualDeltaMetrics, CounterfactualEngine, CounterfactualIntervention,
+    CounterfactualInterventionType, CounterfactualScenario, DatasetManifest, ExperimentRecord,
+    FileExperimentStore,
 };
 use follon_cli::{sha256_text, write_immutable};
 use follon_control_plane::{
@@ -311,7 +314,15 @@ struct DelistingRuntime {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments = parse_arguments(env::args().skip(1).collect())?;
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if let Some(subcommand) = raw_args.first() {
+        match subcommand.as_str() {
+            "adversarial" => return run_adversarial(&raw_args[1..]),
+            "counterfactual" => return run_counterfactual(&raw_args[1..]),
+            _ => {}
+        }
+    }
+    let arguments = parse_arguments(raw_args)?;
     let configuration = load_runtime_configuration(&arguments.configuration_path)?;
     let document = &configuration.document;
     if let Some(parent) = arguments.artifact_path.parent() {
@@ -483,6 +494,213 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!("artifact fingerprint: {}", completed.artifact.fingerprint());
     eprintln!("configuration hash: {}", configuration.content_hash);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialConfigDocument {
+    strategy_version: String,
+    evaluated_at: String,
+    probes: Vec<AdversarialProbeDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialProbeDocument {
+    probe_name: String,
+    probe_description: String,
+    passed: bool,
+    degradation_bps: i64,
+    threshold_bps: i64,
+}
+
+fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.is_empty() || arguments.len() > 2 {
+        return Err("usage: follon-backtest adversarial <config.json> [output.json]".into());
+    }
+    let input_path = PathBuf::from(&arguments[0]);
+    let output_path = arguments
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("var/adversarial-eval.json"));
+
+    let content = fs::read_to_string(&input_path)?;
+    let doc: AdversarialConfigDocument = serde_json::from_str(&content)?;
+    validate_utc_timestamp("evaluated_at", &doc.evaluated_at)?;
+
+    let probes: Vec<AdversarialProbeResult> = doc
+        .probes
+        .into_iter()
+        .map(|p| AdversarialProbeResult {
+            probe_name: p.probe_name,
+            probe_description: p.probe_description,
+            passed: p.passed,
+            degradation_bps: p.degradation_bps,
+            threshold_bps: p.threshold_bps,
+        })
+        .collect();
+
+    let eval =
+        AdversarialResearchGate::evaluate_probes(&doc.strategy_version, probes, &doc.evaluated_at)?;
+    let json = eval.to_json();
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_immutable(&output_path, &json)?;
+    eprintln!("adversarial evaluation: {}", output_path.display());
+    eprintln!("evaluation id: {}", eval.evaluation_id);
+    eprintln!("gate passed: {}", eval.gate_passed);
+    eprintln!(
+        "composite score bps: {}",
+        eval.composite_robustness_score_bps
+    );
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterfactualConfigDocument {
+    #[serde(default)]
+    scenario_id: Option<String>,
+    baseline_run_id: String,
+    seed: u64,
+    divergence_event_id: String,
+    created_at: String,
+    interventions: Vec<CounterfactualInterventionDocument>,
+    #[serde(default)]
+    delta_metrics: Option<CounterfactualDeltaMetricsDocument>,
+    #[serde(default)]
+    metrics: Option<CounterfactualMetricsDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterfactualInterventionDocument {
+    intervention_type: String,
+    parameter_name: String,
+    baseline_value: String,
+    counterfactual_value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterfactualDeltaMetricsDocument {
+    fill_count_delta: i64,
+    pnl_delta_usd: String,
+    max_drawdown_delta_bps: i64,
+    risk_rejection_count_delta: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterfactualMetricsDocument {
+    baseline_fills: i64,
+    counterfactual_fills: i64,
+    baseline_pnl_cents: i64,
+    counterfactual_pnl_cents: i64,
+    baseline_max_drawdown_bps: i64,
+    counterfactual_max_drawdown_bps: i64,
+    baseline_rejections: i64,
+    counterfactual_rejections: i64,
+}
+
+fn parse_intervention_type(
+    s: &str,
+) -> Result<CounterfactualInterventionType, Box<dyn std::error::Error>> {
+    match s {
+        "RISK_COLLAR_ADJUSTMENT" => Ok(CounterfactualInterventionType::RiskCollarAdjustment),
+        "NETWORK_LATENCY_INJECTION" => Ok(CounterfactualInterventionType::NetworkLatencyInjection),
+        "DATA_BAR_CORRUPTION" => Ok(CounterfactualInterventionType::DataBarCorruption),
+        "VOLATILITY_SHOCK" => Ok(CounterfactualInterventionType::VolatilityShock),
+        other => Err(format!("unknown intervention_type: {other}").into()),
+    }
+}
+
+fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.is_empty() || arguments.len() > 2 {
+        return Err("usage: follon-backtest counterfactual <config.json> [output.json]".into());
+    }
+    let input_path = PathBuf::from(&arguments[0]);
+    let output_path = arguments
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("var/counterfactual.json"));
+
+    let content = fs::read_to_string(&input_path)?;
+    let doc: CounterfactualConfigDocument = serde_json::from_str(&content)?;
+    validate_utc_timestamp("created_at", &doc.created_at)?;
+
+    let mut interventions = Vec::with_capacity(doc.interventions.len());
+    for item in doc.interventions {
+        let itype = parse_intervention_type(&item.intervention_type)?;
+        interventions.push(CounterfactualIntervention {
+            intervention_type: itype,
+            parameter_name: item.parameter_name,
+            baseline_value: item.baseline_value,
+            counterfactual_value: item.counterfactual_value,
+        });
+    }
+
+    let scenario = if let Some(m) = doc.metrics {
+        CounterfactualEngine::evaluate_scenario(
+            &doc.baseline_run_id,
+            doc.seed,
+            interventions,
+            m.baseline_fills,
+            m.counterfactual_fills,
+            m.baseline_pnl_cents,
+            m.counterfactual_pnl_cents,
+            m.baseline_max_drawdown_bps,
+            m.counterfactual_max_drawdown_bps,
+            m.baseline_rejections,
+            m.counterfactual_rejections,
+            &doc.divergence_event_id,
+            &doc.created_at,
+        )?
+    } else if let Some(d) = doc.delta_metrics {
+        if interventions.is_empty() {
+            return Err("counterfactual scenario requires at least one intervention".into());
+        }
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(
+                format!("{}:{}:{}", doc.baseline_run_id, doc.seed, doc.created_at).as_bytes()
+            )
+        );
+        let scenario_id = doc
+            .scenario_id
+            .unwrap_or_else(|| format!("cf.{}", &digest[..16]));
+        CounterfactualScenario {
+            scenario_schema_version: 1,
+            scenario_id,
+            baseline_run_id: doc.baseline_run_id,
+            seed: doc.seed,
+            interventions,
+            delta_metrics: CounterfactualDeltaMetrics {
+                fill_count_delta: d.fill_count_delta,
+                pnl_delta_usd: d.pnl_delta_usd,
+                max_drawdown_delta_bps: d.max_drawdown_delta_bps,
+                risk_rejection_count_delta: d.risk_rejection_count_delta,
+            },
+            divergence_event_id: doc.divergence_event_id,
+            created_at: doc.created_at,
+        }
+    } else {
+        return Err(
+            "counterfactual config must specify either 'metrics' or 'delta_metrics'".into(),
+        );
+    };
+
+    let json = scenario.to_json();
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_immutable(&output_path, &json)?;
+    eprintln!("counterfactual scenario: {}", output_path.display());
+    eprintln!("scenario id: {}", scenario.scenario_id);
+    eprintln!("baseline run id: {}", scenario.baseline_run_id);
     Ok(())
 }
 
@@ -1212,5 +1430,45 @@ mod tests {
         assert_eq!(loaded.fill_model.latency_bars, 0);
         assert_eq!(loaded.fill_model.max_fill_quantity, None);
         std::fs::remove_file(legacy_path).unwrap();
+    }
+
+    #[test]
+    fn adversarial_subcommand_processes_fixture_and_emits_valid_json() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/adversarial-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-test-{}.json",
+            std::process::id()
+        ));
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_adversarial(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("\"adversarial_schema_version\":1"));
+        assert!(content.contains("\"LOOKAHEAD_LEAKAGE_PROBE\""));
+        assert!(content.contains("\"gate_passed\":true"));
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn counterfactual_subcommand_processes_fixture_and_emits_valid_json() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/counterfactual-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-test-{}.json",
+            std::process::id()
+        ));
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_counterfactual(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("\"scenario_schema_version\":1"));
+        assert!(content.contains("\"cf.latency-shock.001\""));
+        assert!(content.contains("\"NETWORK_LATENCY_INJECTION\""));
+        let _ = std::fs::remove_file(&output_path);
     }
 }

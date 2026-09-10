@@ -85,7 +85,10 @@ impl CounterfactualScenario {
         let mut json = String::from("{");
         json.push_str("\"scenario_schema_version\":1,");
         json.push_str(&format!("\"scenario_id\":\"{}\",", self.scenario_id));
-        json.push_str(&format!("\"baseline_run_id\":\"{}\",", self.baseline_run_id));
+        json.push_str(&format!(
+            "\"baseline_run_id\":\"{}\",",
+            self.baseline_run_id
+        ));
         json.push_str(&format!("\"seed\":{},", self.seed));
 
         // interventions
@@ -113,7 +116,10 @@ impl CounterfactualScenario {
             self.delta_metrics.risk_rejection_count_delta
         ));
 
-        json.push_str(&format!("\"divergence_event_id\":\"{}\",", self.divergence_event_id));
+        json.push_str(&format!(
+            "\"divergence_event_id\":\"{}\",",
+            self.divergence_event_id
+        ));
         json.push_str(&format!("\"created_at\":\"{}\"", self.created_at));
         json.push('}');
         json
@@ -125,6 +131,7 @@ pub struct CounterfactualEngine;
 
 impl CounterfactualEngine {
     /// Computes counterfactual divergence metrics comparing a baseline and an intervention.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate_scenario(
         baseline_run_id: &str,
         seed: u64,
@@ -141,7 +148,9 @@ impl CounterfactualEngine {
         created_at: &str,
     ) -> Result<CounterfactualScenario, BacktestError> {
         if interventions.is_empty() {
-            return Err(BacktestError("counterfactual scenario requires at least one intervention".to_owned()));
+            return Err(BacktestError(
+                "counterfactual scenario requires at least one intervention".to_owned(),
+            ));
         }
 
         let pnl_diff_cents = counterfactual_pnl_cents - baseline_pnl_cents;
@@ -154,7 +163,10 @@ impl CounterfactualEngine {
             risk_rejection_count_delta: counterfactual_rejections - baseline_rejections,
         };
 
-        let digest = format!("{:x}", Sha256::digest(format!("{}:{}:{}", baseline_run_id, seed, created_at).as_bytes()));
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}:{}", baseline_run_id, seed, created_at).as_bytes())
+        );
         let scenario_id = format!("cf.{}", &digest[..16]);
 
         Ok(CounterfactualScenario {

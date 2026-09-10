@@ -50,7 +50,10 @@ impl AdversarialEvaluation {
         let mut json = String::from("{");
         json.push_str("\"adversarial_schema_version\":1,");
         json.push_str(&format!("\"evaluation_id\":\"{}\",", self.evaluation_id));
-        json.push_str(&format!("\"strategy_version\":\"{}\",", self.strategy_version));
+        json.push_str(&format!(
+            "\"strategy_version\":\"{}\",",
+            self.strategy_version
+        ));
 
         // probes
         json.push_str("\"probes\":[");
@@ -65,7 +68,10 @@ impl AdversarialEvaluation {
         }
         json.push_str("],");
 
-        json.push_str(&format!("\"composite_robustness_score_bps\":{},", self.composite_robustness_score_bps));
+        json.push_str(&format!(
+            "\"composite_robustness_score_bps\":{},",
+            self.composite_robustness_score_bps
+        ));
         json.push_str(&format!("\"gate_passed\":{},", self.gate_passed));
 
         // blocking_failure_reasons
@@ -114,10 +120,14 @@ impl AdversarialResearchGate {
             }
         }
 
-        let composite_robustness_score_bps = ((passed_count as u64 * 10_000) / probes.len() as u64) as u32;
+        let composite_robustness_score_bps =
+            ((passed_count as u64 * 10_000) / probes.len() as u64) as u32;
         let gate_passed = blocking_failure_reasons.is_empty();
 
-        let digest = format!("{:x}", Sha256::digest(format!("{}:{}", strategy_version, evaluated_at).as_bytes()));
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", strategy_version, evaluated_at).as_bytes())
+        );
         let evaluation_id = format!("adveval.{}", &digest[..16]);
 
         Ok(AdversarialEvaluation {
@@ -177,7 +187,12 @@ mod tests {
             },
         ];
 
-        let eval = AdversarialResearchGate::evaluate_probes("strat.v1.0.0", probes, "2026-09-01T15:00:00Z").unwrap();
+        let eval = AdversarialResearchGate::evaluate_probes(
+            "strat.v1.0.0",
+            probes,
+            "2026-09-01T15:00:00Z",
+        )
+        .unwrap();
         assert_eq!(eval.adversarial_schema_version, 1);
         assert!(eval.gate_passed);
         assert_eq!(eval.composite_robustness_score_bps, 10_000);
@@ -228,7 +243,12 @@ mod tests {
             },
         ];
 
-        let eval = AdversarialResearchGate::evaluate_probes("strat.v1.0.0", probes, "2026-09-01T15:00:00Z").unwrap();
+        let eval = AdversarialResearchGate::evaluate_probes(
+            "strat.v1.0.0",
+            probes,
+            "2026-09-01T15:00:00Z",
+        )
+        .unwrap();
         assert!(!eval.gate_passed);
         assert_eq!(eval.composite_robustness_score_bps, 8_000);
         assert_eq!(eval.blocking_failure_reasons.len(), 1);

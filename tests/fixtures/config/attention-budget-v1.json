@@ -1,0 +1,11 @@
+{
+  "session_date": "2026-09-05",
+  "session_duration_hours": 8.0,
+  "raw_alarm_count": 42,
+  "suppressed_count": 35,
+  "max_interruptions_per_hour": 5.0,
+  "critical_task_ids": [
+    "task.recon.review.001"
+  ],
+  "calculated_at": "2026-09-05T16:30:00Z"
+}

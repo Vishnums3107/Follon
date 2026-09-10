@@ -1,0 +1,1 @@
+{"away_mode_permitted":true,"broker_disconnect_action":"RETAIN_UNKNOWN_AND_ESCALATE","created_at":"2026-09-01T00:00:00Z","feed_stale_threshold_seconds":3,"heartbeat_interval_seconds":5,"max_restarts_per_hour":3,"policy_id":"cont-pol.standard.v1","policy_schema_version":1,"unattended_interval_minutes":30}

@@ -1193,6 +1193,10 @@ pub struct PaperRiskPolicy {
     pub max_realized_loss: Decimal,
     /// Maximum permitted age of the exact market observation used for an order decision.
     pub max_market_data_age_seconds: u64,
+    /// Maximum order submissions permitted within `order_rate_window_seconds`.
+    pub max_order_rate: u32,
+    /// Rolling window, in seconds, over which `max_order_rate` is enforced.
+    pub order_rate_window_seconds: u64,
 }
 
 impl PaperRiskPolicy {
@@ -1210,6 +1214,8 @@ impl PaperRiskPolicy {
             || self.max_position_quantity <= Decimal::ZERO
             || self.max_realized_loss < Decimal::ZERO
             || self.max_market_data_age_seconds == 0
+            || self.max_order_rate == 0
+            || self.order_rate_window_seconds == 0
         {
             return Err(PaperError("invalid paper risk policy".to_owned()));
         }
@@ -2631,6 +2637,24 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             Side::Buy => context.position_quantity.checked_add(intent.quantity)?,
             Side::Sell => context.position_quantity.checked_sub(intent.quantity)?,
         };
+        let decision_time = OffsetDateTime::parse(decided_at, &Rfc3339)
+            .map_err(|error| PaperError(error.to_string()))?;
+        let rate_window_start = decision_time
+            - time::Duration::seconds(self.risk_policy.order_rate_window_seconds as i64);
+        let recent_order_count =
+            self.orders
+                .values()
+                .try_fold(0u32, |count, order| -> Result<u32, PaperError> {
+                    let created_at = OffsetDateTime::parse(&order.oms.intent.created_at, &Rfc3339)
+                        .map_err(|error| PaperError(error.to_string()))?;
+                    Ok(
+                        if created_at > rate_window_start && created_at <= decision_time {
+                            count + 1
+                        } else {
+                            count
+                        },
+                    )
+                })?;
         let mut reasons = self.kill_switches.rejection_reasons(intent);
         if intent.quantity > self.risk_policy.max_order_quantity {
             reasons.push("MAX_ORDER_QUANTITY_EXCEEDED".to_owned());
@@ -2640,6 +2664,16 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         }
         if requested_price_deviation_bps > self.risk_policy.max_price_deviation_bps {
             reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
+        }
+        if self.orders.values().any(|order| {
+            order.working()
+                && order.oms.intent.instrument_id == intent.instrument_id
+                && order.oms.intent.side != intent.side
+        }) {
+            reasons.push("SELF_TRADE_RISK".to_owned());
+        }
+        if recent_order_count >= self.risk_policy.max_order_rate {
+            reasons.push("MAX_ORDER_RATE_EXCEEDED".to_owned());
         }
         if self
             .orders
@@ -2684,7 +2718,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
+                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
                 self.risk_policy.max_order_quantity,
                 self.risk_policy.max_order_notional,
                 self.risk_policy.max_price_deviation_bps,
@@ -2692,6 +2726,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 self.risk_policy.max_position_quantity,
                 self.risk_policy.max_realized_loss,
                 self.risk_policy.max_market_data_age_seconds,
+                self.risk_policy.max_order_rate,
+                self.risk_policy.order_rate_window_seconds,
+                recent_order_count,
                 market.instrument_id,
                 market.mark_price,
                 market.observed_at,
@@ -3808,6 +3845,8 @@ mod tests {
             max_position_quantity: decimal("position", "1000").unwrap(),
             max_realized_loss: decimal("loss", "10000").unwrap(),
             max_market_data_age_seconds: 5,
+            max_order_rate: 20,
+            order_rate_window_seconds: 60,
         }
     }
 
@@ -4505,6 +4544,114 @@ mod tests {
             .decision
             .evaluated_limits
             .contains("requested_price_deviation_bps=500.00000000"));
+    }
+
+    #[test]
+    fn paper_self_trade_risk_rejects_a_new_order_opposite_an_existing_working_order() {
+        let mut service = service();
+        let filled = service
+            .submit_intent(
+                intent("intent-paper-self-trade-position", "2026-01-02T14:31:00Z"),
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        assert!(filled.decision.approved);
+        let position_order_id = filled.order_id.unwrap();
+        service
+            .broker_mut()
+            .queue_fill(
+                &position_order_id,
+                decimal("quantity", "1").unwrap(),
+                decimal("price", "100").unwrap(),
+                decimal("fee", "0.10").unwrap(),
+                "2026-01-02T14:31:01Z",
+            )
+            .unwrap();
+        assert_eq!(service.synchronize().unwrap(), 2);
+        assert_eq!(
+            service.order(&position_order_id).unwrap().oms.state,
+            OrderState::Filled
+        );
+
+        let resting_buy = service
+            .submit_intent(
+                intent("intent-paper-self-trade-buy", "2026-01-02T14:32:00Z"),
+                market("2026-01-02T14:32:00Z"),
+                "2026-01-02T14:32:00Z",
+            )
+            .unwrap();
+        assert!(resting_buy.decision.approved);
+        assert_eq!(
+            service
+                .order(&resting_buy.order_id.unwrap())
+                .unwrap()
+                .oms
+                .state,
+            OrderState::Acknowledged
+        );
+
+        let mut opposite_sell = intent("intent-paper-self-trade-sell", "2026-01-02T14:32:01Z");
+        opposite_sell.side = Side::Sell;
+        let sell_result = service
+            .submit_intent(
+                opposite_sell,
+                market("2026-01-02T14:32:01Z"),
+                "2026-01-02T14:32:01Z",
+            )
+            .unwrap();
+        assert!(!sell_result.decision.approved);
+        assert!(sell_result.order_id.is_none());
+        assert!(sell_result
+            .decision
+            .reason_codes
+            .contains(&"SELF_TRADE_RISK".to_owned()));
+    }
+
+    #[test]
+    fn paper_order_rate_limit_rejects_submissions_beyond_the_configured_window() {
+        let mut rate_limited_policy = policy();
+        rate_limited_policy.max_order_rate = 2;
+        let mut service = PaperTradingService::new(
+            account(),
+            rate_limited_policy,
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account()).unwrap(),
+        )
+        .unwrap();
+        let first = service
+            .submit_intent(
+                intent("intent-paper-rate-001", "2026-01-02T14:31:00Z"),
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        assert!(first.decision.approved);
+        let second = service
+            .submit_intent(
+                intent("intent-paper-rate-002", "2026-01-02T14:31:01Z"),
+                market("2026-01-02T14:31:01Z"),
+                "2026-01-02T14:31:01Z",
+            )
+            .unwrap();
+        assert!(second.decision.approved);
+        let third = service
+            .submit_intent(
+                intent("intent-paper-rate-003", "2026-01-02T14:31:02Z"),
+                market("2026-01-02T14:31:02Z"),
+                "2026-01-02T14:31:02Z",
+            )
+            .unwrap();
+        assert!(!third.decision.approved);
+        assert!(third.order_id.is_none());
+        assert!(third
+            .decision
+            .reason_codes
+            .contains(&"MAX_ORDER_RATE_EXCEEDED".to_owned()));
+        assert!(third
+            .decision
+            .evaluated_limits
+            .contains("recent_order_count=2"));
     }
 
     #[test]

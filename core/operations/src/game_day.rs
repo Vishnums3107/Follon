@@ -66,6 +66,7 @@ pub struct GameDayCompiler;
 
 impl GameDayCompiler {
     /// Compiles measured drill telemetry into an immutable `RecoveryDrillResult`.
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_drill(
         scenario_name: &str,
         injected_fault: InjectedFault,
@@ -82,7 +83,15 @@ impl GameDayCompiler {
 
         let digest = format!(
             "{:x}",
-            Sha256::digest(format!("{}:{}:{}", scenario_name, injected_fault.as_str(), executed_at).as_bytes())
+            Sha256::digest(
+                format!(
+                    "{}:{}:{}",
+                    scenario_name,
+                    injected_fault.as_str(),
+                    executed_at
+                )
+                .as_bytes()
+            )
         );
         let drill_id = format!("drill.{}", &digest[..16]);
 

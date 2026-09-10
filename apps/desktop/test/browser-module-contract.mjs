@@ -109,4 +109,49 @@ const submitHandlerStart = orderTicket.indexOf("const handleSubmit");
 const submitHandler = orderTicket.slice(submitHandlerStart, orderTicket.indexOf("return (", submitHandlerStart));
 assert.doesNotMatch(submitHandler, /clearTicketDraft/u);
 assert.match(submitHandler, /draft remains available until authoritative lifecycle evidence is reviewed/u);
+
+// The header telemetry ticker must never fabricate market or portfolio data (2026-09-10 remediation).
+assert.doesNotMatch(appShell, /BTC\/USD/u);
+assert.doesNotMatch(appShell, /92,450\.20/u);
+assert.doesNotMatch(appShell, /VAR \(99% 1D\)/u);
+assert.doesNotMatch(appShell, /142µs/u);
+assert.doesNotMatch(appShell, /VERIFIED KERNEL/u);
+assert.match(appShell, /id="gateway-pulse-dot"/u);
+assert.match(appShell, /id="gateway-latency"/u);
+assert.match(appShell, /id="environment-badge"/u);
+for (const tickerId of ["ticker-nav", "ticker-nav-tag", "ticker-drawdown", "ticker-drawdown-tag", "ticker-oms", "ticker-oms-tag", "ticker-audit", "ticker-audit-tag"]) {
+  assert.ok(appShell.includes(`id="${tickerId}"`), `missing real-evidence ticker target ${tickerId}`);
+}
+assert.match(main, /function renderGatewayTelemetry\(ok: boolean, latencyMs: number\)/u);
+assert.match(main, /function renderPortfolioTicker\(snapshot: WorkspaceSnapshot \| null\)/u);
+assert.match(main, /performance\.now\(\)/u);
+assert.doesNotMatch(main, /142µs|92,450\.20|BTC\/USD/u);
+
+// Mobile layout regressions (2026-09-10): a later, unconditional `.nav-pages`
+// rule silently beat the media-query `.header-nav{display:none}` hide rule on
+// equal specificity, and the mobile table-to-card reflow never reset the
+// desktop `white-space:nowrap` cells nor rendered the `data-label` attribute
+// every cell already carries — together these forced every workspace to
+// scroll horizontally at narrow (390px) viewports. See
+// docs/04-experience/02-ui-overhaul-audit.md for the verified before/after.
+assert.match(styles, /\.site-header \.header-nav\.nav-pages\s*\{\s*display:\s*none/u);
+assert.match(styles, /\.nav-telemetry\s*\{\s*flex-wrap:\s*wrap/u);
+const mobileTableRuleMatch = styles.match(/\.f-table tbody td, \.workspace-panel td \{[^}]*\}/su);
+assert.ok(mobileTableRuleMatch, "missing the mobile table-to-card cell rule");
+assert.match(mobileTableRuleMatch[0], /white-space:\s*normal/u);
+assert.match(mobileTableRuleMatch[0], /overflow-wrap:\s*anywhere/u);
+assert.match(styles, /\.f-table tbody td::before, \.workspace-panel td::before\s*\{\s*content:\s*attr\(data-label\)/u);
+
+// Contrast remediation (2026-09-10): the original --color-signal-buy/-sell,
+// --color-accent, and --color-ruby only cleared WCAG AA 4.5:1 against
+// --color-bg-base, not against the card surfaces (--color-surface-1/2) they
+// are actually rendered on as text; see the master-plan conformance audit.
+assert.doesNotMatch(styles, /--color-signal-buy:\s*#3F8E4D/u);
+assert.doesNotMatch(styles, /--color-signal-sell:\s*#E94F37/u);
+assert.match(styles, /\.f-text-buy::before\s*\{\s*content:\s*"▲ "/u);
+assert.match(styles, /\.f-text-sell::before\s*\{\s*content:\s*"▼ "/u);
+assert.match(styles, /html\[data-signal-mode="mono"\]/u);
+assert.match(appShell, /id="signal-mode-toggle"/u);
+assert.match(main, /function applySignalMode\(mode: "color" \| "mono"\)/u);
+
 console.log("Browser module graph / workspace shell contract passed");

@@ -57,7 +57,11 @@ impl AttentionBudgetController {
         calculated_at: &str,
     ) -> AttentionBudget {
         let active_alarms_count = raw_alarm_count.saturating_sub(suppressed_count);
-        let safe_hours = if session_duration_hours <= 0.0 { 1.0 } else { session_duration_hours };
+        let safe_hours = if session_duration_hours <= 0.0 {
+            1.0
+        } else {
+            session_duration_hours
+        };
         let interruptions_per_hour = (active_alarms_count as f64) / safe_hours;
 
         // Cognitive load ratio
@@ -65,7 +69,11 @@ impl AttentionBudgetController {
         let cognitive_load_score_bps = ((load_ratio.min(1.0)) * 10_000.0) as u32;
         let budget_exhausted = interruptions_per_hour > self.max_interruptions_per_hour;
 
-        let budget_id = format!("attn.{}.{}", session_date.replace('-', ""), active_alarms_count);
+        let budget_id = format!(
+            "attn.{}.{}",
+            session_date.replace('-', ""),
+            active_alarms_count
+        );
 
         AttentionBudget {
             budget_schema_version: 1,

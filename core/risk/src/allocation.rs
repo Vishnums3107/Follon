@@ -77,9 +77,18 @@ impl CapitalAllocationProposal {
         let mut json = String::from("{");
         json.push_str("\"proposal_schema_version\":1,");
         json.push_str(&format!("\"proposal_id\":\"{}\",", self.proposal_id));
-        json.push_str(&format!("\"total_equity_usd\":\"{}\",", self.total_equity_usd));
-        json.push_str(&format!("\"target_annual_volatility_bps\":{},", self.target_annual_volatility_bps));
-        json.push_str(&format!("\"max_drawdown_limit_bps\":{},", self.max_drawdown_limit_bps));
+        json.push_str(&format!(
+            "\"total_equity_usd\":\"{}\",",
+            self.total_equity_usd
+        ));
+        json.push_str(&format!(
+            "\"target_annual_volatility_bps\":{},",
+            self.target_annual_volatility_bps
+        ));
+        json.push_str(&format!(
+            "\"max_drawdown_limit_bps\":{},",
+            self.max_drawdown_limit_bps
+        ));
 
         // allocations
         json.push_str("\"allocations\":[");
@@ -94,8 +103,14 @@ impl CapitalAllocationProposal {
         }
         json.push_str("],");
 
-        json.push_str(&format!("\"portfolio_diversification_ratio_bps\":{},", self.portfolio_diversification_ratio_bps));
-        json.push_str(&format!("\"proposal_status\":\"{}\",", self.proposal_status.as_str()));
+        json.push_str(&format!(
+            "\"portfolio_diversification_ratio_bps\":{},",
+            self.portfolio_diversification_ratio_bps
+        ));
+        json.push_str(&format!(
+            "\"proposal_status\":\"{}\",",
+            self.proposal_status.as_str()
+        ));
         json.push_str(&format!("\"policy_version\":\"{}\",", self.policy_version));
         json.push_str(&format!("\"proposed_at\":\"{}\"", self.proposed_at));
         json.push('}');
@@ -117,7 +132,9 @@ impl CapitalAllocationCouncil {
         proposed_at: &str,
     ) -> Result<CapitalAllocationProposal, RiskError> {
         if strategy_ids.is_empty() {
-            return Err(RiskError("capital allocation requires at least one strategy".to_owned()));
+            return Err(RiskError(
+                "capital allocation requires at least one strategy".to_owned(),
+            ));
         }
         if total_equity <= Decimal::ZERO {
             return Err(RiskError("total equity must be positive".to_owned()));
@@ -139,7 +156,10 @@ impl CapitalAllocationCouncil {
 
         let diversification_ratio_bps = 10_000 + (n - 1) * 1_200; // diversification benefit
 
-        let digest = format!("{:x}", Sha256::digest(format!("{}:{}:{}", total_equity, n, proposed_at).as_bytes()));
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}:{}", total_equity, n, proposed_at).as_bytes())
+        );
         let proposal_id = format!("cap-prop.{}", &digest[..16]);
 
         Ok(CapitalAllocationProposal {

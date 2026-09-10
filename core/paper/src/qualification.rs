@@ -196,7 +196,9 @@ mod tests {
             configuration_version: "cfg.1".to_owned(),
         };
 
-        let err = matrix.check_order_intent(&intent, "EQUITY_OPTION").unwrap_err();
+        let err = matrix
+            .check_order_intent(&intent, "EQUITY_OPTION")
+            .unwrap_err();
         assert!(err.0.contains("not certified"));
     }
 }

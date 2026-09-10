@@ -1,5 +1,6 @@
 import {
   EvidenceEvent,
+  OperationsDashboard,
   parseEvidenceLog,
   parseLiveMonitoringDashboard,
   parseOptionsDashboard,
@@ -309,6 +310,115 @@ function formatTimestamp(value: string): string {
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
 }
 
+function shortHash(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 10)}…` : value;
+}
+
+const SIGNAL_MODE_STORAGE_KEY = "follon:signal_mode";
+
+/** Applies the persisted signal-color preference (docs/04-experience/04-visual-design-system.md
+ * §Signal vs. Monochrome Display Rules). The directional glyph is always rendered by CSS;
+ * this only toggles whether green/red hue is layered on top of it. */
+function applySignalMode(mode: "color" | "mono"): void {
+  document.documentElement.setAttribute("data-signal-mode", mode);
+  const toggle = document.querySelector<HTMLButtonElement>("#signal-mode-toggle");
+  const label = document.querySelector<HTMLElement>("#signal-mode-label");
+  if (toggle) toggle.setAttribute("aria-pressed", mode === "mono" ? "true" : "false");
+  if (label) label.textContent = mode === "mono" ? "Monochrome signals" : "Color signals";
+}
+
+function initializeSignalModeToggle(): void {
+  let saved: string | null = null;
+  try {
+    saved = localStorage.getItem(SIGNAL_MODE_STORAGE_KEY);
+  } catch {
+    // Private browsing or blocked storage; default to the color mode below.
+  }
+  applySignalMode(saved === "mono" ? "mono" : "color");
+  document.querySelector("#signal-mode-toggle")?.addEventListener("click", () => {
+    const next = document.documentElement.getAttribute("data-signal-mode") === "mono" ? "color" : "mono";
+    applySignalMode(next);
+    try {
+      localStorage.setItem(SIGNAL_MODE_STORAGE_KEY, next);
+    } catch {
+      // Ignore; the in-memory preference for this page view still applies.
+    }
+  });
+}
+
+/** The gateway pulse/latency/label reflect only a real, just-measured request outcome. */
+function renderGatewayTelemetry(ok: boolean, latencyMs: number): void {
+  const dot = document.querySelector<HTMLElement>("#gateway-pulse-dot");
+  const label = document.querySelector<HTMLElement>("#gateway-label");
+  const latency = document.querySelector<HTMLElement>("#gateway-latency");
+  if (dot) dot.className = `luxury-pulse-dot ${ok ? "luxury-pulse-dot--emerald" : "luxury-pulse-dot--ruby"}`;
+  if (label) label.textContent = ok ? "GATEWAY · SECURE" : "GATEWAY · UNREACHABLE";
+  if (latency) latency.textContent = `${latencyMs.toFixed(1)} ms`;
+}
+
+function renderEnvironmentBadge(status: SystemStatus): void {
+  const badge = document.querySelector<HTMLElement>("#environment-badge");
+  if (badge) badge.textContent = `${status.mode.toUpperCase()} MODE · READ-ONLY`;
+}
+
+/** The header ticker only ever shows the retained operations snapshot; it never invents a figure. */
+function renderPortfolioTicker(snapshot: WorkspaceSnapshot | null): void {
+  const navValue = document.querySelector<HTMLElement>("#ticker-nav");
+  const navTag = document.querySelector<HTMLElement>("#ticker-nav-tag");
+  const drawdownValue = document.querySelector<HTMLElement>("#ticker-drawdown");
+  const drawdownTag = document.querySelector<HTMLElement>("#ticker-drawdown-tag");
+  const omsValue = document.querySelector<HTMLElement>("#ticker-oms");
+  const omsTag = document.querySelector<HTMLElement>("#ticker-oms-tag");
+  const auditValue = document.querySelector<HTMLElement>("#ticker-audit");
+  const auditTag = document.querySelector<HTMLElement>("#ticker-audit-tag");
+
+  let operations: OperationsDashboard | undefined;
+  if (snapshot?.operations) {
+    try {
+      operations = parseOperationsDashboard(JSON.stringify(snapshot.operations.data));
+    } catch {
+      operations = undefined;
+    }
+  }
+
+  if (operations === undefined) {
+    if (navValue) navValue.textContent = "No snapshot";
+    if (navTag) { navTag.textContent = "—"; navTag.className = "ticker-tag f-badge"; }
+    if (drawdownValue) drawdownValue.textContent = "No snapshot";
+    if (drawdownTag) { drawdownTag.textContent = "—"; drawdownTag.className = "ticker-tag f-badge"; }
+    if (omsValue) omsValue.textContent = "No snapshot";
+    if (omsTag) { omsTag.textContent = "—"; omsTag.className = "ticker-tag f-badge"; }
+    if (auditValue) auditValue.textContent = "No snapshot";
+    if (auditTag) { auditTag.textContent = "—"; auditTag.className = "ticker-tag f-badge"; }
+    return;
+  }
+
+  const limitBreached = operations.risk.limits.some((limit) => limit.breached);
+  const drawdownPct = (Number(operations.risk.drawdown_bps) / 100).toFixed(2);
+  const unknownOrders = operations.operational_health.unknown_orders;
+
+  if (navValue) navValue.textContent = `${operations.risk.current_equity} ${operations.currency}`;
+  if (navTag) {
+    navTag.textContent = operations.operational_health.reconciliation_healthy ? "RECONCILED" : "UNRECONCILED";
+    navTag.className = `ticker-tag f-badge${operations.operational_health.reconciliation_healthy ? "--buy" : "--sell"}`;
+  }
+  if (drawdownValue) drawdownValue.textContent = `${drawdownPct}%`;
+  if (drawdownTag) {
+    drawdownTag.textContent = limitBreached ? "LIMIT BREACHED" : "WITHIN LIMIT";
+    drawdownTag.className = `ticker-tag f-badge${limitBreached ? "--sell" : "--buy"}`;
+  }
+  if (omsValue) omsValue.textContent = `${unknownOrders} UNCONFIRMED`;
+  if (omsTag) {
+    omsTag.textContent = unknownOrders === 0 ? "CLEAN" : "ATTENTION";
+    omsTag.className = `ticker-tag f-badge${unknownOrders === 0 ? "--buy" : "--sell"}`;
+  }
+  if (auditValue) auditValue.textContent = shortHash(operations.journal.head_hash);
+  if (auditTag) {
+    auditTag.textContent = operations.journal.healthy ? "IMMUTABLE" : "DEGRADED";
+    auditTag.className = `ticker-tag f-badge${operations.journal.healthy ? "" : "--sell"}`;
+  }
+}
+
 async function loadFeatureDefinitions(): Promise<void> {
   try {
     const response = await fetch(apiUrl("/api/v1/features"), { cache: "no-store" });
@@ -364,6 +474,7 @@ function updateFeatureCatalog(): void {
 
 async function refreshSystemStatus(): Promise<void> {
   refreshSystemButton.disabled = true;
+  const startedAt = performance.now();
   try {
     const response = await fetch(apiUrl("/api/v1/status"), { cache: "no-store" });
     if (!response.ok) {
@@ -375,8 +486,11 @@ async function refreshSystemStatus(): Promise<void> {
     }
     currentSystemStatus = value;
     renderSystemStatus(systemOverviewRoot, value);
+    renderGatewayTelemetry(true, performance.now() - startedAt);
+    renderEnvironmentBadge(value);
     renderCurrentWorkspace();
   } catch (error) {
+    renderGatewayTelemetry(false, performance.now() - startedAt);
     renderActionableError(
       systemOverviewRoot,
       error instanceof Error ? error.message : "Unable to load system health.",
@@ -395,6 +509,7 @@ async function refreshWorkspaceSnapshot(): Promise<void> {
   }
   const value: unknown = await response.json();
   workspaceSnapshot = parseWorkspaceSnapshot(value);
+  renderPortfolioTicker(workspaceSnapshot);
   renderCurrentWorkspace();
 }
 
@@ -634,6 +749,7 @@ function wirePillarNavigation(): void {
 async function initializeDashboard(): Promise<void> {
   startLiveClock();
   wirePillarNavigation();
+  initializeSignalModeToggle();
 
   // Restore persisted artifact search if present
   try {

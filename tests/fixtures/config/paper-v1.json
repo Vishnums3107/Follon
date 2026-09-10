@@ -17,7 +17,9 @@
     "max_open_orders": 10,
     "max_position_quantity": "1000",
     "max_realized_loss": "10000",
-    "max_market_data_age_seconds": 5
+    "max_market_data_age_seconds": 5,
+    "max_order_rate": 20,
+    "order_rate_window_seconds": 60
   },
   "kill_switch_version": "paper-kills-v1"
 }

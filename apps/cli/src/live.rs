@@ -57,6 +57,8 @@ struct LiveRiskDocument {
     max_position_quantity: String,
     max_realized_loss: String,
     max_market_data_age_seconds: u64,
+    max_order_rate: u32,
+    order_rate_window_seconds: u64,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +143,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_quantity: decimal(&configuration.risk.max_position_quantity)?,
         max_realized_loss: decimal(&configuration.risk.max_realized_loss)?,
         max_market_data_age_seconds: configuration.risk.max_market_data_age_seconds,
+        max_order_rate: configuration.risk.max_order_rate,
+        order_rate_window_seconds: configuration.risk.order_rate_window_seconds,
     };
     let switches = LiveKillSwitchRegistry::new(configuration.kill_switch_version)?;
     let activation = LiveActivation::for_configuration(

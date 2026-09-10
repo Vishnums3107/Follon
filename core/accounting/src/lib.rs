@@ -813,6 +813,7 @@ impl TaxLotBook {
                 existing[*right]
                     .unit_cost
                     .cmp(&existing[*left].unit_cost)
+                    .then_with(|| existing[*left].opened_at.cmp(&existing[*right].opened_at))
                     .then_with(|| existing[*left].lot_id.cmp(&existing[*right].lot_id))
             }),
         }
@@ -1340,6 +1341,52 @@ mod tests {
             )
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn highest_cost_disposal_breaks_a_tied_unit_cost_by_oldest_lot_first() {
+        let usd = currency("USD");
+        let mut book = TaxLotBook::default();
+        for (id, opened, quantity, cost) in [
+            ("lot.cheap", "2026-01-03T00:00:00Z", "2", "100"),
+            ("lot.tied.newer", "2026-01-02T00:00:00Z", "2", "120"),
+            ("lot.tied.older", "2026-01-01T00:00:00Z", "2", "120"),
+        ] {
+            assert!(book
+                .acquire(TaxLot {
+                    lot_id: id.to_owned(),
+                    instrument_id: "instrument.spy".to_owned(),
+                    currency: usd.clone(),
+                    opened_at: opened.to_owned(),
+                    remaining_quantity: amount(quantity),
+                    unit_cost: amount(cost),
+                })
+                .unwrap());
+        }
+        let disposal = book
+            .dispose(
+                "disposal.highest-cost",
+                "instrument.spy",
+                &usd,
+                amount("3"),
+                amount("150"),
+                Decimal::ZERO,
+                "2026-02-01T00:00:00Z",
+                TaxLotSelection::HighestCost,
+            )
+            .unwrap()
+            .expect("new disposal");
+        // Both tied lots are priced at 120; the older lot must be fully
+        // consumed before the newer tied lot, and the cheaper lot must be
+        // untouched while a costlier lot remains available.
+        assert_eq!(
+            disposal.allocations,
+            vec![
+                ("lot.tied.older".to_owned(), amount("2")),
+                ("lot.tied.newer".to_owned(), amount("1")),
+            ]
+        );
+        assert_eq!(disposal.cost_basis, amount("360"));
     }
 
     #[test]

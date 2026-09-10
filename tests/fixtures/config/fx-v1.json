@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-09-05T12:00:00Z",
+  "default_max_age_seconds": 60,
+  "snapshots": [
+    {
+      "snapshot_id": "fx.snapshot.eur-usd.spot.001",
+      "reference_version": "fx.price.v1",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_SPOT",
+      "base_currency": "EUR",
+      "quote_currency": "USD",
+      "terms": {
+        "value_date": "2026-09-07",
+        "bid": "1.08500000",
+        "ask": "1.08520000"
+      },
+      "source_id": "source.primary-fx",
+      "source_sequence": 101,
+      "source_time": "2026-09-05T11:59:55Z",
+      "received_at": "2026-09-05T11:59:56Z"
+    },
+    {
+      "snapshot_id": "fx.snapshot.usd-jpy.spot.001",
+      "reference_version": "fx.price.v1",
+      "instrument_id": "instrument.fx.usd-jpy",
+      "product": "FX_SPOT",
+      "base_currency": "USD",
+      "quote_currency": "JPY",
+      "terms": {
+        "value_date": "2026-09-07",
+        "bid": "155.20000000",
+        "ask": "155.23000000"
+      },
+      "source_id": "source.primary-fx",
+      "source_sequence": 102,
+      "source_time": "2026-09-05T11:59:56Z",
+      "received_at": "2026-09-05T11:59:57Z"
+    },
+    {
+      "snapshot_id": "fx.snapshot.gbp-usd.spot.001",
+      "reference_version": "fx.price.v1",
+      "instrument_id": "instrument.fx.gbp-usd",
+      "product": "FX_SPOT",
+      "base_currency": "GBP",
+      "quote_currency": "USD",
+      "terms": {
+        "value_date": "2026-09-07",
+        "bid": "1.27400000",
+        "ask": "1.27430000"
+      },
+      "source_id": "source.primary-fx",
+      "source_sequence": 103,
+      "source_time": "2026-09-05T11:59:57Z",
+      "received_at": "2026-09-05T11:59:58Z"
+    },
+    {
+      "snapshot_id": "fx.snapshot.eur-usd.fwd-1m.001",
+      "reference_version": "fx.price.v1",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_FORWARD",
+      "base_currency": "EUR",
+      "quote_currency": "USD",
+      "terms": {
+        "value_date": "2026-10-07",
+        "bid": "1.08750000",
+        "ask": "1.08780000"
+      },
+      "source_id": "source.primary-fx",
+      "source_sequence": 104,
+      "source_time": "2026-09-05T11:59:55Z",
+      "received_at": "2026-09-05T11:59:56Z"
+    },
+    {
+      "snapshot_id": "fx.snapshot.eur-usd.swap.001",
+      "reference_version": "fx.price.v1",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_SWAP",
+      "base_currency": "EUR",
+      "quote_currency": "USD",
+      "terms": {
+        "near_value_date": "2026-09-07",
+        "far_value_date": "2026-10-07",
+        "near_bid": "1.08500000",
+        "near_ask": "1.08520000",
+        "far_bid": "1.08750000",
+        "far_ask": "1.08780000"
+      },
+      "source_id": "source.primary-fx",
+      "source_sequence": 105,
+      "source_time": "2026-09-05T11:59:55Z",
+      "received_at": "2026-09-05T11:59:56Z"
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "query.eur-usd.spot",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_SPOT",
+      "value_date": "2026-09-07"
+    },
+    {
+      "query_id": "query.usd-jpy.spot",
+      "instrument_id": "instrument.fx.usd-jpy",
+      "product": "FX_SPOT",
+      "value_date": "2026-09-07"
+    },
+    {
+      "query_id": "query.gbp-usd.spot",
+      "instrument_id": "instrument.fx.gbp-usd",
+      "product": "FX_SPOT",
+      "value_date": "2026-09-07"
+    },
+    {
+      "query_id": "query.eur-usd.forward",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_FORWARD",
+      "value_date": "2026-10-07"
+    },
+    {
+      "query_id": "query.eur-usd.swap.near",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_SWAP",
+      "value_date": "2026-09-07"
+    },
+    {
+      "query_id": "query.eur-usd.swap.far",
+      "instrument_id": "instrument.fx.eur-usd",
+      "product": "FX_SWAP",
+      "value_date": "2026-10-07"
+    }
+  ]
+}

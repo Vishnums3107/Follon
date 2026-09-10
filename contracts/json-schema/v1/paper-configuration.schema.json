@@ -32,7 +32,7 @@
     "risk": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["policy_version", "trading_calendar_id", "max_order_quantity", "max_order_notional", "max_price_deviation_bps", "max_open_orders", "max_position_quantity", "max_realized_loss", "max_market_data_age_seconds"],
+      "required": ["policy_version", "trading_calendar_id", "max_order_quantity", "max_order_notional", "max_price_deviation_bps", "max_open_orders", "max_position_quantity", "max_realized_loss", "max_market_data_age_seconds", "max_order_rate", "order_rate_window_seconds"],
       "properties": {
         "policy_version": { "type": "string", "minLength": 1 },
         "trading_calendar_id": { "$ref": "#/$defs/canonicalId" },
@@ -42,7 +42,9 @@
         "max_open_orders": { "type": "integer", "minimum": 1 },
         "max_position_quantity": { "$ref": "#/$defs/positiveDecimal" },
         "max_realized_loss": { "$ref": "#/$defs/decimal" },
-        "max_market_data_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+        "max_market_data_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "max_order_rate": { "type": "integer", "minimum": 1 },
+        "order_rate_window_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
       }
     }
   }

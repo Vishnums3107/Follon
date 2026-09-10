@@ -1,0 +1,9 @@
+{
+  "commercial_provisioning_schema_version": 1,
+  "tenant_id": "tenant.hosted",
+  "workspace_id": "workspace.hosted",
+  "plan": "SELF_HOSTED",
+  "retention_policy_id": "retention.standard.1",
+  "self_hosted": true,
+  "provisioned_at": "2026-09-07T12:00:00Z"
+}

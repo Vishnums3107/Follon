@@ -1,0 +1,41 @@
+{
+  "strategy_version": "strat.trend.v1",
+  "evaluated_at": "2026-09-05T15:00:00Z",
+  "probes": [
+    {
+      "probe_name": "LOOKAHEAD_LEAKAGE_PROBE",
+      "probe_description": "Shifts input bar timestamps forward by 1 bar to detect lookahead bias",
+      "passed": true,
+      "degradation_bps": 120,
+      "threshold_bps": 500
+    },
+    {
+      "probe_name": "PRICE_JITTER_PROBE",
+      "probe_description": "Injects +/- 2 bps gaussian price noise to test parameter fragility",
+      "passed": true,
+      "degradation_bps": 85,
+      "threshold_bps": 300
+    },
+    {
+      "probe_name": "TRANSACTION_COST_SHOCK",
+      "probe_description": "Doubles execution fee and slippage penalties to measure fee vulnerability",
+      "passed": true,
+      "degradation_bps": 210,
+      "threshold_bps": 600
+    },
+    {
+      "probe_name": "PARAMETER_CLIFF_PROBE",
+      "probe_description": "Tests +/- 10% moving window variations to detect parameter cliff overfitting",
+      "passed": true,
+      "degradation_bps": 95,
+      "threshold_bps": 400
+    },
+    {
+      "probe_name": "REGIME_STRESS_PROBE",
+      "probe_description": "Evaluates candidate against high-volatility 2020 and 2022 market regime stress periods",
+      "passed": true,
+      "degradation_bps": 310,
+      "threshold_bps": 800
+    }
+  ]
+}
