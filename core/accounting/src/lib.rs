@@ -878,6 +878,84 @@ impl TaxLotBook {
             .copied()
             .unwrap_or(Decimal::ZERO)
     }
+
+    /// Exact, complete durable snapshot of this book's internal state,
+    /// including the idempotency identity sets that are not otherwise
+    /// observable (an already fully-disposed lot leaves `lots()`, but its ID
+    /// must still be refused by a future [`Self::acquire`]).
+    pub fn snapshot(&self) -> TaxLotBookSnapshot {
+        TaxLotBookSnapshot {
+            lots: self.lots.clone(),
+            applied_lot_ids: self.applied_lot_ids.clone(),
+            applied_disposal_ids: self.applied_disposal_ids.clone(),
+            realized_by_currency: self.realized_by_currency.clone(),
+        }
+    }
+
+    /// Restores a book from an exact prior [`Self::snapshot`], validating
+    /// every invariant a real `acquire`/`dispose` sequence would have
+    /// enforced rather than trusting the caller's serialization round trip.
+    pub fn recover(snapshot: TaxLotBookSnapshot) -> Result<Self, AccountingError> {
+        for (instrument_id, lots) in &snapshot.lots {
+            if lots.is_empty() {
+                return Err(AccountingError(
+                    "persisted tax lot book cannot retain an empty instrument bucket".to_owned(),
+                ));
+            }
+            let mut canonical = lots.clone();
+            canonical.sort_by(|left, right| {
+                left.opened_at
+                    .cmp(&right.opened_at)
+                    .then_with(|| left.lot_id.cmp(&right.lot_id))
+            });
+            if &canonical != lots {
+                return Err(AccountingError(
+                    "persisted tax lots are not in canonical acquisition order".to_owned(),
+                ));
+            }
+            for lot in lots {
+                validate_canonical_id("tax lot_id", &lot.lot_id)
+                    .map_err(|e| AccountingError(e.0))?;
+                if &lot.instrument_id != instrument_id {
+                    return Err(AccountingError(
+                        "persisted tax lot instrument_id does not match its bucket".to_owned(),
+                    ));
+                }
+                validate_utc_timestamp("tax lot opened_at", &lot.opened_at)
+                    .map_err(|e| AccountingError(e.0))?;
+                if lot.remaining_quantity <= Decimal::ZERO || lot.unit_cost <= Decimal::ZERO {
+                    return Err(AccountingError(
+                        "persisted tax lot economics are invalid".to_owned(),
+                    ));
+                }
+                if !snapshot.applied_lot_ids.contains(&lot.lot_id) {
+                    return Err(AccountingError(
+                        "persisted open tax lot is missing from its applied lot identity set"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            lots: snapshot.lots,
+            applied_lot_ids: snapshot.applied_lot_ids,
+            applied_disposal_ids: snapshot.applied_disposal_ids,
+            realized_by_currency: snapshot.realized_by_currency,
+        })
+    }
+}
+
+/// Exact durable snapshot of a [`TaxLotBook`]'s complete internal state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaxLotBookSnapshot {
+    /// Open lots keyed by instrument, in canonical acquisition order.
+    pub lots: BTreeMap<String, Vec<TaxLot>>,
+    /// Every lot identity ever accepted, including fully disposed ones.
+    pub applied_lot_ids: BTreeSet<String>,
+    /// Every disposal identity ever applied.
+    pub applied_disposal_ids: BTreeSet<String>,
+    /// Cumulative realized P&L per currency.
+    pub realized_by_currency: BTreeMap<Currency, Decimal>,
 }
 
 /// Financing exposure family.
@@ -1341,6 +1419,54 @@ mod tests {
             )
             .unwrap()
             .is_none());
+
+        // A recovered book must behave identically: reject the same
+        // already-applied disposal, still hold the one remaining open unit,
+        // and refuse to re-acquire an already-fully-disposed lot identity.
+        let recovered = TaxLotBook::recover(book.snapshot()).unwrap();
+        assert_eq!(recovered.snapshot(), book.snapshot());
+        let mut recovered = recovered;
+        assert!(recovered
+            .dispose(
+                "disposal.one",
+                "instrument.spy",
+                &usd,
+                amount("4"),
+                amount("120"),
+                amount("2"),
+                "2026-02-01T00:00:00Z",
+                TaxLotSelection::Fifo,
+            )
+            .unwrap()
+            .is_none());
+        assert!(!recovered
+            .acquire(TaxLot {
+                lot_id: "lot.one".to_owned(),
+                instrument_id: "instrument.spy".to_owned(),
+                currency: usd.clone(),
+                opened_at: "2026-03-01T00:00:00Z".to_owned(),
+                remaining_quantity: amount("1"),
+                unit_cost: amount("100"),
+            })
+            .unwrap());
+    }
+
+    #[test]
+    fn tax_lot_recovery_rejects_an_open_lot_missing_from_its_applied_identity_set() {
+        let usd = currency("USD");
+        let mut book = TaxLotBook::default();
+        book.acquire(TaxLot {
+            lot_id: "lot.one".to_owned(),
+            instrument_id: "instrument.spy".to_owned(),
+            currency: usd,
+            opened_at: "2026-01-01T00:00:00Z".to_owned(),
+            remaining_quantity: amount("2"),
+            unit_cost: amount("100"),
+        })
+        .unwrap();
+        let mut snapshot = book.snapshot();
+        snapshot.applied_lot_ids.clear();
+        assert!(TaxLotBook::recover(snapshot).is_err());
     }
 
     #[test]

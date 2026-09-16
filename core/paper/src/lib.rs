@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use follon_accounting::{Currency, TaxLot, TaxLotBook, TaxLotBookSnapshot, TaxLotSelection};
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
     price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
@@ -56,6 +57,12 @@ impl From<follon_domain::DomainError> for PaperError {
 
 impl From<follon_domain::DecimalError> for PaperError {
     fn from(error: follon_domain::DecimalError) -> Self {
+        Self(error.0)
+    }
+}
+
+impl From<follon_accounting::AccountingError> for PaperError {
+    fn from(error: follon_accounting::AccountingError) -> Self {
         Self(error.0)
     }
 }
@@ -1504,6 +1511,27 @@ struct PersistentPaperState {
     broker_connected: bool,
     #[serde(default)]
     latest_reconciliation: Option<PersistentReconciliationReport>,
+    /// Missing on a journal written before this field existed; an empty
+    /// book is exactly correct for one, since no fill could have been
+    /// applied to a tax-lot ledger that did not yet exist.
+    #[serde(default)]
+    tax_lots: PersistentTaxLotBook,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PersistentTaxLotBook {
+    lots: BTreeMap<String, Vec<PersistentTaxLot>>,
+    applied_lot_ids: Vec<String>,
+    applied_disposal_ids: Vec<String>,
+    realized_by_currency: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentTaxLot {
+    lot_id: String,
+    opened_at: String,
+    remaining_quantity: String,
+    unit_cost: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1790,6 +1818,12 @@ pub struct PaperTradingService<B> {
     orders: BTreeMap<String, PaperOrder>,
     risk_evidence: BTreeMap<String, PaperRiskEvidence>,
     portfolios: BTreeMap<String, Portfolio>,
+    /// Independent FIFO long-lot cost-basis ledger, kept in lockstep with
+    /// `portfolios` from the same fills. `Portfolio` tracks a single running
+    /// average cost for OMS/risk decisions; this book instead retains
+    /// individual acquisition lots so a real disposal reports an auditable,
+    /// tax-lot-accurate realized gain/loss, not just the average-cost figure.
+    tax_lots: TaxLotBook,
     execution_ids: BTreeSet<String>,
     incidents: BTreeMap<String, ReconciliationIncident>,
     last_reconciled_at: Option<String>,
@@ -1823,6 +1857,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             orders: BTreeMap::new(),
             risk_evidence: BTreeMap::new(),
             portfolios: BTreeMap::new(),
+            tax_lots: TaxLotBook::default(),
             execution_ids: BTreeSet::new(),
             incidents: BTreeMap::new(),
             last_reconciled_at: None,
@@ -2220,11 +2255,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             // applying the remaining events in the batch.
             let orders_snapshot = self.orders.clone();
             let portfolios_snapshot = self.portfolios.clone();
+            let tax_lots_snapshot = self.tax_lots.clone();
             let execution_ids_snapshot = self.execution_ids.clone();
             let cash_snapshot = self.cash;
             if let Err(error) = self.apply_broker_event(event) {
                 self.orders = orders_snapshot;
                 self.portfolios = portfolios_snapshot;
+                self.tax_lots = tax_lots_snapshot;
                 self.execution_ids = execution_ids_snapshot;
                 self.cash = cash_snapshot;
                 apply_errors.push(error.0);
@@ -2917,6 +2954,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     Portfolio::new(&self.account.account_id, &fill.instrument_id)
                 });
                 portfolio.apply_fill(&fill)?;
+                self.apply_tax_lot_fill(&fill)?;
                 let gross = fill.price.checked_mul(fill.quantity)?;
                 self.cash = match fill.side {
                     Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
@@ -3069,6 +3107,59 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         Ok(())
     }
 
+    /// Applies one real fill to the independent FIFO tax-lot book: a buy
+    /// acquires a new lot at its exact all-in unit cost (price plus fee); a
+    /// sell disposes existing long lots first-in-first-out. `Portfolio`
+    /// already refuses a sell that would exceed the held long quantity
+    /// before this is reached, so a disposal here can never exceed available
+    /// lots. Lot selection is fixed at FIFO — the default a jurisdiction
+    /// without an operator election typically applies — rather than exposing
+    /// a configurable policy; this is a bounded simplification, not a
+    /// correctness gap; LIFO/highest-cost selection remains available to a
+    /// direct `TaxLotBook` caller (see `follon-accounting`) that needs it.
+    fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), PaperError> {
+        let currency = Currency::new(self.account.currency.clone())?;
+        match fill.side {
+            Side::Buy => {
+                let gross = fill.price.checked_mul(fill.quantity)?;
+                let unit_cost = gross.checked_add(fill.fee)?.checked_div(fill.quantity)?;
+                self.tax_lots.acquire(TaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency,
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: fill.quantity,
+                    unit_cost,
+                })?;
+            }
+            Side::Sell => {
+                self.tax_lots.dispose(
+                    &format!("taxdisposal-{}", fill.execution_id),
+                    &fill.instrument_id,
+                    &currency,
+                    fill.quantity,
+                    fill.price,
+                    fill.fee,
+                    &fill.executed_at,
+                    TaxLotSelection::Fifo,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaining open FIFO tax lots for one instrument, oldest first.
+    pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
+        self.tax_lots.lots(instrument_id)
+    }
+
+    /// Cumulative FIFO-realized tax P&L in the account's reporting currency,
+    /// independent of `Portfolio`'s average-cost realized P&L.
+    pub fn realized_tax_pnl(&self) -> Result<Decimal, PaperError> {
+        let currency = Currency::new(self.account.currency.clone())?;
+        Ok(self.tax_lots.realized(&currency))
+    }
+
     fn persist(&mut self) -> Result<(), PaperError> {
         let state = self.persistent_state();
         if let Some(journal) = &mut self.journal {
@@ -3149,6 +3240,32 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 )
             })
             .collect();
+        let tax_lot_snapshot = self.tax_lots.snapshot();
+        let tax_lots = PersistentTaxLotBook {
+            lots: tax_lot_snapshot
+                .lots
+                .into_iter()
+                .map(|(instrument_id, lots)| {
+                    let persisted = lots
+                        .into_iter()
+                        .map(|lot| PersistentTaxLot {
+                            lot_id: lot.lot_id,
+                            opened_at: lot.opened_at,
+                            remaining_quantity: lot.remaining_quantity.to_string(),
+                            unit_cost: lot.unit_cost.to_string(),
+                        })
+                        .collect();
+                    (instrument_id, persisted)
+                })
+                .collect(),
+            applied_lot_ids: tax_lot_snapshot.applied_lot_ids.into_iter().collect(),
+            applied_disposal_ids: tax_lot_snapshot.applied_disposal_ids.into_iter().collect(),
+            realized_by_currency: tax_lot_snapshot
+                .realized_by_currency
+                .into_iter()
+                .map(|(currency, amount)| (currency.as_str().to_owned(), amount.to_string()))
+                .collect(),
+        };
         PersistentPaperState {
             configuration_fingerprint: self.configuration_fingerprint(),
             account_id: self.account.account_id.clone(),
@@ -3169,6 +3286,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 .latest_reconciliation
                 .as_ref()
                 .map(PersistentReconciliationReport::from),
+            tax_lots,
         }
     }
 
@@ -3307,6 +3425,38 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 )?,
             );
         }
+        let account_currency = Currency::new(self.account.currency.clone())?;
+        let mut lots = BTreeMap::new();
+        for (instrument_id, persisted_lots) in state.tax_lots.lots {
+            let mut instrument_lots = Vec::with_capacity(persisted_lots.len());
+            for persisted in persisted_lots {
+                instrument_lots.push(TaxLot {
+                    lot_id: persisted.lot_id,
+                    instrument_id: instrument_id.clone(),
+                    currency: account_currency.clone(),
+                    opened_at: persisted.opened_at,
+                    remaining_quantity: decimal(
+                        "persisted tax lot remaining quantity",
+                        &persisted.remaining_quantity,
+                    )?,
+                    unit_cost: decimal("persisted tax lot unit cost", &persisted.unit_cost)?,
+                });
+            }
+            lots.insert(instrument_id, instrument_lots);
+        }
+        let mut realized_by_currency = BTreeMap::new();
+        for (currency, amount) in state.tax_lots.realized_by_currency {
+            realized_by_currency.insert(
+                Currency::new(currency)?,
+                decimal("persisted realized tax pnl", &amount)?,
+            );
+        }
+        let tax_lots = TaxLotBook::recover(TaxLotBookSnapshot {
+            lots,
+            applied_lot_ids: state.tax_lots.applied_lot_ids.into_iter().collect(),
+            applied_disposal_ids: state.tax_lots.applied_disposal_ids.into_iter().collect(),
+            realized_by_currency,
+        })?;
         let mut execution_ids = BTreeSet::new();
         for execution_id in state.execution_ids {
             validate_canonical_id("persisted execution_id", &execution_id)?;
@@ -3411,6 +3561,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.orders = orders;
         self.risk_evidence = risk_evidence;
         self.portfolios = portfolios;
+        self.tax_lots = tax_lots;
         self.execution_ids = execution_ids;
         self.kill_switches = restored_switches;
         self.incidents = incidents;
@@ -4076,6 +4227,173 @@ mod tests {
         fn reconnect(&mut self, _account_id: &str) -> Result<(), PaperError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn paper_fifo_tax_lots_track_disposal_cost_basis_independent_of_average_cost() {
+        let mut service = service();
+
+        // First lot: 2 units @ $100.
+        let first = service
+            .submit_intent(
+                OrderIntent {
+                    quantity: decimal("quantity", "2").unwrap(),
+                    ..intent("intent-tax-lot-001", "2026-01-02T14:31:00Z")
+                },
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        let first_order_id = first.order_id.unwrap();
+        service
+            .broker_mut()
+            .queue_fill(
+                &first_order_id,
+                decimal("quantity", "2").unwrap(),
+                decimal("price", "100").unwrap(),
+                decimal("fee", "0.20").unwrap(),
+                "2026-01-02T14:31:01Z",
+            )
+            .unwrap();
+        assert_eq!(service.synchronize().unwrap(), 2);
+
+        // Second lot: 2 units @ $120, a distinctly higher price than the
+        // first, so a FIFO disposal's cost basis provably differs from what
+        // a blended average cost would report.
+        let second = service
+            .submit_intent(
+                OrderIntent {
+                    quantity: decimal("quantity", "2").unwrap(),
+                    ..intent("intent-tax-lot-002", "2026-01-02T14:32:00Z")
+                },
+                market("2026-01-02T14:32:00Z"),
+                "2026-01-02T14:32:00Z",
+            )
+            .unwrap();
+        let second_order_id = second.order_id.unwrap();
+        service
+            .broker_mut()
+            .queue_fill(
+                &second_order_id,
+                decimal("quantity", "2").unwrap(),
+                decimal("price", "120").unwrap(),
+                decimal("fee", "0.20").unwrap(),
+                "2026-01-02T14:32:01Z",
+            )
+            .unwrap();
+        assert_eq!(service.synchronize().unwrap(), 2);
+        assert_eq!(service.tax_lots("inst.us_equity.spy").len(), 2);
+
+        // Dispose 2 units at $130. FIFO must consume the $100 lot first.
+        let sell = service
+            .submit_intent(
+                OrderIntent {
+                    side: Side::Sell,
+                    quantity: decimal("quantity", "2").unwrap(),
+                    ..intent("intent-tax-lot-003", "2026-01-02T14:33:00Z")
+                },
+                market("2026-01-02T14:33:00Z"),
+                "2026-01-02T14:33:00Z",
+            )
+            .unwrap();
+        let sell_order_id = sell.order_id.unwrap();
+        service
+            .broker_mut()
+            .queue_fill(
+                &sell_order_id,
+                decimal("quantity", "2").unwrap(),
+                decimal("price", "130").unwrap(),
+                decimal("fee", "0.20").unwrap(),
+                "2026-01-02T14:33:01Z",
+            )
+            .unwrap();
+        assert_eq!(service.synchronize().unwrap(), 2);
+
+        // The FIFO book fully consumed the $100 lot (all-in unit cost
+        // 100.10) and left the $120 lot (all-in unit cost 120.10) untouched.
+        let remaining = service.tax_lots("inst.us_equity.spy");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].unit_cost,
+            decimal("unit cost", "120.10").unwrap()
+        );
+        // realized = proceeds(260) - fifo cost basis(200.20) - fee(0.20) = 59.60
+        assert_eq!(
+            service.realized_tax_pnl().unwrap(),
+            decimal("realized", "59.60").unwrap()
+        );
+
+        // Portfolio's own blended average-cost realized P&L is a distinct
+        // figure: average cost across both lots is 110.10/unit, so
+        // realized = (130 - 110.10) * 2 - 0.20 = 39.60 -- proving the
+        // tax-lot book is an independent ledger, not a relabeling of the
+        // existing average-cost figure.
+        let dashboard = service.dashboard();
+        assert_eq!(dashboard.positions[0].realized_pnl, "39.60000000");
+    }
+
+    #[test]
+    fn paper_tax_lots_survive_a_durable_journal_reopen() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-tax-lots.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&journal_path);
+        let account = account();
+        let mut durable = PaperTradingService::open_durable(
+            account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        let submitted = durable
+            .submit_intent(
+                OrderIntent {
+                    quantity: decimal("quantity", "2").unwrap(),
+                    ..intent("intent-tax-lot-durable-001", "2026-01-02T14:31:00Z")
+                },
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        let order_id = submitted.order_id.unwrap();
+        durable
+            .broker_mut()
+            .queue_fill(
+                &order_id,
+                decimal("quantity", "2").unwrap(),
+                decimal("price", "100").unwrap(),
+                decimal("fee", "0.20").unwrap(),
+                "2026-01-02T14:31:01Z",
+            )
+            .unwrap();
+        assert_eq!(durable.synchronize().unwrap(), 2);
+        assert_eq!(durable.tax_lots("inst.us_equity.spy").len(), 1);
+        drop(durable);
+
+        let recovered = PaperTradingService::open_durable(
+            account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        let remaining = recovered.tax_lots("inst.us_equity.spy");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].unit_cost,
+            decimal("unit cost", "100.10").unwrap()
+        );
+        assert_eq!(
+            remaining[0].remaining_quantity,
+            decimal("qty", "2").unwrap()
+        );
+        assert_eq!(recovered.realized_tax_pnl().unwrap(), Decimal::ZERO);
+        drop(recovered);
+        let _ = fs::remove_file(&journal_path);
     }
 
     #[test]

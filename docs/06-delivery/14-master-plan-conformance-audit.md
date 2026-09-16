@@ -6,8 +6,8 @@ golden-corpus-evidence remediation delta: 2026-09-10; desktop connected-PAPER-ga
 verification delta: 2026-09-14; independent full-repository re-verification,
 stale-fixture-fingerprint, rustls advisory, first-ever live Docker Compose
 runtime, and first-ever PostgreSQL integration-test execution delta:
-2026-09-15; real counterfactual/adversarial intervention-and-probe execution
-delta: 2026-09-16.
+2026-09-15; real counterfactual/adversarial intervention-and-probe execution,
+and PAPER FIFO tax-lot ledger, delta: 2026-09-16.
 Source reviewed: all 29 pages of the original `Solo Trading Operating System
 Master Plan.pdf`.** This is the controlling
 requirement-to-evidence record. It does not turn planned work, a local mechanism,
@@ -237,7 +237,7 @@ kept current, which is itself corrected here rather than left stale):
 | 5.5 OMS | Implemented for current market/limit scope | Stable client identities, idempotency, legal state transitions, cancel/replace, out-of-order evidence, UNKNOWN handling, restart recovery, reconciliation, and causal audit events exist in simulation/PAPER/controlled-LIVE. Execution Blotter renders the lifecycle. `core/paper::evaluate_risk` and `core/live::evaluate_risk` (the exact functions every PAPER/controlled-LIVE order intent passes through before an `OmsOrder` is created) now reject a same-instrument opposite-side order against an existing working order (`SELF_TRADE_RISK`) and reject submissions beyond a configured rolling-window rate (`MAX_ORDER_RATE_EXCEEDED`), closing a prior gap where those two pre-trade-risk-doc checks existed only in the disconnected `core/risk` evidence engine and never actually gated a real order. The desktop order ticket's submit/cancel/close-position commands are no longer permanently wired to an inert `TradingCommandState::unavailable()` stub: `apps/desktop/src-tauri/src/paper_gateway.rs` is a real `RiskOmsGateway` backed by an in-process `follon_paper::PaperTradingService`, so when an operator points `FOLLON_DESKTOP_PAPER_CONFIG` at a valid PAPER configuration file the desktop actually submits, cancels, and closes real PAPER orders through the genuine risk/kill-switch/audit-journal path (see the UX row below and the dated entry in "Locally closed gaps"). | It is not a claim of complete OMS coverage for every future order type, asset class, or live broker. Without `FOLLON_DESKTOP_PAPER_CONFIG` configured, the desktop command surface remains unavailable exactly as before. |
 | 5.6 EMS | Implemented as broker-neutral planning and local TCA; capital gate open | `core/execution` implements immediate, exact TWAP, forecast-volume VWAP, POV/participation, urgency-weighted arrival price, sequential display-size Iceberg, deterministic weighted AlgoWheel with schedule tie-breaking, strict post-only passive cancel/replace with monotonic chase collars, capability-gated multi-venue smart routing (`smart_route_with_capabilities`), stop/stop-limit bracket children, monotonic trailing stops, exact basket legs, and atomic ratio/net-price-protected options combinations. Content-addressed `ExecutionPlanEvidence` records bind parent order, scheduled slices, route decisions, frozen arrival/target benchmarks, and a SHA-256 fingerprint. `follon-tca` produces immutable parent-order implementation-shortfall reports against frozen benchmarks. Quantity conservation and safety boundaries are tested; the versioned gRPC service exposes scheduled execution, cancel-before-replace passive plans, and synchronized net-price-protected option combinations without discarding venue/order-kind/stop fields. | Options-combination atomicity requires a native-combo adapter or rejection before transmitting any leg. TCA relies on operator-supplied frozen evidence and does not validate a broker statement. Every vendor transport still needs independent human review and broker-backed PAPER/LIVE acceptance. |
 | 5.7 Risk engine | Implemented portfolio kernel; operating gate open | `core/risk` evaluates gross/net, leverage, concentration, daily loss, drawdown, margin utilization, delta/gamma, instrument permissions/restrictions, sector/asset/currency/strategy buckets, open orders, order rate, self-trade, and kill state. A fresh FX snapshot can only create an ordinary local candidate with retained snapshot/version/value-date evidence; it still receives the same aggregate risk decision. The kernel returns exact reason codes, is exposed over gRPC, and is visible in Risk Cockpit capability mapping. Self-trade prevention and order-rate limiting are now independently duplicated directly inside the actual PAPER/controlled-LIVE order-gating path (`core/paper`/`core/live` `evaluate_risk`, see 5.5), so those two specific order-shape checks are no longer evidence-only. | This aggregate `core/risk` kernel itself is still not composed into the real PAPER/controlled-LIVE order path: its gross/net/leverage/concentration/sector/asset-class/currency/strategy-bucket/drawdown/margin-utilization checks remain reachable only from `follon-risk-benchmark` and gRPC, not from an actual order submission. FX candidate construction has no gRPC or OMS composition. Production policy calibration, latency/load evidence, independent validation, live-feed staleness history, and clean broker-backed operating sessions remain external. |
-| 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. `follon-operations reconcile-statement` ingests broker CSV statements and reconciles internal cash/positions. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. A `HighestCost` disposal tie between two lots of identical unit cost is now broken by oldest acquisition first, matching the documented policy exactly instead of an incidental lot-identity string order. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. `TaxLotBook::dispose` is exact and unit-tested but still has no caller inside `core/paper` or the advanced backtest account; nothing yet invokes tax-lot disposal from a real fill. Multi-prime allocation and qualifying production reconciliation history remain external/integration work. |
+| 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. `follon-operations reconcile-statement` ingests broker CSV statements and reconciles internal cash/positions. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. A `HighestCost` disposal tie between two lots of identical unit cost is now broken by oldest acquisition first, matching the documented policy exactly instead of an incidental lot-identity string order. `core/paper` now calls `TaxLotBook::acquire`/`dispose` from the one real-fill code path (see item 32), maintaining an independent FIFO cost-basis ledger in lockstep with every PAPER fill, durably persisted and recovered across journal restarts. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. `TaxLotBook` is wired into `core/paper`'s real fills only; `core/live` and the advanced backtest account (`core/backtest::AdvancedBacktestAccount`) still have no caller, so a controlled-LIVE or backtest fill still only produces the pre-existing average-cost realized P&L. Lot selection is fixed at FIFO, not operator-configurable. Multi-prime allocation and qualifying production reconciliation history remain external/integration work. |
 | 5.9 Risk cockpit | Implemented for planned aggregate fields; operating gate open | The cockpit maps portfolio exposure, leverage/drawdown/margin/Greeks and bucket controls alongside kill switches, working/UNKNOWN orders, incidents, broker/reconciliation health, attribution, and evidence links. | Real alert delivery/on-call ownership, live-feed heartbeat history, and operated production evidence remain external. |
 | 5.10 Audit and replay | Implemented for current scope | Canonical causal events, correlation/causation, append-only journals, hash-chain verification, immutable artifacts, restart replay, configuration/dataset/strategy hashes, and replay/incident/journal views are implemented. | Production retention/WORM policy, centralized tenant audit, independently operated log custody, and regulator/customer retention evidence remain deployment obligations. |
 
@@ -782,6 +782,61 @@ These are mandatory master-plan acceptance conditions and are currently open:
       comment, not a silent gap. This closes the "does the intervention/probe actually execute" gap the
       DUR-02/DUR-06 rows above describe for exactly this path; it is not a claim that either laboratory now
       certifies an arbitrary caller-supplied strategy, and it does not change any external gate.
+32. `TaxLotBook::acquire`/`dispose` wired into `core/paper`'s real fill path (2026-09-16). A prior audit
+    entry (5.8) recorded `core/accounting::TaxLotBook::dispose` as exact and unit-tested but with zero
+    callers anywhere in the repository -- confirmed again at the start of this pass by grepping for
+    `TaxLotBook`/`.dispose(`/`.acquire(` outside `core/accounting`. An investigation into the
+    structurally larger 5.7 gap (`core/risk`'s aggregate kernel not composed into the real PAPER/LIVE
+    order path) found that gap requires portfolio-wide state -- multi-instrument live marks, a sector
+    taxonomy, durable equity/peak-equity tracking, a margin model -- that does not exist anywhere in
+    `core/paper` or `core/live` today, roughly doubling the work across both crates; it was set aside as
+    not well-scoped for one pass. This entry instead closes the smaller, fully self-contained 5.8 gap.
+    - `core/accounting::TaxLotBook` gained `snapshot()`/`recover()` (plus the new `TaxLotBookSnapshot`
+      type), mirroring the existing `Portfolio::position_snapshot()`/`Portfolio::recover()` pattern: a
+      complete, faithful round trip of every internal field, including the two idempotency identity sets
+      (`applied_lot_ids`, `applied_disposal_ids`) that are not otherwise observable -- an already
+      fully-disposed lot disappears from `lots()`, but its ID must still be permanently refused by a
+      future `acquire()`. `recover()` re-validates every invariant a normal `acquire`/`dispose` sequence
+      would have enforced (canonical ordering, positive economics, open-lot IDs present in the applied
+      set) rather than trusting the caller's serialization.
+    - `core/paper::PaperTradingService` gained a `tax_lots: TaxLotBook` field, updated from the single
+      real-fill code path in `apply_broker_event`'s `BrokerEvent::Executed` handler, immediately after
+      `Portfolio::apply_fill` -- a buy `acquire`s a lot at its exact all-in unit cost (price plus fee); a
+      sell `dispose`s existing lots FIFO. `Portfolio::apply_fill` already refuses a sell exceeding the
+      held long quantity before this is reached (this codebase's `Portfolio` is long-only: "first slice
+      does not permit short positions"), so a disposal here can never exceed available lots. Lot
+      selection is fixed at FIFO rather than exposing a configurable policy -- a stated bounded
+      simplification, not a correctness gap; `TaxLotSelection::Lifo`/`HighestCost` remain available to a
+      direct `TaxLotBook` caller.
+    - `synchronize()`'s existing per-event rollback (which already snapshots and restores `orders`,
+      `portfolios`, `execution_ids`, and `cash` around each `apply_broker_event` call so one failed event
+      in a batch cannot partially mutate state) was extended to also snapshot and restore `tax_lots` --
+      found by reading the rollback site itself rather than assumed safe, since a fill now mutates one
+      more piece of state than before.
+    - Durability: `tax_lots` was added to the journal's `PersistentPaperState` as a new
+      `#[serde(default)]` field (`PersistentTaxLotBook`/`PersistentTaxLot`), following the same pattern
+      already used for `broker_connected`/`latest_reconciliation` -- a journal written before this change
+      deserializes it as an empty book, which is exactly correct, since no fill could have been applied to
+      a tax-lot ledger that did not yet exist. `configuration_fingerprint()` is derived only from static
+      risk-policy/account/kill-switch configuration, not dynamic state, so this addition does not affect
+      the fingerprint and required no change to any checked-in journal fixture; `follon-paper-status
+      gateway-matrix` against the existing `tests/fixtures/paper/journal-v2.ndjson` fixture was re-run and
+      still passes unchanged.
+    - Two new tests: `paper_fifo_tax_lots_track_disposal_cost_basis_independent_of_average_cost` drives two
+      buys at different prices ($100 then $120) then a disposal, and asserts the FIFO-realized P&L
+      ($59.60, consuming the $100 lot first) is a real, distinct figure from `Portfolio`'s own blended
+      average-cost realized P&L ($39.60) read off the existing dashboard -- proving this is an independent
+      ledger, not a relabeling of the figure that already existed; `paper_tax_lots_survive_a_durable_journal_reopen`
+      closes and reopens a real `FilePaperJournal`-backed service and confirms the open lot and zero
+      realized P&L are recovered exactly. Two new `core/accounting` tests cover the `snapshot`/`recover`
+      round trip and reject a corrupted snapshot missing an applied-lot identity.
+    - `cargo fmt`/`clippy -D warnings`/`test --workspace --all-targets` remained clean (`follon-accounting`
+      17 tests, `follon-paper` 23 tests, both up from before this change, 0 failed across the workspace).
+    - Bounded scope, stated plainly: only `core/paper`'s real fills gained a tax-lot ledger.
+      `core/live`'s real fills (the identical gap, same `Portfolio`/`apply_fill` shape) and
+      `core/backtest::AdvancedBacktestAccount` (a hypothetical, not a real fill) are unchanged and still
+      report only average-cost realized P&L; either would be a mechanical repeat of this same pattern as
+      a follow-up. This does not change any external gate.
 
 ## Business-readiness decision
 

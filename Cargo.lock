@@ -551,6 +551,7 @@ dependencies = [
 name = "follon-paper"
 version = "0.1.0"
 dependencies = [
+ "follon-accounting",
  "follon-control-plane",
  "follon-domain",
  "follon-instrument",
