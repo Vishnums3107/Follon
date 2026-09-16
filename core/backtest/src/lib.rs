@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use follon_accounting::{
     accrue_financing, value_margin_account, AccountingError, Currency, FinancingBalance,
-    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot,
+    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot, TaxLot, TaxLotBook,
+    TaxLotSelection,
 };
 use follon_control_plane::{
     EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
@@ -264,6 +265,13 @@ pub struct BacktestLedger {
     currency: String,
     cash: Decimal,
     positions: BTreeMap<String, LedgerPosition>,
+    /// Independent FIFO long-lot cost-basis ledger, kept in lockstep with
+    /// `positions` from the same fills. `LedgerPosition` tracks a single
+    /// running average cost; this book retains individual acquisition lots
+    /// so a real disposal reports an auditable, tax-lot-accurate realized
+    /// gain/loss. This ledger is long-only (see `apply_fill`'s sell branch),
+    /// so every disposal is a genuine long-lot sale, never a short cover.
+    tax_lots: TaxLotBook,
     execution_ids: BTreeSet<String>,
     corporate_action_ids: BTreeSet<String>,
     entries: Vec<AccountingEntry>,
@@ -285,6 +293,7 @@ impl BacktestLedger {
             currency,
             cash: initial_cash,
             positions: BTreeMap::new(),
+            tax_lots: TaxLotBook::default(),
             execution_ids: BTreeSet::new(),
             corporate_action_ids: BTreeSet::new(),
             entries: Vec::new(),
@@ -360,6 +369,7 @@ impl BacktestLedger {
                 (Decimal::ZERO.checked_sub(fill.quantity)?, proceeds)
             }
         };
+        self.apply_tax_lot_fill(fill)?;
         self.fees = self.fees.checked_add(fill.fee)?;
         self.execution_ids.insert(fill.execution_id.clone());
         self.entries.push(AccountingEntry {
@@ -371,6 +381,56 @@ impl BacktestLedger {
             cash_delta,
         });
         Ok(())
+    }
+
+    /// Applies one fill to the independent FIFO tax-lot book. A buy acquires
+    /// a new lot at its exact all-in unit cost (price plus fee); a sell
+    /// disposes existing lots FIFO. The sell branch of `apply_fill` above
+    /// already refuses a sell exceeding the held quantity before this is
+    /// reached, so a disposal here can never exceed available lots. Lot
+    /// selection is fixed at FIFO rather than exposing a configurable
+    /// policy — a bounded simplification, not a correctness gap.
+    fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), BacktestError> {
+        let currency = Currency::new(self.currency.clone())?;
+        match fill.side {
+            Side::Buy => {
+                let gross = fill.price.checked_mul(fill.quantity)?;
+                let unit_cost = gross.checked_add(fill.fee)?.checked_div(fill.quantity)?;
+                self.tax_lots.acquire(TaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency,
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: fill.quantity,
+                    unit_cost,
+                })?;
+            }
+            Side::Sell => {
+                self.tax_lots.dispose(
+                    &format!("taxdisposal-{}", fill.execution_id),
+                    &fill.instrument_id,
+                    &currency,
+                    fill.quantity,
+                    fill.price,
+                    fill.fee,
+                    &fill.executed_at,
+                    TaxLotSelection::Fifo,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaining open FIFO tax lots for one instrument, oldest first.
+    pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
+        self.tax_lots.lots(instrument_id)
+    }
+
+    /// Cumulative FIFO-realized tax P&L in the ledger's reporting currency,
+    /// independent of each position's average-cost realized P&L.
+    pub fn realized_tax_pnl(&self) -> Result<Decimal, BacktestError> {
+        let currency = Currency::new(self.currency.clone())?;
+        Ok(self.tax_lots.realized(&currency))
     }
 
     /// Applies split or cash-dividend economics to held positions.
@@ -2311,6 +2371,76 @@ mod tests {
         assert_eq!(
             report.positions[0].average_cost,
             Decimal::from_integer(50).unwrap()
+        );
+    }
+
+    #[test]
+    fn ledger_fifo_tax_lots_track_disposal_cost_basis_independent_of_average_cost() {
+        let mut ledger = BacktestLedger::new("USD", Decimal::from_integer(1_000).unwrap()).unwrap();
+        ledger
+            .apply_fill(&Fill {
+                execution_id: "exec-tax-001".to_owned(),
+                order_id: "order-tax-001".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(2).unwrap(),
+                price: Decimal::from_integer(100).unwrap(),
+                fee: Decimal::from_str("0.20").unwrap(),
+                executed_at: "2026-01-02T14:30:00Z".to_owned(),
+            })
+            .unwrap();
+        ledger
+            .apply_fill(&Fill {
+                execution_id: "exec-tax-002".to_owned(),
+                order_id: "order-tax-002".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(2).unwrap(),
+                price: Decimal::from_integer(120).unwrap(),
+                fee: Decimal::from_str("0.20").unwrap(),
+                executed_at: "2026-01-02T14:31:00Z".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(ledger.tax_lots("inst.us_equity.spy").len(), 2);
+
+        ledger
+            .apply_fill(&Fill {
+                execution_id: "exec-tax-003".to_owned(),
+                order_id: "order-tax-003".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                side: Side::Sell,
+                quantity: Decimal::from_integer(2).unwrap(),
+                price: Decimal::from_integer(130).unwrap(),
+                fee: Decimal::from_str("0.20").unwrap(),
+                executed_at: "2026-01-02T14:32:00Z".to_owned(),
+            })
+            .unwrap();
+
+        // FIFO must fully consume the $100 lot (all-in unit cost 100.10),
+        // leaving the $120 lot (all-in unit cost 120.10) untouched.
+        let remaining = ledger.tax_lots("inst.us_equity.spy");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].unit_cost, Decimal::from_str("120.10").unwrap());
+        // realized = proceeds(260) - fifo cost basis(200.20) - fee(0.20) = 59.60
+        assert_eq!(
+            ledger.realized_tax_pnl().unwrap(),
+            Decimal::from_str("59.60").unwrap()
+        );
+
+        // The ledger's own blended average-cost realized P&L is a distinct
+        // figure: average cost across both lots is 110.10/unit, so
+        // realized = (130 - 110.10) * 2 - 0.20 = 39.60 -- proving the
+        // tax-lot book is an independent ledger, not a relabeling of the
+        // figure that already existed.
+        let report = ledger
+            .report(&BTreeMap::from([(
+                "inst.us_equity.spy".to_owned(),
+                Decimal::from_integer(130).unwrap(),
+            )]))
+            .unwrap();
+        assert_eq!(
+            report.positions[0].realized_pnl,
+            Decimal::from_str("39.60").unwrap()
         );
     }
 
