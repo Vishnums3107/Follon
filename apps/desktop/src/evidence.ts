@@ -1644,7 +1644,7 @@ export function parseDecisionReconstruction(json: string): DecisionReconstructio
   return value;
 }
 
-/** Parses a counterfactual replay experiment scenario (DUR-02). */
+/** Parses caller-supplied counterfactual comparison evidence (DUR-02). */
 export function parseCounterfactualScenario(json: string): CounterfactualScenario {
   let value: unknown;
   try {
@@ -1700,7 +1700,7 @@ export function parseAttentionBudget(json: string): AttentionBudget {
   return value;
 }
 
-/** Parses an adversarial research gate evaluation report (DUR-06). */
+/** Parses certification of caller-supplied adversarial probe results (DUR-06). */
 export function parseAdversarialEvaluation(json: string): AdversarialEvaluation {
   let value: unknown;
   try {

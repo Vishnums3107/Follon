@@ -351,16 +351,21 @@ fn evaluate_queries(
         let product = parse_product(&query.product)?;
         let value_date = FxValueDate::new(&query.value_date)?;
 
-        let (snapshot_id, midpoint) = match runtime.book.midpoint_at(
-            &query.instrument_id,
-            product,
-            &value_date,
-            as_of,
-            max_age_seconds,
-        ) {
-            Ok(result) => result,
-            Err(_) => continue,
-        };
+        let (snapshot_id, midpoint) = runtime
+            .book
+            .midpoint_at(
+                &query.instrument_id,
+                product,
+                &value_date,
+                as_of,
+                max_age_seconds,
+            )
+            .map_err(|error| {
+                format!(
+                    "FX query '{}' ({} {} value_date {}) could not be priced: {error}",
+                    query.query_id, query.instrument_id, query.product, query.value_date
+                )
+            })?;
 
         let snapshot = runtime
             .snapshots
@@ -614,5 +619,46 @@ mod tests {
         let report = markdown_report(&runtime, as_of, 60).unwrap();
         assert!(report.contains("# Follon FX Valuation and Reference Report"));
         assert!(report.contains("FRESH"));
+    }
+
+    /// Regression test for the silent-drop bug in `evaluate_queries`: a query
+    /// naming a value date with no matching pricing snapshot used to vanish
+    /// from the output with no error, no warning, and no non-zero exit code.
+    /// It must now fail the whole command with an error that names the
+    /// specific unpriceable query.
+    #[test]
+    fn unpriceable_query_fails_the_command_instead_of_vanishing_silently() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/config/fx-v1.json");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        document["queries"]
+            .as_array_mut()
+            .expect("queries array")
+            .push(serde_json::json!({
+                "query_id": "query.unpriceable.eur-usd.spot",
+                "instrument_id": "instrument.fx.eur-usd",
+                "product": "FX_SPOT",
+                "value_date": "2027-01-01"
+            }));
+
+        let path =
+            std::env::temp_dir().join(format!("follon-fx-unpriceable-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let runtime = load_runtime(&path).unwrap();
+        assert_eq!(runtime.queries.len(), 7);
+
+        let as_of = "2026-09-05T12:00:00Z";
+        let error = canonical_fx_pricing_json(&runtime, as_of, 60)
+            .expect_err("query with no matching snapshot must fail, not vanish");
+        let message = error.to_string();
+        assert!(message.contains("query.unpriceable.eur-usd.spot"));
+        assert!(message.contains("could not be priced"));
+
+        // The Markdown report path must fail the same way.
+        assert!(markdown_report(&runtime, as_of, 60).is_err());
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

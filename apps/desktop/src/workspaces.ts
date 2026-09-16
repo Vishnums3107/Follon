@@ -680,8 +680,8 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   root.append(inputCorrectionPanel);
 
   const counterfactualPanel = createPanel(
-    "Counterfactual scenario replay and intervention lab",
-    "Simulate parameter, latency, data corruption, and volatility interventions on frozen baseline runs without mutating production history (DUR-02)."
+    "Operator-attested counterfactual result comparison",
+    "Compare caller-supplied baseline and intervention results without mutating production history; this view does not execute or prove a replay (DUR-02)."
   );
   counterfactualPanel.id = "counterfactual-panel";
   appendAdvancedEvidenceRows(
@@ -701,7 +701,7 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
       `${scenario.delta_metrics.max_drawdown_delta_bps} bps`,
       String(scenario.delta_metrics.risk_rejection_count_delta),
     ]],
-    "No typed counterfactual replay scenario is published."
+    "No typed operator-attested counterfactual result is published."
   );
   root.append(counterfactualPanel);
   const payoffVisualizer = renderOptionsPayoffVisualizer(options);
@@ -1059,17 +1059,17 @@ function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snaps
     context,
     "adversarial_evaluation",
     parseAdversarialEvaluation,
-    ["Evaluation ID", "Strategy", "Probes Passed", "Composite Robustness", "Gate Status", "Blocking Failure Reasons", "Evaluated At"],
+    ["Evaluation ID", "Strategy", "Attested Probes Passed", "Composite Robustness", "Certification Status", "Blocking Failure Reasons", "Evaluated At"],
     (evaluation) => [[
       evaluation.evaluation_id,
       evaluation.strategy_version,
       `${evaluation.probes.filter((p) => p.passed).length}/${evaluation.probes.length} probes`,
       `${evaluation.composite_robustness_score_bps} bps`,
-      evaluation.gate_passed ? "PASSED" : "FAILED_GATE",
+      evaluation.gate_passed ? "INPUTS_PASS" : "INPUTS_FAIL",
       evaluation.blocking_failure_reasons.join(" | ") || "None",
       evaluation.evaluated_at,
     ]],
-    "No typed adversarial research evaluation is published."
+    "No typed operator-attested adversarial evaluation is published."
   );
   root.append(strategyInvalidationPanel);
 

@@ -1966,14 +1966,39 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             }
         };
         let count = events.len();
+        let mut apply_errors = Vec::new();
         for event in events {
-            self.apply_broker_event(event)?;
+            // `poll` drains broker evidence, so an event that fails to apply can
+            // never be re-fetched: aborting the whole loop on the first failure
+            // would silently and permanently lose every event still queued
+            // behind it. Snapshot the mutable state first so a failed
+            // application leaves no partial mutation in memory, then keep
+            // applying the remaining events in the batch.
+            let orders_snapshot = self.orders.clone();
+            let portfolios_snapshot = self.portfolios.clone();
+            let execution_ids_snapshot = self.execution_ids.clone();
+            let cash_snapshot = self.cash;
+            if let Err(error) = self.apply_broker_event(event) {
+                self.orders = orders_snapshot;
+                self.portfolios = portfolios_snapshot;
+                self.execution_ids = execution_ids_snapshot;
+                self.cash = cash_snapshot;
+                apply_errors.push(error.0);
+                continue;
+            }
             self.persist(
                 "live.broker.event_applied.v1",
                 actor,
                 occurred_at,
                 "broker-event",
             )?;
+        }
+        if !apply_errors.is_empty() {
+            return Err(LiveError(format!(
+                "live broker synchronize failed to apply {} of {count} broker events (each rolled back cleanly): {}",
+                apply_errors.len(),
+                apply_errors.join("; "),
+            )));
         }
         Ok(count)
     }
@@ -2431,14 +2456,22 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         };
         let rate_window_start =
             decision_at - time::Duration::seconds(self.policy.order_rate_window_seconds as i64);
+        // Rate-window membership is keyed off each order's own risk *decision* time
+        // (`LiveRiskDecision::decided_at`), not the caller-supplied
+        // `OrderIntent::created_at`. `created_at` is stamped by the strategy/operator
+        // that originated the intent and is not otherwise constrained to reflect
+        // wall-clock reality, so counting against it would let a caller understate
+        // its own submission rate and silently bypass `MAX_ORDER_RATE_EXCEEDED` by
+        // backdating `created_at` on new intents.
         let recent_order_count =
             self.orders
                 .values()
                 .try_fold(0u32, |count, order| -> Result<u32, LiveError> {
-                    let created_at = OffsetDateTime::parse(&order.oms.intent.created_at, &Rfc3339)
-                        .map_err(|error| LiveError(error.to_string()))?;
+                    let order_decided_at =
+                        OffsetDateTime::parse(&order.decision.decided_at, &Rfc3339)
+                            .map_err(|error| LiveError(error.to_string()))?;
                     Ok(
-                        if created_at > rate_window_start && created_at <= decision_at {
+                        if order_decided_at > rate_window_start && order_decided_at <= decision_at {
                             count + 1
                         } else {
                             count
@@ -3271,8 +3304,10 @@ fn configuration_fingerprint(
     let max_position_quantity = policy.max_position_quantity.to_string();
     let max_realized_loss = policy.max_realized_loss.to_string();
     let max_market_data_age_seconds = policy.max_market_data_age_seconds.to_string();
+    let max_order_rate = policy.max_order_rate.to_string();
+    let order_rate_window_seconds = policy.order_rate_window_seconds.to_string();
     hash_fingerprint_parts(&[
-        "live-configuration-v2",
+        "live-configuration-v3",
         &account.account_id,
         &account.currency,
         &initial_cash,
@@ -3290,6 +3325,8 @@ fn configuration_fingerprint(
         &max_position_quantity,
         &max_realized_loss,
         &max_market_data_age_seconds,
+        &max_order_rate,
+        &order_rate_window_seconds,
         &kill_switches.version,
     ])
 }
@@ -4423,6 +4460,117 @@ mod tests {
             .reason_codes
             .contains(&"MAX_ORDER_RATE_EXCEEDED".to_owned()));
         assert!(decision.evaluated_limits.contains("recent_order_count=2"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn controlled_live_order_rate_limit_counts_decision_time_not_caller_supplied_created_at() {
+        let path = journal_path("order-rate-backdate");
+        let account = account();
+        let mut rate_limited_policy = policy();
+        rate_limited_policy.max_order_rate = 2;
+        rate_limited_policy.canary_max_orders = 10;
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(
+            LiveRunMode::Canary,
+            &account,
+            &rate_limited_policy,
+            &switches,
+        );
+        let mut service = LiveTradingService::open_durable(
+            account,
+            rate_limited_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+
+        // Every intent claims a `created_at` far outside the rate window, but each
+        // is actually decided within it: a caller must not be able to understate
+        // its own submission rate and bypass `MAX_ORDER_RATE_EXCEEDED` by
+        // backdating the intent's self-reported `created_at`.
+        let mut first_intent = intent("LIVE", "intent.live.rate.backdate.001");
+        first_intent.created_at = "2020-01-01T00:00:00Z".to_owned();
+        let mut first_approval = approval_for(&service, &first_intent);
+        first_approval.approval_id = "approval.live.rate.backdate.001".to_owned();
+        service
+            .register_approval(
+                first_approval,
+                "2026-01-02T14:30:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let first = service
+            .submit_canary_intent(
+                first_intent,
+                market(),
+                "approval.live.rate.backdate.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("first submission");
+        assert!(matches!(first, LiveSubmitOutcome::CanaryOrder { .. }));
+
+        let mut second_intent = intent("LIVE", "intent.live.rate.backdate.002");
+        second_intent.created_at = "2020-01-01T00:00:00Z".to_owned();
+        let mut second_approval = approval_for(&service, &second_intent);
+        second_approval.approval_id = "approval.live.rate.backdate.002".to_owned();
+        service
+            .register_approval(
+                second_approval,
+                "2026-01-02T14:30:01Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let second = service
+            .submit_canary_intent(
+                second_intent,
+                market(),
+                "approval.live.rate.backdate.002",
+                "2026-01-02T14:30:01Z",
+                "operator.requester.001",
+            )
+            .expect("second submission");
+        assert!(matches!(second, LiveSubmitOutcome::CanaryOrder { .. }));
+
+        let mut third_intent = intent("LIVE", "intent.live.rate.backdate.003");
+        third_intent.created_at = "2020-01-01T00:00:00Z".to_owned();
+        let mut third_approval = approval_for(&service, &third_intent);
+        third_approval.approval_id = "approval.live.rate.backdate.003".to_owned();
+        service
+            .register_approval(
+                third_approval,
+                "2026-01-02T14:30:02Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let third = service
+            .submit_canary_intent(
+                third_intent,
+                market(),
+                "approval.live.rate.backdate.003",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("third evaluation completes");
+        let LiveSubmitOutcome::RiskRejected { decision } = third else {
+            panic!("a submission beyond the configured order rate must be rejected");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_ORDER_RATE_EXCEEDED".to_owned()));
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");
     }

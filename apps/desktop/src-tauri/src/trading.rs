@@ -54,6 +54,18 @@ pub struct OrderIntent {
     pub environment: ExecutionEnvironment,
     /// Optional parent intent for a bracket or basket.
     pub parent_intent_id: Option<String>,
+    /// Operator-attested reference price observed at submission time.
+    ///
+    /// There is no live market-data feed wired into this desktop boundary, so
+    /// a fresh, honestly-sourced market observation cannot be produced
+    /// automatically. The operator must instead read and enter the price they
+    /// are actually seeing (e.g. from their broker terminal) at the moment of
+    /// submission; risk gating (price collar, notional limits) is evaluated
+    /// against this attested value exactly as it would be against a live
+    /// quote.
+    pub reference_price: String,
+    /// Canonical, second-precision UTC time at which `reference_price` was observed.
+    pub reference_observed_at: String,
 }
 
 impl OrderIntent {
@@ -98,6 +110,12 @@ impl OrderIntent {
         if !is_canonical_utc_second(&self.created_at) {
             return Err(TradingCommandError::validation(
                 "created_at must be canonical second-precision UTC",
+            ));
+        }
+        validate_positive_decimal("reference_price", &self.reference_price)?;
+        if !is_canonical_utc_second(&self.reference_observed_at) {
+            return Err(TradingCommandError::validation(
+                "reference_observed_at must be canonical second-precision UTC",
             ));
         }
         require_paper_environment(&self.environment)?;
@@ -199,6 +217,12 @@ pub struct ClosePositionIntent {
     pub environment: ExecutionEnvironment,
     /// Human-readable reason for the requested close.
     pub rationale: String,
+    /// Operator-attested reference price observed at submission time (see
+    /// `OrderIntent::reference_price` for why this is required rather than
+    /// sourced automatically).
+    pub reference_price: String,
+    /// Canonical, second-precision UTC time at which `reference_price` was observed.
+    pub reference_observed_at: String,
 }
 
 impl ClosePositionIntent {
@@ -214,6 +238,12 @@ impl ClosePositionIntent {
         if self.rationale.trim().is_empty() || self.rationale.len() > MAX_RATIONALE_LENGTH {
             return Err(TradingCommandError::validation(
                 "rationale must be non-empty and at most 1024 characters",
+            ));
+        }
+        validate_positive_decimal("reference_price", &self.reference_price)?;
+        if !is_canonical_utc_second(&self.reference_observed_at) {
+            return Err(TradingCommandError::validation(
+                "reference_observed_at must be canonical second-precision UTC",
             ));
         }
         require_paper_environment(&self.environment)?;
@@ -259,8 +289,24 @@ pub enum CommandStatus {
     RiskRejected,
     /// OMS accepted a broker-submission request.
     PendingSubmit,
+    /// The broker or simulator acknowledged the order.
+    Acknowledged,
+    /// The order has executed only part of its requested quantity.
+    PartiallyFilled,
+    /// The order has executed its complete requested quantity.
+    Filled,
     /// OMS accepted a cancellation request.
     PendingCancel,
+    /// OMS accepted a risk-preserving replacement request.
+    PendingReplace,
+    /// Cancellation completed authoritatively.
+    Cancelled,
+    /// The broker or simulator rejected the order.
+    Rejected,
+    /// The order expired without completing.
+    Expired,
+    /// The submission/cancellation outcome is ambiguous pending reconciliation.
+    Unknown,
     /// OMS accepted a position-close request.
     PendingPositionClose,
 }
@@ -372,9 +418,7 @@ pub fn close_position(
 
 /// Return the native host's read-only Risk/OMS command capability.
 #[tauri::command]
-pub fn trading_command_status(
-    state: State<'_, TradingCommandState>,
-) -> TradingCommandRouteStatus {
+pub fn trading_command_status(state: State<'_, TradingCommandState>) -> TradingCommandRouteStatus {
     state.route_status()
 }
 
@@ -445,7 +489,9 @@ fn validate_canonical_id(name: &str, value: &str) -> Result<(), TradingCommandEr
     Ok(())
 }
 
-fn require_paper_environment(environment: &ExecutionEnvironment) -> Result<(), TradingCommandError> {
+fn require_paper_environment(
+    environment: &ExecutionEnvironment,
+) -> Result<(), TradingCommandError> {
     if *environment == ExecutionEnvironment::Paper {
         Ok(())
     } else {
@@ -566,6 +612,8 @@ mod tests {
             configuration_version: "risk.v1".to_owned(),
             environment: ExecutionEnvironment::Paper,
             parent_intent_id: None,
+            reference_price: "123.40000000".to_owned(),
+            reference_observed_at: "2026-09-03T12:29:59Z".to_owned(),
         }
     }
 
@@ -626,7 +674,8 @@ mod tests {
         assert!(!unavailable.route_available);
         assert!(unavailable.message.contains("not configured"));
 
-        let available = TradingCommandState::with_gateway(Arc::new(RecordingGateway::default())).route_status();
+        let available =
+            TradingCommandState::with_gateway(Arc::new(RecordingGateway::default())).route_status();
         assert!(available.route_available);
         assert!(available.message.contains("native PAPER Risk/OMS"));
     }
@@ -648,6 +697,8 @@ mod tests {
             correlation_id: "correlation.close.1".to_owned(),
             environment: ExecutionEnvironment::Paper,
             rationale: "operator close".to_owned(),
+            reference_price: "123.40000000".to_owned(),
+            reference_observed_at: "2026-09-03T12:29:59Z".to_owned(),
         };
 
         assert_eq!(
@@ -689,6 +740,8 @@ mod tests {
             correlation_id: "correlation.close.simulation.1".to_owned(),
             environment: ExecutionEnvironment::Simulation,
             rationale: "operator close".to_owned(),
+            reference_price: "123.40000000".to_owned(),
+            reference_observed_at: "2026-09-03T12:29:59Z".to_owned(),
         };
         assert_eq!(
             close_position_through(&gateway, close).unwrap_err(),

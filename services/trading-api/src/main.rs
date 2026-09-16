@@ -17,7 +17,7 @@ use follon_execution::{
     ChildOrderKind as CoreChildOrderKind, ComboPriceLimit, ExecutionAlgorithm, OptionComboLeg,
     ParentOrder, PassiveMarketObservation, PassiveRepricePolicy,
 };
-use follon_postgres::PostgresStore;
+use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
     evaluate_portfolio_risk, CandidateOrder as CoreCandidateOrder, PortfolioRiskPolicy,
     PortfolioRiskSnapshot, RestingOrder as CoreRestingOrder, RiskPosition,
@@ -561,6 +561,20 @@ fn env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name).map(PathBuf::from)
 }
 
+/// Returns the certificate and private key paths only when both are present.
+/// The server installs TLS if and only if this returns `Some`, and the
+/// `transport_tls` health flag is derived from this same check so the two can
+/// never drift apart (an operator-supplied certificate without a matching
+/// private key must never be reported as an active TLS transport).
+fn tls_identity_paths(config: &RuntimeConfig) -> Option<(&Path, &Path)> {
+    match (&config.tls_certificate, &config.tls_private_key) {
+        (Some(certificate_path), Some(private_key_path)) => {
+            Some((certificate_path, private_key_path))
+        }
+        _ => None,
+    }
+}
+
 fn database_url(production: bool) -> Result<Option<String>, String> {
     let direct = env::var("FOLLON_DATABASE_URL").ok();
     let file = env_path("FOLLON_DATABASE_URL_FILE");
@@ -610,26 +624,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = RuntimeConfig::from_environment().map_err(std::io::Error::other)?;
-    let database = if let Some(database_url) = &config.database_url {
-        let mut store = if config.production {
-            PostgresStore::connect_tls(database_url, config.database_ca.as_deref())?
-        } else {
-            PostgresStore::connect_development(database_url)?
-        };
-        store.migrate()?;
+    let database = if let Some(database_url) = config.database_url.clone() {
+        // `postgres::Client::connect` (the synchronous client `PostgresStore` wraps) drives
+        // its own private Tokio runtime internally via `block_on`, so calling it directly on
+        // this `#[tokio::main]` async task panics with "Cannot start a runtime from within a
+        // runtime." `spawn_blocking` moves it onto a dedicated blocking-pool thread that has
+        // no ambient runtime context, which is exactly where that pattern is meant to run.
+        let production = config.production;
+        let database_ca = config.database_ca.clone();
+        let store =
+            tokio::task::spawn_blocking(move || -> Result<PostgresStore, PersistenceError> {
+                let mut store = if production {
+                    PostgresStore::connect_tls(&database_url, database_ca.as_deref())?
+                } else {
+                    PostgresStore::connect_development(&database_url)?
+                };
+                store.migrate()?;
+                Ok(store)
+            })
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("database bootstrap task panicked: {error}"))
+            })??;
         Some(Arc::new(Mutex::new(store)))
     } else {
         None
     };
-    let transport_tls = config.tls_certificate.is_some();
+    let transport_tls = tls_identity_paths(&config).is_some();
     let service = OperatingSystemService {
         database,
         transport_tls,
     };
     let mut server = Server::builder();
-    if let (Some(certificate_path), Some(private_key_path)) =
-        (&config.tls_certificate, &config.tls_private_key)
-    {
+    if let Some((certificate_path, private_key_path)) = tls_identity_paths(&config) {
         let identity = Identity::from_pem(
             read_file(certificate_path, "gRPC TLS certificate")?,
             read_file(private_key_path, "gRPC TLS private key")?,
@@ -671,6 +698,48 @@ mod tests {
     fn execution_side_rejects_unspecified() {
         assert!(side(ExecutionSide::Unspecified as i32).is_err());
         assert_eq!(side(ExecutionSide::Buy as i32).unwrap(), Side::Buy);
+    }
+
+    fn base_config() -> RuntimeConfig {
+        RuntimeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            production: false,
+            database_url: None,
+            database_ca: None,
+            tls_certificate: None,
+            tls_private_key: None,
+            tls_client_ca: None,
+        }
+    }
+
+    #[test]
+    fn transport_tls_requires_both_certificate_and_private_key() {
+        let mut config = base_config();
+        config.tls_certificate = Some(PathBuf::from("cert.pem"));
+        assert!(tls_identity_paths(&config).is_none());
+
+        config.tls_private_key = Some(PathBuf::from("key.pem"));
+        assert!(tls_identity_paths(&config).is_some());
+    }
+
+    #[tokio::test]
+    async fn health_check_never_claims_tls_when_only_certificate_is_configured() {
+        let config = {
+            let mut config = base_config();
+            config.tls_certificate = Some(PathBuf::from("cert.pem"));
+            config
+        };
+        let transport_tls = tls_identity_paths(&config).is_some();
+        let service = OperatingSystemService {
+            database: None,
+            transport_tls,
+        };
+        let response = service
+            .check_health(Request::new(HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.transport_tls);
     }
 
     #[test]

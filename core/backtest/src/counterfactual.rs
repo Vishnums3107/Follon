@@ -1,7 +1,22 @@
 //! Counterfactual safety laboratory (DUR-02).
 //!
-//! Simulates "what if" interventions on frozen historical runs without mutating
-//! production state or reusing production order identities.
+//! Aggregates and certifies operator-supplied "what if" intervention results
+//! into delta metrics (fill count, P&L, drawdown, risk rejections) and a
+//! tamper-evident scenario record, keyed to a frozen baseline run identity —
+//! without mutating production state or reusing production order identities.
+//!
+//! This module does **not** itself simulate an intervention, replay a
+//! backtest, or inject network-latency/data-corruption/volatility
+//! perturbations. The baseline and counterfactual figures it diffs are
+//! supplied by the caller — typically deserialized from an operator-authored
+//! JSON configuration file (see `run_counterfactual` in
+//! `apps/cli/src/backtest.rs`) — and are assumed to already come from a real
+//! intervention run performed by a separate tool or human operator. This
+//! engine's guarantee is limited to deterministic, tamper-evident computation
+//! of deltas and certification of whatever figures it is given; it cannot
+//! verify that those figures reflect an actual counterfactual run. Whoever
+//! populates the input is responsible for having actually run (or
+//! commissioned) the real intervention.
 
 use sha2::{Digest, Sha256};
 
@@ -126,11 +141,21 @@ impl CounterfactualScenario {
     }
 }
 
-/// Engine for evaluating counterfactual interventions against frozen baseline runs.
+/// Certifies operator-supplied counterfactual intervention results against a
+/// frozen baseline run by computing deltas between them. Does not execute the
+/// interventions or re-run any simulation itself — see the module-level
+/// documentation for details.
 pub struct CounterfactualEngine;
 
 impl CounterfactualEngine {
-    /// Computes counterfactual divergence metrics comparing a baseline and an intervention.
+    /// Computes divergence metrics between caller-supplied baseline and
+    /// counterfactual figures (fills, P&L, drawdown, risk rejections).
+    ///
+    /// The figures themselves are not computed, perturbed, or verified by
+    /// this function — they must already reflect an intervention run that
+    /// was performed elsewhere (by another tool or by a human operator
+    /// attesting to the results). This function only guarantees a
+    /// deterministic diff and a tamper-evident scenario identifier.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_scenario(
         baseline_run_id: &str,

@@ -69,7 +69,13 @@ impl BrokerStatement {
         for result in rdr.records() {
             let record = result.map_err(|e| AccountingError(format!("CSV parse error: {}", e)))?;
             if record.len() < 3 {
-                continue;
+                let line = record.position().map(|pos| pos.line()).unwrap_or_default();
+                return Err(AccountingError(format!(
+                    "malformed broker statement row at line {}: expected at least 3 fields, found {}: {:?}",
+                    line,
+                    record.len(),
+                    record,
+                )));
             }
             let record_type = &record[0];
             let identifier = &record[1];
@@ -109,7 +115,12 @@ pub fn reconcile_statement(
     for stmt_cash in &statement.cash {
         let currency = Currency::new(&stmt_cash.currency)?;
         let balance = Decimal::from_str(&stmt_cash.balance)?;
-        broker_cash.insert(currency, balance);
+        if broker_cash.insert(currency.clone(), balance).is_some() {
+            return Err(AccountingError(format!(
+                "duplicate CASH row in broker statement for currency {}",
+                currency.as_str()
+            )));
+        }
     }
 
     for (currency, broker_balance) in &broker_cash {
@@ -141,7 +152,15 @@ pub fn reconcile_statement(
     let mut broker_positions = BTreeMap::new();
     for stmt_pos in &statement.positions {
         let quantity = Decimal::from_str(&stmt_pos.quantity)?;
-        broker_positions.insert(stmt_pos.instrument_id.clone(), quantity);
+        if broker_positions
+            .insert(stmt_pos.instrument_id.clone(), quantity)
+            .is_some()
+        {
+            return Err(AccountingError(format!(
+                "duplicate POSITION row in broker statement for instrument {}",
+                stmt_pos.instrument_id
+            )));
+        }
     }
 
     for internal_pos in internal_positions {
@@ -239,5 +258,78 @@ mod tests {
             internal_balance: Decimal::ZERO,
             broker_balance: Decimal::from_str("5000").unwrap(),
         }));
+    }
+
+    #[test]
+    fn from_csv_rejects_malformed_row() {
+        // A broker export that dropped the trailing "value" column from
+        // every row is internally consistent as CSV (every row has the
+        // same field count), so the CSV parser alone will not catch it.
+        // Each row only carries type+identifier, missing the value this
+        // parser requires, and must be rejected rather than silently
+        // `continue`-ing past every row and returning an empty statement.
+        let csv = "type,identifier\nCASH,USD\nPOSITION,AAPL\n";
+
+        let error = BrokerStatement::from_csv(csv)
+            .expect_err("rows with fewer than 3 fields must be rejected, not silently skipped");
+        assert!(
+            error.0.contains("malformed broker statement row"),
+            "unexpected error message: {}",
+            error.0
+        );
+    }
+
+    #[test]
+    fn from_csv_rejects_a_single_truncated_row_amid_well_formed_rows() {
+        // A single dropped field partway through an otherwise well-formed
+        // export must fail the whole parse rather than silently produce a
+        // partial statement that omits the corrupted row.
+        let csv = "type,currency_or_instrument,value\nCASH,USD,5000\nPOSITION,MSFT\n";
+
+        let error = BrokerStatement::from_csv(csv)
+            .expect_err("a truncated row must be rejected, not silently skipped");
+        assert!(
+            !error.0.is_empty(),
+            "expected a descriptive parse error, got an empty message"
+        );
+    }
+
+    #[test]
+    fn reconcile_statement_rejects_duplicate_cash_rows() {
+        let ledger = MultiCurrencyLedger::default();
+        let positions = vec![];
+
+        // Two CASH rows for the same currency: a real export bug (or a
+        // corrupted/replayed statement) must not silently let the second
+        // row overwrite the first.
+        let csv = "type,currency_or_instrument,value\nCASH,USD,5000\nCASH,USD,6000\n";
+        let statement = BrokerStatement::from_csv(csv).unwrap();
+
+        let error = reconcile_statement(&ledger, &positions, &statement, "cash.broker")
+            .expect_err("duplicate CASH rows for the same currency must be rejected");
+        assert!(
+            error.0.contains("duplicate CASH row"),
+            "unexpected error message: {}",
+            error.0
+        );
+    }
+
+    #[test]
+    fn reconcile_statement_rejects_duplicate_position_rows() {
+        let ledger = MultiCurrencyLedger::default();
+        let positions = vec![];
+
+        // Two POSITION rows for the same instrument must not silently let
+        // the second row overwrite the first.
+        let csv = "type,currency_or_instrument,value\nPOSITION,AAPL,100\nPOSITION,AAPL,50\n";
+        let statement = BrokerStatement::from_csv(csv).unwrap();
+
+        let error = reconcile_statement(&ledger, &positions, &statement, "cash.broker")
+            .expect_err("duplicate POSITION rows for the same instrument must be rejected");
+        assert!(
+            error.0.contains("duplicate POSITION row"),
+            "unexpected error message: {}",
+            error.0
+        );
     }
 }

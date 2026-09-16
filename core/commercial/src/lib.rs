@@ -2301,7 +2301,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(label: &str, value: &str) -> Result<Vec<u8>, CommercialError> {
-    if value.len() % 2 != 0
+    if !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte <= b'f'))

@@ -20,15 +20,18 @@ earlier gate is open.
 
 ## Gate enforcement
 
-At the evidence snapshot dated 2026-08-13, the non-live research gate has
-passed. The **30** observed paper sessions and **60** controlled-live sessions
-gates are officially **waived / in progress** to allow immediate development
-of live execution features. Consequently:
+At the evidence snapshot dated 2026-09-14, the non-live research engineering  *
+gate has passed. The **30** observed PAPER sessions and **60** controlled-LIVE
+sessions gates remain open; repository development may continue, but code and
+fixtures do not waive the evidence required to promote or operate those paths.
+Consequently:
 
-- The active execution scope includes building active trading controls for the Release 1 replay-to-paper workflow and LIVE environments.
+- The active executable scope remains the Release 1 replay-to-PAPER workflow.
+- Controlled-LIVE code may be hardened behind inert, fail-closed boundaries,
+  but must not be represented as an admitted operational capability.
 - New brokers, asset classes, India order flow, FIX, multi-account allocation,
-  team features, and additional commercial infrastructure are actively being evaluated.
-- Existing later-phase code is being connected to enable these execution paths.
+  team features, and additional commercial infrastructure remain outside the
+  admitted scope until the preceding gates are independently evidenced.
 - A gate changes status only when its independently retained evidence is linked
   from the relevant implementation-status document. Passing tests proves the
   mechanism, not the real-world outcome.

@@ -515,6 +515,12 @@ struct AdversarialProbeDocument {
     threshold_bps: i64,
 }
 
+/// Reads operator-attested adversarial probe results from a JSON config file
+/// and certifies them into a composite score and pass/fail gate via
+/// `AdversarialResearchGate::evaluate_probes`. This does not run any stress
+/// probe itself — the config file's `passed` / `degradation_bps` values must
+/// already reflect a real stress test performed by a separate tool or human
+/// operator; this command only aggregates and certifies those numbers.
 fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() || arguments.len() > 2 {
         return Err("usage: follon-backtest adversarial <config.json> [output.json]".into());
@@ -551,7 +557,10 @@ fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     write_immutable(&output_path, &json)?;
     eprintln!("adversarial evaluation: {}", output_path.display());
     eprintln!("evaluation id: {}", eval.evaluation_id);
-    eprintln!("gate passed: {}", eval.gate_passed);
+    eprintln!(
+        "gate passed (per operator-supplied probe results): {}",
+        eval.gate_passed
+    );
     eprintln!(
         "composite score bps: {}",
         eval.composite_robustness_score_bps
@@ -618,6 +627,13 @@ fn parse_intervention_type(
     }
 }
 
+/// Reads an operator-supplied counterfactual scenario (baseline run identity,
+/// interventions, and either pre-computed deltas or raw baseline/
+/// counterfactual figures) from a JSON config file and certifies it via
+/// `CounterfactualEngine::evaluate_scenario`. This does not simulate any
+/// intervention itself — the figures in the config file must already come
+/// from a real counterfactual run performed by a separate tool or human
+/// operator; this command only computes deltas and certifies the result.
 fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() || arguments.len() > 2 {
         return Err("usage: follon-backtest counterfactual <config.json> [output.json]".into());

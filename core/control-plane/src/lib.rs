@@ -1737,7 +1737,12 @@ pub struct DeterministicFillModel {
     pub slippage_bps: Decimal,
     /// Exact flat fee per fill.
     pub flat_fee: Decimal,
-    /// Number of complete market bars to wait before the first fill attempt.
+    /// Number of complete market bars to wait before the first fill attempt,
+    /// counted from the bar after the one that produced the order. `0` and `1`
+    /// are equivalent: a newly created order is never eligible on the very
+    /// bar that produced it, since the strategy already observed that bar's
+    /// complete OHLC before deciding, and filling against its own low/high
+    /// would be look-ahead no live order could realize.
     pub latency_bars: u32,
     /// Optional maximum quantity executable on each eligible market bar.
     pub max_fill_quantity: Option<Decimal>,
@@ -2210,9 +2215,19 @@ impl ReplayEngine {
             let change = order.transition(state, reason)?;
             self.emit_order_change(sink, &mut events, &intent, &decision_event_id, change)?;
         }
+        // A newly created order can never be eligible on the same bar that
+        // produced it, even at `latency_bars == 0`. `strategy.on_bar` above
+        // already received this bar's complete OHLC (including `low`/`high`),
+        // so evaluating a fill for a brand-new limit order against this same
+        // bar's own extremes would let the strategy trade on a range it could
+        // only have known once the bar had already closed -- a look-ahead bias
+        // no live order could ever realize. Flooring eligibility at the next
+        // bar closes that gap while leaving already-working orders (whose
+        // `eligible_on_bar` was computed on an earlier bar) and any configured
+        // `latency_bars >= 1` completely unchanged.
         let eligible_on_bar = self
             .bar_sequence
-            .checked_add(u64::from(self.fill_model.latency_bars))
+            .checked_add(u64::from(self.fill_model.latency_bars).max(1))
             .ok_or_else(|| EngineError("simulated order latency overflow".to_owned()))?;
         let mut working = SimulatedWorkingOrder {
             remaining_quantity: intent.quantity,
@@ -3064,7 +3079,22 @@ mod tests {
                 &market,
             )
             .unwrap();
-        assert!(resumed.position.is_some());
+        // The strategy's one-time buy order is created on this first bar it
+        // actually observes, but a newly created order is never eligible
+        // until the following bar (see `process_bar`'s `eligible_on_bar`
+        // comment) -- so no fill has happened yet.
+        assert!(resumed.position.is_none());
+        let filled = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut example_strategy,
+                "acct-paper-001",
+                "2026-01-02T14:33:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap();
+        assert!(filled.position.is_some());
     }
 
     #[test]
@@ -3604,6 +3634,9 @@ mod tests {
                 bar(),
             )
             .unwrap();
+        // Bar 1's order (intent-cumulative-001) is never eligible until bar 2,
+        // so bar 2 both fills it and creates bar 2's own order
+        // (intent-cumulative-002), which is in turn only eligible on bar 3.
         let second = replay
             .process_bar(
                 &mut store,
@@ -3615,8 +3648,96 @@ mod tests {
             .unwrap();
         assert_eq!(
             second.position.unwrap().quantity,
+            Decimal::from_integer(1).unwrap()
+        );
+        let third = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:32:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert_eq!(
+            third.position.unwrap().quantity,
             Decimal::from_integer(2).unwrap()
         );
+    }
+
+    #[test]
+    fn a_new_limit_order_cannot_fill_against_the_same_bar_that_produced_it() {
+        // `bar()` is high=101/low=99/close=100. A strategy that only ever sees
+        // a bar *after* it has fully closed could never have known that low
+        // beforehand; setting a limit exactly at it and filling within that
+        // same bar would be look-ahead no live order could realize.
+        struct BuyAtThisBarsOwnLow {
+            submitted: bool,
+        }
+
+        impl Strategy for BuyAtThisBarsOwnLow {
+            fn on_bar(
+                &mut self,
+                bar: &Bar,
+                replay_time: &str,
+            ) -> Result<Option<OrderIntent>, EngineError> {
+                if self.submitted {
+                    return Ok(None);
+                }
+                self.submitted = true;
+                Ok(Some(OrderIntent {
+                    intent_id: "intent-lookahead-001".to_owned(),
+                    account_id: "acct-paper-001".to_owned(),
+                    strategy_id: "strategy-lookahead-001".to_owned(),
+                    instrument_id: bar.instrument_id.clone(),
+                    correlation_id: "corr-lookahead-001".to_owned(),
+                    side: Side::Buy,
+                    quantity: Decimal::from_integer(1)?,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(bar.low),
+                    time_in_force: TimeInForce::Day,
+                    rationale: "look-ahead regression".to_owned(),
+                    created_at: replay_time.to_owned(),
+                    strategy_version: "strategy-lookahead-v1".to_owned(),
+                    configuration_version: "cfg-example-1".to_owned(),
+                    environment: "SIMULATION".to_owned(),
+                }))
+            }
+        }
+
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = BuyAtThisBarsOwnLow { submitted: false };
+
+        let first = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert!(first.position.is_none());
+        assert!(!first
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::Fill(_))));
+
+        let second = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:32:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert!(second.position.is_some());
+        assert!(second
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::Fill(_))));
     }
 
     struct NewsIntentStrategy;

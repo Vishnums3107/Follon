@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "AdversarialEvaluation",
-  "description": "Adversarial research gate challenging strategy candidates with 5 automated stress probes (DUR-06).",
+  "description": "Deterministic certification of 5 caller-supplied adversarial stress-probe results (DUR-06); this artifact does not prove the probes were executed.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -60,7 +60,10 @@
       "minimum": 0,
       "maximum": 10000
     },
-    "gate_passed": { "type": "boolean" },
+    "gate_passed": {
+      "type": "boolean",
+      "description": "Deterministic aggregate of the caller-supplied probe outcomes; not proof that any probe was executed."
+    },
     "blocking_failure_reasons": {
       "type": "array",
       "items": { "type": "string" }

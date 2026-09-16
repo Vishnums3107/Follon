@@ -1877,6 +1877,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         &mut self.broker
     }
 
+    /// Returns the canonical account identity owned by this service instance.
+    /// Delivery boundaries use this before account-scoped cancel/close actions
+    /// so a syntactically valid but mismatched account can never act on an
+    /// order or position belonging to the configured route.
+    pub fn account_id(&self) -> &str {
+        &self.account.account_id
+    }
+
     /// Returns an OMS order by its immutable client identity.
     pub fn order(&self, order_id: &str) -> Option<&PaperOrder> {
         self.orders.get(order_id)
@@ -2089,6 +2097,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .ok_or_else(|| PaperError("paper OMS does not know order".to_owned()))?
             .oms
             .state;
+        // A retry after the original cancellation was durably accepted or
+        // completed is an idempotent success. Re-sending to the adapter could
+        // manufacture an avoidable broker error and turn authoritative
+        // cancellation evidence into ambiguity.
+        if matches!(state, OrderState::PendingCancel | OrderState::Cancelled) {
+            return Ok(());
+        }
         if !matches!(
             state,
             OrderState::Acknowledged | OrderState::PartiallyFilled
@@ -2195,12 +2210,37 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             }
         };
         let count = events.len();
+        let mut apply_errors = Vec::new();
         for event in events {
-            self.apply_broker_event(event)?;
+            // `poll` drains broker evidence, so an event that fails to apply can
+            // never be re-fetched: aborting the whole loop on the first failure
+            // would silently and permanently lose every event still queued
+            // behind it. Snapshot the mutable state first so a failed
+            // application leaves no partial mutation in memory, then keep
+            // applying the remaining events in the batch.
+            let orders_snapshot = self.orders.clone();
+            let portfolios_snapshot = self.portfolios.clone();
+            let execution_ids_snapshot = self.execution_ids.clone();
+            let cash_snapshot = self.cash;
+            if let Err(error) = self.apply_broker_event(event) {
+                self.orders = orders_snapshot;
+                self.portfolios = portfolios_snapshot;
+                self.execution_ids = execution_ids_snapshot;
+                self.cash = cash_snapshot;
+                apply_errors.push(error.0);
+                continue;
+            }
             // Broker evidence is append-only. Persist each arrival so resolving an
             // UNKNOWN or correcting an earlier terminal observation never rewrites
             // the durable history.
             self.persist()?;
+        }
+        if !apply_errors.is_empty() {
+            return Err(PaperError(format!(
+                "paper broker synchronize failed to apply {} of {count} broker events (each rolled back cleanly): {}",
+                apply_errors.len(),
+                apply_errors.join("; "),
+            )));
         }
         Ok(count)
     }
@@ -2641,14 +2681,32 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .map_err(|error| PaperError(error.to_string()))?;
         let rate_window_start = decision_time
             - time::Duration::seconds(self.risk_policy.order_rate_window_seconds as i64);
+        // Rate-window membership is keyed off each order's own risk *decision* time
+        // (`RiskDecision::decided_at`, sourced from `risk_evidence`), not the
+        // caller-supplied `OrderIntent::created_at`. `created_at` is stamped by the
+        // strategy/operator that originated the intent and is not otherwise
+        // constrained to reflect wall-clock reality, so counting against it would
+        // let a caller understate its own submission rate and silently bypass
+        // `MAX_ORDER_RATE_EXCEEDED` by backdating `created_at` on new intents.
         let recent_order_count =
             self.orders
                 .values()
                 .try_fold(0u32, |count, order| -> Result<u32, PaperError> {
-                    let created_at = OffsetDateTime::parse(&order.oms.intent.created_at, &Rfc3339)
+                    let decision_id = format!("paper-risk-{}", order.oms.intent.intent_id);
+                    let order_decided_at = self
+                        .risk_evidence
+                        .get(&decision_id)
+                        .map(|evidence| evidence.decision.decided_at.as_str())
+                        .ok_or_else(|| {
+                            PaperError(
+                                "paper order is missing its originating risk evidence".to_owned(),
+                            )
+                        })?;
+                    let order_decided_at = OffsetDateTime::parse(order_decided_at, &Rfc3339)
                         .map_err(|error| PaperError(error.to_string()))?;
                     Ok(
-                        if created_at > rate_window_start && created_at <= decision_time {
+                        if order_decided_at > rate_window_start && order_decided_at <= decision_time
+                        {
                             count + 1
                         } else {
                             count
@@ -3374,8 +3432,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         let max_position_quantity = self.risk_policy.max_position_quantity.to_string();
         let max_realized_loss = self.risk_policy.max_realized_loss.to_string();
         let max_market_data_age_seconds = self.risk_policy.max_market_data_age_seconds.to_string();
+        let max_order_rate = self.risk_policy.max_order_rate.to_string();
+        let order_rate_window_seconds = self.risk_policy.order_rate_window_seconds.to_string();
         let mut parts = vec![
-            "paper-configuration-v2",
+            "paper-configuration-v3",
             &self.account.account_id,
             &self.account.currency,
             &initial_cash,
@@ -3389,6 +3449,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             &max_position_quantity,
             &max_realized_loss,
             &max_market_data_age_seconds,
+            &max_order_rate,
+            &order_rate_window_seconds,
             &self.kill_switches.version,
         ];
         if !self.broker_route_fingerprint.is_empty() {
@@ -4652,6 +4714,52 @@ mod tests {
             .decision
             .evaluated_limits
             .contains("recent_order_count=2"));
+    }
+
+    #[test]
+    fn paper_order_rate_limit_counts_decision_time_not_caller_supplied_created_at() {
+        let mut rate_limited_policy = policy();
+        rate_limited_policy.max_order_rate = 2;
+        let mut service = PaperTradingService::new(
+            account(),
+            rate_limited_policy,
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account()).unwrap(),
+        )
+        .unwrap();
+        // Every intent claims a `created_at` far outside the rate window, but each
+        // is actually decided within it: a caller must not be able to understate
+        // its own submission rate and bypass `MAX_ORDER_RATE_EXCEEDED` by
+        // backdating the intent's self-reported `created_at`.
+        let first = service
+            .submit_intent(
+                intent("intent-paper-rate-backdate-001", "2020-01-01T00:00:00Z"),
+                market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:31:00Z",
+            )
+            .unwrap();
+        assert!(first.decision.approved);
+        let second = service
+            .submit_intent(
+                intent("intent-paper-rate-backdate-002", "2020-01-01T00:00:00Z"),
+                market("2026-01-02T14:31:01Z"),
+                "2026-01-02T14:31:01Z",
+            )
+            .unwrap();
+        assert!(second.decision.approved);
+        let third = service
+            .submit_intent(
+                intent("intent-paper-rate-backdate-003", "2020-01-01T00:00:00Z"),
+                market("2026-01-02T14:31:02Z"),
+                "2026-01-02T14:31:02Z",
+            )
+            .unwrap();
+        assert!(!third.decision.approved);
+        assert!(third.order_id.is_none());
+        assert!(third
+            .decision
+            .reason_codes
+            .contains(&"MAX_ORDER_RATE_EXCEEDED".to_owned()));
     }
 
     #[test]

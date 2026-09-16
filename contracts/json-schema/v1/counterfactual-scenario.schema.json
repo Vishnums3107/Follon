@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CounterfactualScenario",
-  "description": "Counterfactual replay experiment simulating interventions on frozen baseline runs without mutating production history (DUR-02).",
+  "description": "Deterministic comparison of caller-supplied baseline and intervention results for a frozen run (DUR-02); this artifact does not execute or prove a counterfactual replay.",
   "type": "object",
   "additionalProperties": false,
   "required": [

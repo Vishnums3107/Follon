@@ -1,14 +1,29 @@
 //! Adversarial research gate (DUR-06).
 //!
-//! Automatically challenges strategy candidates with 5 automated stress probes
-//! to identify look-ahead leakage, fragility to noise, cost vulnerability,
-//! parameter cliff overfitting, and regime shifts.
+//! Aggregates and certifies the results of the 5 standardized adversarial
+//! stress probes (look-ahead leakage, noise fragility, cost vulnerability,
+//! parameter cliff overfitting, and regime shifts) into a single composite
+//! robustness score and a pass/fail gate decision.
+//!
+//! This module does **not** itself execute a backtest, inject noise/latency/
+//! cost perturbations, time-shift any indicator, or otherwise run a stress
+//! test. Each probe's `passed` / `degradation_bps` figures are supplied by
+//! the caller — typically deserialized from an operator-authored JSON
+//! configuration file (see `run_adversarial` in `apps/cli/src/backtest.rs`)
+//! — and are assumed to already reflect a real stress test that was executed
+//! by a separate tool or human operator. This gate's guarantee is limited to
+//! deterministic, tamper-evident aggregation and certification of whatever
+//! probe results it is handed; it cannot verify that those results actually
+//! came from a real simulation. Whoever populates the input is responsible
+//! for having actually run (or commissioned) the real probes.
 
 use sha2::{Digest, Sha256};
 
 use crate::BacktestError;
 
-/// Individual probe evaluation result within an adversarial audit.
+/// Operator-attested result of a single stress probe, supplied by the caller.
+/// This module does not compute or verify these values — it only aggregates
+/// and certifies whatever numbers it is given.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdversarialProbeResult {
     /// Standardized probe identifier.
@@ -90,11 +105,22 @@ impl AdversarialEvaluation {
     }
 }
 
-/// Adversarial research gate conducting the 5 standardized stress probes.
+/// Certifies operator-attested results for the 5 standardized adversarial
+/// stress probes into a composite score and pass/fail gate. Does not execute
+/// the probes itself — see the module-level documentation for details.
 pub struct AdversarialResearchGate;
 
 impl AdversarialResearchGate {
-    /// Evaluates candidate strategy probe outcomes and generates a certified report.
+    /// Aggregates caller-supplied probe outcomes into a composite robustness
+    /// score and a certified, tamper-evident gate report.
+    ///
+    /// This function performs no simulation, perturbation, or stress testing
+    /// of its own: `probes` must already contain the outcomes of a real
+    /// adversarial stress test that was run elsewhere (by another tool or by
+    /// a human operator attesting to the results). The correctness of the
+    /// resulting report depends entirely on the accuracy of the probe results
+    /// it is given; this function only guarantees consistent, deterministic
+    /// aggregation and a tamper-evident evaluation identifier.
     pub fn evaluate_probes(
         strategy_version: &str,
         probes: Vec<AdversarialProbeResult>,

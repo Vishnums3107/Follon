@@ -25,8 +25,26 @@ from time import monotonic
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import urlopen
 
+def _ancestor(path: Path, levels: int) -> Path:
+    """Returns the ``levels``-th ancestor of ``path``, or the root-most
+    ancestor available if ``path`` is not nested that deeply.
+
+    In the real repository layout (``apps/desktop/server.py``), two levels up
+    from this file is the repository root. The dashboard's Docker image,
+    however, copies this file directly to ``/app/server.py`` -- a flattened
+    layout with no such ancestor -- and this value is only ever used as a
+    fallback default for ``FOLLON_EVIDENCE_ROOT``/``FOLLON_DASHBOARD_STATIC_ROOT``,
+    which the image always sets explicitly. Indexing ``.parents[levels]``
+    directly would raise ``IndexError`` and crash the server before that
+    override is even consulted, in an environment that was never going to use
+    the fallback value anyway.
+    """
+    parents = path.parents
+    return parents[levels] if levels < len(parents) else parents[-1]
+
+
 _DEFAULT_STATIC = Path(__file__).resolve().parent / "web-dist"
-_DEFAULT_EVIDENCE = Path(__file__).resolve().parents[2] / "var"
+_DEFAULT_EVIDENCE = _ancestor(Path(__file__).resolve(), 2) / "var"
 STATIC_ROOT = Path(
     os.environ.get(
         "FOLLON_DASHBOARD_STATIC_ROOT",

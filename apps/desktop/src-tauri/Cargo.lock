@@ -803,12 +803,71 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "follon-control-plane"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "follon-instrument",
+ "follon-news",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "follon-desktop"
 version = "0.1.0"
 dependencies = [
+ "follon-domain",
+ "follon-paper",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
+ "time",
+]
+
+[[package]]
+name = "follon-domain"
+version = "0.1.0"
+dependencies = [
+ "time",
+]
+
+[[package]]
+name = "follon-fx"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "time",
+]
+
+[[package]]
+name = "follon-instrument"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "follon-fx",
+]
+
+[[package]]
+name = "follon-news"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "serde_json",
+]
+
+[[package]]
+name = "follon-paper"
+version = "0.1.0"
+dependencies = [
+ "follon-control-plane",
+ "follon-domain",
+ "follon-instrument",
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
  "time",
 ]
 
@@ -846,6 +905,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

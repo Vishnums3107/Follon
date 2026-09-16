@@ -2383,12 +2383,22 @@ mod tests {
     }
 
     fn runner_input() -> BacktestInput {
+        // `BuyOnceStrategy` submits its one order on the first bar it sees
+        // (14:30), but a newly created order is never eligible until the
+        // following bar (see `ReplayEngine::process_bar`'s `eligible_on_bar`
+        // comment), so the fill actually happens on the second bar (14:31),
+        // still at the pre-split price level. The split then lands between
+        // the second and third bars, adjusting the now-filled position; the
+        // third bar (14:32, already at the post-split price level) is only
+        // present so replay has a tick that crosses the split's
+        // `effective_at` boundary and applies it.
         let first = bar();
-        let mut second = bar();
-        second.open = Decimal::from_integer(50).unwrap();
-        second.high = Decimal::from_integer(51).unwrap();
-        second.low = Decimal::from_integer(49).unwrap();
-        second.close = Decimal::from_integer(50).unwrap();
+        let second = bar();
+        let mut third = bar();
+        third.open = Decimal::from_integer(50).unwrap();
+        third.high = Decimal::from_integer(51).unwrap();
+        third.low = Decimal::from_integer(49).unwrap();
+        third.close = Decimal::from_integer(50).unwrap();
         BacktestInput {
             account_id: "acct-paper-001".to_owned(),
             currency: "USD".to_owned(),
@@ -2402,11 +2412,15 @@ mod tests {
                     event_time: "2026-01-02T14:31:00Z".to_owned(),
                     bar: second,
                 },
+                HistoricalBar {
+                    event_time: "2026-01-02T14:32:00Z".to_owned(),
+                    bar: third,
+                },
             ],
             corporate_actions: vec![CorporateAction::Split {
                 action_id: "action-split-001".to_owned(),
                 instrument_id: "inst.us_equity.spy".to_owned(),
-                effective_at: "2026-01-02T14:30:30Z".to_owned(),
+                effective_at: "2026-01-02T14:31:30Z".to_owned(),
                 ratio: Decimal::from_integer(2).unwrap(),
             }],
         }
@@ -2435,7 +2449,7 @@ mod tests {
             seed: 7,
             engine_version: "engine-v1".to_owned(),
             starts_at: "2026-01-02T14:30:00Z".to_owned(),
-            ends_at: "2026-01-02T14:31:00Z".to_owned(),
+            ends_at: "2026-01-02T14:32:00Z".to_owned(),
         }
     }
 
@@ -2492,7 +2506,7 @@ mod tests {
         assert_eq!(first.artifact.accounting_entries.len(), 2);
         assert_eq!(first.artifact.performance.trade_count, 1);
         assert_eq!(first.artifact.performance.corporate_action_count, 1);
-        assert_eq!(first.artifact.performance.equity_curve.len(), 2);
+        assert_eq!(first.artifact.performance.equity_curve.len(), 3);
         assert!(first
             .artifact
             .markdown_report()
