@@ -11,18 +11,20 @@ use follon_accounting::{Currency, FxBook, FxQuote, MarginPolicy, MarginRate};
 use follon_backtest::{
     AdvancedBacktestAccount, AdvancedBacktestReport, AdvancedInstrumentTerms,
     AdversarialProbeResult, AdversarialResearchGate, BacktestCapitalCheck,
-    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec,
+    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec, CompletedBacktest,
     CounterfactualDeltaMetrics, CounterfactualEngine, CounterfactualIntervention,
     CounterfactualInterventionType, CounterfactualScenario, DatasetManifest, ExperimentRecord,
     FileExperimentStore,
 };
 use follon_cli::{sha256_text, write_immutable};
 use follon_control_plane::{
-    import_historical_bars, BuyOnceStrategy, DeterministicFillModel, MarketPreconditions,
-    ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity,
+    import_historical_bars, BuyOnceStrategy, DeterministicFillModel, HistoricalBar,
+    MarketPreconditions, ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity,
     StrategyWorkerServicesConfig,
 };
-use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, Fill, Side};
+use follon_domain::{
+    validate_canonical_id, validate_utc_timestamp, Decimal, Fill, Side, DECIMAL_SCALE,
+};
 use follon_instrument::{
     AssetClass, Instrument, InstrumentRegistry, InstrumentVersion, StaticTradingCalendar,
     TradingHalt, TradingSession,
@@ -502,7 +504,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct AdversarialConfigDocument {
     strategy_version: String,
     evaluated_at: String,
+    #[serde(default)]
     probes: Vec<AdversarialProbeDocument>,
+    #[serde(default)]
+    execute: Option<AdversarialExecuteDocument>,
 }
 
 #[derive(Deserialize)]
@@ -515,12 +520,45 @@ struct AdversarialProbeDocument {
     threshold_bps: i64,
 }
 
-/// Reads operator-attested adversarial probe results from a JSON config file
-/// and certifies them into a composite score and pass/fail gate via
-/// `AdversarialResearchGate::evaluate_probes`. This does not run any stress
-/// probe itself — the config file's `passed` / `degradation_bps` values must
-/// already reflect a real stress test performed by a separate tool or human
-/// operator; this command only aggregates and certifies those numbers.
+/// Configuration for actually executing the 5 standardized stress probes
+/// against a real deterministic backtest, instead of certifying
+/// operator-attested figures. See [`execute_adversarial_probes`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialExecuteDocument {
+    /// Path to a `backtest-*.json`-shaped configuration, resolved relative to
+    /// the directory containing this adversarial config file.
+    backtest_configuration: String,
+    /// Path to the historical-bar CSV, resolved the same way.
+    historical_bars: String,
+    /// Seed for the deterministic perturbations used by the noise and regime
+    /// probes (independent of the backtest configuration's own `seed`).
+    #[serde(default)]
+    seed: u64,
+    probes: Vec<AdversarialExecuteProbeDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialExecuteProbeDocument {
+    probe_name: String,
+    probe_description: String,
+    threshold_bps: i64,
+}
+
+/// Certifies adversarial probe results into a composite score and pass/fail
+/// gate via `AdversarialResearchGate::evaluate_probes`.
+///
+/// The config file selects one of two modes. `probes` (a `passed` /
+/// `degradation_bps` value per probe) is operator-attested: this command does
+/// not run any stress probe itself, and those figures must already reflect a
+/// real stress test performed by a separate tool or human operator. `execute`
+/// instead names a real backtest configuration and historical-bar corpus;
+/// this command then actually drives the built-in deterministic strategy
+/// through 5 genuine perturbed replays (see [`execute_adversarial_probes`])
+/// and computes `passed`/`degradation_bps` from their real output. Either way
+/// the final certification step — aggregation, composite score, and gate
+/// decision — is the same unchanged `AdversarialResearchGate`.
 fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() || arguments.len() > 2 {
         return Err("usage: follon-backtest adversarial <config.json> [output.json]".into());
@@ -535,17 +573,30 @@ fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     let doc: AdversarialConfigDocument = serde_json::from_str(&content)?;
     validate_utc_timestamp("evaluated_at", &doc.evaluated_at)?;
 
-    let probes: Vec<AdversarialProbeResult> = doc
-        .probes
-        .into_iter()
-        .map(|p| AdversarialProbeResult {
-            probe_name: p.probe_name,
-            probe_description: p.probe_description,
-            passed: p.passed,
-            degradation_bps: p.degradation_bps,
-            threshold_bps: p.threshold_bps,
-        })
-        .collect();
+    let probes: Vec<AdversarialProbeResult> = match (doc.execute, doc.probes) {
+        (Some(_), probes) if !probes.is_empty() => {
+            return Err(
+                "adversarial config cannot combine 'execute' with attested 'probes' results".into(),
+            );
+        }
+        (Some(execute), _) => {
+            let base_dir = input_path.parent().unwrap_or_else(|| Path::new("."));
+            execute_adversarial_probes(base_dir, &execute)?
+        }
+        (None, probes) if probes.is_empty() => {
+            return Err("adversarial config must specify 'probes' or 'execute'".into());
+        }
+        (None, probes) => probes
+            .into_iter()
+            .map(|p| AdversarialProbeResult {
+                probe_name: p.probe_name,
+                probe_description: p.probe_description,
+                passed: p.passed,
+                degradation_bps: p.degradation_bps,
+                threshold_bps: p.threshold_bps,
+            })
+            .collect(),
+    };
 
     let eval =
         AdversarialResearchGate::evaluate_probes(&doc.strategy_version, probes, &doc.evaluated_at)?;
@@ -557,10 +608,7 @@ fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     write_immutable(&output_path, &json)?;
     eprintln!("adversarial evaluation: {}", output_path.display());
     eprintln!("evaluation id: {}", eval.evaluation_id);
-    eprintln!(
-        "gate passed (per operator-supplied probe results): {}",
-        eval.gate_passed
-    );
+    eprintln!("gate passed: {}", eval.gate_passed);
     eprintln!(
         "composite score bps: {}",
         eval.composite_robustness_score_bps
@@ -582,6 +630,21 @@ struct CounterfactualConfigDocument {
     delta_metrics: Option<CounterfactualDeltaMetricsDocument>,
     #[serde(default)]
     metrics: Option<CounterfactualMetricsDocument>,
+    #[serde(default)]
+    execute: Option<CounterfactualExecuteDocument>,
+}
+
+/// Configuration for actually executing the declared `interventions` against
+/// a real deterministic backtest, instead of certifying operator-attested
+/// figures. See [`execute_counterfactual_scenario`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterfactualExecuteDocument {
+    /// Path to a `backtest-*.json`-shaped configuration, resolved relative to
+    /// the directory containing this counterfactual config file.
+    backtest_configuration: String,
+    /// Path to the historical-bar CSV, resolved the same way.
+    historical_bars: String,
 }
 
 #[derive(Deserialize)]
@@ -627,13 +690,21 @@ fn parse_intervention_type(
     }
 }
 
-/// Reads an operator-supplied counterfactual scenario (baseline run identity,
-/// interventions, and either pre-computed deltas or raw baseline/
-/// counterfactual figures) from a JSON config file and certifies it via
-/// `CounterfactualEngine::evaluate_scenario`. This does not simulate any
-/// intervention itself — the figures in the config file must already come
-/// from a real counterfactual run performed by a separate tool or human
-/// operator; this command only computes deltas and certifies the result.
+/// Reads an operator-supplied counterfactual scenario (baseline run identity
+/// and interventions) from a JSON config file and certifies it via
+/// `CounterfactualEngine::evaluate_scenario`.
+///
+/// The config file selects one of three ways to obtain the baseline/
+/// counterfactual figures. `metrics` and `delta_metrics` are
+/// operator-attested: this command does not simulate any intervention
+/// itself, and those figures must already come from a real counterfactual
+/// run performed by a separate tool or human operator. `execute` instead
+/// names a real backtest configuration and historical-bar corpus; this
+/// command then actually drives the built-in deterministic strategy through
+/// two genuine replays — one unperturbed, one with every declared
+/// intervention applied (see [`execute_counterfactual_scenario`]) — and
+/// computes the metrics from their real output. Either way the final
+/// certification step is the same unchanged `CounterfactualEngine`.
 fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() || arguments.len() > 2 {
         return Err("usage: follon-backtest counterfactual <config.json> [output.json]".into());
@@ -659,7 +730,34 @@ fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
         });
     }
 
-    let scenario = if let Some(m) = doc.metrics {
+    let scenario = if let Some(execute) = doc.execute {
+        if doc.metrics.is_some() || doc.delta_metrics.is_some() {
+            return Err(
+                "counterfactual config cannot combine 'execute' with 'metrics' or 'delta_metrics'"
+                    .into(),
+            );
+        }
+        if interventions.is_empty() {
+            return Err("counterfactual scenario requires at least one intervention".into());
+        }
+        let base_dir = input_path.parent().unwrap_or_else(|| Path::new("."));
+        let m = execute_counterfactual_scenario(base_dir, &execute, &interventions, doc.seed)?;
+        CounterfactualEngine::evaluate_scenario(
+            &doc.baseline_run_id,
+            doc.seed,
+            interventions,
+            m.baseline_fills,
+            m.counterfactual_fills,
+            m.baseline_pnl_cents,
+            m.counterfactual_pnl_cents,
+            m.baseline_max_drawdown_bps,
+            m.counterfactual_max_drawdown_bps,
+            m.baseline_rejections,
+            m.counterfactual_rejections,
+            &doc.divergence_event_id,
+            &doc.created_at,
+        )?
+    } else if let Some(m) = doc.metrics {
         CounterfactualEngine::evaluate_scenario(
             &doc.baseline_run_id,
             doc.seed,
@@ -705,7 +803,7 @@ fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
         }
     } else {
         return Err(
-            "counterfactual config must specify either 'metrics' or 'delta_metrics'".into(),
+            "counterfactual config must specify 'execute', 'metrics', or 'delta_metrics'".into(),
         );
     };
 
@@ -718,6 +816,622 @@ fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
     eprintln!("scenario id: {}", scenario.scenario_id);
     eprintln!("baseline run id: {}", scenario.baseline_run_id);
     Ok(())
+}
+
+/// Immutable inputs shared by every genuine replay a counterfactual
+/// intervention or adversarial probe drives, factored out of a loaded
+/// `RuntimeConfiguration` so each perturbed rerun only has to name what it
+/// actually changes: bars, risk policy, fill model, or entry threshold.
+struct ReplayContext<'a> {
+    account_id: &'a str,
+    currency: &'a str,
+    initial_cash: Decimal,
+    strategy_id: &'a str,
+    strategy_version: &'a str,
+    configuration_id: &'a str,
+    configuration_version: &'a str,
+    configuration_hash: &'a str,
+    engine_version: &'a str,
+    seed: u64,
+    instruments: &'a InstrumentRegistry,
+    calendar: &'a StaticTradingCalendar,
+    dataset_id: &'a str,
+    dataset_version: &'a str,
+    reference_data_version: &'a str,
+    universe_id: &'a str,
+}
+
+impl<'a> ReplayContext<'a> {
+    fn from_configuration(
+        document: &'a BacktestConfigurationDocument,
+        configuration: &'a RuntimeConfiguration,
+    ) -> Self {
+        Self {
+            account_id: &document.account.account_id,
+            currency: &document.account.currency,
+            initial_cash: configuration.initial_cash,
+            strategy_id: &document.strategy.strategy_id,
+            strategy_version: &document.strategy.strategy_version,
+            configuration_id: &document.configuration_id,
+            configuration_version: &document.configuration_version,
+            configuration_hash: &configuration.content_hash,
+            engine_version: &document.engine_version,
+            seed: document.seed,
+            instruments: &configuration.instruments,
+            calendar: &configuration.calendar,
+            dataset_id: &document.dataset.dataset_id,
+            dataset_version: &document.dataset.dataset_version,
+            reference_data_version: &document.dataset.reference_data_version,
+            universe_id: &document.dataset.universe_id,
+        }
+    }
+
+    /// Executes one complete, independent, single-use replay of the built-in
+    /// `BuyOnceStrategy` against the given bars and economics. No corporate
+    /// actions are supported at this boundary: a counterfactual or
+    /// adversarial rerun perturbs price, cost, timing, or risk-limit inputs,
+    /// not corporate-action evidence.
+    fn run(
+        &self,
+        bars: Vec<HistoricalBar>,
+        risk_policy: RiskPolicy,
+        fill_model: DeterministicFillModel,
+        entry_threshold: Decimal,
+    ) -> Result<CompletedBacktest, Box<dyn std::error::Error>> {
+        let dataset_bars: Vec<_> = bars
+            .iter()
+            .map(|bar| (bar.event_time.clone(), bar.bar.clone()))
+            .collect();
+        let dataset = DatasetManifest::from_market_data(
+            self.dataset_id,
+            self.dataset_version,
+            self.reference_data_version,
+            self.universe_id,
+            &dataset_bars,
+            &[],
+        )?;
+        let starts_at = dataset.starts_at.clone();
+        let ends_at = dataset.ends_at.clone();
+        let strategy_bundle_hash =
+            format!("{:x}", Sha256::digest(BUILTIN_STRATEGY_SOURCE.as_bytes()));
+        let spec = BacktestSpec {
+            strategy_bundle_hash,
+            dataset,
+            configuration_id: self.configuration_id.to_owned(),
+            configuration_version: self.configuration_version.to_owned(),
+            configuration_hash: self.configuration_hash.to_owned(),
+            seed: self.seed,
+            engine_version: self.engine_version.to_owned(),
+            starts_at: starts_at.clone(),
+            ends_at,
+        };
+        let market = MarketPreconditions {
+            instruments: self.instruments,
+            calendar: self.calendar,
+        };
+        let mut runner = BacktestRunner::new(
+            spec,
+            ReplayEngine::new(
+                starts_at,
+                self.engine_version,
+                self.configuration_version,
+                risk_policy,
+                fill_model,
+            )?,
+        )?;
+        let input = BacktestInput {
+            account_id: self.account_id.to_owned(),
+            currency: self.currency.to_owned(),
+            initial_cash: self.initial_cash,
+            bars,
+            corporate_actions: Vec::new(),
+        };
+        let mut strategy = BuyOnceStrategy::new(
+            self.account_id,
+            self.strategy_id,
+            self.strategy_version,
+            self.configuration_version,
+            entry_threshold,
+        );
+        Ok(runner.run(&mut strategy, &input, &market)?)
+    }
+}
+
+/// Converts a [`Decimal`] to an exact integer count of `unit_scale`-sized
+/// units (for example `DECIMAL_SCALE / 100` for cents, or `DECIMAL_SCALE` for
+/// integer basis points already expressed as a whole-number `Decimal`),
+/// truncating any remaining fraction.
+fn decimal_to_scaled_i64(
+    value: Decimal,
+    unit_scale: i128,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    i64::try_from(value.scaled() / unit_scale).map_err(|_| "decimal value out of i64 range".into())
+}
+
+/// Counts `risk.decision.v1` canonical events carrying `"approved":false`,
+/// the exact rejection marker every real pre-trade risk decision emits.
+fn count_risk_rejections(canonical_events: &[String]) -> i64 {
+    canonical_events
+        .iter()
+        .filter(|event| {
+            event.contains("\"event_type\":\"risk.decision.v1\"")
+                && event.contains("\"approved\":false")
+        })
+        .count() as i64
+}
+
+/// Real fill count, total (realized plus unrealized) P&L in cents, maximum
+/// drawdown in basis points, and risk-rejection count derived from one
+/// genuinely completed replay.
+fn summarize_run(
+    completed: &CompletedBacktest,
+) -> Result<(i64, i64, i64, i64), Box<dyn std::error::Error>> {
+    let fills = i64::try_from(completed.artifact.performance.trade_count)
+        .map_err(|_| "trade count out of i64 range")?;
+    let total_pnl = completed
+        .artifact
+        .report
+        .realized_pnl
+        .checked_add(completed.artifact.report.unrealized_pnl)?;
+    let pnl_cents = decimal_to_scaled_i64(total_pnl, DECIMAL_SCALE / 100)?;
+    let drawdown_bps = decimal_to_scaled_i64(
+        completed.artifact.performance.max_drawdown_bps,
+        DECIMAL_SCALE,
+    )?;
+    let rejections = count_risk_rejections(&completed.canonical_events);
+    Ok((fills, pnl_cents, drawdown_bps, rejections))
+}
+
+/// Applies a basis-point shift to a [`Decimal`]: `10_000 + bps` parts per
+/// ten-thousand of the original value. A negative `bps` shrinks it.
+fn shift_by_bps(value: Decimal, bps: i64) -> Result<Decimal, Box<dyn std::error::Error>> {
+    let multiplier =
+        Decimal::from_integer(10_000 + bps)?.checked_div(Decimal::from_integer(10_000)?)?;
+    Ok(value.checked_mul(multiplier)?)
+}
+
+/// Scales every OHLC field of every bar from `start_index` onward by the same
+/// `shock_bps` basis-point factor, preserving each bar's internal ordering
+/// (open/close within [low, high]) exactly because all four fields move by
+/// the identical positive multiplier.
+fn shock_bars_from(
+    bars: &[HistoricalBar],
+    start_index: usize,
+    shock_bps: i64,
+) -> Result<Vec<HistoricalBar>, Box<dyn std::error::Error>> {
+    let mut result = bars.to_vec();
+    for historical in result.iter_mut().skip(start_index) {
+        historical.bar.open = shift_by_bps(historical.bar.open, shock_bps)?;
+        historical.bar.high = shift_by_bps(historical.bar.high, shock_bps)?;
+        historical.bar.low = shift_by_bps(historical.bar.low, shock_bps)?;
+        historical.bar.close = shift_by_bps(historical.bar.close, shock_bps)?;
+        historical.bar.validate()?;
+    }
+    Ok(result)
+}
+
+/// Removes `count` consecutive bars starting at `start_index`, simulating a
+/// missing-data gap. At least one bar must remain.
+fn drop_bars(
+    bars: &[HistoricalBar],
+    start_index: usize,
+    count: usize,
+) -> Result<Vec<HistoricalBar>, Box<dyn std::error::Error>> {
+    let mut result = bars.to_vec();
+    let start = start_index.min(result.len());
+    let end = start.saturating_add(count).min(result.len());
+    result.drain(start..end);
+    if result.is_empty() {
+        return Err("DATA_BAR_CORRUPTION would remove every bar".into());
+    }
+    Ok(result)
+}
+
+/// Deterministic pseudo-random basis-point offset in `[-magnitude, magnitude]`
+/// for one bar, derived from a scenario seed and the bar's index so the same
+/// seed always reproduces byte-identical perturbed bars.
+fn deterministic_bps_offset(seed: u64, index: usize, magnitude_bps: i64) -> i64 {
+    if magnitude_bps <= 0 {
+        return 0;
+    }
+    let digest = Sha256::digest(format!("{seed}:{index}").as_bytes());
+    let raw = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    let span = u32::try_from(2 * magnitude_bps + 1).unwrap_or(u32::MAX);
+    i64::from(raw % span) - magnitude_bps
+}
+
+/// Applies an independent deterministic +/- `magnitude_bps` noise offset to
+/// every bar's OHLC fields, simulating microstructure jitter.
+fn jitter_bars(
+    bars: &[HistoricalBar],
+    seed: u64,
+    magnitude_bps: i64,
+) -> Result<Vec<HistoricalBar>, Box<dyn std::error::Error>> {
+    let mut result = bars.to_vec();
+    for (index, historical) in result.iter_mut().enumerate() {
+        let offset = deterministic_bps_offset(seed, index, magnitude_bps);
+        historical.bar.open = shift_by_bps(historical.bar.open, offset)?;
+        historical.bar.high = shift_by_bps(historical.bar.high, offset)?;
+        historical.bar.low = shift_by_bps(historical.bar.low, offset)?;
+        historical.bar.close = shift_by_bps(historical.bar.close, offset)?;
+        historical.bar.validate()?;
+    }
+    Ok(result)
+}
+
+/// Applies a `RISK_COLLAR_ADJUSTMENT` intervention to a cloned risk policy.
+/// `parameter_name` selects which pre-trade limit changes; every other field
+/// keeps its baseline value.
+fn apply_risk_override(
+    base: &RiskPolicy,
+    parameter_name: &str,
+    counterfactual_value: &str,
+) -> Result<RiskPolicy, Box<dyn std::error::Error>> {
+    let mut policy = base.clone();
+    match parameter_name {
+        "max_quantity" => policy.max_quantity = decimal(counterfactual_value)?,
+        "max_notional" => policy.max_notional = decimal(counterfactual_value)?,
+        "max_price_deviation_bps" => policy.max_price_deviation_bps = decimal(counterfactual_value)?,
+        "global_kill_switch" => {
+            policy.global_kill_switch = counterfactual_value.parse::<bool>().map_err(|_| {
+                "RISK_COLLAR_ADJUSTMENT global_kill_switch counterfactual_value must be true or false"
+            })?
+        }
+        other => return Err(format!("unknown RISK_COLLAR_ADJUSTMENT parameter_name: {other}").into()),
+    }
+    policy.validate()?;
+    Ok(policy)
+}
+
+/// Applies a `NETWORK_LATENCY_INJECTION` intervention to a cloned fill model.
+fn apply_latency_override(
+    base: &DeterministicFillModel,
+    counterfactual_value: &str,
+) -> Result<DeterministicFillModel, Box<dyn std::error::Error>> {
+    let mut model = base.clone();
+    model.latency_bars = counterfactual_value.parse::<u32>().map_err(|_| {
+        "NETWORK_LATENCY_INJECTION counterfactual_value must be a non-negative integer bar count"
+    })?;
+    model.validate()?;
+    Ok(model)
+}
+
+/// Doubles slippage and the flat fee, used by `TRANSACTION_COST_SHOCK`.
+fn double_costs(
+    base: &DeterministicFillModel,
+) -> Result<DeterministicFillModel, Box<dyn std::error::Error>> {
+    let mut model = base.clone();
+    let two = Decimal::from_integer(2)?;
+    model.slippage_bps = model.slippage_bps.checked_mul(two)?;
+    model.flat_fee = model.flat_fee.checked_mul(two)?;
+    model.validate()?;
+    Ok(model)
+}
+
+/// Resolves a path declared inside a counterfactual/adversarial config file
+/// relative to that config file's own directory, so a checked-in fixture
+/// works regardless of the caller's working directory.
+fn resolve_relative(base_dir: &Path, declared: &str) -> PathBuf {
+    base_dir.join(declared)
+}
+
+/// Actually executes a counterfactual scenario: one unperturbed baseline
+/// replay and one replay with every declared intervention applied, both
+/// through the exact same deterministic `BuyOnceStrategy` kernel used by
+/// `follon-backtest run`. Returns the real fill/P&L/drawdown/rejection
+/// figures `CounterfactualEngine::evaluate_scenario` certifies.
+///
+/// `RISK_COLLAR_ADJUSTMENT`, `NETWORK_LATENCY_INJECTION`, `DATA_BAR_CORRUPTION`,
+/// and `VOLATILITY_SHOCK` interventions are applied in the order declared;
+/// `DATA_BAR_CORRUPTION`/`VOLATILITY_SHOCK` locate their starting bar
+/// deterministically from the scenario's `seed`. Only the built-in strategy
+/// is supported — a Python-worker-driven backtest still requires
+/// operator-attested `metrics`/`delta_metrics`.
+fn execute_counterfactual_scenario(
+    base_dir: &Path,
+    execute: &CounterfactualExecuteDocument,
+    interventions: &[CounterfactualIntervention],
+    seed: u64,
+) -> Result<CounterfactualMetricsDocument, Box<dyn std::error::Error>> {
+    let configuration =
+        load_runtime_configuration(&resolve_relative(base_dir, &execute.backtest_configuration))?;
+    let document = &configuration.document;
+    let bars = import_historical_bars(&fs::read_to_string(resolve_relative(
+        base_dir,
+        &execute.historical_bars,
+    ))?)?;
+    let context = ReplayContext::from_configuration(document, &configuration);
+
+    let baseline = context.run(
+        bars.clone(),
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+
+    let mut risk_policy = configuration.risk_policy.clone();
+    let mut fill_model = configuration.fill_model.clone();
+    let mut counterfactual_bars = bars.clone();
+    for intervention in interventions {
+        match intervention.intervention_type {
+            CounterfactualInterventionType::RiskCollarAdjustment => {
+                risk_policy = apply_risk_override(
+                    &risk_policy,
+                    &intervention.parameter_name,
+                    &intervention.counterfactual_value,
+                )?;
+            }
+            CounterfactualInterventionType::NetworkLatencyInjection => {
+                fill_model =
+                    apply_latency_override(&fill_model, &intervention.counterfactual_value)?;
+            }
+            CounterfactualInterventionType::DataBarCorruption => {
+                let count: usize = intervention.counterfactual_value.parse().map_err(|_| {
+                    "DATA_BAR_CORRUPTION counterfactual_value must be a non-negative integer bar count"
+                })?;
+                let start_index = (seed as usize) % counterfactual_bars.len();
+                counterfactual_bars = drop_bars(&counterfactual_bars, start_index, count)?;
+            }
+            CounterfactualInterventionType::VolatilityShock => {
+                let shock_bps: i64 = intervention.counterfactual_value.parse().map_err(|_| {
+                    "VOLATILITY_SHOCK counterfactual_value must be a signed integer basis-point shock"
+                })?;
+                let start_index = (seed as usize) % counterfactual_bars.len();
+                counterfactual_bars =
+                    shock_bars_from(&counterfactual_bars, start_index, shock_bps)?;
+            }
+        }
+    }
+    let counterfactual = context.run(
+        counterfactual_bars,
+        risk_policy,
+        fill_model,
+        configuration.entry_threshold,
+    )?;
+
+    let (baseline_fills, baseline_pnl_cents, baseline_max_drawdown_bps, baseline_rejections) =
+        summarize_run(&baseline)?;
+    let (
+        counterfactual_fills,
+        counterfactual_pnl_cents,
+        counterfactual_max_drawdown_bps,
+        counterfactual_rejections,
+    ) = summarize_run(&counterfactual)?;
+    Ok(CounterfactualMetricsDocument {
+        baseline_fills,
+        counterfactual_fills,
+        baseline_pnl_cents,
+        counterfactual_pnl_cents,
+        baseline_max_drawdown_bps,
+        counterfactual_max_drawdown_bps,
+        baseline_rejections,
+        counterfactual_rejections,
+    })
+}
+
+/// Actually executes the 5 standardized adversarial stress probes against a
+/// real deterministic backtest, returning genuine `passed`/`degradation_bps`
+/// results for `AdversarialResearchGate::evaluate_probes` to certify. Only
+/// the built-in strategy is supported — a Python-worker-driven backtest
+/// still requires operator-attested `probes` results.
+fn execute_adversarial_probes(
+    base_dir: &Path,
+    execute: &AdversarialExecuteDocument,
+) -> Result<Vec<AdversarialProbeResult>, Box<dyn std::error::Error>> {
+    if execute.probes.len() < 5 {
+        return Err("adversarial execute requires all 5 standardized stress probes".into());
+    }
+    let configuration =
+        load_runtime_configuration(&resolve_relative(base_dir, &execute.backtest_configuration))?;
+    let document = &configuration.document;
+    let bars = import_historical_bars(&fs::read_to_string(resolve_relative(
+        base_dir,
+        &execute.historical_bars,
+    ))?)?;
+    let context = ReplayContext::from_configuration(document, &configuration);
+
+    let baseline = context.run(
+        bars.clone(),
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let baseline_return_bps =
+        decimal_to_scaled_i64(baseline.artifact.performance.return_bps, DECIMAL_SCALE)?;
+
+    let mut results = Vec::with_capacity(execute.probes.len());
+    for probe in &execute.probes {
+        let degradation_bps = match probe.probe_name.as_str() {
+            "LOOKAHEAD_LEAKAGE_PROBE" => {
+                run_lookahead_probe(&context, &configuration, &bars, &baseline)?
+            }
+            "PRICE_JITTER_PROBE" => run_jitter_probe(
+                &context,
+                &configuration,
+                &bars,
+                execute.seed,
+                baseline_return_bps,
+            )?,
+            "TRANSACTION_COST_SHOCK" => {
+                run_cost_shock_probe(&context, &configuration, &bars, baseline_return_bps)?
+            }
+            "PARAMETER_CLIFF_PROBE" => run_parameter_cliff_probe(&context, &configuration, &bars)?,
+            "REGIME_STRESS_PROBE" => run_regime_stress_probe(
+                &context,
+                &configuration,
+                &bars,
+                execute.seed,
+                baseline_return_bps,
+            )?,
+            other => {
+                return Err(
+                    format!("unknown standardized probe_name for execute mode: {other}").into(),
+                )
+            }
+        };
+        results.push(AdversarialProbeResult {
+            probe_name: probe.probe_name.clone(),
+            probe_description: probe.probe_description.clone(),
+            passed: degradation_bps <= probe.threshold_bps,
+            degradation_bps,
+            threshold_bps: probe.threshold_bps,
+        });
+    }
+    Ok(results)
+}
+
+/// Reruns the replay against the first three-quarters of the bars only and
+/// compares its equity curve against the full baseline's over that shared
+/// prefix. A real look-ahead leak would move an earlier decision when later
+/// bars are removed, showing up as a nonzero divergence; the engine's
+/// bar-by-bar construction makes that structurally impossible, so this
+/// proves the invariant on this corpus rather than assuming it.
+fn run_lookahead_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    baseline: &CompletedBacktest,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let keep = (bars.len() * 3 / 4).max(1);
+    if keep >= bars.len() {
+        return Err(
+            "LOOKAHEAD_LEAKAGE_PROBE requires enough bars to truncate a quarter of them".into(),
+        );
+    }
+    let truncated_bars = bars[..keep].to_vec();
+    let truncated = context.run(
+        truncated_bars,
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let mut max_bps: i64 = 0;
+    for point in &truncated.artifact.performance.equity_curve {
+        let Some(full_point) = baseline
+            .artifact
+            .performance
+            .equity_curve
+            .iter()
+            .find(|candidate| candidate.event_time == point.event_time)
+        else {
+            continue;
+        };
+        let diff = if full_point.total_equity >= point.total_equity {
+            full_point.total_equity.checked_sub(point.total_equity)?
+        } else {
+            point.total_equity.checked_sub(full_point.total_equity)?
+        };
+        let denominator = if point.total_equity > Decimal::ZERO {
+            point.total_equity
+        } else {
+            Decimal::from_integer(1)?
+        };
+        let bps = diff
+            .checked_mul(Decimal::from_integer(10_000)?)?
+            .checked_div(denominator)?;
+        max_bps = max_bps.max(decimal_to_scaled_i64(bps, DECIMAL_SCALE)?);
+    }
+    Ok(max_bps)
+}
+
+/// Reruns the replay with deterministic +/-20bps per-bar microstructure
+/// noise and measures the return degradation against the baseline.
+fn run_jitter_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    seed: u64,
+    baseline_return_bps: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    const JITTER_MAGNITUDE_BPS: i64 = 20;
+    let jittered_bars = jitter_bars(bars, seed, JITTER_MAGNITUDE_BPS)?;
+    let jittered = context.run(
+        jittered_bars,
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let jittered_return_bps =
+        decimal_to_scaled_i64(jittered.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    Ok((baseline_return_bps - jittered_return_bps).max(0))
+}
+
+/// Reruns the replay with slippage and the flat fee doubled and measures the
+/// return degradation against the baseline.
+fn run_cost_shock_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    baseline_return_bps: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let costed_fill_model = double_costs(&configuration.fill_model)?;
+    let costed = context.run(
+        bars.to_vec(),
+        configuration.risk_policy.clone(),
+        costed_fill_model,
+        configuration.entry_threshold,
+    )?;
+    let costed_return_bps =
+        decimal_to_scaled_i64(costed.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    Ok((baseline_return_bps - costed_return_bps).max(0))
+}
+
+/// Reruns the replay with the entry threshold shifted +/-10bps and measures
+/// the largest resulting return swing, revealing whether the configured
+/// threshold sits on a fragile decision boundary.
+fn run_parameter_cliff_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+) -> Result<i64, Box<dyn std::error::Error>> {
+    const NEIGHBOR_SHIFT_BPS: i64 = 10;
+    let baseline = context.run(
+        bars.to_vec(),
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let baseline_return_bps =
+        decimal_to_scaled_i64(baseline.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    let mut max_swing: i64 = 0;
+    for shift in [NEIGHBOR_SHIFT_BPS, -NEIGHBOR_SHIFT_BPS] {
+        let neighbor_threshold = shift_by_bps(configuration.entry_threshold, shift)?;
+        let neighbor = context.run(
+            bars.to_vec(),
+            configuration.risk_policy.clone(),
+            configuration.fill_model.clone(),
+            neighbor_threshold,
+        )?;
+        let neighbor_return_bps =
+            decimal_to_scaled_i64(neighbor.artifact.performance.return_bps, DECIMAL_SCALE)?;
+        max_swing = max_swing.max((baseline_return_bps - neighbor_return_bps).abs());
+    }
+    Ok(max_swing)
+}
+
+/// Reruns the replay with a -15% price shock applied to every bar from a
+/// seed-selected point onward, simulating a sudden regime change, and
+/// measures the return degradation against the baseline.
+fn run_regime_stress_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    seed: u64,
+    baseline_return_bps: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    const REGIME_SHOCK_BPS: i64 = -1_500;
+    let start_index = (bars.len() / 2) + ((seed as usize) % bars.len().max(1).div_ceil(2).max(1));
+    let start_index = start_index.min(bars.len().saturating_sub(1));
+    let shocked_bars = shock_bars_from(bars, start_index, REGIME_SHOCK_BPS)?;
+    let shocked = context.run(
+        shocked_bars,
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let shocked_return_bps =
+        decimal_to_scaled_i64(shocked.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    Ok((baseline_return_bps - shocked_return_bps).max(0))
 }
 
 fn parse_arguments(arguments: Vec<String>) -> Result<CommandArguments, Box<dyn std::error::Error>> {
@@ -1486,5 +2200,229 @@ mod tests {
         assert!(content.contains("\"cf.latency-shock.001\""));
         assert!(content.contains("\"NETWORK_LATENCY_INJECTION\""));
         let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn counterfactual_execute_mode_runs_a_real_intervention_and_computes_genuine_deltas() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/counterfactual-execute-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-execute-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_counterfactual(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        // A real ~$100 buy is rejected once max_notional drops to $50: the
+        // baseline's one fill and small unrealized gain disappear, and a
+        // genuine MAX_NOTIONAL_EXCEEDED risk rejection is recorded — not a
+        // caller-supplied number.
+        assert!(content.contains("\"fill_count_delta\":-1"));
+        assert!(content.contains("\"risk_rejection_count_delta\":1"));
+        assert!(content.contains("\"max_drawdown_delta_bps\":-53"));
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn counterfactual_execute_mode_rejects_an_unknown_risk_parameter() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/counterfactual-execute-v1.json");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        document["interventions"][0]["parameter_name"] =
+            serde_json::Value::String("not_a_real_risk_parameter".to_owned());
+        let fixtures_dir = fixture.parent().unwrap();
+        document["execute"]["backtest_configuration"] = serde_json::Value::String(
+            fixtures_dir
+                .join("backtest-probe-v1.json")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        document["execute"]["historical_bars"] = serde_json::Value::String(
+            fixtures_dir
+                .join("../historical-bars/probe-corpus-one-minute.csv")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let config_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-bad-parameter-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&config_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-bad-parameter-out-{}.json",
+            std::process::id()
+        ));
+        let args = vec![
+            config_path.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        let error = run_counterfactual(&args).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown RISK_COLLAR_ADJUSTMENT parameter_name"));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn adversarial_execute_mode_runs_real_probes_and_computes_genuine_degradation() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/adversarial-execute-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-execute-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_adversarial(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let probes = parsed["probes"].as_array().unwrap();
+        let degradation = |name: &str| -> i64 {
+            probes
+                .iter()
+                .find(|probe| probe["probe_name"] == name)
+                .unwrap()["degradation_bps"]
+                .as_i64()
+                .unwrap()
+        };
+        // A real look-ahead leak would move the truncated run's equity curve
+        // away from the full run's over their shared prefix; the engine's
+        // bar-by-bar construction makes that impossible, so this is a
+        // genuine, computed zero rather than a hardcoded pass.
+        assert_eq!(degradation("LOOKAHEAD_LEAKAGE_PROBE"), 0);
+        assert_eq!(degradation("TRANSACTION_COST_SHOCK"), 16);
+        assert_eq!(degradation("PARAMETER_CLIFF_PROBE"), 19);
+        assert_eq!(degradation("REGIME_STRESS_PROBE"), 1005);
+        assert_eq!(parsed["gate_passed"], true);
+        assert_eq!(parsed["composite_robustness_score_bps"], 10_000);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn adversarial_execute_mode_fails_the_gate_when_real_degradation_exceeds_the_operators_threshold(
+    ) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/adversarial-execute-v1.json");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        // The real REGIME_STRESS_PROBE measurement is 1005bps (see the test
+        // above); tightening its allowed threshold below that must fail the
+        // gate on a genuine measured number, not a caller-supplied one.
+        document["execute"]["probes"][4]["threshold_bps"] = serde_json::Value::from(100);
+        let fixtures_dir = fixture.parent().unwrap();
+        document["execute"]["backtest_configuration"] = serde_json::Value::String(
+            fixtures_dir
+                .join("backtest-probe-v1.json")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        document["execute"]["historical_bars"] = serde_json::Value::String(
+            fixtures_dir
+                .join("../historical-bars/probe-corpus-one-minute.csv")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let config_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-strict-threshold-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&config_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-strict-threshold-out-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let args = vec![
+            config_path.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_adversarial(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["gate_passed"], false);
+        assert!(parsed["blocking_failure_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("REGIME_STRESS_PROBE")));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn jitter_bars_perturbs_every_bar_but_keeps_ohlc_valid() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let jittered = jitter_bars(&bars, 11, 20).unwrap();
+        assert_eq!(bars.len(), jittered.len());
+        assert!(bars
+            .iter()
+            .zip(&jittered)
+            .any(|(original, perturbed)| original.bar.close != perturbed.bar.close));
+        for historical in &jittered {
+            historical.bar.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn shock_bars_from_preserves_ohlc_ordering_under_a_large_negative_shock() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let shocked = shock_bars_from(&bars, bars.len() / 2, -1_500).unwrap();
+        for historical in shocked.iter().skip(bars.len() / 2) {
+            historical.bar.validate().unwrap();
+        }
+        assert_eq!(
+            shocked[0].bar.close, bars[0].bar.close,
+            "bars before the shock start index are untouched"
+        );
+        assert!(shocked[bars.len() / 2].bar.close < bars[bars.len() / 2].bar.close);
+    }
+
+    #[test]
+    fn drop_bars_removes_exactly_the_requested_range() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let dropped = drop_bars(&bars, 10, 5).unwrap();
+        assert_eq!(dropped.len(), bars.len() - 5);
+        assert_eq!(dropped[9].event_time, bars[9].event_time);
+        assert_eq!(dropped[10].event_time, bars[15].event_time);
+    }
+
+    #[test]
+    fn drop_bars_refuses_to_remove_every_bar() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let count = bars.len();
+        assert!(drop_bars(&bars, 0, count).is_err());
     }
 }

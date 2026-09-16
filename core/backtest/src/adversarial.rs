@@ -7,15 +7,18 @@
 //!
 //! This module does **not** itself execute a backtest, inject noise/latency/
 //! cost perturbations, time-shift any indicator, or otherwise run a stress
-//! test. Each probe's `passed` / `degradation_bps` figures are supplied by
-//! the caller — typically deserialized from an operator-authored JSON
-//! configuration file (see `run_adversarial` in `apps/cli/src/backtest.rs`)
-//! — and are assumed to already reflect a real stress test that was executed
-//! by a separate tool or human operator. This gate's guarantee is limited to
-//! deterministic, tamper-evident aggregation and certification of whatever
-//! probe results it is handed; it cannot verify that those results actually
-//! came from a real simulation. Whoever populates the input is responsible
-//! for having actually run (or commissioned) the real probes.
+//! test — it only aggregates and certifies whatever `passed` /
+//! `degradation_bps` figures its caller supplies. `run_adversarial` in
+//! `apps/cli/src/backtest.rs` calls it two different ways: its `execute`
+//! input mode actually drives the built-in deterministic strategy through 5
+//! genuine perturbed replays — one per standardized probe (see
+//! `execute_adversarial_probes`) — and computes `passed`/`degradation_bps`
+//! from their real output; its `probes`-only mode instead passes through
+//! operator-attested figures, assumed to already reflect a real stress test
+//! executed by a separate tool or human operator. This gate cannot itself
+//! distinguish the two — its guarantee is limited to deterministic,
+//! tamper-evident aggregation and certification of whatever probe results it
+//! is handed.
 
 use sha2::{Digest, Sha256};
 

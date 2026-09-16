@@ -6,7 +6,8 @@ golden-corpus-evidence remediation delta: 2026-09-10; desktop connected-PAPER-ga
 verification delta: 2026-09-14; independent full-repository re-verification,
 stale-fixture-fingerprint, rustls advisory, first-ever live Docker Compose
 runtime, and first-ever PostgreSQL integration-test execution delta:
-2026-09-15.
+2026-09-15; real counterfactual/adversarial intervention-and-probe execution
+delta: 2026-09-16.
 Source reviewed: all 29 pages of the original `Solo Trading Operating System
 Master Plan.pdf`.** This is the controlling
 requirement-to-evidence record. It does not turn planned work, a local mechanism,
@@ -394,13 +395,13 @@ These are mandatory master-plan acceptance conditions and are currently open:
 17. The `follon-operations` CLI now includes `reconcile-statement`, integrating `core/accounting/src/statement.rs` into the operational toolchain to ingest broker CSV statements (e.g. IBKR Activity Flex Queries), perform automated multi-currency cash and position reconciliation against the internal ledger, and emit canonical reconciliation artifacts with incident classification.
 18. Desktop evidence parsing and UI panels in `apps/desktop/src/evidence.ts` and `apps/desktop/src/workspaces.ts` now natively display both Broker Statement Reconciliation incidents and Deterministic FX Pricing dashboards in the Portfolio workspace, fully covered by automated contract tests in `apps/desktop/test/evidence-contract.mjs`.
 19. `tools/generate_pipeline_evidence.py` orchestrates the complete CLI toolchain (`follon-build-bars`, `follon-options`, `follon-fx`, `follon-operations`, `follon-tca`, `follon-risk-benchmark`, `follon-news`) to generate all canonical, content-addressed evidence artifacts in `var/`.
-20. The 12 Enduring Capability artifact shapes (DUR-01 through DUR-12) from `docs/06-delivery/15-end-to-end-product-plan.md` are represented across core domain crates, contracts, JSON schemas, fixtures, and CLI binaries. DUR-02 and DUR-06 remain certification-only rather than executing the experiments their product requirements describe:
+20. The 12 Enduring Capability artifact shapes (DUR-01 through DUR-12) from `docs/06-delivery/15-end-to-end-product-plan.md` are represented across core domain crates, contracts, JSON schemas, fixtures, and CLI binaries. DUR-02 and DUR-06 support two input modes: an `execute` mode that actually drives a real perturbed replay of the built-in strategy (added 2026-09-16, item 31 below), and an operator-attested mode retained for a Python-worker-driven backtest or a genuinely externally-run intervention/probe:
     - **DUR-01 (Historical Corpus Compatibility Matrix)**: `CompatibilityRegistry` verifies golden corpus backward compatibility via `follon-operations compatibility-matrix`.
-    - **DUR-02 (Counterfactual result certification; simulation gap open)**: `CounterfactualEngine` deterministically compares caller-supplied baseline and intervention figures without mutating production history via `follon-backtest counterfactual`. It does not execute the intervention or prove that a replay occurred, so the automated safety-lab requirement remains partial.
+    - **DUR-02 (Counterfactual Safety Lab; built-in-strategy execution closed, arbitrary-strategy gap open)**: `follon-backtest counterfactual`'s `execute` input mode actually runs the declared intervention as a second genuine deterministic replay of the built-in `BuyOnceStrategy` and certifies the real resulting deltas via `CounterfactualEngine`; its `metrics`/`delta_metrics` modes still certify operator-attested figures for a Python-worker-driven backtest or an externally-run intervention. `CounterfactualEngine` itself remains a pure certification function with no execution capability of its own — see item 31.
     - **DUR-03 (Advanced Account Economics & Margin Projections)**: Projected multi-currency margin, financing, and delistings in `follon-backtest`.
     - **DUR-04 (Point-in-Time Knowledge Graphs)**: Replay and vector alignment in `follon-news`.
     - **DUR-05 (Operator Attention Budget & Cognitive Load)**: `AttentionBudgetController` prevents alarm fatigue and enforces cognitive load caps via `follon-operations attention-budget`.
-    - **DUR-06 (Adversarial result certification; probe-execution gap open)**: `AdversarialResearchGate` deterministically aggregates and fingerprints five caller-supplied probe results via `follon-backtest adversarial`. It does not execute or verify the probes, so it is not an automated adversarial gate and the automatic challenge requirement remains partial.
+    - **DUR-06 (Adversarial Research Gate; built-in-strategy execution closed, arbitrary-strategy gap open)**: `follon-backtest adversarial`'s `execute` input mode actually runs all 5 standardized stress probes as genuine perturbed replays of the built-in `BuyOnceStrategy` and certifies the real resulting `passed`/`degradation_bps` via `AdversarialResearchGate`; its `probes`-only mode still certifies operator-attested figures for a Python-worker-driven backtest or an externally-run probe suite. `AdversarialResearchGate` itself remains a pure certification function with no execution capability of its own — see item 31.
     - **DUR-07 (Assumption & Regime Drift Monitor)**: Regime shift and degradation tracking across backtest and operations.
     - **DUR-08 (Continuous Recovery Game-Day Drills)**: `GameDayCompiler` executes RTO/RPO recovery drills via `follon-operations recovery-drill`.
     - **DUR-09 (Execution Coach & Fill Quality Benchmarks)**: Parent-order implementation shortfall and TCA analysis via `follon-tca`.
@@ -707,6 +708,80 @@ These are mandatory master-plan acceptance conditions and are currently open:
     revealing a new bug. `cargo test --workspace --all-targets -- --include-ignored` against a final fresh
     container passed **100% clean: 0 failed, 0 ignored**, across every crate in the main workspace -- the
     first time this document can record that figure rather than "3 ignored."
+31. Real intervention/probe execution for the Counterfactual Safety Lab and Adversarial Research Gate
+    (2026-09-16). Every prior verification snapshot in this document recorded `CounterfactualEngine` and
+    `AdversarialResearchGate` as pure certification functions over caller-supplied numbers -- the module
+    doc comments in `core/backtest/src/counterfactual.rs` and `adversarial.rs` said so explicitly, and
+    `follon-backtest counterfactual`/`adversarial` only ever read a `metrics`/`delta_metrics`/`probes`
+    JSON block an operator had to have populated from a real run performed elsewhere. This pass added a
+    second input mode, `execute`, to both CLI subcommands that actually drives the real deterministic
+    replay kernel instead of trusting operator-attested figures, without touching `CounterfactualEngine`
+    or `AdversarialResearchGate` themselves (both remain exactly the pure aggregation/certification
+    functions they were; only their caller in `apps/cli/src/backtest.rs` changed).
+    - A new `ReplayContext` in `apps/cli/src/backtest.rs` factors the immutable per-run inputs (account,
+      strategy identity, instrument registry, calendar, dataset identity) out of a loaded
+      `RuntimeConfiguration`, exposing one `run(bars, risk_policy, fill_model, entry_threshold)` method
+      that builds a fresh `DatasetManifest`/`BacktestSpec`/`ReplayEngine`/`BuyOnceStrategy` and drives them
+      through the exact same `BacktestRunner` the plain `follon-backtest run` command uses -- a genuinely
+      independent, single-use replay per call, not a reimplementation of the kernel.
+    - `execute_counterfactual_scenario` runs one unperturbed baseline replay and one replay with every
+      declared intervention applied, then derives `baseline_fills`/`counterfactual_fills`/
+      `*_pnl_cents`/`*_max_drawdown_bps`/`*_rejections` from each real `CompletedBacktest` (fill count and
+      max drawdown from its `PerformanceReport`, P&L from its ledger's realized-plus-unrealized total, and
+      risk rejections by counting real `risk.decision.v1` events carrying `"approved":false` in its
+      canonical event stream) before handing them to the unchanged `CounterfactualEngine::evaluate_scenario`.
+      `RISK_COLLAR_ADJUSTMENT` overrides a named `RiskPolicy` field (`max_quantity`, `max_notional`,
+      `max_price_deviation_bps`, or `global_kill_switch`); `NETWORK_LATENCY_INJECTION` overrides
+      `DeterministicFillModel::latency_bars`; `DATA_BAR_CORRUPTION` removes a run of bars at a
+      seed-selected index; `VOLATILITY_SHOCK` scales every OHLC field of every bar from a seed-selected
+      index onward by the same positive multiplier, which preserves each bar's internal ordering exactly
+      and so cannot itself produce an invalid bar.
+    - `execute_adversarial_probes` runs one baseline replay and one perturbed replay per standardized
+      probe, deriving each `degradation_bps` from a real comparison rather than a fabricated number:
+      `LOOKAHEAD_LEAKAGE_PROBE` reruns against the first three-quarters of the bars and compares the
+      truncated run's equity curve to the full run's over their shared prefix -- any divergence would mean
+      a later bar changed an earlier decision, which the engine's bar-by-bar construction makes
+      structurally impossible, so this is a genuine, computed regression check rather than an assumed
+      pass; `PRICE_JITTER_PROBE` applies an independent deterministic +/-20bps offset to every bar (a
+      SHA-256 hash of the scenario seed and bar index, not a system RNG, so the same seed always
+      reproduces byte-identical perturbed bars) and measures the return degradation, floored at zero
+      because noise that happens to help is not "degradation"; `TRANSACTION_COST_SHOCK` doubles slippage
+      and the flat fee; `PARAMETER_CLIFF_PROBE` reruns at the entry threshold shifted +/-10bps and reports
+      the larger of the two return swings; `REGIME_STRESS_PROBE` applies a -15% shock from a seed-selected
+      bar onward. All five probe results still flow through the unchanged
+      `AdversarialResearchGate::evaluate_probes`.
+    - New fixtures exercise this against a real 40-bar corpus rather than the existing 2-bar
+      `spy-one-minute.csv`, which is too short to observe a meaningful equity curve:
+      `tests/fixtures/historical-bars/probe-corpus-one-minute.csv` (a deterministic synthetic walk between
+      roughly $99.8 and $100.9), `tests/fixtures/config/backtest-probe-v1.json` (a $150 account so a single
+      ~$100 share materially moves total equity -- the original $100,000 fixture diluted every perturbation
+      to under 1bps and made the mechanism impossible to observe), and
+      `tests/fixtures/config/counterfactual-execute-v1.json`/`adversarial-execute-v1.json`. Every
+      threshold/degradation value asserted in the new `apps/cli/src/backtest.rs` tests
+      (`counterfactual_execute_mode_runs_a_real_intervention_and_computes_genuine_deltas`,
+      `adversarial_execute_mode_runs_real_probes_and_computes_genuine_degradation`) was taken from the
+      actual computed CLI output, not predicted by hand: `max_notional` cut to $50 produces a real
+      `MAX_NOTIONAL_EXCEEDED` rejection (fill count -1, drawdown -53bps); the built-in strategy's
+      `TRANSACTION_COST_SHOCK`/`PARAMETER_CLIFF_PROBE`/`REGIME_STRESS_PROBE` degradations on this corpus are
+      16, 19, and 1005bps respectively; a dedicated test
+      (`adversarial_execute_mode_fails_the_gate_when_real_degradation_exceeds_the_operators_threshold`)
+      tightens `REGIME_STRESS_PROBE`'s threshold below its real 1005bps measurement and confirms
+      `gate_passed` genuinely turns `false` with a matching blocking-failure reason, proving the mechanism
+      can fail on real data rather than only ever reporting success. Four further unit tests exercise the
+      perturbation helpers (`jitter_bars`, `shock_bars_from`, `drop_bars`) directly for OHLC-validity and
+      boundary behavior. `cargo fmt`/`clippy -D warnings`/`test --workspace --all-targets` remained clean
+      across both Rust workspaces after this change (245 passed, 0 failed, 3 ignored in the main
+      workspace, up from 237 by the 8 new `apps/cli/src/backtest.rs` tests); the two prior attested-mode
+      fixtures and their tests are untouched and still pass
+      unchanged.
+    - Bounded scope, stated plainly: only the CLI's built-in `BuyOnceStrategy` path gained real execution.
+      A Python-worker-driven backtest, the desktop/gRPC surfaces, and any future non-CLI caller still have
+      no execute mode and must supply operator-attested figures exactly as before. `DATA_BAR_CORRUPTION`
+      and `VOLATILITY_SHOCK` do not carry corporate actions through a perturbed run (`ReplayContext::run`
+      always passes an empty corporate-action list) -- a bounded simplification stated in its own doc
+      comment, not a silent gap. This closes the "does the intervention/probe actually execute" gap the
+      DUR-02/DUR-06 rows above describe for exactly this path; it is not a claim that either laboratory now
+      certifies an arbitrary caller-supplied strategy, and it does not change any external gate.
 
 ## Business-readiness decision
 

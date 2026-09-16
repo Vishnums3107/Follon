@@ -7,16 +7,18 @@
 //!
 //! This module does **not** itself simulate an intervention, replay a
 //! backtest, or inject network-latency/data-corruption/volatility
-//! perturbations. The baseline and counterfactual figures it diffs are
-//! supplied by the caller — typically deserialized from an operator-authored
-//! JSON configuration file (see `run_counterfactual` in
-//! `apps/cli/src/backtest.rs`) — and are assumed to already come from a real
-//! intervention run performed by a separate tool or human operator. This
-//! engine's guarantee is limited to deterministic, tamper-evident computation
-//! of deltas and certification of whatever figures it is given; it cannot
-//! verify that those figures reflect an actual counterfactual run. Whoever
-//! populates the input is responsible for having actually run (or
-//! commissioned) the real intervention.
+//! perturbations — it only diffs and certifies whatever baseline and
+//! counterfactual figures its caller supplies. `run_counterfactual` in
+//! `apps/cli/src/backtest.rs` calls it two different ways: its `execute`
+//! input mode actually drives the built-in deterministic strategy through a
+//! real unperturbed replay and a real replay with every declared
+//! intervention applied (via `execute_counterfactual_scenario`), so those
+//! figures come from a genuine intervention; its `metrics`/`delta_metrics`
+//! modes instead pass through operator-attested figures, assumed to already
+//! come from a real run performed by a separate tool or human operator. This
+//! module cannot itself distinguish the two — its guarantee is limited to
+//! deterministic, tamper-evident computation of deltas and certification of
+//! whatever figures it is given.
 
 use sha2::{Digest, Sha256};
 

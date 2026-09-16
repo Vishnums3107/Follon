@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CounterfactualScenario",
-  "description": "Deterministic comparison of caller-supplied baseline and intervention results for a frozen run (DUR-02); this artifact does not execute or prove a counterfactual replay.",
+  "description": "Deterministic comparison of baseline and intervention results for a frozen run (DUR-02). The `follon-backtest counterfactual` CLI's 'execute' input mode actually drives the intervention as a second genuine deterministic replay of the built-in strategy and computes these deltas from its real output; its 'metrics'/'delta_metrics' modes instead certify operator-attested figures. This artifact records only the resulting deltas either way and does not itself prove which mode produced them.",
   "type": "object",
   "additionalProperties": false,
   "required": [

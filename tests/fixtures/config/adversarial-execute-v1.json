@@ -1,0 +1,36 @@
+{
+  "strategy_version": "strat.probe-corpus.v1",
+  "evaluated_at": "2026-09-16T00:00:00Z",
+  "execute": {
+    "backtest_configuration": "backtest-probe-v1.json",
+    "historical_bars": "../historical-bars/probe-corpus-one-minute.csv",
+    "seed": 11,
+    "probes": [
+      {
+        "probe_name": "LOOKAHEAD_LEAKAGE_PROBE",
+        "probe_description": "Compares the full replay's equity curve against a truncated replay missing the final quarter of bars; any divergence over the shared prefix would prove a future bar influenced an earlier decision.",
+        "threshold_bps": 1
+      },
+      {
+        "probe_name": "PRICE_JITTER_PROBE",
+        "probe_description": "Reruns the replay with deterministic +/-20bps per-bar microstructure noise and measures the return degradation versus the unperturbed baseline.",
+        "threshold_bps": 200
+      },
+      {
+        "probe_name": "TRANSACTION_COST_SHOCK",
+        "probe_description": "Reruns the replay with slippage and the flat fee doubled and measures the return degradation.",
+        "threshold_bps": 50
+      },
+      {
+        "probe_name": "PARAMETER_CLIFF_PROBE",
+        "probe_description": "Reruns the replay with the entry threshold shifted +/-10bps and measures the largest resulting return swing.",
+        "threshold_bps": 100
+      },
+      {
+        "probe_name": "REGIME_STRESS_PROBE",
+        "probe_description": "Reruns the replay with a -15% price shock applied from a seed-selected bar onward and measures the return degradation.",
+        "threshold_bps": 3000
+      }
+    ]
+  }
+}
