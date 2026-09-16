@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use follon_accounting::{Currency, TaxLot, TaxLotBook, TaxLotBookSnapshot, TaxLotSelection};
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
     price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
@@ -60,6 +61,12 @@ impl From<follon_domain::DecimalError> for LiveError {
 
 impl From<follon_secrets::SecretError> for LiveError {
     fn from(error: follon_secrets::SecretError) -> Self {
+        Self(error.0)
+    }
+}
+
+impl From<follon_accounting::AccountingError> for LiveError {
+    fn from(error: follon_accounting::AccountingError) -> Self {
         Self(error.0)
     }
 }
@@ -1030,6 +1037,27 @@ struct PersistentLiveState {
     last_reconciled_at: Option<String>,
     last_reconciliation_clean: Option<bool>,
     latest_reconciliation: Option<PersistentReconciliationReport>,
+    /// Missing on a journal written before this field existed; an empty
+    /// book is exactly correct for one, since no fill could have been
+    /// applied to a tax-lot ledger that did not yet exist.
+    #[serde(default)]
+    tax_lots: PersistentTaxLotBook,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PersistentTaxLotBook {
+    lots: BTreeMap<String, Vec<PersistentTaxLot>>,
+    applied_lot_ids: Vec<String>,
+    applied_disposal_ids: Vec<String>,
+    realized_by_currency: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentTaxLot {
+    lot_id: String,
+    opened_at: String,
+    remaining_quantity: String,
+    unit_cost: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1329,6 +1357,13 @@ pub struct LiveTradingService<B> {
     orders: BTreeMap<String, LiveOrder>,
     approvals: BTreeMap<String, RegisteredLiveApproval>,
     portfolios: BTreeMap<String, Portfolio>,
+    /// Independent FIFO long-lot cost-basis ledger, kept in lockstep with
+    /// `portfolios` from the same fills. See `core/paper`'s identical field
+    /// for the full rationale: `Portfolio` tracks a single running average
+    /// cost for OMS/risk decisions; this book retains individual acquisition
+    /// lots so a real disposal reports an auditable, tax-lot-accurate
+    /// realized gain/loss.
+    tax_lots: TaxLotBook,
     execution_ids: BTreeSet<String>,
     incidents: BTreeMap<String, LiveIncident>,
     live_days: BTreeMap<String, PersistentLiveDay>,
@@ -1371,6 +1406,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             orders: BTreeMap::new(),
             approvals: BTreeMap::new(),
             portfolios: BTreeMap::new(),
+            tax_lots: TaxLotBook::default(),
             execution_ids: BTreeSet::new(),
             incidents: BTreeMap::new(),
             live_days: BTreeMap::new(),
@@ -1976,11 +2012,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             // applying the remaining events in the batch.
             let orders_snapshot = self.orders.clone();
             let portfolios_snapshot = self.portfolios.clone();
+            let tax_lots_snapshot = self.tax_lots.clone();
             let execution_ids_snapshot = self.execution_ids.clone();
             let cash_snapshot = self.cash;
             if let Err(error) = self.apply_broker_event(event) {
                 self.orders = orders_snapshot;
                 self.portfolios = portfolios_snapshot;
+                self.tax_lots = tax_lots_snapshot;
                 self.execution_ids = execution_ids_snapshot;
                 self.cash = cash_snapshot;
                 apply_errors.push(error.0);
@@ -2703,6 +2741,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     Portfolio::new(&self.account.account_id, &fill.instrument_id)
                 });
                 portfolio.apply_fill(&fill)?;
+                self.apply_tax_lot_fill(&fill)?;
                 let gross = fill.price.checked_mul(fill.quantity)?;
                 self.cash = match fill.side {
                     Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
@@ -2874,6 +2913,57 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         Ok(())
     }
 
+    /// Applies one real fill to the independent FIFO tax-lot book. See
+    /// `core/paper`'s identical method for the full rationale: a buy
+    /// acquires a new lot at its exact all-in unit cost (price plus fee); a
+    /// sell disposes existing long lots FIFO, and `Portfolio` already
+    /// refuses a sell exceeding the held long quantity before this is
+    /// reached, so a disposal here can never exceed available lots. Lot
+    /// selection is fixed at FIFO — a bounded simplification, not a
+    /// correctness gap.
+    fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), LiveError> {
+        let currency = Currency::new(self.account.currency.clone())?;
+        match fill.side {
+            Side::Buy => {
+                let gross = fill.price.checked_mul(fill.quantity)?;
+                let unit_cost = gross.checked_add(fill.fee)?.checked_div(fill.quantity)?;
+                self.tax_lots.acquire(TaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency,
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: fill.quantity,
+                    unit_cost,
+                })?;
+            }
+            Side::Sell => {
+                self.tax_lots.dispose(
+                    &format!("taxdisposal-{}", fill.execution_id),
+                    &fill.instrument_id,
+                    &currency,
+                    fill.quantity,
+                    fill.price,
+                    fill.fee,
+                    &fill.executed_at,
+                    TaxLotSelection::Fifo,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaining open FIFO tax lots for one instrument, oldest first.
+    pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
+        self.tax_lots.lots(instrument_id)
+    }
+
+    /// Cumulative FIFO-realized tax P&L in the account's reporting currency,
+    /// independent of `Portfolio`'s average-cost realized P&L.
+    pub fn realized_tax_pnl(&self) -> Result<Decimal, LiveError> {
+        let currency = Currency::new(self.account.currency.clone())?;
+        Ok(self.tax_lots.realized(&currency))
+    }
+
     fn record_internal_incident(&mut self, category: &str, subject: String, detail: String) {
         let incident_id = format!("incident-internal-{:03}", self.incidents.len() + 1);
         self.incidents
@@ -3008,6 +3098,36 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .latest_reconciliation
                 .as_ref()
                 .map(PersistentReconciliationReport::from),
+            tax_lots: {
+                let snapshot = self.tax_lots.snapshot();
+                PersistentTaxLotBook {
+                    lots: snapshot
+                        .lots
+                        .into_iter()
+                        .map(|(instrument_id, lots)| {
+                            let persisted = lots
+                                .into_iter()
+                                .map(|lot| PersistentTaxLot {
+                                    lot_id: lot.lot_id,
+                                    opened_at: lot.opened_at,
+                                    remaining_quantity: lot.remaining_quantity.to_string(),
+                                    unit_cost: lot.unit_cost.to_string(),
+                                })
+                                .collect();
+                            (instrument_id, persisted)
+                        })
+                        .collect(),
+                    applied_lot_ids: snapshot.applied_lot_ids.into_iter().collect(),
+                    applied_disposal_ids: snapshot.applied_disposal_ids.into_iter().collect(),
+                    realized_by_currency: snapshot
+                        .realized_by_currency
+                        .into_iter()
+                        .map(|(currency, amount)| {
+                            (currency.as_str().to_owned(), amount.to_string())
+                        })
+                        .collect(),
+                }
+            },
         }
     }
 
@@ -3146,6 +3266,38 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 )?,
             );
         }
+        let account_currency = Currency::new(self.account.currency.clone())?;
+        let mut lots = BTreeMap::new();
+        for (instrument_id, persisted_lots) in state.tax_lots.lots {
+            let mut instrument_lots = Vec::with_capacity(persisted_lots.len());
+            for persisted in persisted_lots {
+                instrument_lots.push(TaxLot {
+                    lot_id: persisted.lot_id,
+                    instrument_id: instrument_id.clone(),
+                    currency: account_currency.clone(),
+                    opened_at: persisted.opened_at,
+                    remaining_quantity: decimal(
+                        "persisted live tax lot remaining quantity",
+                        &persisted.remaining_quantity,
+                    )?,
+                    unit_cost: decimal("persisted live tax lot unit cost", &persisted.unit_cost)?,
+                });
+            }
+            lots.insert(instrument_id, instrument_lots);
+        }
+        let mut realized_by_currency = BTreeMap::new();
+        for (currency, amount) in state.tax_lots.realized_by_currency {
+            realized_by_currency.insert(
+                Currency::new(currency)?,
+                decimal("persisted live realized tax pnl", &amount)?,
+            );
+        }
+        let tax_lots = TaxLotBook::recover(TaxLotBookSnapshot {
+            lots,
+            applied_lot_ids: state.tax_lots.applied_lot_ids.into_iter().collect(),
+            applied_disposal_ids: state.tax_lots.applied_disposal_ids.into_iter().collect(),
+            realized_by_currency,
+        })?;
         let mut execution_ids = BTreeSet::new();
         for execution_id in state.execution_ids {
             validate_canonical_id("persisted live execution_id", &execution_id)?;
@@ -3245,6 +3397,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         self.orders = orders;
         self.approvals = approvals;
         self.portfolios = portfolios;
+        self.tax_lots = tax_lots;
         self.execution_ids = execution_ids;
         self.kill_switches = switches;
         self.incidents = incidents;
@@ -4117,6 +4270,11 @@ mod tests {
         service
             .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
             .expect("broker event synchronization");
+        let tax_lots = service.tax_lots("inst.us_equity.spy");
+        assert_eq!(tax_lots.len(), 1);
+        assert_eq!(tax_lots[0].remaining_quantity, amount("2"));
+        assert_eq!(tax_lots[0].unit_cost, amount("10"));
+        assert_eq!(service.realized_tax_pnl().unwrap(), Decimal::ZERO);
         let report = service
             .reconcile("operator.approver.001", "2026-01-02T21:01:00Z")
             .expect("independent reconciliation");
@@ -4135,6 +4293,11 @@ mod tests {
         let recovered = test_service(LiveRunMode::Canary, &path);
         assert!(!recovered.monitoring_dashboard().broker_connected);
         assert_eq!(recovered.monitoring_dashboard().clean_live_days, 1);
+        let recovered_lots = recovered.tax_lots("inst.us_equity.spy");
+        assert_eq!(recovered_lots.len(), 1);
+        assert_eq!(recovered_lots[0].remaining_quantity, amount("2"));
+        assert_eq!(recovered_lots[0].unit_cost, amount("10"));
+        assert_eq!(recovered.realized_tax_pnl().unwrap(), Decimal::ZERO);
         std::fs::remove_file(path).expect("remove test journal");
     }
 
