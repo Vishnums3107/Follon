@@ -12,13 +12,17 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use follon_accounting::{Currency, TaxLot, TaxLotBook, TaxLotBookSnapshot, TaxLotSelection};
+use follon_accounting::{
+    Currency, FxBook, MarginPolicy, MarginPosition, TaxLot, TaxLotBook, TaxLotBookSnapshot,
+    TaxLotSelection,
+};
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
     price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
     OrderState, RiskDecision, Side,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
+use follon_risk::{CandidateOrder, PortfolioRiskSnapshot, RestingOrder, RiskPosition};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -71,6 +75,12 @@ impl From<follon_accounting::AccountingError> for LiveError {
     }
 }
 
+impl From<follon_risk::RiskError> for LiveError {
+    fn from(error: follon_risk::RiskError) -> Self {
+        Self(error.0)
+    }
+}
+
 /// Explicitly bounded LIVE account. It is never constructed from an environment variable.
 #[derive(Clone, Debug)]
 pub struct LiveAccount {
@@ -111,6 +121,62 @@ impl LiveAccount {
     }
 }
 
+/// Operator-attested reference data the live OMS cannot otherwise derive:
+/// there is no sector/asset-class taxonomy anywhere in this codebase, so
+/// composing `core/risk`'s bucket checks requires the operator to supply one
+/// directly, exactly like every other existing caller of
+/// `follon_risk::evaluate_portfolio_risk` (the `follon-risk-benchmark` CLI and
+/// the gRPC `EvaluatePortfolioRisk` RPC) already does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstrumentBucket {
+    /// Stable asset-class label fed to the aggregate risk kernel.
+    pub asset_class: String,
+    /// Three-letter currency fed to the aggregate risk kernel.
+    pub currency: String,
+    /// Stable sector or risk-bucket label fed to the aggregate risk kernel.
+    pub sector: String,
+}
+
+/// Composes `core/risk`'s aggregate portfolio kernel into the real live
+/// order-gating path: gross/net exposure, leverage, concentration, and
+/// sector/asset-class/currency bucket limits (Slice 1); drawdown, via a
+/// durable peak-equity high-water-mark (Slice 2a); and daily loss, via a
+/// durable session-start equity baseline (Slice 2b). Present only when an
+/// operator has explicitly configured it; `evaluate_risk` is byte-for-byte
+/// unchanged when this is `None`.
+///
+/// Margin-utilization and strategy-bucket limits are deliberately not
+/// exposed here: `core/live` has no wired margin model, and `Portfolio` does
+/// not attribute existing positions to a strategy, so those two specific
+/// checks in `follon_risk::PortfolioRiskPolicy` would either be permanently
+/// unreachable or actively misleading if wired in now. `evaluate_risk`
+/// supplies fixed, non-configurable neutral values for exactly those fields
+/// so they can never fire, rather than exposing operator-facing knobs that
+/// silently do nothing. See
+/// docs/06-delivery/14-master-plan-conformance-audit.md (row 5.7) for the
+/// full boundary and the remaining Slice 2 scope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortfolioRiskComposition {
+    /// The aggregate policy's real, operator-configured bucket/exposure limits.
+    pub policy: follon_risk::PortfolioRiskPolicy,
+    /// Reference data for every instrument this account may hold or trade.
+    /// An instrument missing from this map is treated as `"unclassified"` for
+    /// asset class and sector, and as the account's own currency for
+    /// currency -- an honest reflection of missing reference data, not a
+    /// fabricated guess.
+    pub instrument_buckets: BTreeMap<String, InstrumentBucket>,
+    /// Slice-2c margin-utilization composition: an operator-authored initial/
+    /// maintenance margin rate per asset class, reused from the same
+    /// classification already required for bucket/exposure composition.
+    /// `None` preserves `max_margin_utilization_bps`'s inert behavior exactly
+    /// (`margin_used` stays fixed at zero). `core/live` positions and cash
+    /// are always denominated in the account's own currency -- this codebase
+    /// has no cross-currency position support -- so this deliberately does
+    /// not expose a base currency or FX freshness window: valuation always
+    /// converts within a single currency, which requires no FX quote at all.
+    pub margin_rates: Option<BTreeMap<String, follon_accounting::MarginRate>>,
+}
+
 /// Immutable live risk and canary limits.
 #[derive(Clone, Debug)]
 pub struct LiveRiskPolicy {
@@ -140,6 +206,9 @@ pub struct LiveRiskPolicy {
     pub max_order_rate: u32,
     /// Rolling window, in seconds, over which `max_order_rate` is enforced.
     pub order_rate_window_seconds: u64,
+    /// Slice-1 aggregate portfolio-risk composition; `None` preserves today's
+    /// behavior exactly.
+    pub portfolio_risk: Option<PortfolioRiskComposition>,
 }
 
 impl LiveRiskPolicy {
@@ -163,6 +232,40 @@ impl LiveRiskPolicy {
             || self.order_rate_window_seconds == 0
         {
             return Err(LiveError("invalid controlled-live risk policy".to_owned()));
+        }
+        if let Some(composition) = &self.portfolio_risk {
+            composition.policy.validate()?;
+            for bucket in composition.instrument_buckets.values() {
+                if validate_canonical_id("instrument bucket asset_class", &bucket.asset_class)
+                    .is_err()
+                    || validate_canonical_id("instrument bucket sector", &bucket.sector).is_err()
+                    || bucket.currency.len() != 3
+                    || !bucket
+                        .currency
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase())
+                {
+                    return Err(LiveError(
+                        "invalid instrument bucket reference data".to_owned(),
+                    ));
+                }
+            }
+            if let Some(rates) = &composition.margin_rates {
+                if rates.is_empty() {
+                    return Err(LiveError(
+                        "configured margin_rates must not be empty".to_owned(),
+                    ));
+                }
+                for (asset_class, rate) in rates {
+                    if validate_canonical_id("margin rate asset_class", asset_class).is_err()
+                        || rate.initial_bps > 10_000
+                        || rate.maintenance_bps > rate.initial_bps
+                        || rate.maintenance_bps == 0
+                    {
+                        return Err(LiveError("invalid margin rate".to_owned()));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1042,6 +1145,35 @@ struct PersistentLiveState {
     /// applied to a tax-lot ledger that did not yet exist.
     #[serde(default)]
     tax_lots: PersistentTaxLotBook,
+    /// Last observed mark per instrument (Decimal-as-string, matching every
+    /// other persisted decimal field). Missing on a journal written before
+    /// this field existed; an empty map is correct for one -- every position
+    /// simply falls back to its own average cost until re-quoted.
+    #[serde(default)]
+    marks: BTreeMap<String, String>,
+    /// Highest observed real equity (Decimal-as-string). `None` on a journal
+    /// written before this field existed; `restore()` bootstraps it to the
+    /// account's real equity computed from the rest of the just-restored
+    /// state, which is the honest value for a peak that was never tracked
+    /// before now.
+    #[serde(default)]
+    peak_equity: Option<String>,
+    /// UTC calendar date of the current session-start daily-loss baseline
+    /// (Decimal-as-string equity paired below). `None` on a journal written
+    /// before this field existed, or before any risk evaluation has ever run.
+    #[serde(default)]
+    daily_baseline_date: Option<String>,
+    /// Equity observed at the first risk evaluation of `daily_baseline_date`
+    /// (Decimal-as-string). Present if and only if `daily_baseline_date` is.
+    #[serde(default)]
+    daily_baseline_equity: Option<String>,
+    /// Net signed per-strategy contribution to each instrument
+    /// (`instrument_id -> strategy_id -> quantity`, Decimal-as-string).
+    /// Missing or absent entries on a journal written before this field
+    /// existed are correct as empty: no fill could have been attributed to a
+    /// strategy-attribution ledger that did not yet exist.
+    #[serde(default)]
+    strategy_attribution: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1364,6 +1496,36 @@ pub struct LiveTradingService<B> {
     /// lots so a real disposal reports an auditable, tax-lot-accurate
     /// realized gain/loss.
     tax_lots: TaxLotBook,
+    /// Last observed mark per instrument, from every past risk evaluation this
+    /// service has performed. Feeds the Slice-1 aggregate risk composition's
+    /// multi-instrument exposure calculation; a position with no cached mark
+    /// yet falls back to its own average cost. Not a live market-data feed --
+    /// see [`PortfolioRiskComposition`].
+    marks: BTreeMap<String, Decimal>,
+    /// Highest real equity (cash plus every marked position) this service has
+    /// ever observed, updated unconditionally from every risk evaluation --
+    /// independent of whether Slice-1 composition is even configured, so
+    /// enabling it later does not start drawdown tracking from a fresh,
+    /// artificially favorable baseline. Feeds the Slice-2 `PortfolioRiskSnapshot`'s
+    /// real `peak_equity` (see [`PortfolioRiskComposition`]).
+    peak_equity: Decimal,
+    /// UTC calendar date (`YYYY-MM-DD`, sliced from a risk decision's own
+    /// canonical `decided_at`) of the current session-start daily-loss
+    /// baseline. `None` until the first risk evaluation this service has ever
+    /// performed. Reset -- not maxed, unlike `peak_equity` -- at the first
+    /// evaluation whose decision time falls on a new UTC calendar day.
+    daily_baseline_date: Option<String>,
+    /// Real equity observed at the first risk evaluation of
+    /// `daily_baseline_date`. Meaningless while `daily_baseline_date` is
+    /// `None`. Feeds the Slice-2b `PortfolioRiskSnapshot`'s real `daily_pnl`
+    /// (`equity - daily_baseline_equity`) -- see [`PortfolioRiskComposition`].
+    daily_baseline_equity: Decimal,
+    /// Net signed quantity each strategy has contributed to each instrument
+    /// (`instrument_id -> strategy_id -> quantity`), updated from every real
+    /// fill. Feeds the Slice-2d aggregate-risk snapshot's real per-strategy
+    /// `RiskPosition` rows -- see [`PortfolioRiskComposition`] and
+    /// [`Self::apply_strategy_attribution_fill`].
+    strategy_attribution: BTreeMap<String, BTreeMap<String, Decimal>>,
     execution_ids: BTreeSet<String>,
     incidents: BTreeMap<String, LiveIncident>,
     live_days: BTreeMap<String, PersistentLiveDay>,
@@ -1397,6 +1559,10 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         let latest = journal.latest().cloned();
         let mut service = Self {
             cash: account.initial_cash,
+            peak_equity: account.initial_cash,
+            daily_baseline_date: None,
+            daily_baseline_equity: Decimal::ZERO,
+            strategy_attribution: BTreeMap::new(),
             account,
             policy,
             activation,
@@ -1407,6 +1573,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             approvals: BTreeMap::new(),
             portfolios: BTreeMap::new(),
             tax_lots: TaxLotBook::default(),
+            marks: BTreeMap::new(),
             execution_ids: BTreeSet::new(),
             incidents: BTreeMap::new(),
             live_days: BTreeMap::new(),
@@ -2013,12 +2180,14 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             let orders_snapshot = self.orders.clone();
             let portfolios_snapshot = self.portfolios.clone();
             let tax_lots_snapshot = self.tax_lots.clone();
+            let strategy_attribution_snapshot = self.strategy_attribution.clone();
             let execution_ids_snapshot = self.execution_ids.clone();
             let cash_snapshot = self.cash;
             if let Err(error) = self.apply_broker_event(event) {
                 self.orders = orders_snapshot;
                 self.portfolios = portfolios_snapshot;
                 self.tax_lots = tax_lots_snapshot;
+                self.strategy_attribution = strategy_attribution_snapshot;
                 self.execution_ids = execution_ids_snapshot;
                 self.cash = cash_snapshot;
                 apply_errors.push(error.0);
@@ -2436,7 +2605,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
     }
 
     fn evaluate_risk(
-        &self,
+        &mut self,
         intent: &OrderIntent,
         market: &LiveMarketData,
         decided_at: &str,
@@ -2449,6 +2618,29 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             return Err(LiveError(
                 "live market observation does not match intent instrument".to_owned(),
             ));
+        }
+        self.marks
+            .insert(intent.instrument_id.clone(), market.mark_price);
+        // Peak-equity tracking runs unconditionally, independent of whether
+        // Slice-2 composition is even configured, so enabling it later does
+        // not start drawdown tracking from a fresh, artificially favorable
+        // baseline -- the same reasoning as the unconditional `marks` update
+        // above.
+        let observed_equity = self.current_equity()?;
+        if observed_equity > self.peak_equity {
+            self.peak_equity = observed_equity;
+        }
+        // Session-start daily-loss baseline: reset (not maxed) whenever the
+        // UTC calendar date of this decision differs from the stored
+        // baseline date -- including the very first evaluation ever
+        // (`daily_baseline_date` starts `None`). `decided_at` is already
+        // `validate_utc_timestamp`-checked above (canonical second-precision
+        // UTC, `YYYY-MM-DDTHH:MM:SSZ`), so its first 10 bytes are exactly its
+        // UTC calendar date.
+        let decision_date = &decided_at[..10];
+        if self.daily_baseline_date.as_deref() != Some(decision_date) {
+            self.daily_baseline_date = Some(decision_date.to_owned());
+            self.daily_baseline_equity = observed_equity;
         }
         let observed_at = OffsetDateTime::parse(&market.observed_at, &Rfc3339)
             .map_err(|error| LiveError(error.to_string()))?;
@@ -2587,12 +2779,46 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if realized_loss > self.policy.max_realized_loss {
             reasons.push("MAX_REALIZED_LOSS_EXCEEDED".to_owned());
         }
+        let mut portfolio_risk_limits = String::new();
+        if let Some(composition) = self.policy.portfolio_risk.as_ref() {
+            if let Some((decision, margin_used)) =
+                self.portfolio_risk_decision(composition, intent, market, decided_at)?
+            {
+                reasons.extend(
+                    decision
+                        .reason_codes
+                        .into_iter()
+                        // `SELF_TRADE_RISK` is already independently detected above from
+                        // the same working-order state; every other reason this composed
+                        // kernel can produce is new coverage (see `PortfolioRiskComposition`).
+                        .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
+                );
+                portfolio_risk_limits = format!(
+                    ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
+                    decision.policy_version,
+                    decision.metrics.gross_exposure,
+                    decision.metrics.net_exposure,
+                    decision.metrics.leverage_bps,
+                    decision.metrics.concentration_bps,
+                    self.peak_equity,
+                    decision.metrics.drawdown_bps,
+                    self.daily_baseline_equity,
+                    observed_equity.checked_sub(self.daily_baseline_equity)?,
+                    margin_used,
+                    decision.metrics.margin_utilization_bps,
+                    render_bucket_map(&decision.metrics.sector_gross),
+                    render_bucket_map(&decision.metrics.asset_class_gross),
+                    render_bucket_map(&decision.metrics.currency_gross),
+                    render_bucket_map(&decision.metrics.strategy_gross),
+                );
+            }
+        }
         let approved = reasons.is_empty();
         if approved {
             reasons.push("APPROVED".to_owned());
         }
         let evaluated_limits = format!(
-            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}",
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}{}",
             self.policy.max_order_quantity,
             self.policy.max_order_notional,
             self.policy.max_price_deviation_bps,
@@ -2613,6 +2839,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             estimated_notional,
             projected_position,
             available_cash,
+            portfolio_risk_limits,
         );
         Ok(LiveRiskDecision {
             decision_id: format!("live-risk-{}", intent.intent_id),
@@ -2623,6 +2850,234 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             market_fingerprint: market_fingerprint(market),
             evaluated_limits,
         })
+    }
+
+    /// Real point-in-time equity: cash plus every non-zero position marked at
+    /// its cached observed mark, falling back to average cost when this
+    /// instrument has never been independently quoted. Shared by peak-equity
+    /// tracking (always) and the Slice-1/2 aggregate-risk snapshot (when
+    /// composed).
+    fn current_equity(&self) -> Result<Decimal, LiveError> {
+        let mut equity = self.cash;
+        for portfolio in self.portfolios.values() {
+            let snapshot = portfolio.position_snapshot();
+            if snapshot.quantity == Decimal::ZERO {
+                continue;
+            }
+            let mark = self
+                .marks
+                .get(&snapshot.instrument_id)
+                .copied()
+                .unwrap_or(snapshot.average_cost);
+            equity = equity.checked_add(snapshot.quantity.checked_mul(mark)?)?;
+        }
+        Ok(equity)
+    }
+
+    /// Builds the aggregate-risk snapshot/candidate from real service state
+    /// and calls the composed `core/risk` kernel. Returns `Ok(None)` when
+    /// computed equity is not yet positive -- a benign boundary condition,
+    /// not an error; the existing per-order checks still apply on their own.
+    /// On `Some`, the second tuple element is the real margin requirement
+    /// computed for the decision (`Decimal::ZERO` when `margin_rates` is not
+    /// configured), returned alongside the decision because
+    /// `core/risk::AggregateRiskMetrics` only ever reports the *ratio*
+    /// (`margin_utilization_bps`), not the raw currency amount that produced
+    /// it.
+    fn portfolio_risk_decision(
+        &self,
+        composition: &PortfolioRiskComposition,
+        intent: &OrderIntent,
+        market: &LiveMarketData,
+        decided_at: &str,
+    ) -> Result<Option<(follon_risk::PortfolioRiskDecision, Decimal)>, LiveError> {
+        let equity = self.current_equity()?;
+        if equity <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let mut positions = Vec::new();
+        for portfolio in self.portfolios.values() {
+            let snapshot = portfolio.position_snapshot();
+            if snapshot.quantity == Decimal::ZERO {
+                continue;
+            }
+            let mark = self
+                .marks
+                .get(&snapshot.instrument_id)
+                .copied()
+                .unwrap_or(snapshot.average_cost);
+            let bucket = composition.instrument_buckets.get(&snapshot.instrument_id);
+            let asset_class = bucket
+                .map(|bucket| bucket.asset_class.clone())
+                .unwrap_or_else(|| "unclassified".to_owned());
+            let sector = bucket
+                .map(|bucket| bucket.sector.clone())
+                .unwrap_or_else(|| "unclassified".to_owned());
+            let currency = bucket
+                .map(|bucket| bucket.currency.clone())
+                .unwrap_or_else(|| self.account.currency.clone());
+            // Slice 2d: split the aggregate position into one `RiskPosition`
+            // row per strategy that has ever traded this instrument, plus
+            // one "unattributed" remainder row for whatever the tracked
+            // strategies do not account for (a legacy journal, or a fill
+            // predating this ledger). Every row's quantity always
+            // reconciles exactly against `snapshot.quantity` (see
+            // `apply_strategy_attribution_fill`), so gross/net exposure can
+            // never be mis-stated by this split, only how it is attributed.
+            let mut attributed_total = Decimal::ZERO;
+            if let Some(strategies) = self.strategy_attribution.get(&snapshot.instrument_id) {
+                for (strategy_id, quantity) in strategies {
+                    if *quantity == Decimal::ZERO {
+                        continue;
+                    }
+                    attributed_total = attributed_total.checked_add(*quantity)?;
+                    positions.push(RiskPosition {
+                        account_id: snapshot.account_id.clone(),
+                        strategy_id: strategy_id.clone(),
+                        instrument_id: snapshot.instrument_id.clone(),
+                        asset_class: asset_class.clone(),
+                        sector: sector.clone(),
+                        currency: currency.clone(),
+                        quantity: *quantity,
+                        mark_price: mark,
+                        multiplier: Decimal::from_integer(1)?,
+                        delta: Decimal::ZERO,
+                        gamma: Decimal::ZERO,
+                    });
+                }
+            }
+            let remainder = snapshot.quantity.checked_sub(attributed_total)?;
+            if remainder != Decimal::ZERO {
+                positions.push(RiskPosition {
+                    account_id: snapshot.account_id,
+                    strategy_id: "unattributed".to_owned(),
+                    instrument_id: snapshot.instrument_id,
+                    asset_class,
+                    sector,
+                    currency,
+                    quantity: remainder,
+                    mark_price: mark,
+                    multiplier: Decimal::from_integer(1)?,
+                    delta: Decimal::ZERO,
+                    gamma: Decimal::ZERO,
+                });
+            }
+        }
+        let resting_orders = self
+            .orders
+            .values()
+            .filter(|order| order.working())
+            .map(|order| RestingOrder {
+                order_id: order.oms.order_id.clone(),
+                account_id: order.oms.intent.account_id.clone(),
+                instrument_id: order.oms.intent.instrument_id.clone(),
+                side: order.oms.intent.side,
+            })
+            .collect::<Vec<_>>();
+        // Real, computed only when `margin_rates` is configured (Slice 2c):
+        // the *currently held* margin requirement, not a projection that
+        // includes the candidate order -- the same "pre-trade observed, not
+        // post-trade projected" convention `equity`/`peak_equity`/
+        // `daily_baseline_equity` already use above. Every asset class among
+        // currently held positions must have a configured rate or this fails
+        // closed with a technical error rather than silently under-counting
+        // margin -- an intentional operator-configuration requirement, not a
+        // soft risk rejection.
+        let margin_used = if let Some(rates) = composition.margin_rates.as_ref() {
+            let mut margin_positions = Vec::new();
+            for portfolio in self.portfolios.values() {
+                let snapshot = portfolio.position_snapshot();
+                if snapshot.quantity == Decimal::ZERO {
+                    continue;
+                }
+                let mark = self
+                    .marks
+                    .get(&snapshot.instrument_id)
+                    .copied()
+                    .unwrap_or(snapshot.average_cost);
+                let bucket = composition.instrument_buckets.get(&snapshot.instrument_id);
+                margin_positions.push(MarginPosition {
+                    instrument_id: snapshot.instrument_id,
+                    asset_class: bucket
+                        .map(|bucket| bucket.asset_class.clone())
+                        .unwrap_or_else(|| "unclassified".to_owned()),
+                    currency: Currency::new(
+                        bucket
+                            .map(|bucket| bucket.currency.clone())
+                            .unwrap_or_else(|| self.account.currency.clone()),
+                    )?,
+                    quantity: snapshot.quantity,
+                    mark_price: mark,
+                    multiplier: Decimal::from_integer(1)?,
+                });
+            }
+            let account_currency = Currency::new(self.account.currency.clone())?;
+            let mut cash_by_currency = BTreeMap::new();
+            cash_by_currency.insert(account_currency.clone(), self.cash);
+            let margin_policy = MarginPolicy {
+                base_currency: account_currency,
+                // Never actually consulted: every position and cash balance
+                // here is denominated in the account's own currency, so
+                // `FxBook::convert` always takes its same-currency fast path
+                // and never reaches a freshness check.
+                maximum_fx_age_seconds: i64::MAX,
+                rates: rates.clone(),
+            };
+            let as_of_epoch_seconds = OffsetDateTime::parse(decided_at, &Rfc3339)
+                .map_err(|error| LiveError(error.to_string()))?
+                .unix_timestamp();
+            follon_accounting::value_margin_account(
+                &cash_by_currency,
+                &margin_positions,
+                &FxBook::default(),
+                &margin_policy,
+                as_of_epoch_seconds,
+            )?
+            .initial_margin
+        } else {
+            Decimal::ZERO
+        };
+        let snapshot = PortfolioRiskSnapshot {
+            equity,
+            // Real, durable running high-water-mark (see `peak_equity` on
+            // `LiveTradingService`) -- never below `equity` itself, since
+            // `evaluate_risk` updates it from the same observation before
+            // this function ever runs.
+            peak_equity: self.peak_equity.max(equity),
+            // Real, durable session-start baseline (see `daily_baseline_equity`
+            // on `LiveTradingService`) -- `evaluate_risk` updates it from the
+            // same observation before this function ever runs.
+            daily_pnl: equity.checked_sub(self.daily_baseline_equity)?,
+            margin_used,
+            positions,
+            resting_orders,
+            recent_order_count: 0,
+        };
+        let bucket = composition.instrument_buckets.get(&intent.instrument_id);
+        let candidate = CandidateOrder {
+            intent_id: intent.intent_id.clone(),
+            account_id: intent.account_id.clone(),
+            strategy_id: intent.strategy_id.clone(),
+            instrument_id: intent.instrument_id.clone(),
+            asset_class: bucket
+                .map(|bucket| bucket.asset_class.clone())
+                .unwrap_or_else(|| "unclassified".to_owned()),
+            sector: bucket
+                .map(|bucket| bucket.sector.clone())
+                .unwrap_or_else(|| "unclassified".to_owned()),
+            currency: bucket
+                .map(|bucket| bucket.currency.clone())
+                .unwrap_or_else(|| self.account.currency.clone()),
+            side: intent.side,
+            quantity: intent.quantity,
+            mark_price: market.mark_price,
+            multiplier: Decimal::from_integer(1)?,
+            delta: Decimal::ZERO,
+            gamma: Decimal::ZERO,
+        };
+        let decision =
+            follon_risk::evaluate_portfolio_risk(&composition.policy, &snapshot, Some(&candidate))?;
+        Ok(Some((decision, margin_used)))
     }
 
     fn apply_broker_event(&mut self, event: LiveBrokerEvent) -> Result<(), LiveError> {
@@ -2675,7 +3130,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 if self.execution_ids.contains(&execution_id) {
                     return Ok(());
                 }
-                let (instrument_id, side, order_id) = {
+                let (instrument_id, side, order_id, strategy_id) = {
                     let order = self.order_mut(&client_order_id)?;
                     if let Some(existing) = &order.broker_order_id {
                         if existing != &broker_order_id
@@ -2724,6 +3179,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         order.oms.intent.instrument_id.clone(),
                         order.oms.intent.side,
                         order.oms.order_id.clone(),
+                        order.oms.intent.strategy_id.clone(),
                     )
                 };
                 self.execution_ids.insert(execution_id.clone());
@@ -2742,6 +3198,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 });
                 portfolio.apply_fill(&fill)?;
                 self.apply_tax_lot_fill(&fill)?;
+                self.apply_strategy_attribution_fill(&fill, &strategy_id)?;
                 let gross = fill.price.checked_mul(fill.quantity)?;
                 self.cash = match fill.side {
                     Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
@@ -2952,6 +3409,37 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         Ok(())
     }
 
+    /// Updates each strategy's own net signed contribution to one
+    /// instrument's aggregate position. See `core/paper`'s identical method
+    /// for the full rationale: a buy adds, a sell subtracts, never clamped
+    /// or floored at zero, so summed across every strategy it always
+    /// reconciles exactly against `Portfolio`'s own aggregate quantity. This
+    /// is a deliberately separate, live-local bookkeeping layer, not a
+    /// change to `Portfolio` or `PositionSnapshot` (the canonical position of
+    /// record, also part of the audit event schema) -- see
+    /// docs/06-delivery/14-master-plan-conformance-audit.md (row 5.7) for why
+    /// that remains explicitly out of scope.
+    fn apply_strategy_attribution_fill(
+        &mut self,
+        fill: &Fill,
+        strategy_id: &str,
+    ) -> Result<(), LiveError> {
+        let instrument_attribution = self
+            .strategy_attribution
+            .entry(fill.instrument_id.clone())
+            .or_default();
+        let current = instrument_attribution
+            .get(strategy_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let updated = match fill.side {
+            Side::Buy => current.checked_add(fill.quantity)?,
+            Side::Sell => current.checked_sub(fill.quantity)?,
+        };
+        instrument_attribution.insert(strategy_id.to_owned(), updated);
+        Ok(())
+    }
+
     /// Remaining open FIFO tax lots for one instrument, oldest first.
     pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
         self.tax_lots.lots(instrument_id)
@@ -3128,6 +3616,32 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         .collect(),
                 }
             },
+            marks: self
+                .marks
+                .iter()
+                .map(|(instrument_id, mark)| (instrument_id.clone(), mark.to_string()))
+                .collect(),
+            peak_equity: Some(self.peak_equity.to_string()),
+            daily_baseline_date: self.daily_baseline_date.clone(),
+            daily_baseline_equity: self
+                .daily_baseline_date
+                .as_ref()
+                .map(|_| self.daily_baseline_equity.to_string()),
+            strategy_attribution: self
+                .strategy_attribution
+                .iter()
+                .map(|(instrument_id, strategies)| {
+                    (
+                        instrument_id.clone(),
+                        strategies
+                            .iter()
+                            .map(|(strategy_id, quantity)| {
+                                (strategy_id.clone(), quantity.to_string())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -3297,6 +3811,12 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             applied_lot_ids: state.tax_lots.applied_lot_ids.into_iter().collect(),
             applied_disposal_ids: state.tax_lots.applied_disposal_ids.into_iter().collect(),
             realized_by_currency,
+            // `core/live`'s `Portfolio` is long-only, so this journal format
+            // never carries short-lot data; an empty short-side ledger is
+            // correct, not a gap.
+            short_lots: BTreeMap::new(),
+            applied_short_lot_ids: BTreeSet::new(),
+            applied_cover_ids: BTreeSet::new(),
         })?;
         let mut execution_ids = BTreeSet::new();
         for execution_id in state.execution_ids {
@@ -3305,6 +3825,52 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 return Err(LiveError(
                     "persisted live execution ID is duplicated".to_owned(),
                 ));
+            }
+        }
+        let mut marks = BTreeMap::new();
+        for (instrument_id, mark) in state.marks {
+            validate_canonical_id("persisted live mark instrument_id", &instrument_id)?;
+            let mark = decimal("persisted live mark price", &mark)?;
+            if mark <= Decimal::ZERO {
+                return Err(LiveError("persisted live mark price is invalid".to_owned()));
+            }
+            marks.insert(instrument_id, mark);
+        }
+        let mut strategy_attribution = BTreeMap::new();
+        for (instrument_id, strategies) in state.strategy_attribution {
+            validate_canonical_id("persisted live attribution instrument_id", &instrument_id)?;
+            let mut parsed_strategies = BTreeMap::new();
+            for (strategy_id, quantity) in strategies {
+                validate_canonical_id("persisted live attribution strategy_id", &strategy_id)?;
+                // Deliberately signed, not required positive: a strategy's
+                // own tracked contribution can legitimately be negative (see
+                // `apply_strategy_attribution_fill`).
+                let quantity = decimal("persisted live attribution quantity", &quantity)?;
+                parsed_strategies.insert(strategy_id, quantity);
+            }
+            strategy_attribution.insert(instrument_id, parsed_strategies);
+        }
+        let persisted_peak_equity = state
+            .peak_equity
+            .map(|value| decimal("persisted live peak equity", &value))
+            .transpose()?;
+        if persisted_peak_equity.is_some_and(|value| value <= Decimal::ZERO) {
+            return Err(LiveError(
+                "persisted live peak equity is invalid".to_owned(),
+            ));
+        }
+        let persisted_daily_baseline_equity = state
+            .daily_baseline_equity
+            .map(|value| decimal("persisted live daily-loss baseline equity", &value))
+            .transpose()?;
+        match (&state.daily_baseline_date, &persisted_daily_baseline_equity) {
+            (Some(date), Some(_)) => validate_exchange_date(date)?,
+            (None, None) => {}
+            _ => {
+                return Err(LiveError(
+                    "persisted live daily-loss baseline date and equity must be present together"
+                        .to_owned(),
+                ))
             }
         }
         let mut switches = LiveKillSwitchRegistry::new(self.kill_switches.version.clone())?;
@@ -3398,6 +3964,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         self.approvals = approvals;
         self.portfolios = portfolios;
         self.tax_lots = tax_lots;
+        self.marks = marks;
+        self.strategy_attribution = strategy_attribution;
         self.execution_ids = execution_ids;
         self.kill_switches = switches;
         self.incidents = incidents;
@@ -3407,6 +3975,23 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         self.last_reconciled_at = state.last_reconciled_at;
         self.last_reconciliation_clean = state.last_reconciliation_clean;
         self.latest_reconciliation = latest_reconciliation;
+        // `cash`/`portfolios`/`marks` are already restored above, so
+        // `current_equity()` reflects real recovered state here. A journal
+        // that never tracked peak equity (`persisted_peak_equity` absent)
+        // bootstraps its peak to that real equity -- the honest value for a
+        // peak that starts being tracked only from this reopen onward.
+        let recovered_equity = self.current_equity()?;
+        self.peak_equity = persisted_peak_equity
+            .unwrap_or(recovered_equity)
+            .max(recovered_equity);
+        // Unlike peak equity, a daily-loss baseline is never maxed against
+        // recovered equity: it is either the exact value durably persisted
+        // from earlier the same UTC day, or (absent -- a legacy journal, or
+        // one that has never evaluated risk) left unset so the very next
+        // `evaluate_risk` call establishes an honest fresh baseline from real
+        // recovered state.
+        self.daily_baseline_date = state.daily_baseline_date;
+        self.daily_baseline_equity = persisted_daily_baseline_equity.unwrap_or(Decimal::ZERO);
         // Restart recovery never assumes a still-valid external session.
         self.broker_connected = false;
         Ok(())
@@ -3459,7 +4044,51 @@ fn configuration_fingerprint(
     let max_market_data_age_seconds = policy.max_market_data_age_seconds.to_string();
     let max_order_rate = policy.max_order_rate.to_string();
     let order_rate_window_seconds = policy.order_rate_window_seconds.to_string();
-    hash_fingerprint_parts(&[
+    // Absent for every configuration that does not opt into Slice-1 aggregate-
+    // risk composition, so this leaves the fingerprint of an unconfigured
+    // operator byte-for-byte unchanged.
+    let portfolio_risk_parts: Vec<String> = policy
+        .portfolio_risk
+        .as_ref()
+        .map(|composition| {
+            vec![
+                composition.policy.version.clone(),
+                composition.policy.max_gross_exposure.to_string(),
+                composition.policy.max_abs_net_exposure.to_string(),
+                composition.policy.max_leverage_bps.to_string(),
+                composition.policy.max_concentration_bps.to_string(),
+                render_bucket_map(&composition.policy.sector_limits),
+                render_bucket_map(&composition.policy.asset_class_limits),
+                render_bucket_map(&composition.policy.currency_limits),
+                composition
+                    .policy
+                    .allowed_instruments
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                composition
+                    .policy
+                    .restricted_instruments
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                composition
+                    .instrument_buckets
+                    .iter()
+                    .map(|(instrument_id, bucket)| {
+                        format!(
+                            "{instrument_id}:{}:{}:{}",
+                            bucket.asset_class, bucket.currency, bucket.sector
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ]
+        })
+        .unwrap_or_default();
+    let mut parts = vec![
         "live-configuration-v3",
         &account.account_id,
         &account.currency,
@@ -3481,7 +4110,14 @@ fn configuration_fingerprint(
         &max_order_rate,
         &order_rate_window_seconds,
         &kill_switches.version,
-    ])
+    ];
+    if !portfolio_risk_parts.is_empty() {
+        parts.push("live-portfolio-risk-v1");
+        for part in &portfolio_risk_parts {
+            parts.push(part);
+        }
+    }
+    hash_fingerprint_parts(&parts)
 }
 
 fn intent_fingerprint(intent: &OrderIntent) -> Result<String, LiveError> {
@@ -3529,6 +4165,17 @@ fn hash_fingerprint_parts(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Renders a bucket-exposure map deterministically (`BTreeMap` iteration is
+/// already sorted) for the `evaluated_limits` evidence string and the
+/// configuration fingerprint.
+fn render_bucket_map(buckets: &BTreeMap<String, Decimal>) -> String {
+    buckets
+        .iter()
+        .map(|(bucket, amount)| format!("{bucket}:{amount}"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn transition_to_acknowledged(order: &mut LiveOrder, reason: &str) -> Result<(), LiveError> {
@@ -4100,6 +4747,7 @@ mod tests {
             max_market_data_age_seconds: 60,
             max_order_rate: 20,
             order_rate_window_seconds: 60,
+            portfolio_risk: None,
         }
     }
 
@@ -4135,6 +4783,62 @@ mod tests {
             "2026-01-02T14:00:00Z",
         )
         .expect("test service")
+    }
+
+    fn test_service_with_policy(
+        mode: LiveRunMode,
+        path: &Path,
+        policy: LiveRiskPolicy,
+    ) -> LiveTradingService<TestBroker> {
+        let account = account();
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(mode, &account, &policy, &switches);
+        LiveTradingService::open_durable(
+            account,
+            policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service")
+    }
+
+    /// A permissive aggregate policy: every real limit is wide enough that
+    /// nothing rejects until a test deliberately tightens one field.
+    /// `max_drawdown_bps` at `10000` (100%) can never trigger -- the ratio is
+    /// always strictly below `10000` since equity must be positive to reach
+    /// this kernel at all -- unlike a `0` sentinel, which would be the
+    /// tightest possible drawdown limit now that drawdown is genuinely
+    /// computed (Slice 2), not permanently zeroed (Slice 1).
+    fn permissive_portfolio_risk_policy() -> follon_risk::PortfolioRiskPolicy {
+        follon_risk::PortfolioRiskPolicy {
+            version: "portfolio-risk-v1".to_owned(),
+            global_kill_switch: false,
+            max_gross_exposure: amount("100000"),
+            max_abs_net_exposure: amount("100000"),
+            max_leverage_bps: amount("10000"),
+            max_concentration_bps: amount("10000"),
+            // Never trip on daily loss unless a test deliberately overrides
+            // it: `i64::MAX`, the same "no real limit" sentinel the CLI
+            // loader uses when an operator omits `max_daily_loss`.
+            max_daily_loss: Decimal::from_integer(i64::MAX).unwrap(),
+            max_drawdown_bps: amount("10000"),
+            max_margin_utilization_bps: Decimal::ZERO,
+            max_abs_delta: Decimal::ZERO,
+            max_abs_gamma: Decimal::ZERO,
+            max_open_orders: usize::MAX,
+            max_order_rate: u32::MAX,
+            allowed_instruments: BTreeSet::new(),
+            restricted_instruments: BTreeSet::new(),
+            sector_limits: BTreeMap::new(),
+            asset_class_limits: BTreeMap::new(),
+            currency_limits: BTreeMap::new(),
+            strategy_limits: BTreeMap::new(),
+            max_news_slippage_bps: None,
+            max_spread_multiplier_bps: None,
+        }
     }
 
     fn intent(environment: &str, intent_id: &str) -> OrderIntent {
@@ -4624,6 +5328,1744 @@ mod tests {
             .contains(&"MAX_ORDER_RATE_EXCEEDED".to_owned()));
         assert!(decision.evaluated_limits.contains("recent_order_count=2"));
         drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_when_gross_exposure_limit_is_exceeded() {
+        let path = journal_path("portfolio-risk-gross");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_gross_exposure = amount("10");
+        let mut risk_policy = policy();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, risk_policy);
+        let outcome = service
+            .record_shadow_intent(
+                intent("SHADOW", "intent.shadow.portfolio-risk-gross.001"),
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow decision");
+        let LiveSubmitOutcome::ShadowRecorded { decision } = outcome else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_gross_exposure=20.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_when_sector_bucket_limit_is_exceeded() {
+        let path = journal_path("portfolio-risk-sector");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy
+            .sector_limits
+            .insert("index".to_owned(), amount("10"));
+        let mut instrument_buckets = BTreeMap::new();
+        instrument_buckets.insert(
+            "inst.us_equity.spy".to_owned(),
+            InstrumentBucket {
+                asset_class: "equity".to_owned(),
+                currency: "USD".to_owned(),
+                sector: "index".to_owned(),
+            },
+        );
+        let mut risk_policy = policy();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets,
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, risk_policy);
+        let outcome = service
+            .record_shadow_intent(
+                intent("SHADOW", "intent.shadow.portfolio-risk-sector.001"),
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow decision");
+        let LiveSubmitOutcome::ShadowRecorded { decision } = outcome else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"SECTOR_LIMIT_EXCEEDED:index".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_sector_gross=index:20.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_a_restricted_instrument() {
+        let path = journal_path("portfolio-risk-restricted");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy
+            .restricted_instruments
+            .insert("inst.us_equity.spy".to_owned());
+        let mut risk_policy = policy();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, risk_policy);
+        let outcome = service
+            .record_shadow_intent(
+                intent("SHADOW", "intent.shadow.portfolio-risk-restricted.001"),
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow decision");
+        let LiveSubmitOutcome::ShadowRecorded { decision } = outcome else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"RESTRICTED_INSTRUMENT".to_owned()));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_when_drawdown_limit_is_exceeded() {
+        let path = journal_path("portfolio-risk-drawdown");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_drawdown_bps = amount("2000");
+        // Never trip on leverage; this test only wants drawdown exercised.
+        portfolio_policy.max_leverage_bps = amount("1000000");
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1000");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut service = LiveTradingService::open_durable(
+            big_account,
+            risk_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Buy and fill 1,000 shares at 100 -- equity moves from 100,000 cash
+        // into a position of equal value, establishing a 100,000 peak.
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.drawdown.001")
+        };
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.drawdown.001".to_owned(),
+            client_order_id: "order-intent.live.drawdown.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.drawdown.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // Sell 1 share at 70: a real, computed 30% drawdown from the
+        // 100,000 peak (equity is now 1,000 * 70 = 70,000), which exceeds
+        // the configured 20% limit.
+        let mut sell = intent("LIVE", "intent.live.drawdown.sell");
+        sell.side = Side::Sell;
+        sell.quantity = amount("1");
+        let sell_approval = LiveApproval {
+            approval_id: "approval.live.drawdown.sell".to_owned(),
+            ..approval_for(&service, &sell)
+        };
+        service
+            .register_approval(
+                sell_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = service
+            .submit_canary_intent(
+                sell,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("70"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.drawdown.sell",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("drawdown breach must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_DRAWDOWN_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_peak_equity=100000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_drawdown_bps=3000.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_when_daily_loss_limit_is_exceeded() {
+        let path = journal_path("portfolio-risk-daily-loss");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_daily_loss = amount("2000");
+        // Never trip on leverage; this test only wants daily loss exercised.
+        portfolio_policy.max_leverage_bps = amount("1000000");
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1000");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut service = LiveTradingService::open_durable(
+            big_account,
+            risk_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Buy and fill 1,000 shares at 100 -- the very first risk evaluation
+        // ever establishes the session-start baseline at pure cash equity
+        // (100,000; no position exists yet).
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.daily-loss.001")
+        };
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.daily-loss.001".to_owned(),
+            client_order_id: "order-intent.live.daily-loss.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.daily-loss.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // Sell 1 share at 70 later the same UTC day: real equity falls from
+        // the baseline's 100,000 (pure cash, observed before the buy filled)
+        // to 70,000 -- a genuine 30,000 daily loss exceeding the configured
+        // 2,000 limit.
+        let mut sell = intent("LIVE", "intent.live.daily-loss.sell");
+        sell.side = Side::Sell;
+        sell.quantity = amount("1");
+        let sell_approval = LiveApproval {
+            approval_id: "approval.live.daily-loss.sell".to_owned(),
+            ..approval_for(&service, &sell)
+        };
+        service
+            .register_approval(
+                sell_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = service
+            .submit_canary_intent(
+                sell,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("70"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.daily-loss.sell",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("daily-loss breach must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_DAILY_LOSS_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_baseline_equity=100000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_pnl=-30000.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_peak_equity_survives_a_durable_journal_reopen() {
+        let path = journal_path("peak-equity");
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1001");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut durable = LiveTradingService::open_durable(
+            big_account.clone(),
+            risk_policy.clone(),
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Buy and fill 1,000 shares at 100 -- equity starts at 100,000.
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.peak.001")
+        };
+        let approval = approval_for(&durable, &order_intent);
+        durable
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        durable
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = durable
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = durable.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.peak.001".to_owned(),
+            client_order_id: "order-intent.live.peak.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.peak.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        durable
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // Re-quote to 150: a real mark-to-market gain pushes equity to
+        // 150,000, raising the peak. This order is rejected on quantity
+        // alone, but the peak-equity update is unconditional.
+        let mut spike = intent("LIVE", "intent.live.peak.spike");
+        spike.quantity = amount("1002");
+        let spike_approval = LiveApproval {
+            approval_id: "approval.live.peak.spike".to_owned(),
+            ..approval_for(&durable, &spike)
+        };
+        durable
+            .register_approval(
+                spike_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let spiked = durable
+            .submit_canary_intent(
+                spike,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("150"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.peak.spike",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = spiked else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_peak_equity=150000.00000000"));
+
+        // Re-quote back down to 100: equity falls back to 100,000, but the
+        // peak must not fall with it.
+        let mut retreat = intent("LIVE", "intent.live.peak.retreat");
+        retreat.quantity = amount("1002");
+        let retreat_approval = LiveApproval {
+            approval_id: "approval.live.peak.retreat".to_owned(),
+            ..approval_for(&durable, &retreat)
+        };
+        durable
+            .register_approval(
+                retreat_approval,
+                "2026-01-02T14:33:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let retreated = durable
+            .submit_canary_intent(
+                retreat,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:33:00Z".to_owned(),
+                },
+                "approval.live.peak.retreat",
+                "2026-01-02T14:33:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = retreated else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_peak_equity=150000.00000000"));
+        drop(durable);
+
+        // Reopen: the durable peak (150,000) must survive, not reset to
+        // today's current equity (100,000).
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut reopened = LiveTradingService::open_durable(
+            big_account.clone(),
+            risk_policy,
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:34:00Z",
+        )
+        .expect("reopened test service");
+        reopened
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:34:00Z",
+            )
+            .expect("managed-secret reconnection");
+        let mut probe = intent("LIVE", "intent.live.peak.after-reopen");
+        probe.quantity = amount("1002");
+        let probe_approval = LiveApproval {
+            approval_id: "approval.live.peak.after-reopen".to_owned(),
+            ..approval_for(&reopened, &probe)
+        };
+        reopened
+            .register_approval(
+                probe_approval,
+                "2026-01-02T14:34:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = reopened
+            .submit_canary_intent(
+                probe,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:34:00Z".to_owned(),
+                },
+                "approval.live.peak.after-reopen",
+                "2026-01-02T14:34:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_peak_equity=150000.00000000"));
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_daily_loss_baseline_resets_at_a_new_utc_calendar_day() {
+        let path = journal_path("daily-loss-reset");
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1001");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut service = LiveTradingService::open_durable(
+            big_account,
+            risk_policy,
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Buy and fill 1,000 shares at 100 -- the very first risk evaluation
+        // ever establishes the day-1 baseline at pure cash equity (100,000).
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.daily-reset.001")
+        };
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.daily-reset.001".to_owned(),
+            client_order_id: "order-intent.live.daily-reset.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.daily-reset.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // Re-quote to 150 later the same UTC day: equity rises to 150,000
+        // against the still-standing day-1 baseline of 100,000, a real
+        // +50,000 daily gain. This order is rejected on quantity alone, but
+        // the mark update (and hence the daily-P&L read) is unconditional.
+        let mut spike = intent("LIVE", "intent.live.daily-reset.spike");
+        spike.quantity = amount("1002");
+        let spike_approval = LiveApproval {
+            approval_id: "approval.live.daily-reset.spike".to_owned(),
+            ..approval_for(&service, &spike)
+        };
+        service
+            .register_approval(
+                spike_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let spiked = service
+            .submit_canary_intent(
+                spike,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("150"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.daily-reset.spike",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = spiked else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_baseline_equity=100000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_pnl=50000.00000000"));
+
+        // The next UTC calendar day resets the baseline to that day's own
+        // first observed equity (150,000, the mark is unchanged), not the
+        // prior day's 100,000 -- proving a genuine reset rather than a
+        // carried-over accumulation. The approval window is extended past
+        // the default same-day expiry so this later-day submission itself
+        // is not rejected on approval expiry before reaching risk
+        // composition.
+        let mut next_day = intent("LIVE", "intent.live.daily-reset.day2");
+        next_day.quantity = amount("1002");
+        let next_day_approval = LiveApproval {
+            approval_id: "approval.live.daily-reset.day2".to_owned(),
+            approved_at: "2026-01-03T09:00:00Z".to_owned(),
+            expires_at: "2026-01-03T10:00:00Z".to_owned(),
+            ..approval_for(&service, &next_day)
+        };
+        service
+            .register_approval(
+                next_day_approval,
+                "2026-01-03T09:00:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let after_rollover = service
+            .submit_canary_intent(
+                next_day,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("150"),
+                    observed_at: "2026-01-03T09:00:00Z".to_owned(),
+                },
+                "approval.live.daily-reset.day2",
+                "2026-01-03T09:00:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = after_rollover else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_baseline_equity=150000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_pnl=0.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_daily_loss_baseline_survives_a_durable_journal_reopen() {
+        let path = journal_path("daily-loss-durability");
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1001");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut durable = LiveTradingService::open_durable(
+            big_account.clone(),
+            risk_policy.clone(),
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Buy and fill 1,000 shares at 100 -- the very first risk evaluation
+        // ever establishes the baseline at pure cash equity (100,000).
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.daily-durability.001")
+        };
+        let approval = approval_for(&durable, &order_intent);
+        durable
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        durable
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = durable
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = durable.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.daily-durability.001".to_owned(),
+            client_order_id: "order-intent.live.daily-durability.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.daily-durability.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        durable
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // Re-quote to 150: equity rises to 150,000 -- a real +50,000 gain
+        // against the day's still-standing 100,000 baseline. This order is
+        // rejected on quantity alone, but the mark update (and hence the
+        // daily-P&L read) is unconditional.
+        let mut spike = intent("LIVE", "intent.live.daily-durability.spike");
+        spike.quantity = amount("1002");
+        let spike_approval = LiveApproval {
+            approval_id: "approval.live.daily-durability.spike".to_owned(),
+            ..approval_for(&durable, &spike)
+        };
+        durable
+            .register_approval(
+                spike_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let spiked = durable
+            .submit_canary_intent(
+                spike,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("150"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.daily-durability.spike",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = spiked else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_baseline_equity=100000.00000000"));
+        drop(durable);
+
+        // Reopen later the same UTC day: the durable baseline (100,000) must
+        // survive, not reset to today's current equity (150,000).
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut reopened = LiveTradingService::open_durable(
+            big_account.clone(),
+            risk_policy,
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:34:00Z",
+        )
+        .expect("reopened test service");
+        reopened
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:34:00Z",
+            )
+            .expect("managed-secret reconnection");
+        let mut probe = intent("LIVE", "intent.live.daily-durability.after-reopen");
+        probe.quantity = amount("1002");
+        let probe_approval = LiveApproval {
+            approval_id: "approval.live.daily-durability.after-reopen".to_owned(),
+            ..approval_for(&reopened, &probe)
+        };
+        reopened
+            .register_approval(
+                probe_approval,
+                "2026-01-02T14:34:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = reopened
+            .submit_canary_intent(
+                probe,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("150"),
+                    observed_at: "2026-01-02T14:34:00Z".to_owned(),
+                },
+                "approval.live.daily-durability.after-reopen",
+                "2026-01-02T14:34:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_baseline_equity=100000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_daily_pnl=50000.00000000"));
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_when_margin_utilization_limit_is_exceeded() {
+        let path = journal_path("portfolio-risk-margin");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_margin_utilization_bps = amount("4000");
+        // Never trip on leverage; this test only wants margin utilization
+        // exercised.
+        portfolio_policy.max_leverage_bps = amount("1000000");
+        let mut instrument_buckets = BTreeMap::new();
+        instrument_buckets.insert(
+            "inst.us_equity.spy".to_owned(),
+            InstrumentBucket {
+                asset_class: "equity".to_owned(),
+                currency: "USD".to_owned(),
+                sector: "index".to_owned(),
+            },
+        );
+        let mut margin_rates = BTreeMap::new();
+        margin_rates.insert(
+            "equity".to_owned(),
+            follon_accounting::MarginRate {
+                initial_bps: 5000,
+                maintenance_bps: 2500,
+            },
+        );
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1000");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets,
+            margin_rates: Some(margin_rates),
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut service = LiveTradingService::open_durable(
+            big_account,
+            risk_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Buy and fill 1,000 shares at 100 -- cash is fully spent, so equity
+        // (100,000) equals the position's mark value exactly.
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.margin.001")
+        };
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.margin.001".to_owned(),
+            client_order_id: "order-intent.live.margin.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.margin.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // A second order against the same mark: real margin_used is now
+        // 100,000 * 50% = 50,000 against equity of 100,000, a genuine 50%
+        // utilization exceeding the configured 40% limit.
+        let mut sell = intent("LIVE", "intent.live.margin.sell");
+        sell.side = Side::Sell;
+        sell.quantity = amount("1");
+        let sell_approval = LiveApproval {
+            approval_id: "approval.live.margin.sell".to_owned(),
+            ..approval_for(&service, &sell)
+        };
+        service
+            .register_approval(
+                sell_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = service
+            .submit_canary_intent(
+                sell,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.margin.sell",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("margin-utilization breach must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_MARGIN_UTILIZATION_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_margin_used=50000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_margin_utilization_bps=5000.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_fails_closed_when_a_held_position_has_no_margin_rate() {
+        let path = journal_path("portfolio-risk-margin-gap");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_leverage_bps = amount("1000000");
+        let mut instrument_buckets = BTreeMap::new();
+        instrument_buckets.insert(
+            "inst.us_equity.spy".to_owned(),
+            InstrumentBucket {
+                asset_class: "equity".to_owned(),
+                currency: "USD".to_owned(),
+                sector: "index".to_owned(),
+            },
+        );
+        // A margin_rates map that covers a *different* asset class than the
+        // one actually held: `value_margin_account` requires a rate for
+        // every asset class among currently held positions, so this must
+        // fail closed with a technical error rather than silently treating
+        // the uncovered position as zero margin.
+        let mut margin_rates = BTreeMap::new();
+        margin_rates.insert(
+            "option".to_owned(),
+            follon_accounting::MarginRate {
+                initial_bps: 5000,
+                maintenance_bps: 2500,
+            },
+        );
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1000");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets,
+            margin_rates: Some(margin_rates),
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut service = LiveTradingService::open_durable(
+            big_account,
+            risk_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+        let order_intent = OrderIntent {
+            quantity: amount("1000"),
+            ..intent("LIVE", "intent.live.margin-gap.001")
+        };
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.margin-gap.001".to_owned(),
+            client_order_id: "order-intent.live.margin-gap.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.margin-gap.001".to_owned(),
+            quantity: amount("1000"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("1000");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("1000"),
+        });
+        broker.snapshot.cash = Decimal::ZERO;
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        let mut sell = intent("LIVE", "intent.live.margin-gap.sell");
+        sell.side = Side::Sell;
+        sell.quantity = amount("1");
+        let sell_approval = LiveApproval {
+            approval_id: "approval.live.margin-gap.sell".to_owned(),
+            ..approval_for(&service, &sell)
+        };
+        service
+            .register_approval(
+                sell_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let error = service
+            .submit_canary_intent(
+                sell,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.margin-gap.sell",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .unwrap_err();
+        assert!(error.0.contains("missing margin policy"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_rejects_when_strategy_limit_is_exceeded() {
+        let path = journal_path("portfolio-risk-strategy");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        // Never trip on leverage/concentration/gross; this test only wants
+        // the strategy-bucket check exercised.
+        portfolio_policy.max_leverage_bps = amount("1000000");
+        portfolio_policy.max_gross_exposure = amount("1000000");
+        let mut strategy_limits = BTreeMap::new();
+        strategy_limits.insert("strategy.beta".to_owned(), amount("25000"));
+        portfolio_policy.strategy_limits = strategy_limits;
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1000");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut service = LiveTradingService::open_durable(
+            big_account,
+            risk_policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Strategy "strategy.live.001" (the default test strategy) buys and
+        // fills 100 shares at 100 -- a real, durably attributed 10,000
+        // position for that strategy alone.
+        let order_intent = OrderIntent {
+            quantity: amount("100"),
+            ..intent("LIVE", "intent.live.strategy-alpha.001")
+        };
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.strategy-alpha.001".to_owned(),
+            client_order_id: "order-intent.live.strategy-alpha.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.strategy-alpha.001".to_owned(),
+            quantity: amount("100"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("100");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("100"),
+        });
+        broker.snapshot.cash = amount("99000");
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // A second, distinct strategy ("strategy.beta") submits a 300-share
+        // buy of the *same* instrument at the same mark. Its own candidate
+        // notional alone (30,000) already exceeds the configured 25,000
+        // strategy.beta limit, independent of strategy.live.001's already-
+        // filled 10,000 position -- proving the two strategies are tracked
+        // and limited separately, not pooled into one aggregate bucket.
+        let mut beta_buy = intent("LIVE", "intent.live.strategy-beta.001");
+        beta_buy.strategy_id = "strategy.beta".to_owned();
+        beta_buy.quantity = amount("300");
+        let beta_approval = LiveApproval {
+            approval_id: "approval.live.strategy-beta.001".to_owned(),
+            ..approval_for(&service, &beta_buy)
+        };
+        service
+            .register_approval(
+                beta_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = service
+            .submit_canary_intent(
+                beta_buy,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.strategy-beta.001",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("strategy-limit breach must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"STRATEGY_LIMIT_EXCEEDED:strategy.beta".to_owned()));
+        // Total gross exposure reflects both strategies exactly (10,000 from
+        // the filled strategy.live.001 position plus 30,000 from the
+        // rejected strategy.beta candidate), proving the per-strategy split
+        // never mis-states the true aggregate.
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_gross_exposure=40000.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("strategy.beta:30000.00000000"));
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_strategy_attribution_survives_a_durable_journal_reopen() {
+        let path = journal_path("strategy-attribution");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_leverage_bps = amount("1000000");
+        portfolio_policy.max_gross_exposure = amount("1000000");
+        let mut strategy_limits = BTreeMap::new();
+        strategy_limits.insert("strategy.beta".to_owned(), amount("25000"));
+        portfolio_policy.strategy_limits = strategy_limits;
+        let mut risk_policy = policy();
+        risk_policy.max_order_quantity = amount("1000");
+        risk_policy.max_order_notional = amount("200000");
+        risk_policy.canary_max_order_notional = amount("200000");
+        risk_policy.max_position_quantity = amount("2000");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let big_account = LiveAccount {
+            initial_cash: amount("100000"),
+            max_deployed_capital: amount("100000"),
+            ..account()
+        };
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut durable = LiveTradingService::open_durable(
+            big_account.clone(),
+            risk_policy.clone(),
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:00:00Z",
+        )
+        .expect("test service");
+
+        // Strategy "strategy.live.001" buys and fills 100 shares at 100.
+        let order_intent = OrderIntent {
+            quantity: amount("100"),
+            ..intent("LIVE", "intent.live.attribution-durability.alpha")
+        };
+        let approval = approval_for(&durable, &order_intent);
+        durable
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        durable
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = durable
+            .submit_canary_intent(
+                order_intent,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = durable.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.attribution-durability.alpha".to_owned(),
+            client_order_id: "order-intent.live.attribution-durability.alpha".to_owned(),
+            broker_order_id: "broker-order-intent.live.attribution-durability.alpha".to_owned(),
+            quantity: amount("100"),
+            price: amount("100"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("100");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("100"),
+        });
+        broker.snapshot.cash = amount("99000");
+        durable
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+        drop(durable);
+
+        // Reopen: the durable per-strategy attribution (100 shares owned by
+        // strategy.live.001) must survive, so a fresh strategy.beta candidate
+        // still sees the correct pre-existing gross exposure and its own
+        // limit is still evaluated against exactly its own contribution.
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation_record =
+            activation(LiveRunMode::Canary, &big_account, &risk_policy, &switches);
+        let mut reopened = LiveTradingService::open_durable(
+            big_account.clone(),
+            risk_policy,
+            activation_record,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T14:32:00Z",
+        )
+        .expect("reopened test service");
+        reopened
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:32:00Z",
+            )
+            .expect("managed-secret reconnection");
+        let mut beta_buy = intent("LIVE", "intent.live.attribution-durability.beta");
+        beta_buy.strategy_id = "strategy.beta".to_owned();
+        beta_buy.quantity = amount("300");
+        let beta_approval = LiveApproval {
+            approval_id: "approval.live.attribution-durability.beta".to_owned(),
+            ..approval_for(&reopened, &beta_buy)
+        };
+        reopened
+            .register_approval(
+                beta_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let result = reopened
+            .submit_canary_intent(
+                beta_buy,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("100"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.attribution-durability.beta",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("strategy-limit breach must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"STRATEGY_LIMIT_EXCEEDED:strategy.beta".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_gross_exposure=40000.00000000"));
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn live_portfolio_risk_composition_uses_a_durable_mark_cache_after_journal_reopen() {
+        let path = journal_path("portfolio-risk-marks");
+        let mut portfolio_policy = permissive_portfolio_risk_policy();
+        portfolio_policy.max_gross_exposure = amount("40");
+        let mut risk_policy = policy();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: portfolio_policy,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy.clone());
+
+        // Buy and fill A (spy) at 10, so its average cost is 10.
+        let order_intent = intent("LIVE", "intent.live.marks.001");
+        let approval = approval_for(&service, &order_intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let outcome = service
+            .submit_canary_intent(
+                order_intent,
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let broker = service.broker_mut();
+        broker.events.push(LiveBrokerEvent::Execution {
+            execution_id: "execution.live.marks.001".to_owned(),
+            client_order_id: "order-intent.live.marks.001".to_owned(),
+            broker_order_id: "broker-order-intent.live.marks.001".to_owned(),
+            quantity: amount("2"),
+            price: amount("10"),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        });
+        broker.snapshot.orders[0].state = OrderState::Filled;
+        broker.snapshot.orders[0].filled_quantity = amount("2");
+        broker.snapshot.positions.push(LiveBrokerPositionSnapshot {
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            quantity: amount("2"),
+        });
+        broker.snapshot.cash = amount("980");
+        service
+            .synchronize("operator.approver.001", "2026-01-02T14:31:00Z")
+            .expect("broker event synchronization");
+
+        // Re-quote A at 25 via a second canary attempt that is rejected on
+        // quantity alone -- the mark observation is cached unconditionally
+        // before any check runs.
+        let mut requote = intent("LIVE", "intent.live.marks.requote");
+        requote.quantity = amount("1000");
+        let requote_approval = LiveApproval {
+            approval_id: "approval.live.marks.requote".to_owned(),
+            ..approval_for(&service, &requote)
+        };
+        service
+            .register_approval(
+                requote_approval,
+                "2026-01-02T14:32:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let requoted = service
+            .submit_canary_intent(
+                requote,
+                LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("25"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                "approval.live.marks.requote",
+                "2026-01-02T14:32:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = requoted else {
+            panic!("over-quantity canary submission must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_ORDER_QUANTITY_EXCEEDED".to_owned()));
+        drop(service);
+
+        // Reopen: the cached mark for A (25) must survive and be used, not
+        // fall back to its average cost (10).
+        let mut reopened = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        reopened
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:33:00Z",
+            )
+            .expect("managed-secret reconnection");
+        let second_intent = OrderIntent {
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            quantity: amount("1"),
+            ..intent("LIVE", "intent.live.marks.002")
+        };
+        let second_approval = LiveApproval {
+            approval_id: "approval.live.marks.002".to_owned(),
+            ..approval_for(&reopened, &second_intent)
+        };
+        reopened
+            .register_approval(
+                second_approval,
+                "2026-01-02T14:33:00Z",
+                "operator.approver.001",
+            )
+            .expect("four-eyes approval");
+        let second_market = LiveMarketData {
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            mark_price: amount("10"),
+            observed_at: "2026-01-02T14:33:00Z".to_owned(),
+        };
+        let result = reopened
+            .submit_canary_intent(
+                second_intent,
+                second_market,
+                "approval.live.marks.002",
+                "2026-01-02T14:33:00Z",
+                "operator.requester.001",
+            )
+            .expect("risk-rejected outcome");
+        let LiveSubmitOutcome::RiskRejected { decision } = result else {
+            panic!("gross-exposure breach must be risk-rejected");
+        };
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("portfolio_gross_exposure=60.00000000"));
+        drop(reopened);
         std::fs::remove_file(path).expect("remove test journal");
     }
 

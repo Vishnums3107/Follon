@@ -8,7 +8,28 @@ stale-fixture-fingerprint, rustls advisory, first-ever live Docker Compose
 runtime, and first-ever PostgreSQL integration-test execution delta:
 2026-09-15; real counterfactual/adversarial intervention-and-probe execution,
 PAPER/LIVE/backtest FIFO tax-lot ledger, and a stale-journal-fixture fix
-this pass's own change required, delta: 2026-09-16.
+this pass's own change required, delta: 2026-09-16; Slices 1 and 2a of the 5.7
+core/risk aggregate-kernel composition gap (gross/net/leverage/concentration/
+bucket checks and, via a new durable peak-equity high-water-mark, drawdown are
+now real in the PAPER/controlled-LIVE order path; margin/daily-loss/strategy
+tracking deferred to Slice 2b/2c) delta: 2026-09-17; Slice 2b of the same gap
+(daily loss, via a new durable session-start equity baseline, is now real in
+the PAPER/controlled-LIVE order path; margin-utilization and strategy-bucket
+tracking remain deferred) delta: 2026-09-18; Slice 2c of the same gap
+(margin utilization, via `core/accounting::value_margin_account` wired against
+an operator-authored per-asset-class margin rate, is now real in the
+PAPER/controlled-LIVE order path; strategy-bucket tracking remains deferred,
+assessed this pass as requiring a `Portfolio` architectural redesign, not a
+wiring task) delta: 2026-09-18; Slice 2d of the same gap, and closure of the
+entire 5.7 Slice 2 backlog (strategy-bucket limits are now real, via a new
+paper/live-local per-strategy attribution ledger deliberately kept separate
+from `Portfolio`/`PositionSnapshot` rather than the architectural redesign
+previously assessed as required -- the redesign turned out to be avoidable,
+not merely deferred) delta: 2026-09-18; short-side tax-lot support added to
+`core/accounting::TaxLotBook` and wired into `core/backtest::
+AdvancedBacktestAccount`'s real fill path, including proportional fee-split
+crossing-fill handling, closing the row 5.8 gap recorded since item 32
+delta: 2026-09-18.
 Source reviewed: all 29 pages of the original `Solo Trading Operating System
 Master Plan.pdf`.** This is the controlling
 requirement-to-evidence record. It does not turn planned work, a local mechanism,
@@ -44,6 +65,94 @@ Status terms used below:
 - **Deferred by plan**: the master plan intentionally sequences or freezes it.
 
 ## Verification snapshot
+
+The same 2026-09-18 session, having closed the entire 5.7 Slice 2 backlog
+(item 39), moved to row 5.8's own long-standing recorded gap: item 40 added a
+short-side mirror (`ShortTaxLot`/`open_short`/`cover`) to
+`core/accounting::TaxLotBook` and wired it into
+`core/backtest::AdvancedBacktestAccount`'s real fill path, including a
+proportional fee split for a fill that crosses through zero. This pass's own
+first attempt broke the full workspace build (adding fields to
+`TaxLotBookSnapshot` left two exhaustive struct-literal call sites in
+`core/paper`/`core/live` uncompilable) and that failure was initially missed
+because the verification command was piped through `grep`, whose own exit
+code (0, matching error lines) masked the real `cargo test` failure -- caught
+only by reading the captured log's actual content, not trusting the pipe's
+exit status. Both sites were fixed and the full suite was re-run capturing a
+genuine exit code directly: `cargo fmt`/`clippy -D warnings`/
+`test --workspace --all-targets` clean throughout, **282 passed, 0 failed, 3
+ignored** in the main workspace (`follon-accounting` 19, up from 17;
+`follon-backtest` 15, up from 13) and **17 passed, 0 failed** in the separate
+`apps/desktop/src-tauri` Tauri workspace, unchanged. `AdvancedBacktestAccount`
+is not durably persisted (a backtest is a one-shot batch replay, not a
+restartable service), so neither checked-in journal fixture needed
+regenerating -- confirmed by diffing both against their pre-this-entry state,
+not assumed. The full 23-step `tools/generate_pipeline_evidence.py` pipeline
+was re-run afterward and completed with zero failures, producing all 73
+evidence artifacts. Full detail is item 40 below.
+
+The same 2026-09-18 session continued directly into Slice 2d after item 38,
+after first re-investigating item 38's own conclusion that strategy-bucket
+composition needed a `Portfolio` architectural redesign -- reading
+`core/risk::RiskPosition`/`aggregate_metrics` closely enough to see that the
+kernel already supported real per-strategy bucketing, and that the actual gap
+was a missing paper/live-local ledger, not a shared-type change. Item 39
+(strategy-bucket limits are now real, closing the entire Slice 2 backlog) was
+implemented and verified on that corrected basis. `cargo fmt`/
+`clippy -D warnings`/`test --workspace --all-targets` remained clean
+throughout: **278 passed, 0 failed, 3 ignored** in the main workspace
+(`follon-paper` 37, up from 35; `follon-live` 22, up from 20) and **17 passed,
+0 failed** in the separate `apps/desktop/src-tauri` Tauri workspace, unchanged.
+`strategy_attribution` is a new persisted field on
+`PersistentPaperState`/`PersistentLiveState` (unlike item 38's margin work),
+so the two checked-in journal fixtures were regenerated again using the same
+procedure as items 27/34-37, and the full 23-step
+`tools/generate_pipeline_evidence.py` pipeline was re-run afterward and
+completed with zero failures, producing all 73 evidence artifacts. Full detail
+is item 39 below.
+
+The same 2026-09-18 session continued directly into Slice 2c after item 37
+(item 38: margin utilization, via the unmodified `core/accounting::
+value_margin_account`, is now a real, composed decision in `core/paper`/
+`core/live`). `cargo fmt`/`clippy -D warnings`/`test --workspace --all-targets`
+remained clean throughout: **274 passed, 0 failed, 3 ignored** in the main
+workspace (`follon-paper` 35, up from 33; `follon-live` 20, up from 18) and
+**17 passed, 0 failed** in the separate `apps/desktop/src-tauri` Tauri
+workspace, unchanged. Unlike item 37, no field was added to
+`PersistentPaperState`/`PersistentLiveState` this pass (margin data is computed
+transiently, never persisted), so the two checked-in journal fixtures did not
+need regenerating -- confirmed by grepping both `Persistent*` structs for
+`margin` before concluding it, not assumed. The full 23-step
+`tools/generate_pipeline_evidence.py` pipeline was re-run afterward and
+completed with zero failures, producing all 73 evidence artifacts. This pass
+also read `core/control-plane::Portfolio`'s actual definition to assess the
+one remaining Slice 2 item (strategy-bucket composition) rather than
+re-asserting the prior finding, and confirmed it is a `Portfolio`-level
+architectural redesign affecting `core/backtest`, the gRPC service, and
+desktop projections -- not a bounded wiring task -- so it was not attempted
+this pass. Full detail is item 38 below.
+
+The 2026-09-18 session closed Slice 2b of the 5.7 `core/risk` composition gap
+(item 37: a durable session-start equity baseline makes `MAX_DAILY_LOSS_EXCEEDED`
+a real, composed decision in `core/paper`/`core/live`). Before writing any code,
+this session independently verified the uncommitted Slices 1/2a change set
+already sitting in the working tree (items 35-36, never previously committed or
+verified in this document) was real: `cargo build --workspace --all-targets`,
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, and `cargo test --workspace --all-targets` all passed clean, with the
+`follon-paper` count (30 passed) matching that entry's own claim exactly. After
+implementing and testing item 37, the same full suite was re-run clean:
+`cargo fmt`/`clippy -D warnings` clean; **270 passed, 0 failed, 3 ignored** in
+the main workspace (`follon-paper` 33, up from 30; `follon-live` 18, up from 15)
+and **17 passed, 0 failed** in the separate `apps/desktop/src-tauri` Tauri
+workspace, unchanged. The two checked-in journal fixtures
+(`tests/fixtures/paper/journal-v2.ndjson`, `tests/fixtures/live/journal-v1.ndjson`)
+were regenerated using the actual current CLI binaries against their unchanged
+configuration documents (the same procedure items 27/34/35/36 established),
+and the full 23-step `tools/generate_pipeline_evidence.py` pipeline -- which no
+`cargo test` invocation exercises -- was re-run end to end afterward and
+completed with zero failures, producing all 73 evidence artifacts. Full detail
+is item 37 below.
 
 The 2026-09-15 independent re-verification run (a separate session with no
 memory of producing the 2026-09-14 entry below re-ran every check from a
@@ -237,8 +346,8 @@ kept current, which is itself corrected here rather than left stale):
 | 5.4 Professional backtester | Implemented CLI projection; runner-internal accounting remains bounded | Event-driven replay, exact decimal accounting, spread, adverse slippage, attributed commission/exchange/regulatory charges, latency, per-bar partial-fill caps, persistent working orders, post-cost limit protection, sessions/halts, dividends/splits, point-in-time universe membership, long/short accounting, borrow availability/recall calculation, exact borrow/cash-debit financing, multi-currency FX, initial-margin capital checks, delisting settlement, immutable reports/manifests, experiment records, and Backtest Explorer capability evidence are implemented and tested. Every CLI backtest derives a hashed advanced-account result from the same canonical event stream and refuses publication when its capital or lifecycle checks fail. Explicit economics use `advanced_account`; older configurations use a deterministic fully-paid profile derived from immutable reference data. | Multi-account allocation and proof against production-size performance targets remain. The in-run `BacktestRunner` ledger is retained for backward-compatible event construction, so an operator must consume the advanced-account sidecar for advanced economics. |
 | 5.5 OMS | Implemented for current market/limit scope | Stable client identities, idempotency, legal state transitions, cancel/replace, out-of-order evidence, UNKNOWN handling, restart recovery, reconciliation, and causal audit events exist in simulation/PAPER/controlled-LIVE. Execution Blotter renders the lifecycle. `core/paper::evaluate_risk` and `core/live::evaluate_risk` (the exact functions every PAPER/controlled-LIVE order intent passes through before an `OmsOrder` is created) now reject a same-instrument opposite-side order against an existing working order (`SELF_TRADE_RISK`) and reject submissions beyond a configured rolling-window rate (`MAX_ORDER_RATE_EXCEEDED`), closing a prior gap where those two pre-trade-risk-doc checks existed only in the disconnected `core/risk` evidence engine and never actually gated a real order. The desktop order ticket's submit/cancel/close-position commands are no longer permanently wired to an inert `TradingCommandState::unavailable()` stub: `apps/desktop/src-tauri/src/paper_gateway.rs` is a real `RiskOmsGateway` backed by an in-process `follon_paper::PaperTradingService`, so when an operator points `FOLLON_DESKTOP_PAPER_CONFIG` at a valid PAPER configuration file the desktop actually submits, cancels, and closes real PAPER orders through the genuine risk/kill-switch/audit-journal path (see the UX row below and the dated entry in "Locally closed gaps"). | It is not a claim of complete OMS coverage for every future order type, asset class, or live broker. Without `FOLLON_DESKTOP_PAPER_CONFIG` configured, the desktop command surface remains unavailable exactly as before. |
 | 5.6 EMS | Implemented as broker-neutral planning and local TCA; capital gate open | `core/execution` implements immediate, exact TWAP, forecast-volume VWAP, POV/participation, urgency-weighted arrival price, sequential display-size Iceberg, deterministic weighted AlgoWheel with schedule tie-breaking, strict post-only passive cancel/replace with monotonic chase collars, capability-gated multi-venue smart routing (`smart_route_with_capabilities`), stop/stop-limit bracket children, monotonic trailing stops, exact basket legs, and atomic ratio/net-price-protected options combinations. Content-addressed `ExecutionPlanEvidence` records bind parent order, scheduled slices, route decisions, frozen arrival/target benchmarks, and a SHA-256 fingerprint. `follon-tca` produces immutable parent-order implementation-shortfall reports against frozen benchmarks. Quantity conservation and safety boundaries are tested; the versioned gRPC service exposes scheduled execution, cancel-before-replace passive plans, and synchronized net-price-protected option combinations without discarding venue/order-kind/stop fields. | Options-combination atomicity requires a native-combo adapter or rejection before transmitting any leg. TCA relies on operator-supplied frozen evidence and does not validate a broker statement. Every vendor transport still needs independent human review and broker-backed PAPER/LIVE acceptance. |
-| 5.7 Risk engine | Implemented portfolio kernel; operating gate open | `core/risk` evaluates gross/net, leverage, concentration, daily loss, drawdown, margin utilization, delta/gamma, instrument permissions/restrictions, sector/asset/currency/strategy buckets, open orders, order rate, self-trade, and kill state. A fresh FX snapshot can only create an ordinary local candidate with retained snapshot/version/value-date evidence; it still receives the same aggregate risk decision. The kernel returns exact reason codes, is exposed over gRPC, and is visible in Risk Cockpit capability mapping. Self-trade prevention and order-rate limiting are now independently duplicated directly inside the actual PAPER/controlled-LIVE order-gating path (`core/paper`/`core/live` `evaluate_risk`, see 5.5), so those two specific order-shape checks are no longer evidence-only. | This aggregate `core/risk` kernel itself is still not composed into the real PAPER/controlled-LIVE order path: its gross/net/leverage/concentration/sector/asset-class/currency/strategy-bucket/drawdown/margin-utilization checks remain reachable only from `follon-risk-benchmark` and gRPC, not from an actual order submission. FX candidate construction has no gRPC or OMS composition. Production policy calibration, latency/load evidence, independent validation, live-feed staleness history, and clean broker-backed operating sessions remain external. |
-| 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. `follon-operations reconcile-statement` ingests broker CSV statements and reconciles internal cash/positions. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. A `HighestCost` disposal tie between two lots of identical unit cost is now broken by oldest acquisition first, matching the documented policy exactly instead of an incidental lot-identity string order. `core/paper`, `core/live`, and the plain `core/backtest::BacktestLedger` now all call `TaxLotBook::acquire`/`dispose` from their one real-fill code path (see items 32-34), each maintaining an independent FIFO cost-basis ledger in lockstep with every real fill; the two durable services persist and recover it across journal restarts. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. `core/backtest::AdvancedBacktestAccount` (the long/short-capable advanced projection, distinct from `BacktestLedger`) remains unwired: it explicitly supports short positions, and `TaxLotBook` has no concept of a short lot, so wiring it in is a materially harder design question than the mechanical repeat used for the other three ledgers, not attempted. Lot selection is fixed at FIFO, not operator-configurable, everywhere it is wired. Multi-prime allocation and qualifying production reconciliation history remain external/integration work. |
+| 5.7 Risk engine | Implemented portfolio kernel; the entire Slice 2 aggregate-composition backlog is closed -- gross/net/leverage/concentration/bucket (Slice 1), drawdown (Slice 2a), daily loss (Slice 2b), margin utilization (Slice 2c), and strategy-bucket limits (Slice 2d) are all now composed into the real order path | `core/risk` evaluates gross/net, leverage, concentration, daily loss, drawdown, margin utilization, delta/gamma, instrument permissions/restrictions, sector/asset/currency/strategy buckets, open orders, order rate, self-trade, and kill state. A fresh FX snapshot can only create an ordinary local candidate with retained snapshot/version/value-date evidence; it still receives the same aggregate risk decision. The kernel returns exact reason codes, is exposed over gRPC, and is visible in Risk Cockpit capability mapping. Self-trade prevention and order-rate limiting are independently duplicated directly inside the actual PAPER/controlled-LIVE order-gating path (`core/paper`/`core/live` `evaluate_risk`, see 5.5). As of item 35, that same real order-gating path also calls the unmodified `evaluate_portfolio_risk` kernel itself (not just two of its individual checks) behind an opt-in `portfolio_risk` configuration block, with a real per-service `PortfolioRiskSnapshot` built from actual positions/working orders/observed marks. As of item 36, that snapshot's `peak_equity` is a real, durable running high-water-mark (`PaperTradingService`/`LiveTradingService::peak_equity`), making `MAX_DRAWDOWN_EXCEEDED` a genuine computed decision rather than a permanently inert one. As of item 37, that same snapshot's `daily_pnl` is a real, durable session-start equity baseline (`PaperTradingService`/`LiveTradingService::daily_baseline_equity`, reset at the first risk evaluation of each new UTC calendar day), making `MAX_DAILY_LOSS_EXCEEDED` a genuine computed decision rather than a permanently inert one. As of item 38, that same snapshot's `margin_used` is a real value computed by calling the unmodified `core/accounting::value_margin_account` against an operator-authored per-asset-class margin rate, making `MAX_MARGIN_UTILIZATION_EXCEEDED` a genuine computed decision rather than a permanently inert one. As of item 39, every held position is split into one real `RiskPosition` row per strategy (plus an honest "unattributed" remainder), sourced from a new durable per-strategy attribution ledger (`PaperTradingService`/`LiveTradingService::strategy_attribution`), making `STRATEGY_LIMIT_EXCEEDED` a genuine computed decision rather than a permanently inert one. | **Status side by side, row 5.7 remainder (2026-09-18, item 39):**<br>**Before (pre-item-39):** "Strategy-bucket checks remain **not** composed: `strategy_limits` stays empty because `Portfolio` (`core/control-plane`, shared by `core/paper`/`core/live`/`core/backtest`) has no `strategy_id` field at all... closing this gap is a `Portfolio`-level architectural redesign... not a bounded wiring task like margin utilization, daily loss, or drawdown were."<br>**After (post-item-39):** That assessment's conclusion changed on closer investigation, and the correction is recorded rather than quietly overwritten: `Portfolio`/`PositionSnapshot` were never touched. `core/paper`/`core/live` each gained a new, deliberately separate per-strategy attribution ledger (`strategy_attribution: BTreeMap<instrument_id, BTreeMap<strategy_id, signed_quantity>>`), updated from the same real-fill code path as `TaxLotBook`, and durably persisted the same way. `portfolio_risk_decision` now splits each instrument's aggregate position into one real `RiskPosition` row per strategy that has ever traded it, plus an "unattributed" remainder row so the split can never mis-state total gross/net exposure -- only how it is attributed. `strategy_limits` is a real, operator-configurable bucket-limit map now (previously always empty). **Every item in the Slice 2 backlog first identified in item 35 is now closed**: peak-equity/drawdown (item 36), daily-loss baseline (item 37), margin utilization (item 38), and strategy-bucket attribution (item 39). No further aggregate-risk-kernel composition work remains queued for `core/paper`/`core/live`; production policy calibration, latency/load evidence, independent validation, live-feed staleness history, and clean broker-backed operating sessions remain external. |
+| 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel with long *and* short tax-lot coverage; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. `follon-operations reconcile-statement` ingests broker CSV statements and reconciles internal cash/positions. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. A `HighestCost` disposal tie between two lots of identical unit cost is now broken by oldest acquisition first, matching the documented policy exactly instead of an incidental lot-identity string order. `core/paper`, `core/live`, and the plain `core/backtest::BacktestLedger` now all call `TaxLotBook::acquire`/`dispose` from their one real-fill code path (see items 32-34), each maintaining an independent FIFO cost-basis ledger in lockstep with every real fill; the two durable services persist and recover it across journal restarts. As of item 40, `TaxLotBook` also models the short side (`open_short`/`cover`, mirroring `acquire`/`dispose` exactly), and `core/backtest::AdvancedBacktestAccount` -- the long/short-capable advanced projection previously left unwired -- now calls it from its own real-fill path, including a crossing fill (one execution that closes an existing long/short and opens the opposite side) split into a closing leg and an opening leg with the fill's fee divided proportionally between them. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. Lot selection is fixed at FIFO, not operator-configurable, everywhere it is wired. `AdvancedBacktestAccount`'s own average-cost `realized_pnl` and the new FIFO tax-lot `realized_pnl` are intentionally different figures (the former ignores fees, the latter is fee-inclusive) -- an existing, already-documented distinction for `core/paper`/`core/live`, not a new inconsistency. Multi-prime allocation and qualifying production reconciliation history remain external/integration work. |
 | 5.9 Risk cockpit | Implemented for planned aggregate fields; operating gate open | The cockpit maps portfolio exposure, leverage/drawdown/margin/Greeks and bucket controls alongside kill switches, working/UNKNOWN orders, incidents, broker/reconciliation health, attribution, and evidence links. | Real alert delivery/on-call ownership, live-feed heartbeat history, and operated production evidence remain external. |
 | 5.10 Audit and replay | Implemented for current scope | Canonical causal events, correlation/causation, append-only journals, hash-chain verification, immutable artifacts, restart replay, configuration/dataset/strategy hashes, and replay/incident/journal views are implemented. | Production retention/WORM policy, centralized tenant audit, independently operated log custody, and regulator/customer retention evidence remain deployment obligations. |
 
@@ -915,6 +1024,443 @@ These are mandatory master-plan acceptance conditions and are currently open:
       all 73 evidence artifacts.
     - `cargo fmt`/`clippy -D warnings`/`test --workspace --all-targets` remained clean throughout
       (`follon-backtest` 13 tests, up from 12).
+35. Slice 1 of the 5.7 `core/risk` composition gap closed: gross/net exposure, leverage,
+    concentration, and sector/asset-class/currency bucket checks are now real, composed decisions in
+    `core/paper::evaluate_risk` and `core/live::evaluate_risk` (2026-09-17). Item 32 above investigated
+    composing the full aggregate kernel in one pass and set it aside as requiring portfolio-wide state
+    that does not exist in either crate -- multi-instrument live marks, a sector taxonomy, durable
+    equity/peak-equity tracking, a margin model -- "roughly doubling the work across both crates." This
+    pass splits that gap into exactly the two slices its own investigation implied, and closes the
+    first: bucketing/exposure now, equity/margin tracking later.
+    - **What is now real.** Both `evaluate_risk` functions gained a `portfolio_risk_decision` helper
+      that builds a genuine `follon_risk::PortfolioRiskSnapshot`/`CandidateOrder` from the service's own
+      state -- every non-zero position in `self.portfolios`, every working order in `self.orders` -- and
+      calls the unmodified `follon_risk::evaluate_portfolio_risk` kernel. Its non-`APPROVED` reason
+      codes are merged into the real decision (deduplicating `SELF_TRADE_RISK`, which both engines
+      already detect independently from the same working-order state). `RESTRICTED_INSTRUMENT`/
+      `INSTRUMENT_NOT_PERMITTED` are a genuine first-time gap-close: neither crate enforced an
+      instrument allow/restrict list before this change.
+    - **The two new pieces this required.** (1) A `marks: BTreeMap<String, Decimal>` field on both
+      services, updated unconditionally at the top of `evaluate_risk` from every order's market
+      observation, giving a "last observed mark" for every instrument the service has ever quoted;
+      a position with no cached mark yet (e.g. recovered from a pre-existing journal) falls back to its
+      own average cost, a stated bounded simplification, not a live feed. (2) `PortfolioRiskComposition`
+      -- a new `pub` type holding the real `follon_risk::PortfolioRiskPolicy` plus an operator-authored
+      `instrument_buckets: BTreeMap<String, InstrumentBucket>` map (asset class/currency/sector per
+      instrument). There is no sector or asset-class taxonomy anywhere in this codebase --
+      `core/instrument::Instrument` has no `sector` field, and grepping confirms no separate taxonomy
+      type exists -- so this follows the same convention every existing caller of
+      `evaluate_portfolio_risk` (the `follon-risk-benchmark` CLI, the gRPC `EvaluatePortfolioRisk` RPC)
+      already uses: buckets are operator-supplied strings, not derived from a registry. An instrument
+      missing from the map is bucketed as `"unclassified"` (asset class/sector) or the account's own
+      currency, not a fabricated guess.
+    - **Why equity/margin/drawdown/daily-loss/strategy-bucket checks are still not real, precisely.**
+      `evaluate_portfolio_risk` hard-requires `equity > 0`, `peak_equity > 0`, `margin_used >= 0` just to
+      run at all (`core/risk/src/lib.rs:493-500`) -- there is no way to call the kernel for bucket checks
+      alone without supplying *something* for every one of these. This pass computes a real, point-in-time
+      `equity` (cash plus every position marked at its cached/fallback price) but fixes `peak_equity` equal
+      to that same `equity` (so `drawdown_bps` is always exactly `0` -- `core/risk`'s own drawdown formula
+      only fires when `peak_equity > equity`) and fixes `margin_used`/`daily_pnl` at `Decimal::ZERO`. The
+      composed `PortfolioRiskPolicy`'s `max_drawdown_bps`/`max_margin_utilization_bps`/`max_daily_loss`/
+      `max_abs_delta`/`max_abs_gamma` are therefore fixed internal constants (`0`), and
+      `max_open_orders`/`max_order_rate` are fixed to `usize::MAX`/`u32::MAX` -- **never operator-configurable
+      fields** in the new `portfolio_risk` JSON section, specifically so an operator cannot configure a
+      limit that silently never fires. `strategy_limits` stays permanently empty for a sharper reason:
+      `core/paper`/`core/live`'s `Portfolio` type has no per-strategy attribution at all -- it aggregates
+      every strategy's fills into one position per instrument -- so a strategy-bucket check could only ever
+      see the incoming candidate's own notional, never cumulative strategy exposure, which would be
+      actively misleading rather than merely incomplete. This is a structurally harder problem than the
+      other four (it needs `Portfolio` itself redesigned), not just deferred by a neutral constant.
+    - **Regression discipline.** Composition is opt-in per configuration: a new optional `portfolio_risk`
+      block in the `risk` section of both the paper-v2 and live-v1 JSON schemas
+      (`contracts/json-schema/v2/paper-configuration.schema.json`,
+      `contracts/json-schema/v1/live-configuration.schema.json`), parsed only by the CLI loaders
+      (`apps/cli/src/paper.rs`, `apps/cli/src/live.rs`); the desktop's flat, `deny_unknown_fields`
+      `DesktopPaperConfiguration` document is unchanged and always passes `portfolio_risk: None` --
+      matching the existing "CLI path first" precedent from item 31. When the block is absent, both
+      `evaluate_risk` functions are byte-for-byte unchanged: confirmed by every one of the 23 pre-existing
+      `follon-paper` tests and 9 pre-existing `follon-live` tests passing unmodified. The two crates'
+      `configuration_fingerprint` functions gained the identical conditional-append pattern already used
+      for `broker_route_fingerprint` (paper) -- present only when `portfolio_risk` is `Some`, so an
+      unconfigured operator's fingerprint is unaffected. This was independently confirmed, not assumed: the
+      checked-in `tests/fixtures/paper/journal-v2.ndjson` and `tests/fixtures/live/journal-v1.ndjson`
+      fixtures were regenerated by running the real `follon-paper-status`/`follon-live-status` binaries
+      (the identical procedure item 34 used for the `tax_lots` field), and both regenerated
+      `configuration_fingerprint` values matched the checked-in originals byte-for-byte
+      (`fd36c32e...`/`aa6f2f03...`) -- only the new `marks` field and the `entry_hash` values covering it
+      differ. The full 23-step `tools/generate_pipeline_evidence.py` pipeline was re-run afterward and
+      completed with zero failures, producing all 73 evidence artifacts again.
+    - **New tests, real computed numbers.** Six new tests in `core/paper` and six mirrored in `core/live`
+      (`follon-paper` 28 tests total, up from 23; `follon-live` 13, up from 9), plus one loader test in each
+      of `apps/cli/src/paper.rs` and `apps/cli/src/live.rs` against new fixtures
+      (`tests/fixtures/config/paper-v2-portfolio-risk.json`,
+      `tests/fixtures/config/live-v1-portfolio-risk.json`). Per this codebase's existing testing
+      discipline, expected figures were taken from real computed decisions, not predicted by hand: e.g.
+      `live_portfolio_risk_composition_uses_a_durable_mark_cache_after_journal_reopen` fills a real
+      2-share SPY position at 10, re-quotes it to 25 through a second (quantity-rejected) canary attempt so
+      the mark cache updates independently of that order's own outcome, closes and reopens the durable
+      journal, and asserts a third order against a different instrument is rejected with
+      `portfolio_gross_exposure=60.00000000` -- exactly `2 * 25 + 1 * 10`, proving the reopened service
+      used the recovered cached mark and not the position's `10` average cost (which would have computed
+      `30`, under the configured `40` limit, and passed). `cargo fmt`/`clippy --workspace --all-targets -D
+      warnings`/`test --workspace --all-targets` remained fully clean throughout, including the separate
+      `apps/desktop/src-tauri` Tauri workspace (17 tests, unchanged).
+    - **Bounded scope, stated plainly.** This closes exactly the bucket/exposure half of row 5.7's
+      remainder for the real PAPER/controlled-LIVE order path. It is not a claim that portfolio-wide risk
+      is fully composed: drawdown, margin utilization, daily-loss, and strategy-bucket checks remain
+      structurally uncomposed, by design, until a Slice 2 pass adds durable peak-equity tracking, wires
+      `core/accounting::value_margin_account` in with real position/margin-policy data, adds a session-
+      start equity baseline, and gives `Portfolio` per-strategy attribution. The desktop order-ticket path
+      does not yet expose the new configuration section. FX candidate construction
+      (`FxRiskCandidate::from_pricing_snapshot`) and the standalone gRPC `EvaluatePortfolioRisk`/
+      `ValueMarginAccount` RPCs are unchanged.
+36. Slice 2a of the 5.7 `core/risk` composition gap closed: durable peak-equity tracking makes
+    `MAX_DRAWDOWN_EXCEEDED` a real, composed decision (2026-09-17, same day as item 35). Item 35's own
+    backlog named four remaining pieces -- durable equity/peak-equity tracking, a wired margin model, a
+    session-start daily-loss baseline, and per-strategy `Portfolio` attribution -- and stated they should
+    be sequenced, not attempted together. This entry closes the first and smallest of the four: it needed
+    only a durable high-water-mark, not new portfolio-wide state `core/paper`/`core/live` lacked entirely
+    (unlike margin utilization or strategy attribution, both still open below).
+    - **What is now real.** Both `PaperTradingService` and `LiveTradingService` gained a `peak_equity:
+      Decimal` field, updated unconditionally at the top of `evaluate_risk` from a new shared
+      `current_equity()` helper (cash plus every non-zero position marked at its cached observed mark or
+      average-cost fallback) -- the same unconditional-update discipline as the existing `marks` cache, so
+      enabling composition later does not start drawdown tracking from an artificially favorable fresh
+      baseline. The composed `PortfolioRiskSnapshot`'s `peak_equity` field is now this real running maximum
+      instead of a value fixed equal to `equity` (which made `drawdown_bps` always exactly `0` in Slice 1).
+      `max_drawdown_bps` is a real, operator-configurable field in the `portfolio_risk` JSON section of both
+      schemas now, validated against the same `basisPoints`-style pattern extended to allow the literal
+      `10000` (100%) boundary; absent from the document, it defaults to `10000`, which the kernel's ratio
+      can mathematically never reach, preserving the "not configurable until it's real" discipline for any
+      operator who has not set it explicitly.
+    - **Durability.** `peak_equity` is persisted as a new `Option<String>` field on `PersistentPaperState`/
+      `PersistentLiveState` (`#[serde(default)]`, so it does not affect the `configuration_fingerprint` --
+      it is dynamic state, not static configuration, the same reasoning already applied to `marks`).
+      `restore()` bootstraps a journal that never tracked it (`None`) to the real equity computed from the
+      just-restored cash/positions/marks, and otherwise takes `max(persisted value, recovered equity)` --
+      never silently resets a real historical peak to today's lower current equity. The checked-in
+      `tests/fixtures/paper/journal-v2.ndjson` and `tests/fixtures/live/journal-v1.ndjson` fixtures needed
+      regenerating again for exactly the same reason item 34 and item 35 already document (a new
+      always-serialized field breaks the byte-for-byte tamper check against journals written before it
+      existed); both regenerated `configuration_fingerprint` values again matched the checked-in originals
+      byte-for-byte, and the full 23-step pipeline was re-run clean afterward.
+    - **New tests, real computed numbers.** One drawdown-rejection test and one peak-equity durability test
+      were added to each of `core/paper` (30 tests total, up from 28) and `core/live` (15, up from 13).
+      `paper_portfolio_risk_composition_rejects_when_drawdown_limit_is_exceeded` fills a real 1,000-share
+      position at 100 (a genuine 100,000 peak), re-quotes it to 70, and asserts a real
+      `portfolio_drawdown_bps=3000.00000000` (exactly `(100000-70000)/100000`) against a configured 2,000
+      bps (20%) limit -- computed, not predicted. `paper_peak_equity_survives_a_durable_journal_reopen` and
+      its `core/live` mirror push equity to a real 150,000 peak via a genuine mark-to-market gain, retreat
+      the mark back down without the peak following, close and reopen the durable service, and assert the
+      recovered peak is still 150,000, not reset to the now-current 100,000. `cargo fmt`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace --all-targets` remained fully clean
+      throughout, including the separate `apps/desktop/src-tauri` Tauri workspace (17 tests, unchanged).
+    - **Bounded scope, stated plainly.** Only drawdown moved from inert to real. Margin utilization,
+      daily-loss, and strategy-bucket checks remain exactly as item 35 described: fixed, non-configurable
+      neutral constants, not yet composed. The remaining Slice 2 backlog is now three items, not four:
+      wiring `core/accounting::value_margin_account` in with real position/margin-policy data for margin
+      utilization; a session-start equity baseline for real `daily_pnl`; and per-strategy position
+      attribution in `Portfolio` as a prerequisite for a real strategy-bucket check. The desktop order-ticket
+      path still does not expose the `portfolio_risk` configuration section at all (unchanged from item 35).
+37. Slice 2b of the 5.7 `core/risk` composition gap closed: a durable session-start equity baseline
+    makes `MAX_DAILY_LOSS_EXCEEDED` a real, composed decision (2026-09-18). Item 36's own backlog named
+    three remaining pieces -- a wired margin model, a session-start daily-loss baseline, and per-strategy
+    `Portfolio` attribution. This entry closes the second: like peak-equity in item 36, it needed only a
+    durable baseline value, not new portfolio-wide state `core/paper`/`core/live` lacked entirely (unlike
+    margin utilization or strategy attribution, both still open below).
+    - **What is now real.** Both `PaperTradingService` and `LiveTradingService` gained a
+      `daily_baseline_date: Option<String>` and `daily_baseline_equity: Decimal` field pair, updated
+      unconditionally at the top of `evaluate_risk` from the same `current_equity()` helper item 36 added
+      -- but *reset*, not maxed, whenever the UTC calendar date sliced from the risk decision's own
+      canonical `decided_at` differs from the stored baseline date (including the very first evaluation
+      ever, when the baseline date starts `None`). This is a deliberately different update discipline from
+      `peak_equity`'s permanent high-water-mark: a daily-loss limit must measure loss *since today's open*,
+      not since the account's entire lifetime, so the baseline has to roll forward every UTC day rather than
+      only ever increase. The composed `PortfolioRiskSnapshot`'s `daily_pnl` field is now
+      `equity - daily_baseline_equity` instead of a value fixed at `Decimal::ZERO`. `max_daily_loss` is a
+      real, operator-configurable field in the `portfolio_risk` JSON section of both schemas now; absent
+      from the document, it defaults to `i64::MAX` currency units -- the same "no real limit" sentinel
+      idiom already used for `max_open_orders`/`max_order_rate` (`usize::MAX`/`u32::MAX`), extended here to
+      a fixed-point `Decimal` field with no natural bps-style ceiling. This was a deliberate substitute for
+      leaving `max_daily_loss` fixed at `Decimal::ZERO`: with a real, non-zero `daily_pnl` now computed
+      unconditionally, a fixed-zero limit would have made `MAX_DAILY_LOSS_EXCEEDED` fire on any loss at all
+      for every existing Slice-1/2a `portfolio_risk` configuration the moment this shipped -- so the two
+      pre-existing test fixtures (`permissive_portfolio_risk_policy()` in both crates' own test modules)
+      were updated to the same sentinel in the same change, verified not to regress any of their other,
+      unrelated portfolio-risk tests.
+    - **Durability.** `daily_baseline_date`/`daily_baseline_equity` are persisted as new
+      `Option<String>` field pairs on `PersistentPaperState`/`PersistentLiveState` (`#[serde(default)]`,
+      dynamic state, not static configuration, so `configuration_fingerprint` is unaffected). `restore()`
+      never maxes the recovered baseline against current equity the way it does for peak equity: it
+      restores exactly the persisted date/equity pair (or leaves both unset for a legacy journal that never
+      tracked this), and lets the very next `evaluate_risk` call's own date comparison decide whether that
+      persisted baseline is still today's or must roll forward -- an honest reset, not a carried-over
+      accumulation, is the entire point of a *daily* baseline. The checked-in
+      `tests/fixtures/paper/journal-v2.ndjson` and `tests/fixtures/live/journal-v1.ndjson` fixtures needed
+      regenerating again for exactly the reason items 34-36 already document: a new always-serialized field
+      breaks the byte-for-byte re-serialization hash-chain check against journals written before it existed.
+      Both were regenerated using the actual, current CLI binaries against their unchanged configuration
+      documents -- `follon-paper-status` once (the paper fixture is a single freshly initialized entry) and
+      `follon-live-status` eleven times in sequence (reproducing the live fixture's exact 1-initialized +
+      10-restarted entry count, which had itself grown from item 27's original 9 across the intervening
+      items 34-36 regenerations) -- and both regenerated `configuration_fingerprint` values matched the
+      checked-in originals byte-for-byte (`fd36c32e...`/`aa6f2f03...`); only the two new fields and the
+      hashes covering them differ. The full 23-step `tools/generate_pipeline_evidence.py` pipeline was
+      re-run afterward and completed with zero failures, producing all 73 evidence artifacts again.
+    - **New tests, real computed numbers.** Three new tests in `core/paper` and three mirrored in
+      `core/live` (`follon-paper` 33 tests total, up from 30; `follon-live` 18, up from 15). Per this
+      codebase's existing testing discipline, expected figures were taken from real computed decisions, not
+      predicted by hand: `paper_portfolio_risk_composition_rejects_when_daily_loss_limit_is_exceeded` fills
+      a real 1,000-share position at 100 (the very first risk evaluation of the day, establishing a real
+      100,000 pure-cash baseline before the fill even happens), re-quotes it to 70, and asserts a real
+      `portfolio_daily_pnl=-30000.00000000` against a configured 2,000 limit -- computed, not predicted.
+      `paper_daily_loss_baseline_resets_at_a_new_utc_calendar_day` pushes equity to a real 150,000 gain
+      against a 100,000 day-1 baseline (`portfolio_daily_pnl=50000.00000000`), then submits again on the
+      next UTC calendar date and asserts the baseline itself reset to 150,000
+      (`portfolio_daily_baseline_equity=150000.00000000`) with `portfolio_daily_pnl=0.00000000` -- proving a
+      genuine reset rather than a carried-over accumulation, the one behavior with no equivalent in item
+      36's peak-equity tests. `paper_daily_loss_baseline_survives_a_durable_journal_reopen` (and its
+      `core/live` mirror) push a real +50,000 gain against a 100,000 baseline, close and reopen the durable
+      service later the same UTC day, and assert the reopened service still reports the original 100,000
+      baseline and the same +50,000 `daily_pnl` -- not a baseline reset to the now-current 150,000 equity.
+      `cargo fmt`/`clippy --workspace --all-targets -D warnings`/`test --workspace --all-targets` remained
+      fully clean throughout: **270 passed, 0 failed, 3 ignored** in the main workspace (up from 245 by item
+      31's count plus the tax-lot/Slice-1/Slice-2a/Slice-2b tests added since), and **17 passed, 0 failed**
+      in the separate `apps/desktop/src-tauri` Tauri workspace, unchanged.
+    - **Bounded scope, stated plainly.** Only daily loss moved from inert to real. Margin utilization and
+      strategy-bucket checks remain exactly as items 35-36 described: fixed, non-configurable neutral
+      constants, not yet composed. The remaining Slice 2 backlog is now two items, not three: wiring
+      `core/accounting::value_margin_account` in with real position/margin-policy data for margin
+      utilization; and per-strategy position attribution in `Portfolio` as a prerequisite for a real
+      strategy-bucket check. The desktop order-ticket path still does not expose the `portfolio_risk`
+      configuration section at all (unchanged from item 35). The daily baseline resets on UTC calendar-day
+      boundaries derived from each risk decision's own `decided_at`, not from an exchange session-open time
+      -- a stated bounded simplification consistent with this codebase's existing "no live market-data feed
+      at this boundary" posture, not a silent gap.
+38. Slice 2c of the 5.7 `core/risk` composition gap closed: margin utilization is now a real, composed
+    decision, and the remaining strategy-bucket gap is assessed and precisely scoped rather than left as a
+    one-line deferral (2026-09-18, same day as item 37). Item 37's own backlog named two remaining pieces --
+    a wired margin model and per-strategy `Portfolio` attribution. This entry closes the first and
+    investigates the second in enough depth to state exactly why it is not a same-shape wiring task.
+    - **What is now real.** Both `PaperTradingService` and `LiveTradingService` gained a `margin_rates:
+      Option<BTreeMap<String, follon_accounting::MarginRate>>` field on `PortfolioRiskComposition`: an
+      operator-authored initial/maintenance margin rate per asset class, reusing the exact same
+      classification already required for bucket/exposure composition (`instrument_buckets`). When
+      configured, `portfolio_risk_decision` builds real `follon_accounting::MarginPosition`s from the
+      service's own currently-held positions (the same "pre-trade observed, not post-trade projected"
+      convention `equity`/`peak_equity`/`daily_baseline_equity` already use) and calls the unmodified
+      `follon_accounting::value_margin_account` -- the same function `follon-operations reconcile-statement`
+      and the standalone gRPC `ValueMarginAccount` RPC already use, not a reimplementation. Its
+      `initial_margin` becomes the composed `PortfolioRiskSnapshot`'s real `margin_used`. `max_margin_
+      utilization_bps` is a real, operator-configurable field in both schemas now; absent, it defaults to
+      `10000` (100%). Unlike `max_drawdown_bps` (where 100% is a mathematically exact ceiling the ratio can
+      never reach), margin utilization has no such universal bound -- an over-leveraged account could in
+      principle exceed it. The sentinel is safe here specifically because `core/paper`/`core/live`'s
+      `Portfolio` is fully-paid and long-only (no margin borrowing is modeled anywhere in either crate): with
+      a per-position rate at or under 100% and no cash borrowed against a position, utilization cannot reach
+      exactly 100% unless an operator sets a 100% rate *and* the account carries zero spare cash -- an edge
+      case the operator controls directly by their own `margin_rates` choice, not one this default silently
+      hides. This bounded reasoning is stated in the field's own doc comment, not left implicit.
+    - **A deliberate no-FX simplification, stated plainly.** `value_margin_account` takes a full `FxBook` and
+      a `base_currency`/`maximum_fx_age_seconds` policy for genuine multi-currency accounts. Neither
+      `core/paper` nor `core/live` has any cross-currency position support anywhere else in either crate
+      (every cash balance and position is implicitly the account's own currency), so this composition
+      deliberately does not expose a base currency or FX freshness window: it always passes the account's own
+      currency as `base_currency` and an empty `FxBook::default()`, which is exactly correct because
+      `FxBook::convert` takes its same-currency fast path (`if from == to { return Ok(amount) }`) and never
+      reaches a quote lookup at all. This is not a workaround for missing FX data -- it is the honest
+      reflection of a single-currency account, the same boundary `core/backtest`'s "explicit single account"
+      scope statement already draws elsewhere in this document.
+    - **Fails closed on missing reference data, by design, not by accident.** `value_margin_account` requires
+      a configured rate for every asset class among the positions it is asked to value, or it returns an
+      error. This composition does not catch that error and substitute a zero: a real technical error
+      propagates out of `evaluate_risk`/`submit_intent`/`submit_canary_intent`, aborting the entire order
+      submission rather than silently under-counting margin for an unclassified position. A new test in each
+      crate (`paper_portfolio_risk_composition_fails_closed_when_a_held_position_has_no_margin_rate`,
+      `live_portfolio_risk_composition_fails_closed_when_a_held_position_has_no_margin_rate`) proves this
+      directly: a position held in an asset class absent from `margin_rates` makes the next order submission
+      return `Err` containing `"missing margin policy"`, not an approved or silently-wrong decision.
+    - **New tests, real computed numbers.** Two new tests in each of `core/paper` (35 tests total, up from
+      33) and `core/live` (20, up from 18). `paper_portfolio_risk_composition_rejects_when_margin_
+      utilization_limit_is_exceeded` (and its `core/live` mirror) fill a real 1,000-share position at 100 with
+      all cash spent (cash exactly zero), configure a real 50% initial-margin rate for `equity`, and assert a
+      genuinely computed `portfolio_margin_used=50000.00000000` and
+      `portfolio_margin_utilization_bps=5000.00000000` (`50,000 / 100,000`) against a configured 40% limit --
+      computed, not predicted. `cargo fmt`/`clippy --workspace --all-targets -D warnings`/
+      `test --workspace --all-targets` remained fully clean throughout: **274 passed, 0 failed, 3 ignored** in
+      the main workspace (up from 270), and **17 passed, 0 failed** in the separate `apps/desktop/src-tauri`
+      Tauri workspace, unchanged. `PersistentPaperState`/`PersistentLiveState` gained no new field this pass
+      (`margin_used` is computed transiently inside `evaluate_risk`, never persisted; `margin_rates` lives
+      only in operator configuration), so -- unlike items 34-37 -- the two checked-in journal fixtures did
+      not need regenerating; this was verified by grepping both `Persistent*` structs for `margin` before
+      concluding it, not assumed. The full 23-step `tools/generate_pipeline_evidence.py` pipeline was
+      re-run afterward and completed with zero failures, producing all 73 evidence artifacts.
+    - **Strategy-bucket assessment, precisely scoped rather than re-asserted.** Every prior entry in this row
+      (items 35-37) stated that `Portfolio` has no per-strategy position attribution and left it at that. This
+      pass instead read `Portfolio`'s actual definition (`core/control-plane/src/lib.rs`): it is one aggregate
+      position per `(account_id, instrument_id)` with a single running `quantity`/`average_cost`/
+      `realized_pnl` -- every contributing strategy's fills are already merged into one average cost before
+      `core/paper`/`core/live` ever see it, and there is no `strategy_id` field anywhere on `Portfolio` or
+      `PositionSnapshot` to retrofit. Closing this requires an actual design decision -- either changing
+      position identity to `(account_id, strategy_id, instrument_id)` (which would also change what "one
+      position" means for every existing per-order aggregate check that intentionally sums across strategies
+      today, e.g. `POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED`) or adding a parallel per-strategy attribution
+      ledger alongside the existing aggregate (the same shape `TaxLotBook` already uses relative to
+      `Portfolio`, but for strategy attribution instead of tax lots) -- and then reconciling that decision
+      against every other consumer of `Portfolio`/`PositionSnapshot`: `core/backtest`, the standalone gRPC
+      service, desktop Portfolio-workspace projections, and the durable journal formats both crates already
+      persist. This is not a same-pass wiring task like margin utilization, daily loss, or drawdown were, and
+      is not attempted here; it is recorded as the sole remaining Slice 2 item, precisely bounded rather than
+      left as a recurring one-line deferral.
+39. Slice 2d of the 5.7 `core/risk` composition gap closed, and the entire Slice 2 backlog opened by item 35
+    is now fully closed (2026-09-18, same day as items 37-38). Item 38 assessed strategy-bucket composition
+    as requiring a `Portfolio`-level architectural redesign -- either changing position identity to
+    `(account_id, strategy_id, instrument_id)` or adding a parallel per-strategy attribution ledger, and
+    reconciling either choice against `core/backtest`, the gRPC service, and desktop projections. This entry
+    records that on closer investigation the second option did not, in fact, require touching `Portfolio`,
+    `PositionSnapshot`, or any of their other consumers at all -- the assessment's *conclusion* (a redesign
+    is needed) does not survive contact with the actual implementation, and that correction belongs in this
+    document rather than being silently absorbed into a clean "done" entry.
+    - **Why the redesign turned out to be avoidable.** `core/risk::RiskPosition` (the kernel's own input
+      type) already carries a mandatory `strategy_id` field, and `aggregate_metrics` already computes a real
+      `strategy_gross` bucket from whatever `RiskPosition` rows it is given -- both existed before this pass
+      and were exercised by every other caller (`follon-risk-benchmark`, the gRPC `EvaluatePortfolioRisk`
+      RPC). The gap was never in the kernel; it was that `core/paper`/`core/live` only ever built *one*
+      `RiskPosition` row per instrument, hardcoding `strategy_id: "unattributed"`, because neither crate
+      tracked which strategy contributed how much of an aggregate position. Splitting that one row into
+      several -- one per contributing strategy, at the exact same total quantity -- required new bookkeeping
+      *alongside* `Portfolio`, not a change *to* `Portfolio`. `TaxLotBook` (items 32-34) already established
+      the precedent of exactly this shape: an independent ledger kept in lockstep with the same fills,
+      answering a question `Portfolio`'s single running average cost cannot.
+    - **What is now real.** Both `PaperTradingService` and `LiveTradingService` gained a
+      `strategy_attribution: BTreeMap<String, BTreeMap<String, Decimal>>` field
+      (`instrument_id -> strategy_id -> net signed quantity`), updated from the same real-fill code path as
+      `TaxLotBook` (`apply_strategy_attribution_fill`, called immediately after `apply_tax_lot_fill` in the
+      `BrokerEvent::Executed` handler): a buy adds the fill quantity to that strategy's own running total for
+      that instrument, a sell subtracts, with **no floor at zero** -- a strategy's own tracked value can
+      legitimately go negative if it net-sells more than it has net-bought (e.g. because another strategy
+      holds shares of the same instrument), an honest signal rather than a clamped, misleading zero.
+      `portfolio_risk_decision` now builds the position list by, for each instrument, iterating its tracked
+      strategies and emitting one real `RiskPosition` per non-zero entry, then computing
+      `remainder = aggregate_quantity - sum(tracked)` and emitting one final "unattributed" row for that
+      remainder whenever it is non-zero. This construction guarantees, by simple arithmetic, that gross/net
+      exposure, leverage, and concentration are computed from exactly the same total quantity as before this
+      change -- only the number of rows and their `strategy_id` attribution differ -- so the split can add
+      new bucket-check coverage without being able to silently corrupt any of the four checks already shipped
+      in Slices 1-2c. `strategy_limits` is a real, operator-configurable bucket-limit map in both schemas now
+      (previously always hardcoded empty).
+    - **Durability.** `strategy_attribution` is persisted as a new nested
+      `BTreeMap<String, BTreeMap<String, String>>` field (Decimal-as-string, `#[serde(default)]`) on
+      `PersistentPaperState`/`PersistentLiveState`, following the same pattern as `marks`; `restore()` parses
+      and validates it (canonical instrument/strategy IDs, well-formed decimals) with no positivity
+      constraint, since a negative tracked value is a legitimate state as explained above. The `synchronize()`
+      per-event rollback snapshot (which already restores `orders`/`portfolios`/`tax_lots`/`execution_ids`/
+      `cash` on a failed event application) was extended to also snapshot and restore
+      `strategy_attribution`, found by reading the rollback site itself rather than assumed safe, matching
+      the exact discipline item 32 already established for `tax_lots`. The checked-in
+      `tests/fixtures/paper/journal-v2.ndjson` and `tests/fixtures/live/journal-v1.ndjson` fixtures needed
+      regenerating again for the same reason items 34-38 already document; both regenerated
+      `configuration_fingerprint` values again matched the checked-in originals byte-for-byte
+      (`fd36c32e...`/`aa6f2f03...`), and the full 23-step `tools/generate_pipeline_evidence.py` pipeline was
+      re-run afterward and completed with zero failures, producing all 73 evidence artifacts.
+    - **New tests, real computed numbers.** Two new tests in each of `core/paper` (37 tests total, up from
+      35) and `core/live` (22, up from 20): a rejection test and a durability test. Per this codebase's
+      existing testing discipline, expected figures were taken from real computed decisions, not predicted by
+      hand. `paper_portfolio_risk_composition_rejects_when_strategy_limit_is_exceeded` fills strategy
+      `strategy.paper.001`'s real 100-share position at 100 (a real, attributed 10,000 exposure), then submits
+      a *second, distinct* strategy's (`strategy.beta`) 300-share candidate at the same mark and asserts a
+      real `STRATEGY_LIMIT_EXCEEDED:strategy.beta` rejection with `portfolio_gross_exposure=40000.00000000`
+      (the sum of both strategies' real exposure, proving the split never mis-states the total) and
+      `strategy.beta:30000.00000000` in the rendered `portfolio_strategy_gross` bucket map (a new field added
+      to `evaluated_limits` this pass, mirroring the existing sector/asset-class/currency bucket rendering).
+      `paper_strategy_attribution_survives_a_durable_journal_reopen` (and its `core/live` mirror) fill
+      strategy.paper.001's position, close and reopen the durable service, and assert a fresh strategy.beta
+      candidate submitted *after* the reopen is rejected against exactly the same pre-existing exposure --
+      proving the ledger, not just the mechanism, survives a restart. `cargo fmt`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace --all-targets` remained fully clean
+      throughout: **278 passed, 0 failed, 3 ignored** in the main workspace (up from 274), and **17 passed, 0
+      failed** in the separate `apps/desktop/src-tauri` Tauri workspace, unchanged.
+    - **Bounded scope, stated plainly.** `Portfolio`/`PositionSnapshot` (the canonical position of record,
+      also part of the audit event schema serialized in `core/domain::EventPayload::Position`) are completely
+      unchanged by this entry, on purpose: every other consumer of those types (`core/backtest`, the gRPC
+      service, desktop Portfolio-workspace projections, PostgreSQL position projections) is entirely
+      unaffected, and required no review. The new attribution ledger is local to `core/paper`/`core/live`
+      only; `core/backtest` gets no equivalent, and is not claimed to. A strategy's own tracked contribution
+      going negative (the cross-strategy netting case) is handled by arithmetic (the "unattributed" remainder
+      absorbs it) rather than by an explicit warning or incident record -- a stated bounded simplification,
+      not a silent gap, since it can only ever affect *which* strategy a given unit of exposure is attributed
+      to, never the total exposure figure every other check in this row depends on.
+40. `TaxLotBook` now models the short side, and `core/backtest::AdvancedBacktestAccount`'s previously
+    unwired long/short advanced projection is wired to it (2026-09-18, row 5.8). Item 32 (and the 5.8 row
+    ever since) recorded this specific gap and its reason plainly: "`TaxLotBook` has no concept of a short
+    lot, so wiring it in is a materially harder design question than the mechanical repeat used for the
+    other three ledgers, not attempted." This entry closes it.
+    - **What is now real.** `core/accounting::TaxLotBook` gained a parallel short-side ledger: a new
+      `ShortTaxLot` type (mirroring `TaxLot`, but holding `unit_proceeds` -- what was received when the
+      short was opened -- rather than a cost paid), `open_short` (mirrors `acquire` exactly), and `cover`
+      (mirrors `dispose` exactly, except realized P&L is `proceeds - cost_basis - fee`, the inverse of a
+      long disposal's `proceeds - cost_basis - fee` because the economics themselves are inverted -- you
+      receive money opening a short and pay to close it, the reverse of a long). Both are additive: `acquire`
+      and `dispose` are byte-for-byte unchanged, so every existing long-only caller (`core/paper`, `core/live`,
+      `core/backtest::BacktestLedger`) is unaffected. `AdvancedBacktestAccount` gained a `tax_lots: TaxLotBook`
+      field and now calls the appropriate long or short operation from its one real-fill code path
+      (`apply_fill`), exactly mirroring the pattern items 32-34 already established for the other three
+      ledgers -- new public `tax_lots()`/`short_tax_lots()`/`tax_realized_pnl()` accessors expose it,
+      matching the existing accessor shape on `core/paper`/`core/live`.
+    - **The crossing-fill design, the actual "materially harder" part.** `AdvancedBacktestAccount`, unlike the
+      three already-wired ledgers, permits a single fill to close an existing position *and* open the
+      opposite position in one execution (e.g. selling 8 shares against a 5-share long: 5 shares close the
+      long, the remaining 3 open a new short) -- `apply_fill`'s own pre-existing `same_direction`/`closing`
+      logic already computed exactly this split for the average-cost position, so the tax-lot wiring reuses
+      that same `closing` quantity rather than recomputing it. The one new problem it introduces is the fee:
+      one fill has one fee, but now two tax-lot operations. It is split proportionally by quantity (the
+      closing leg gets `fee * closing / fill.quantity`; the opening leg gets the exact remainder, `fee -
+      closing_fee`, not its own independently rounded share, so fixed-point division never drops or invents
+      a fraction of a cent and the two legs always sum to exactly `fill.fee`). A pure addition to an existing
+      side (or a new position from flat, the `same_direction` branch) needs no split: the entire fee goes to
+      the one operation, exactly as items 32-34's mechanical repeat already does.
+    - **New tests, real computed numbers.** Two new tests in `core/accounting` (19 total, up from 17:
+      `short_tax_lots_apply_fifo_and_idempotent_covers_exactly` and its recovery-rejection counterpart,
+      mirroring the existing long-lot pair exactly) and two in `core/backtest` (15 total, up from 13). Per
+      this codebase's testing discipline, expected figures were taken from real computed values, not
+      predicted by hand:
+      `advanced_account_tracks_a_pure_short_position_in_the_tax_lot_ledger` opens a 5-share short at 100
+      with a 5-unit fee and asserts the resulting lot's `unit_proceeds` is exactly `99` (`(5*100-5)/5`).
+      `advanced_account_crossing_fill_splits_tax_lots_and_fee_across_both_sides` buys 5 shares at 100 (fee 5,
+      so an all-in cost basis of 101/share), then sells 8 at 120 (fee 8) in one fill: the long lot disposes
+      completely (`tax_lots()` empty) with a real, computed `tax_realized_pnl` of `90`
+      (`(5*120) - (5*101) - (8*5/8)`), and a fresh short lot opens for the 3-share remainder at a real
+      `unit_proceeds` of `119` (`(3*120 - (8-5)) / 3`) -- proving both the split and the fee allocation are
+      exactly self-consistent, not merely plausible-looking. `cargo fmt`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace --all-targets` remained fully clean
+      throughout: **282 passed, 0 failed, 3 ignored** in the main workspace (up from 278), and **17 passed, 0
+      failed** in the separate `apps/desktop/src-tauri` Tauri workspace, unchanged. `AdvancedBacktestAccount`
+      is not durably persisted the way `core/paper`/`core/live` are (a backtest is a one-shot batch replay,
+      not a restartable service), so no journal fixture needed regenerating; this was confirmed by re-running
+      the full workspace suite and diffing the two checked-in journal fixtures against their pre-this-entry
+      state, not assumed. The full 23-step `tools/generate_pipeline_evidence.py` pipeline was re-run
+      afterward and completed with zero failures, producing all 73 evidence artifacts.
+    - **A real defect this pass found and fixed in its own uncommitted work, not shipped past review.** The
+      first attempt at this change compiled `core/accounting` and `core/backtest` cleanly in isolation but
+      broke the full workspace build: `core/paper`'s and `core/live`'s own `restore()` methods each construct
+      a `TaxLotBookSnapshot` literal (converting their journal's persisted tax-lot fields back into the type
+      `TaxLotBook::recover` accepts), and adding the three new short-lot fields to that struct without
+      `#[non_exhaustive]` turned both call sites into compile errors (`missing fields`). This was only caught
+      because this session ran the actual full-workspace `cargo test`, not just the two crates being changed
+      -- a first pass at automating that check piped the command through `grep`, which reports its own exit
+      code (0, because it found matching error lines), silently masking the real compilation failure; the
+      mistake was caught by reading the captured log's content, not the pipe's exit code, and the verification
+      approach was corrected to capture a real exit code directly before trusting a clean result again. Both
+      sites were fixed with an explicit, documented empty short-side ledger (`core/paper`/`core/live`'s
+      `Portfolio` is long-only, so their journals never carry short-lot data), and the full suite was then
+      re-run genuinely clean.
+    - **Bounded scope, stated plainly.** Lot selection remains fixed at FIFO for both sides, matching every
+      other wired ledger. `AdvancedBacktestAccount`'s own average-cost `realized_pnl` (fee-exclusive) and the
+      new FIFO tax-lot `realized_pnl` (fee-inclusive) are intentionally different numbers measuring different
+      things, exactly the same documented distinction items 32-34 already established for `core/paper`/
+      `core/live` -- not a new inconsistency introduced here. This closes the specific gap 5.8 has recorded
+      since item 32; it does not change borrow/recall/financing modeling (already implemented and unaffected)
+      or any external gate.
 
 ## Business-readiness decision
 

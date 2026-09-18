@@ -508,6 +508,12 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
         max_market_data_age_seconds: document.max_market_data_age_seconds,
         max_order_rate: document.max_order_rate,
         order_rate_window_seconds: document.order_rate_window_seconds,
+        // The desktop's flat, `deny_unknown_fields` configuration document
+        // does not yet expose Slice-1 aggregate portfolio-risk composition;
+        // `core/paper::evaluate_risk` still gains it for every caller once an
+        // operator adopts the CLI/journal configuration path (see
+        // `follon_paper::PortfolioRiskComposition`).
+        portfolio_risk: None,
     };
     let kill_switches = KillSwitchRegistry::new(document.kill_switch_version)
         .map_err(|error| format!("kill switch registry: {error}"))?;

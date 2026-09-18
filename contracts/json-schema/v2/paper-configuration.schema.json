@@ -55,7 +55,50 @@
         "max_realized_loss": { "$ref": "#/$defs/decimal" },
         "max_market_data_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
         "max_order_rate": { "type": "integer", "minimum": 1 },
-        "order_rate_window_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+        "order_rate_window_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "portfolio_risk": { "$ref": "#/$defs/portfolioRisk" }
+      }
+    },
+    "portfolioRisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "max_gross_exposure", "max_abs_net_exposure", "max_leverage_bps", "max_concentration_bps"],
+      "properties": {
+        "policy_version": { "type": "string", "minLength": 1 },
+        "max_gross_exposure": { "$ref": "#/$defs/positiveDecimal" },
+        "max_abs_net_exposure": { "$ref": "#/$defs/positiveDecimal" },
+        "max_leverage_bps": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,5})(?:\\.[0-9]{1,8})?$" },
+        "max_concentration_bps": { "$ref": "#/$defs/basisPoints" },
+        "max_drawdown_bps": { "type": "string", "pattern": "^(?:10000|[0-9]{1,4})(?:\\.[0-9]{1,8})?$" },
+        "max_daily_loss": { "type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{1,8})?$" },
+        "max_margin_utilization_bps": { "type": "string", "pattern": "^(?:10000|[0-9]{1,4})(?:\\.[0-9]{1,8})?$" },
+        "allowed_instruments": { "type": "array", "items": { "$ref": "#/$defs/canonicalId" } },
+        "restricted_instruments": { "type": "array", "items": { "$ref": "#/$defs/canonicalId" } },
+        "sector_limits": { "type": "object", "additionalProperties": { "$ref": "#/$defs/positiveDecimal" } },
+        "asset_class_limits": { "type": "object", "additionalProperties": { "$ref": "#/$defs/positiveDecimal" } },
+        "currency_limits": { "type": "object", "additionalProperties": { "$ref": "#/$defs/positiveDecimal" } },
+        "strategy_limits": { "type": "object", "additionalProperties": { "$ref": "#/$defs/positiveDecimal" } },
+        "instrument_buckets": { "type": "object", "additionalProperties": { "$ref": "#/$defs/instrumentBucket" } },
+        "margin_rates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/marginRate" } }
+      }
+    },
+    "instrumentBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_class", "currency", "sector"],
+      "properties": {
+        "asset_class": { "$ref": "#/$defs/canonicalId" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "sector": { "$ref": "#/$defs/canonicalId" }
+      }
+    },
+    "marginRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial_bps", "maintenance_bps"],
+      "properties": {
+        "initial_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "maintenance_bps": { "type": "integer", "minimum": 1, "maximum": 10000 }
       }
     }
   }

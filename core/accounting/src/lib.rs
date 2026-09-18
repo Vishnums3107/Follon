@@ -726,6 +726,47 @@ pub struct TaxLotDisposal {
     pub allocations: Vec<(String, Decimal)>,
 }
 
+/// One remaining short tax lot: proceeds received when the short was opened,
+/// mirroring [`TaxLot`]'s cost-basis role but for the short side.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShortTaxLot {
+    /// Immutable lot identity.
+    pub lot_id: String,
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// Settlement currency.
+    pub currency: Currency,
+    /// Canonical UTC time the short was opened.
+    pub opened_at: String,
+    /// Remaining positive quantity still short.
+    pub remaining_quantity: Decimal,
+    /// Exact all-in proceeds received per share when the short was opened.
+    pub unit_proceeds: Decimal,
+}
+
+/// Exact realized short-cover result with auditable lot allocations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShortCoverResult {
+    /// Idempotent cover identity.
+    pub cover_id: String,
+    /// Instrument covered.
+    pub instrument_id: String,
+    /// Settlement currency.
+    pub currency: Currency,
+    /// Total covered quantity.
+    pub quantity: Decimal,
+    /// Original short-sale proceeds attributable to the covered lots.
+    pub proceeds: Decimal,
+    /// Gross cost paid to cover, before the cover fee.
+    pub cost_basis: Decimal,
+    /// Exact fee applied once to the complete cover.
+    pub fee: Decimal,
+    /// Net realized P&L (proceeds minus cost basis minus fee).
+    pub realized_pnl: Decimal,
+    /// `(lot_id, quantity)` allocations in deterministic selection order.
+    pub allocations: Vec<(String, Decimal)>,
+}
+
 /// Idempotent exact long-lot accounting projection.
 #[derive(Clone, Debug, Default)]
 pub struct TaxLotBook {
@@ -733,6 +774,13 @@ pub struct TaxLotBook {
     applied_lot_ids: BTreeSet<String>,
     applied_disposal_ids: BTreeSet<String>,
     realized_by_currency: BTreeMap<Currency, Decimal>,
+    /// Open short lots, mirroring `lots` for the short side. Kept in a
+    /// separate map (not a signed `TaxLot`) because a short lot's economics
+    /// are inverted: it holds proceeds received at open, not cost paid, and
+    /// is closed by *covering* (buying back), not disposing.
+    short_lots: BTreeMap<String, Vec<ShortTaxLot>>,
+    applied_short_lot_ids: BTreeSet<String>,
+    applied_cover_ids: BTreeSet<String>,
 }
 
 impl TaxLotBook {
@@ -866,6 +914,153 @@ impl TaxLotBook {
         }))
     }
 
+    /// Adds a validated short-open lot exactly once. Mirrors [`Self::acquire`]
+    /// exactly, except the lot records `unit_proceeds` (received when the
+    /// short was opened) rather than a cost paid.
+    pub fn open_short(&mut self, lot: ShortTaxLot) -> Result<bool, AccountingError> {
+        validate_canonical_id("short tax lot_id", &lot.lot_id)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_canonical_id("short tax lot instrument_id", &lot.instrument_id)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_utc_timestamp("short tax lot opened_at", &lot.opened_at)
+            .map_err(|error| AccountingError(error.0))?;
+        if lot.remaining_quantity <= Decimal::ZERO || lot.unit_proceeds <= Decimal::ZERO {
+            return Err(AccountingError(
+                "invalid short tax lot economics".to_owned(),
+            ));
+        }
+        if self.applied_short_lot_ids.contains(&lot.lot_id) {
+            return Ok(false);
+        }
+        self.applied_short_lot_ids.insert(lot.lot_id.clone());
+        let instrument_lots = self
+            .short_lots
+            .entry(lot.instrument_id.clone())
+            .or_default();
+        instrument_lots.push(lot);
+        instrument_lots.sort_by(|left, right| {
+            left.opened_at
+                .cmp(&right.opened_at)
+                .then_with(|| left.lot_id.cmp(&right.lot_id))
+        });
+        Ok(true)
+    }
+
+    /// Covers (buys back) short inventory under an explicit selection policy.
+    /// Mirrors [`Self::dispose`] exactly, except realized P&L is the original
+    /// short-sale proceeds minus the cover cost minus the fee (inverted from
+    /// a long disposal, where P&L is proceeds minus cost).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cover(
+        &mut self,
+        cover_id: &str,
+        instrument_id: &str,
+        currency: &Currency,
+        quantity: Decimal,
+        unit_cost: Decimal,
+        fee: Decimal,
+        occurred_at: &str,
+        selection: TaxLotSelection,
+    ) -> Result<Option<ShortCoverResult>, AccountingError> {
+        validate_canonical_id("short cover_id", cover_id)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_canonical_id("short cover instrument_id", instrument_id)
+            .map_err(|error| AccountingError(error.0))?;
+        validate_utc_timestamp("short cover occurred_at", occurred_at)
+            .map_err(|error| AccountingError(error.0))?;
+        if quantity <= Decimal::ZERO || unit_cost <= Decimal::ZERO || fee < Decimal::ZERO {
+            return Err(AccountingError("invalid short cover economics".to_owned()));
+        }
+        if self.applied_cover_ids.contains(cover_id) {
+            return Ok(None);
+        }
+        let existing = self
+            .short_lots
+            .get(instrument_id)
+            .ok_or_else(|| AccountingError("no short tax lots for cover".to_owned()))?;
+        if existing.iter().any(|lot| lot.currency != *currency) {
+            return Err(AccountingError(
+                "short tax lots for one instrument must use the cover currency".to_owned(),
+            ));
+        }
+        let available = existing.iter().try_fold(Decimal::ZERO, |total, lot| {
+            total
+                .checked_add(lot.remaining_quantity)
+                .map_err(AccountingError::from)
+        })?;
+        if quantity > available {
+            return Err(AccountingError(
+                "short cover exceeds available short lots".to_owned(),
+            ));
+        }
+        let mut order: Vec<usize> = (0..existing.len()).collect();
+        match selection {
+            TaxLotSelection::Fifo => {}
+            TaxLotSelection::Lifo => order.reverse(),
+            TaxLotSelection::HighestCost => order.sort_by(|left, right| {
+                existing[*right]
+                    .unit_proceeds
+                    .cmp(&existing[*left].unit_proceeds)
+                    .then_with(|| existing[*left].opened_at.cmp(&existing[*right].opened_at))
+                    .then_with(|| existing[*left].lot_id.cmp(&existing[*right].lot_id))
+            }),
+        }
+        let mut projected = existing.clone();
+        let mut remaining = quantity;
+        let mut proceeds = Decimal::ZERO;
+        let mut allocations = Vec::new();
+        for index in order {
+            if remaining == Decimal::ZERO {
+                break;
+            }
+            let selected = projected[index].remaining_quantity.min(remaining);
+            if selected == Decimal::ZERO {
+                continue;
+            }
+            proceeds =
+                proceeds.checked_add(selected.checked_mul(projected[index].unit_proceeds)?)?;
+            projected[index].remaining_quantity =
+                projected[index].remaining_quantity.checked_sub(selected)?;
+            remaining = remaining.checked_sub(selected)?;
+            allocations.push((projected[index].lot_id.clone(), selected));
+        }
+        if remaining != Decimal::ZERO {
+            return Err(AccountingError(
+                "short lot selection failed to conserve quantity".to_owned(),
+            ));
+        }
+        let cost_basis = quantity.checked_mul(unit_cost)?;
+        let realized_pnl = proceeds.checked_sub(cost_basis)?.checked_sub(fee)?;
+        projected.retain(|lot| lot.remaining_quantity > Decimal::ZERO);
+        self.short_lots.insert(instrument_id.to_owned(), projected);
+        self.applied_cover_ids.insert(cover_id.to_owned());
+        let prior = self
+            .realized_by_currency
+            .get(currency)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        self.realized_by_currency
+            .insert(currency.clone(), prior.checked_add(realized_pnl)?);
+        Ok(Some(ShortCoverResult {
+            cover_id: cover_id.to_owned(),
+            instrument_id: instrument_id.to_owned(),
+            currency: currency.clone(),
+            quantity,
+            proceeds,
+            cost_basis,
+            fee,
+            realized_pnl,
+            allocations,
+        }))
+    }
+
+    /// Stable remaining short lots for one instrument.
+    pub fn short_lots(&self, instrument_id: &str) -> &[ShortTaxLot] {
+        self.short_lots
+            .get(instrument_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// Stable remaining lots for one instrument.
     pub fn lots(&self, instrument_id: &str) -> &[TaxLot] {
         self.lots.get(instrument_id).map_or(&[], Vec::as_slice)
@@ -889,6 +1084,9 @@ impl TaxLotBook {
             applied_lot_ids: self.applied_lot_ids.clone(),
             applied_disposal_ids: self.applied_disposal_ids.clone(),
             realized_by_currency: self.realized_by_currency.clone(),
+            short_lots: self.short_lots.clone(),
+            applied_short_lot_ids: self.applied_short_lot_ids.clone(),
+            applied_cover_ids: self.applied_cover_ids.clone(),
         }
     }
 
@@ -936,11 +1134,56 @@ impl TaxLotBook {
                 }
             }
         }
+        for (instrument_id, lots) in &snapshot.short_lots {
+            if lots.is_empty() {
+                return Err(AccountingError(
+                    "persisted tax lot book cannot retain an empty short instrument bucket"
+                        .to_owned(),
+                ));
+            }
+            let mut canonical = lots.clone();
+            canonical.sort_by(|left, right| {
+                left.opened_at
+                    .cmp(&right.opened_at)
+                    .then_with(|| left.lot_id.cmp(&right.lot_id))
+            });
+            if &canonical != lots {
+                return Err(AccountingError(
+                    "persisted short tax lots are not in canonical acquisition order".to_owned(),
+                ));
+            }
+            for lot in lots {
+                validate_canonical_id("short tax lot_id", &lot.lot_id)
+                    .map_err(|e| AccountingError(e.0))?;
+                if &lot.instrument_id != instrument_id {
+                    return Err(AccountingError(
+                        "persisted short tax lot instrument_id does not match its bucket"
+                            .to_owned(),
+                    ));
+                }
+                validate_utc_timestamp("short tax lot opened_at", &lot.opened_at)
+                    .map_err(|e| AccountingError(e.0))?;
+                if lot.remaining_quantity <= Decimal::ZERO || lot.unit_proceeds <= Decimal::ZERO {
+                    return Err(AccountingError(
+                        "persisted short tax lot economics are invalid".to_owned(),
+                    ));
+                }
+                if !snapshot.applied_short_lot_ids.contains(&lot.lot_id) {
+                    return Err(AccountingError(
+                        "persisted open short tax lot is missing from its applied lot identity set"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
         Ok(Self {
             lots: snapshot.lots,
             applied_lot_ids: snapshot.applied_lot_ids,
             applied_disposal_ids: snapshot.applied_disposal_ids,
             realized_by_currency: snapshot.realized_by_currency,
+            short_lots: snapshot.short_lots,
+            applied_short_lot_ids: snapshot.applied_short_lot_ids,
+            applied_cover_ids: snapshot.applied_cover_ids,
         })
     }
 }
@@ -956,6 +1199,12 @@ pub struct TaxLotBookSnapshot {
     pub applied_disposal_ids: BTreeSet<String>,
     /// Cumulative realized P&L per currency.
     pub realized_by_currency: BTreeMap<Currency, Decimal>,
+    /// Open short lots keyed by instrument, in canonical open order.
+    pub short_lots: BTreeMap<String, Vec<ShortTaxLot>>,
+    /// Every short-lot identity ever accepted, including fully covered ones.
+    pub applied_short_lot_ids: BTreeSet<String>,
+    /// Every cover identity ever applied.
+    pub applied_cover_ids: BTreeSet<String>,
 }
 
 /// Financing exposure family.
@@ -1449,6 +1698,111 @@ mod tests {
                 unit_cost: amount("100"),
             })
             .unwrap());
+    }
+
+    #[test]
+    fn short_tax_lots_apply_fifo_and_idempotent_covers_exactly() {
+        let usd = currency("USD");
+        let mut book = TaxLotBook::default();
+        for (id, opened, quantity, proceeds) in [
+            ("short.one", "2026-01-01T00:00:00Z", "2", "100"),
+            ("short.two", "2026-01-02T00:00:00Z", "3", "110"),
+        ] {
+            assert!(book
+                .open_short(ShortTaxLot {
+                    lot_id: id.to_owned(),
+                    instrument_id: "instrument.spy".to_owned(),
+                    currency: usd.clone(),
+                    opened_at: opened.to_owned(),
+                    remaining_quantity: amount(quantity),
+                    unit_proceeds: amount(proceeds),
+                })
+                .unwrap());
+        }
+        let cover = book
+            .cover(
+                "cover.one",
+                "instrument.spy",
+                &usd,
+                amount("4"),
+                amount("60"),
+                amount("2"),
+                "2026-02-01T00:00:00Z",
+                TaxLotSelection::Fifo,
+            )
+            .unwrap()
+            .expect("new cover");
+        // FIFO: 2 shares from short.one (proceeds 100 each) + 2 from
+        // short.two (proceeds 110 each) = 420 total proceeds attributed;
+        // cost to buy back is 4 * 60 = 240; realized P&L = 420 - 240 - 2.
+        assert_eq!(cover.proceeds, amount("420"));
+        assert_eq!(cover.cost_basis, amount("240"));
+        assert_eq!(cover.realized_pnl, amount("178"));
+        assert_eq!(
+            book.short_lots("instrument.spy")[0].remaining_quantity,
+            amount("1")
+        );
+        assert!(book
+            .cover(
+                "cover.one",
+                "instrument.spy",
+                &usd,
+                amount("4"),
+                amount("60"),
+                amount("2"),
+                "2026-02-01T00:00:00Z",
+                TaxLotSelection::Lifo,
+            )
+            .unwrap()
+            .is_none());
+
+        // A recovered book must behave identically: reject the same
+        // already-applied cover, still hold the one remaining open unit, and
+        // refuse to re-open an already-fully-covered short lot identity.
+        let recovered = TaxLotBook::recover(book.snapshot()).unwrap();
+        assert_eq!(recovered.snapshot(), book.snapshot());
+        let mut recovered = recovered;
+        assert!(recovered
+            .cover(
+                "cover.one",
+                "instrument.spy",
+                &usd,
+                amount("4"),
+                amount("60"),
+                amount("2"),
+                "2026-02-01T00:00:00Z",
+                TaxLotSelection::Fifo,
+            )
+            .unwrap()
+            .is_none());
+        assert!(!recovered
+            .open_short(ShortTaxLot {
+                lot_id: "short.one".to_owned(),
+                instrument_id: "instrument.spy".to_owned(),
+                currency: usd.clone(),
+                opened_at: "2026-03-01T00:00:00Z".to_owned(),
+                remaining_quantity: amount("1"),
+                unit_proceeds: amount("100"),
+            })
+            .unwrap());
+    }
+
+    #[test]
+    fn short_tax_lot_recovery_rejects_an_open_lot_missing_from_its_applied_identity_set() {
+        let usd = currency("USD");
+        let mut book = TaxLotBook::default();
+        book.open_short(ShortTaxLot {
+            lot_id: "short.one".to_owned(),
+            instrument_id: "instrument.spy".to_owned(),
+            currency: usd,
+            opened_at: "2026-01-01T00:00:00Z".to_owned(),
+            remaining_quantity: amount("2"),
+            unit_proceeds: amount("100"),
+        })
+        .unwrap();
+        let mut snapshot = book.snapshot();
+        snapshot.applied_short_lot_ids.clear();
+        assert!(TaxLotBook::recover(snapshot).is_err());
     }
 
     #[test]

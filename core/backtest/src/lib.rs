@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use follon_accounting::{
     accrue_financing, value_margin_account, AccountingError, Currency, FinancingBalance,
-    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot, TaxLot, TaxLotBook,
-    TaxLotSelection,
+    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot, ShortTaxLot, TaxLot,
+    TaxLotBook, TaxLotSelection,
 };
 use follon_control_plane::{
     EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
@@ -762,6 +762,15 @@ pub struct AdvancedBacktestAccount {
     charges_by_currency: BTreeMap<Currency, BacktestExecutionCharges>,
     financing_by_currency: BTreeMap<Currency, Decimal>,
     delistings: Vec<DelistingSettlement>,
+    /// Independent FIFO cost-basis ledger, kept in lockstep with `positions`
+    /// from the same fills, covering both the long and short side. Unlike
+    /// `positions`' single running average price, this retains individual
+    /// acquisition/short-open lots so a real disposal or cover reports an
+    /// auditable, tax-lot-accurate realized gain/loss. A fill that crosses
+    /// through zero (e.g. a sell that closes a long and opens a short in one
+    /// execution) closes the existing side's lots and opens a new lot on the
+    /// other side, splitting the fill's fee proportionally between the two.
+    tax_lots: TaxLotBook,
 }
 
 impl AdvancedBacktestAccount {
@@ -780,6 +789,7 @@ impl AdvancedBacktestAccount {
             charges_by_currency: BTreeMap::new(),
             financing_by_currency: BTreeMap::new(),
             delistings: Vec::new(),
+            tax_lots: TaxLotBook::default(),
         })
     }
 
@@ -868,6 +878,9 @@ impl AdvancedBacktestAccount {
                 .checked_mul(prior_units)?
                 .checked_add(fill.price.checked_mul(fill.quantity)?)?
                 .checked_div(projected_units)?;
+            // Tax-lot wiring: a pure addition to the existing side (or a
+            // brand-new position from flat), never a crossing fill.
+            self.apply_tax_lot_open(fill, terms, fill.side, fill.quantity, fill.fee)?;
         } else {
             let closing = absolute_decimal(projected.quantity)?.min(fill.quantity);
             let direction = if projected.quantity > Decimal::ZERO {
@@ -880,6 +893,32 @@ impl AdvancedBacktestAccount {
                     .checked_mul(closing)?
                     .checked_mul(terms.multiplier)?,
             )?;
+            // Tax-lot wiring: close out `closing` units of the existing side
+            // (a long dispose or a short cover). A fill quantity exceeding
+            // what closes the existing side crosses through zero and opens a
+            // new lot on the *other* side for the remainder; the fill's one
+            // fee is split proportionally between the two legs so they sum
+            // exactly to `fill.fee` (the remainder leg takes the exact
+            // remainder rather than its own independently rounded share, so
+            // fixed-point division never drops or invents a fraction of a
+            // cent).
+            let remainder = fill.quantity.checked_sub(closing)?;
+            let closing_fee = if remainder == Decimal::ZERO {
+                fill.fee
+            } else {
+                fill.fee.checked_mul(closing)?.checked_div(fill.quantity)?
+            };
+            let remainder_fee = fill.fee.checked_sub(closing_fee)?;
+            self.apply_tax_lot_close(
+                fill,
+                terms,
+                projected.quantity > Decimal::ZERO,
+                closing,
+                closing_fee,
+            )?;
+            if remainder > Decimal::ZERO {
+                self.apply_tax_lot_open(fill, terms, fill.side, remainder, remainder_fee)?;
+            }
             if projected_quantity == Decimal::ZERO {
                 projected.average_price = Decimal::ZERO;
             } else if (projected.quantity > Decimal::ZERO && projected_quantity < Decimal::ZERO)
@@ -902,6 +941,106 @@ impl AdvancedBacktestAccount {
         totals.exchange = totals.exchange.checked_add(charges.exchange)?;
         totals.regulatory = totals.regulatory.checked_add(charges.regulatory)?;
         Ok(())
+    }
+
+    /// Applies the "opening" leg of a fill to the independent tax-lot ledger:
+    /// a buy acquires a new long lot; a sell opens a new short lot. This is
+    /// always either the entire fill (a pure addition to the existing side,
+    /// or a brand-new position from flat) or the crossing remainder after
+    /// [`Self::apply_tax_lot_close`] has closed out the opposite side --
+    /// `quantity`/`fee` are already the exact amount attributable to this
+    /// leg in either case.
+    fn apply_tax_lot_open(
+        &mut self,
+        fill: &Fill,
+        terms: &AdvancedInstrumentTerms,
+        side: Side,
+        quantity: Decimal,
+        fee: Decimal,
+    ) -> Result<(), BacktestError> {
+        let gross = fill.price.checked_mul(quantity)?;
+        match side {
+            Side::Buy => {
+                let unit_cost = gross.checked_add(fee)?.checked_div(quantity)?;
+                self.tax_lots.acquire(TaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency: terms.currency.clone(),
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: quantity,
+                    unit_cost,
+                })?;
+            }
+            Side::Sell => {
+                let unit_proceeds = gross.checked_sub(fee)?.checked_div(quantity)?;
+                self.tax_lots.open_short(ShortTaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency: terms.currency.clone(),
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: quantity,
+                    unit_proceeds,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the "closing" leg of a fill to the independent tax-lot
+    /// ledger: closing a prior long position disposes long lots FIFO;
+    /// closing a prior short position covers short lots FIFO. `quantity` is
+    /// bounded by the prior position's own size, so this can never exceed
+    /// available lots (mirroring the same invariant `core/paper`/`core/live`
+    /// already rely on for their long-only `dispose` calls).
+    fn apply_tax_lot_close(
+        &mut self,
+        fill: &Fill,
+        terms: &AdvancedInstrumentTerms,
+        closing_long: bool,
+        quantity: Decimal,
+        fee: Decimal,
+    ) -> Result<(), BacktestError> {
+        if closing_long {
+            self.tax_lots.dispose(
+                &format!("taxdisposal-{}", fill.execution_id),
+                &fill.instrument_id,
+                &terms.currency,
+                quantity,
+                fill.price,
+                fee,
+                &fill.executed_at,
+                TaxLotSelection::Fifo,
+            )?;
+        } else {
+            self.tax_lots.cover(
+                &format!("taxcover-{}", fill.execution_id),
+                &fill.instrument_id,
+                &terms.currency,
+                quantity,
+                fill.price,
+                fee,
+                &fill.executed_at,
+                TaxLotSelection::Fifo,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remaining open FIFO long tax lots for one instrument, oldest first.
+    pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
+        self.tax_lots.lots(instrument_id)
+    }
+
+    /// Remaining open FIFO short tax lots for one instrument, oldest first.
+    pub fn short_tax_lots(&self, instrument_id: &str) -> &[ShortTaxLot] {
+        self.tax_lots.short_lots(instrument_id)
+    }
+
+    /// Cumulative FIFO-realized tax P&L (long disposals and short covers
+    /// combined) in one currency, independent of `AdvancedBacktestPosition`'s
+    /// average-cost `realized_pnl`.
+    pub fn tax_realized_pnl(&self, currency: &Currency) -> Decimal {
+        self.tax_lots.realized(currency)
     }
 
     /// Applies a fill only when the resulting account satisfies initial margin.
@@ -2289,6 +2428,10 @@ mod tests {
         }
     }
 
+    fn amount(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
     #[test]
     fn identical_specifications_have_identical_fingerprints() {
         let dataset = DatasetManifest {
@@ -2830,6 +2973,120 @@ mod tests {
             report.margin.net_liquidation_value,
             Decimal::from_str("11194.50").unwrap()
         );
+    }
+
+    #[test]
+    fn advanced_account_tracks_a_pure_short_position_in_the_tax_lot_ledger() {
+        let usd = Currency::new("USD").unwrap();
+        let mut account =
+            AdvancedBacktestAccount::new(BTreeMap::from([(usd.clone(), amount("10000"))])).unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: true,
+            borrow_available: amount("10"),
+            borrow_rate_bps: 100,
+        };
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.short-open-1".to_owned(),
+                    order_id: "order.short-open-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: amount("5"),
+                    price: amount("100"),
+                    fee: amount("5"),
+                    executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: amount("5"),
+                    exchange: Decimal::ZERO,
+                    regulatory: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        // A pure short-open is a `same_direction` addition from flat: no
+        // long lot is ever touched, and the short lot's all-in proceeds are
+        // net of the fee -- (5*100 - 5) / 5 = 99.
+        assert!(account.tax_lots("inst.us_equity.spy").is_empty());
+        let short_lots = account.short_tax_lots("inst.us_equity.spy");
+        assert_eq!(short_lots.len(), 1);
+        assert_eq!(short_lots[0].remaining_quantity, amount("5"));
+        assert_eq!(short_lots[0].unit_proceeds, amount("99"));
+        assert_eq!(account.tax_realized_pnl(&usd), Decimal::ZERO);
+    }
+
+    #[test]
+    fn advanced_account_crossing_fill_splits_tax_lots_and_fee_across_both_sides() {
+        let usd = Currency::new("USD").unwrap();
+        let mut account =
+            AdvancedBacktestAccount::new(BTreeMap::from([(usd.clone(), amount("10000"))])).unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: true,
+            borrow_available: amount("10"),
+            borrow_rate_bps: 100,
+        };
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.cross-buy-1".to_owned(),
+                    order_id: "order.cross-buy-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Buy,
+                    quantity: amount("5"),
+                    price: amount("100"),
+                    fee: amount("5"),
+                    executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: amount("5"),
+                    exchange: Decimal::ZERO,
+                    regulatory: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        // One 8-share sell crosses the entire 5-share long position: the
+        // first 5 shares close the long lot (dispose), and the remaining 3
+        // open a brand-new short lot -- all from one fill, one execution_id.
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.cross-sell-1".to_owned(),
+                    order_id: "order.cross-sell-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: amount("8"),
+                    price: amount("120"),
+                    fee: amount("8"),
+                    executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: amount("8"),
+                    exchange: Decimal::ZERO,
+                    regulatory: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        // The long lot's cost basis included the buy's fee (5*100+5)/5=101/
+        // share, so disposing all 5 at 120 with a proportional closing fee
+        // of 8*(5/8)=5 realizes exactly (5*120) - (5*101) - 5 = 90.
+        assert!(account.tax_lots("inst.us_equity.spy").is_empty());
+        assert_eq!(account.tax_realized_pnl(&usd), amount("90"));
+        // The crossing remainder (3 shares) opens a fresh short lot at the
+        // same fill price, net of its own proportional fee share
+        // (8 - 5 = 3): (3*120 - 3) / 3 = 119/share.
+        let short_lots = account.short_tax_lots("inst.us_equity.spy");
+        assert_eq!(short_lots.len(), 1);
+        assert_eq!(short_lots[0].remaining_quantity, amount("3"));
+        assert_eq!(short_lots[0].unit_proceeds, amount("119"));
     }
 
     #[test]

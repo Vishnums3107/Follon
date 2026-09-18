@@ -896,11 +896,21 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-instrument",
+ "follon-risk",
  "fs2",
  "serde",
  "serde_json",
  "sha2",
  "time",
+]
+
+[[package]]
+name = "follon-risk"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "follon-fx",
+ "sha2",
 ]
 
 [[package]]
