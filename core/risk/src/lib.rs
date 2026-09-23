@@ -598,11 +598,20 @@ pub fn evaluate_portfolio_risk_with_candidates(
         reasons.push("MAX_GAMMA_EXCEEDED".to_owned());
     }
     // One atomic group is one order here, however many legs it carries -- see
-    // this function's own contract. `!is_empty()` rather than `len()` is what
-    // makes that true, and it is exactly the previous single-candidate
-    // behaviour when the group holds zero or one candidate.
-    if snapshot.resting_orders.len() + usize::from(!candidates.is_empty()) > policy.max_open_orders
-    {
+    // this function's own contract. Two things make that true. `!is_empty()`
+    // rather than `len()` counts the candidate group once, and is exactly the
+    // previous single-candidate behaviour for zero or one candidate. And
+    // resting orders are counted by *distinct* identity, because a caller
+    // reports one resting row per leg so the per-instrument self-trade check
+    // above can see every leg -- those rows share one `order_id` and must not
+    // inflate the open-order count. Plain orders each carry their own identity,
+    // so this is unchanged for them.
+    let resting_identities = snapshot
+        .resting_orders
+        .iter()
+        .map(|resting| resting.order_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if resting_identities.len() + usize::from(!candidates.is_empty()) > policy.max_open_orders {
         reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
     }
     if snapshot

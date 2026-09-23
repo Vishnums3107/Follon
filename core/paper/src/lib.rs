@@ -16,7 +16,7 @@ use follon_accounting::{
     Currency, FxBook, MarginPolicy, MarginPosition, TaxLot, TaxLotBook, TaxLotBookSnapshot,
     TaxLotSelection,
 };
-use follon_control_plane::{EngineError, OmsOrder, Portfolio};
+use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
     price_deviation_bps, validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill,
     OrderIntent, OrderState, OrderType, RiskDecision, Side, TimeInForce,
@@ -184,6 +184,31 @@ pub struct BrokerComboRequest {
 }
 
 impl BrokerComboRequest {
+    /// Normalizes an approved OMS combination order into a broker request.
+    ///
+    /// The broker sees each leg's **exact contract quantity**, ratio already
+    /// applied, so no adapter has to re-derive it from a unit count and a
+    /// ratio. `limit_price` carries the protection amount the operator stated,
+    /// whose direction is fixed by the combination's own price-limit kind.
+    fn from_combo_order(order: &OmsComboOrder) -> Result<Self, PaperError> {
+        let mut legs = Vec::with_capacity(order.intent.legs.len());
+        for leg in &order.intent.legs {
+            let quantity = order.intent.leg_quantity(leg)?;
+            legs.push(BrokerComboLeg {
+                instrument_id: leg.instrument_id.clone(),
+                side: leg.side,
+                ratio: leg.ratio,
+                quantity,
+            });
+        }
+        Ok(Self {
+            client_order_id: order.order_id.clone(),
+            account_id: order.intent.account_id.clone(),
+            legs,
+            limit_price: Some(order.intent.price_limit.amount()),
+        })
+    }
+
     fn validate(&self) -> Result<(), PaperError> {
         for (name, value) in [
             ("combo client_order_id", self.client_order_id.as_str()),
@@ -208,6 +233,11 @@ impl BrokerComboRequest {
                     "paper combo leg ratio must be positive".to_owned(),
                 ));
             }
+            if leg.quantity <= Decimal::ZERO {
+                return Err(PaperError(
+                    "paper combo leg quantity must be positive".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -222,6 +252,11 @@ pub struct BrokerComboLeg {
     pub side: Side,
     /// Exact requested quantity ratio.
     pub ratio: u32,
+    /// Exact contract quantity for this leg, ratio already applied.
+    ///
+    /// Carried alongside the ratio so no adapter has to re-derive it from a
+    /// unit count, which is the kind of duplicated arithmetic that drifts.
+    pub quantity: Decimal,
 }
 
 impl BrokerOrderRequest {
@@ -689,6 +724,13 @@ struct IbkrOrder {
     filled_quantity: Decimal,
 }
 
+/// One accepted atomic combination in the paper-bridge model.
+#[derive(Clone, Debug)]
+struct IbkrCombo {
+    broker_order_id: String,
+    request: BrokerComboRequest,
+}
+
 /// Deterministic local model of the Interactive Brokers paper-order contract.
 ///
 /// This adapter is deliberately named and configured as paper-only. It models
@@ -701,6 +743,10 @@ pub struct IbkrPaperAdapter {
     next_order: u64,
     next_execution: u64,
     orders: BTreeMap<String, IbkrOrder>,
+    /// Accepted atomic combinations, keyed by client identity. Separate from
+    /// `orders` because a combination is one broker order over several
+    /// instruments and has no single `BrokerOrderRequest` shape.
+    combos: BTreeMap<String, IbkrCombo>,
     positions: BTreeMap<String, Decimal>,
     cash: Decimal,
     pending_events: VecDeque<BrokerEvent>,
@@ -716,6 +762,7 @@ impl IbkrPaperAdapter {
             next_order: 1,
             next_execution: 1,
             orders: BTreeMap::new(),
+            combos: BTreeMap::new(),
             positions: BTreeMap::new(),
             cash: account.initial_cash,
             pending_events: VecDeque::new(),
@@ -832,6 +879,50 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
             client_order_id: request.client_order_id.clone(),
             broker_order_id: broker_order_id.clone(),
         });
+        Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
+    }
+
+    /// Accepts an atomic combination, mirroring the real paper bridge.
+    ///
+    /// The genuine IBKR paper transport does support native BAG combinations
+    /// (`adapters/brokers/ibkr::submit_paper_combo`), so this deterministic
+    /// model of that same bridge supports them too. A model that refused what
+    /// the thing it models accepts would make the combination path untestable
+    /// against anything but a rejection.
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        request.validate()?;
+        if !self.connected {
+            return Err(PaperError(
+                "IBKR paper connection is unavailable; combination outcome is unknown".to_owned(),
+            ));
+        }
+        if request.account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match combination request".to_owned(),
+            ));
+        }
+        if let Some(existing) = self.combos.get(&request.client_order_id) {
+            if existing.request != *request {
+                return Err(PaperError(
+                    "client order id was reused with different paper combination data".to_owned(),
+                ));
+            }
+            return Ok(BrokerSubmitResult::Acknowledged {
+                broker_order_id: existing.broker_order_id.clone(),
+            });
+        }
+        let broker_order_id = format!("ibkr-paper-combo-{:08}", self.next_order);
+        self.next_order += 1;
+        self.combos.insert(
+            request.client_order_id.clone(),
+            IbkrCombo {
+                broker_order_id: broker_order_id.clone(),
+                request: request.clone(),
+            },
+        );
         Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
     }
 
@@ -1557,6 +1648,69 @@ impl PaperOrder {
     }
 }
 
+/// Internal paper OMS record for one atomic multi-leg combination.
+#[derive(Clone, Debug)]
+pub struct PaperComboOrder {
+    /// Durable OMS combination order and legal lifecycle state.
+    pub oms: OmsComboOrder,
+    /// Broker order identity once known. One identity for the whole group: an
+    /// atomic combination is a single broker order, not one per leg.
+    pub broker_order_id: Option<String>,
+    /// Every broker-native order identity issued for this immutable OMS order.
+    pub broker_order_versions: Vec<String>,
+    /// Exact per-leg observation used for approval and cash reservation.
+    pub market: PaperComboMarketData,
+}
+
+impl PaperComboOrder {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.oms.state,
+            OrderState::RiskRejected
+                | OrderState::Filled
+                | OrderState::Cancelled
+                | OrderState::Rejected
+                | OrderState::Expired
+        )
+    }
+
+    fn working(&self) -> bool {
+        !self.is_terminal()
+    }
+
+    /// Cash a working combination still has committed.
+    ///
+    /// Only a net debit reserves cash, matching the gate that approved it. No
+    /// partial-fill reduction appears here because this slice submits but does
+    /// not yet fill a combination; when fills land, this must subtract them the
+    /// way [`PaperOrder::reserved_cash`] does, or a partially filled
+    /// combination will over-reserve.
+    fn reserved_cash(&self) -> Result<Decimal, PaperError> {
+        if !self.working() {
+            return Ok(Decimal::ZERO);
+        }
+        let net_price = self.oms.intent.protected_net_price()?;
+        if net_price <= Decimal::ZERO {
+            return Ok(Decimal::ZERO);
+        }
+        net_price
+            .checked_mul(self.oms.intent.combo_quantity)
+            .map_err(Into::into)
+    }
+}
+
+/// Immutable record of a combination decision and the observation behind it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaperComboRiskEvidence {
+    /// The complete immutable combination intent evaluated by risk, including
+    /// rejected ones.
+    pub intent: ComboIntent,
+    /// The versioned risk result.
+    pub decision: RiskDecision,
+    /// The exact validated per-leg observation evaluated by risk.
+    pub market: PaperComboMarketData,
+}
+
 /// Immutable record of the decision and exact market observation that produced it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperRiskEvidence {
@@ -1762,15 +1916,23 @@ struct PersistentPaperState {
     broker_connected: bool,
     #[serde(default)]
     latest_reconciliation: Option<PersistentReconciliationReport>,
-    /// Missing on a journal written before this field existed; an empty
-    /// book is exactly correct for one, since no fill could have been
-    /// applied to a tax-lot ledger that did not yet exist.
+    /// Absent in a document written before this field existed; an empty book
+    /// is exactly correct for one, since no fill could have been applied to a
+    /// tax-lot ledger that did not yet exist.
+    ///
+    /// This default makes the *type* tolerant. It does not, on its own, let
+    /// `FilePaperJournal::open` read an older journal **file**: that reader
+    /// additionally requires every line to re-serialize byte-for-byte, so a
+    /// line missing any field the current serializer writes is rejected before
+    /// a default can apply. Verified directly rather than assumed. The same
+    /// correction applies to every `#[serde(default)]` field below.
     #[serde(default)]
     tax_lots: PersistentTaxLotBook,
     /// Last observed mark per instrument (Decimal-as-string, matching every
-    /// other persisted decimal field). Missing on a journal written before
+    /// other persisted decimal field). Absent in a document written before
     /// this field existed; an empty map is correct for one -- every position
-    /// simply falls back to its own average cost until re-quoted.
+    /// simply falls back to its own average cost until re-quoted. See
+    /// `tax_lots` above on what this default does and does not achieve.
     #[serde(default)]
     marks: BTreeMap<String, String>,
     /// Highest observed real equity (Decimal-as-string). `None` on a journal
@@ -1796,6 +1958,17 @@ struct PersistentPaperState {
     /// strategy-attribution ledger that did not yet exist.
     #[serde(default)]
     strategy_attribution: BTreeMap<String, BTreeMap<String, String>>,
+    /// Atomic multi-leg combination orders. Absent in a document written
+    /// before the combination path existed; an empty map is exactly correct
+    /// for one, since no combination could have been submitted through a path
+    /// that did not yet exist. See `tax_lots` above on what this default does
+    /// and does not achieve.
+    #[serde(default)]
+    combo_orders: BTreeMap<String, PersistentComboOrder>,
+    /// Combination risk evidence, including refusals. Empty on an older
+    /// journal for the same reason.
+    #[serde(default)]
+    combo_risk_evidence: BTreeMap<String, PersistentComboRiskEvidence>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1847,6 +2020,58 @@ struct PersistentMarketData {
     instrument_id: String,
     mark_price: String,
     observed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentComboOrder {
+    intent: PersistentComboIntent,
+    state: String,
+    broker_order_id: Option<String>,
+    #[serde(default)]
+    broker_order_versions: Vec<String>,
+    /// One persisted mark per leg, reusing the single-instrument observation
+    /// shape rather than inventing a second format to migrate later.
+    market: Vec<PersistentMarketData>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentComboRiskEvidence {
+    intent: PersistentComboIntent,
+    approved: bool,
+    reason_codes: Vec<String>,
+    policy_version: String,
+    decided_at: String,
+    correlation_id: String,
+    actor: String,
+    evaluated_limits: String,
+    market: Vec<PersistentMarketData>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentComboIntent {
+    intent_id: String,
+    account_id: String,
+    strategy_id: String,
+    correlation_id: String,
+    legs: Vec<PersistentComboLeg>,
+    combo_quantity: String,
+    /// `MAXIMUM_DEBIT` or `MINIMUM_CREDIT`, matching `ComboPriceLimit::kind`.
+    price_limit_kind: String,
+    price_limit_amount: String,
+    time_in_force: String,
+    rationale: String,
+    created_at: String,
+    strategy_version: String,
+    configuration_version: String,
+    environment: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentComboLeg {
+    instrument_id: String,
+    side: String,
+    ratio: u32,
+    limit_price: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2097,6 +2322,13 @@ pub struct PaperTradingService<B> {
     cash: Decimal,
     orders: BTreeMap<String, PaperOrder>,
     risk_evidence: BTreeMap<String, PaperRiskEvidence>,
+    /// Atomic multi-leg combinations, tracked separately from `orders` because
+    /// a combination is one order over several instruments and does not fit the
+    /// single-instrument shape of [`PaperOrder`]. Every risk counter that reads
+    /// `orders` reads this map too -- a combination that were invisible to the
+    /// single-order gate would be a hole in exactly the limits it is subject to.
+    combo_orders: BTreeMap<String, PaperComboOrder>,
+    combo_risk_evidence: BTreeMap<String, PaperComboRiskEvidence>,
     portfolios: BTreeMap<String, Portfolio>,
     /// Independent FIFO long-lot cost-basis ledger, kept in lockstep with
     /// `portfolios` from the same fills. `Portfolio` tracks a single running
@@ -2170,6 +2402,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             broker_connected: true,
             orders: BTreeMap::new(),
             risk_evidence: BTreeMap::new(),
+            combo_orders: BTreeMap::new(),
+            combo_risk_evidence: BTreeMap::new(),
             portfolios: BTreeMap::new(),
             tax_lots: TaxLotBook::default(),
             marks: BTreeMap::new(),
@@ -2430,6 +2664,196 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 Err(error)
             }
         }
+    }
+
+    /// Submits one atomic multi-leg combination through the full risk gate.
+    ///
+    /// This is the combination analogue of [`Self::submit_intent`] and follows
+    /// the same order of operations for the same reasons: validate, refuse a
+    /// disconnected session, answer an idempotent retry from stored evidence,
+    /// evaluate risk, persist `PENDING_SUBMIT` **before** crossing the broker
+    /// boundary, then record the normalized outcome. A transport failure leaves
+    /// the combination explicitly `UNKNOWN` rather than guessing.
+    ///
+    /// A combination is submitted as one broker order. If the adapter does not
+    /// support a native atomic combination it rejects the whole request, and no
+    /// leg is ever transmitted on its own — that boundary is the adapter's, and
+    /// this method does not work around it by splitting the group.
+    pub fn submit_combo_intent(
+        &mut self,
+        intent: ComboIntent,
+        market: PaperComboMarketData,
+        decided_at: &str,
+    ) -> Result<PaperSubmitOutcome, PaperError> {
+        self.ensure_persistence_healthy()?;
+        intent.validate()?;
+        validate_utc_timestamp("paper combo risk decision time", decided_at)?;
+        market.validate_for(&intent)?;
+        if intent.environment != "PAPER" {
+            return Err(PaperError(
+                "paper OMS refuses a combination outside the PAPER environment".to_owned(),
+            ));
+        }
+        if intent.account_id != self.account.account_id {
+            return Err(PaperError(
+                "paper combo intent account does not match service".to_owned(),
+            ));
+        }
+        if !self.broker_connected {
+            return Err(PaperError(
+                "paper broker session is disconnected; reconnect and reconcile before submission"
+                    .to_owned(),
+            ));
+        }
+
+        let order_id = OmsComboOrder::order_id_for(&intent.intent_id);
+        if let Some(existing) = self.combo_orders.get(&order_id) {
+            if existing.oms.intent != intent {
+                return Err(PaperError(
+                    "paper combination idempotency key was reused with different intent data"
+                        .to_owned(),
+                ));
+            }
+            let evidence = self
+                .combo_risk_evidence
+                .get(&format!("paper-combo-risk-{}", intent.intent_id))
+                .ok_or_else(|| {
+                    PaperError(
+                        "existing paper combination order is missing its risk evidence".to_owned(),
+                    )
+                })?;
+            if evidence.market != market || evidence.decision.decided_at != decided_at {
+                return Err(PaperError(
+                    "paper combination retry must use the original market observation and decision time"
+                        .to_owned(),
+                ));
+            }
+            return Ok(PaperSubmitOutcome {
+                decision: evidence.decision.clone(),
+                order_id: Some(order_id),
+                state: Some(existing.oms.state),
+            });
+        }
+
+        // `evaluate_combo_risk` performs its own staleness check and updates
+        // the mark cache, peak equity and daily baseline, exactly as the
+        // single-order path relies on `evaluate_risk` to do.
+        let decision = self.evaluate_combo_risk(&intent, &market, decided_at)?;
+        let evidence = PaperComboRiskEvidence {
+            intent: intent.clone(),
+            decision: decision.clone(),
+            market: market.clone(),
+        };
+        if !decision.approved {
+            self.combo_risk_evidence
+                .insert(decision.decision_id.clone(), evidence);
+            self.persist()?;
+            return Ok(PaperSubmitOutcome {
+                decision,
+                order_id: None,
+                state: None,
+            });
+        }
+
+        let mut oms = OmsComboOrder::from_approved_intent(intent, &decision)?;
+        oms.transition(OrderState::Approved, "PAPER_COMBO_RISK_APPROVED")?;
+        oms.transition(
+            OrderState::PendingSubmit,
+            "PAPER_COMBO_SUBMISSION_REQUESTED",
+        )?;
+        let request = BrokerComboRequest::from_combo_order(&oms)?;
+        self.combo_orders.insert(
+            oms.order_id.clone(),
+            PaperComboOrder {
+                oms,
+                broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                market,
+            },
+        );
+        self.combo_risk_evidence
+            .insert(decision.decision_id.clone(), evidence);
+        // Persist `PENDING_SUBMIT` before crossing the external broker boundary.
+        self.persist()?;
+
+        let submission = self.broker.submit_combo(&request);
+        match submission {
+            Ok(BrokerSubmitResult::Acknowledged { broker_order_id }) => {
+                validate_canonical_id("broker order_id", &broker_order_id)?;
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order
+                    .oms
+                    .transition(OrderState::Submitted, "PAPER_COMBO_SUBMISSION_SENT")?;
+                order
+                    .oms
+                    .transition(OrderState::Acknowledged, "IBKR_PAPER_COMBO_ACKNOWLEDGED")?;
+                order.broker_order_id = Some(broker_order_id.clone());
+                order.broker_order_versions.push(broker_order_id);
+                let state = order.oms.state;
+                self.persist()?;
+                Ok(PaperSubmitOutcome {
+                    decision,
+                    order_id: Some(request.client_order_id),
+                    state: Some(state),
+                })
+            }
+            Ok(BrokerSubmitResult::Rejected { reason }) => {
+                validate_broker_reason("broker rejection reason", &reason)?;
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order
+                    .oms
+                    .transition(OrderState::Submitted, "PAPER_COMBO_SUBMISSION_SENT")?;
+                order.oms.transition(OrderState::Rejected, reason)?;
+                let state = order.oms.state;
+                self.persist()?;
+                Ok(PaperSubmitOutcome {
+                    decision,
+                    order_id: Some(request.client_order_id),
+                    state: Some(state),
+                })
+            }
+            Ok(BrokerSubmitResult::Unknown { reason }) => {
+                validate_broker_reason("broker unknown-outcome reason", &reason)?;
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order.oms.transition(OrderState::Unknown, reason)?;
+                self.persist()?;
+                Ok(PaperSubmitOutcome {
+                    decision,
+                    order_id: Some(request.client_order_id),
+                    state: Some(OrderState::Unknown),
+                })
+            }
+            Err(error) => {
+                // An adapter that cannot execute an atomic combination returns
+                // an error here, and that is a *transport* outcome like any
+                // other: the request may or may not have reached the venue, so
+                // the combination goes to `UNKNOWN` and the session is marked
+                // disconnected rather than assumed untouched.
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order
+                    .oms
+                    .transition(OrderState::Unknown, "PAPER_COMBO_TRANSPORT_OUTCOME_UNKNOWN")?;
+                self.broker_connected = false;
+                self.persist()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// The durable combination order for one client identity, if known.
+    pub fn combo_order(&self, order_id: &str) -> Option<&PaperComboOrder> {
+        self.combo_orders.get(order_id)
+    }
+
+    /// The immutable combination risk evidence for one decision identity.
+    pub fn combo_risk_evidence(&self, decision_id: &str) -> Option<&PaperComboRiskEvidence> {
+        self.combo_risk_evidence.get(decision_id)
+    }
+
+    fn combo_order_mut(&mut self, order_id: &str) -> Result<&mut PaperComboOrder, PaperError> {
+        self.combo_orders
+            .get_mut(order_id)
+            .ok_or_else(|| PaperError("paper OMS does not know combination order".to_owned()))
     }
 
     /// Requests cancellation. A transport failure leaves the order explicitly `UNKNOWN`.
@@ -2718,11 +3142,32 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             }
         }
         for broker in &snapshot.orders {
-            if !self.orders.contains_key(&broker.client_order_id) {
+            if !self.orders.contains_key(&broker.client_order_id)
+                && !self.combo_orders.contains_key(&broker.client_order_id)
+            {
                 raw_issues.push((
                     "UNEXPECTED_BROKER_ORDER",
                     broker.client_order_id.clone(),
                     "broker snapshot contains no matching internal order".to_owned(),
+                ));
+            }
+        }
+        // A working combination cannot yet be reconciled against a broker
+        // snapshot: this slice submits combinations but does not yet consume
+        // their fills, so there is no internal filled quantity or per-leg state
+        // to compare. That is recorded as a real issue rather than passed over.
+        // The consequence is deliberate -- a session holding a working
+        // combination does not reconcile clean, and so cannot count toward the
+        // 30-clean-PAPER-session gate. A gate that counted sessions in which
+        // part of the order flow was never checked would not be measuring what
+        // it claims to.
+        for (order_id, internal) in &self.combo_orders {
+            if internal.working() {
+                raw_issues.push((
+                    "UNRECONCILED_COMBINATION",
+                    order_id.clone(),
+                    "combination reconciliation is not implemented; see conformance row 5.6"
+                        .to_owned(),
                 ));
             }
         }
@@ -2961,7 +3406,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 .map(|journal| journal.head_hash().to_owned())
                 .unwrap_or_else(|| "0".repeat(64)),
             internal_cash: self.cash.to_string(),
-            working_orders: self.orders.values().filter(|order| order.working()).count() as u32,
+            working_orders: self.working_order_count() as u32,
             unknown_orders: self
                 .orders
                 .values()
@@ -3030,16 +3475,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .try_fold(Decimal::ZERO, |total, portfolio| {
                 total.checked_add(portfolio.position_snapshot().realized_pnl)
             })?;
-        let reserved_cash = self.orders.values().try_fold(
-            Decimal::ZERO,
-            |total, order| -> Result<Decimal, PaperError> {
-                total
-                    .checked_add(order.reserved_cash()?)
-                    .map_err(Into::into)
-            },
-        )?;
+        let reserved_cash = self.total_reserved_cash()?;
         let context = PaperRiskContext {
-            open_orders: self.orders.values().filter(|order| order.working()).count(),
+            open_orders: self.working_order_count(),
             position_quantity: current_position,
             available_cash: self.cash.checked_sub(reserved_cash)?,
             realized_pnl,
@@ -3065,21 +3503,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if requested_price_deviation_bps > self.risk_policy.max_price_deviation_bps {
             reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
-        if self.orders.values().any(|order| {
-            order.working()
-                && order.oms.intent.instrument_id == intent.instrument_id
-                && order.oms.intent.side != intent.side
-        }) {
+        if self.conflicts_with_working_order(&intent.instrument_id, intent.side) {
             reasons.push("SELF_TRADE_RISK".to_owned());
         }
         if recent_order_count >= self.risk_policy.max_order_rate {
             reasons.push("MAX_ORDER_RATE_EXCEEDED".to_owned());
         }
-        if self
-            .orders
-            .values()
-            .any(|order| order.oms.state == OrderState::Unknown)
-        {
+        if self.has_unknown_order() {
             reasons.push("UNKNOWN_ORDER_REQUIRES_RECONCILIATION".to_owned());
         }
         if self.unexplained_incident_count() > 0 {
@@ -3240,14 +3670,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             self.daily_baseline_equity = observed_equity;
         }
 
-        let reserved_cash = self.orders.values().try_fold(
-            Decimal::ZERO,
-            |total, order| -> Result<Decimal, PaperError> {
-                total
-                    .checked_add(order.reserved_cash()?)
-                    .map_err(Into::into)
-            },
-        )?;
+        let reserved_cash = self.total_reserved_cash()?;
         let available_cash = self.cash.checked_sub(reserved_cash)?;
         let realized_pnl = self
             .portfolios
@@ -3255,7 +3678,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .try_fold(Decimal::ZERO, |total, portfolio| {
                 total.checked_add(portfolio.position_snapshot().realized_pnl)
             })?;
-        let open_orders = self.orders.values().filter(|order| order.working()).count();
+        let open_orders = self.working_order_count();
         let recent_order_count = self.recent_order_count(decided_at)?;
 
         let gross_notional = intent.gross_notional()?;
@@ -3302,11 +3725,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             // Self-trade is assessed per leg against every working order, and a
             // breach on any one leg rejects the whole structure: the group is
             // atomic, so there is no version of it that omits the offending leg.
-            if self.orders.values().any(|order| {
-                order.working()
-                    && order.oms.intent.instrument_id == leg.instrument_id
-                    && order.oms.intent.side != leg.side
-            }) {
+            if self.conflicts_with_working_order(&leg.instrument_id, leg.side) {
                 reasons.push("SELF_TRADE_RISK".to_owned());
             }
             leg_evidence.push(format!(
@@ -3332,11 +3751,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if recent_order_count >= self.risk_policy.max_order_rate {
             reasons.push("MAX_ORDER_RATE_EXCEEDED".to_owned());
         }
-        if self
-            .orders
-            .values()
-            .any(|order| order.oms.state == OrderState::Unknown)
-        {
+        if self.has_unknown_order() {
             reasons.push("UNKNOWN_ORDER_REQUIRES_RECONCILIATION".to_owned());
         }
         if self.unexplained_incident_count() > 0 {
@@ -3448,29 +3863,102 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .map_err(|error| PaperError(error.to_string()))?;
         let rate_window_start = decision_time
             - time::Duration::seconds(self.risk_policy.order_rate_window_seconds as i64);
+        let within_window = |order_decided_at: &str| -> Result<bool, PaperError> {
+            let parsed = OffsetDateTime::parse(order_decided_at, &Rfc3339)
+                .map_err(|error| PaperError(error.to_string()))?;
+            Ok(parsed > rate_window_start && parsed <= decision_time)
+        };
+        let mut count = 0u32;
+        for order in self.orders.values() {
+            let decision_id = format!("paper-risk-{}", order.oms.intent.intent_id);
+            let order_decided_at = self
+                .risk_evidence
+                .get(&decision_id)
+                .map(|evidence| evidence.decision.decided_at.as_str())
+                .ok_or_else(|| {
+                    PaperError("paper order is missing its originating risk evidence".to_owned())
+                })?;
+            if within_window(order_decided_at)? {
+                count += 1;
+            }
+        }
+        // A combination counts once, not once per leg: it is one broker
+        // submission. Leaving it out entirely would let an operator submit an
+        // unlimited number of combinations inside a rate window that a plain
+        // order would be refused in.
+        for order in self.combo_orders.values() {
+            let decision_id = format!("paper-combo-risk-{}", order.oms.intent.intent_id);
+            let order_decided_at = self
+                .combo_risk_evidence
+                .get(&decision_id)
+                .map(|evidence| evidence.decision.decided_at.as_str())
+                .ok_or_else(|| {
+                    PaperError(
+                        "paper combination order is missing its originating risk evidence"
+                            .to_owned(),
+                    )
+                })?;
+            if within_window(order_decided_at)? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Non-terminal orders of both kinds. A combination counts once.
+    fn working_order_count(&self) -> usize {
+        self.orders.values().filter(|order| order.working()).count()
+            + self
+                .combo_orders
+                .values()
+                .filter(|order| order.working())
+                .count()
+    }
+
+    /// Whether any order of either kind is in the `UNKNOWN` safety state.
+    fn has_unknown_order(&self) -> bool {
         self.orders
             .values()
-            .try_fold(0u32, |count, order| -> Result<u32, PaperError> {
-                let decision_id = format!("paper-risk-{}", order.oms.intent.intent_id);
-                let order_decided_at = self
-                    .risk_evidence
-                    .get(&decision_id)
-                    .map(|evidence| evidence.decision.decided_at.as_str())
-                    .ok_or_else(|| {
-                        PaperError(
-                            "paper order is missing its originating risk evidence".to_owned(),
-                        )
-                    })?;
-                let order_decided_at = OffsetDateTime::parse(order_decided_at, &Rfc3339)
-                    .map_err(|error| PaperError(error.to_string()))?;
-                Ok(
-                    if order_decided_at > rate_window_start && order_decided_at <= decision_time {
-                        count + 1
-                    } else {
-                        count
-                    },
-                )
-            })
+            .any(|order| order.oms.state == OrderState::Unknown)
+            || self
+                .combo_orders
+                .values()
+                .any(|order| order.oms.state == OrderState::Unknown)
+    }
+
+    /// Cash committed by every working order of either kind.
+    fn total_reserved_cash(&self) -> Result<Decimal, PaperError> {
+        let mut reserved = Decimal::ZERO;
+        for order in self.orders.values() {
+            reserved = reserved.checked_add(order.reserved_cash()?)?;
+        }
+        for order in self.combo_orders.values() {
+            reserved = reserved.checked_add(order.reserved_cash()?)?;
+        }
+        Ok(reserved)
+    }
+
+    /// Whether a working order of either kind would trade against `side` on
+    /// `instrument_id`.
+    ///
+    /// A combination's legs count individually here: a working short leg is a
+    /// real resting sell on that instrument however the group is labelled, and
+    /// a plain buy submitted against it is the same self-trade it would be
+    /// against a plain sell.
+    fn conflicts_with_working_order(&self, instrument_id: &str, side: Side) -> bool {
+        self.orders.values().any(|order| {
+            order.working()
+                && order.oms.intent.instrument_id == instrument_id
+                && order.oms.intent.side != side
+        }) || self.combo_orders.values().any(|order| {
+            order.working()
+                && order
+                    .oms
+                    .intent
+                    .legs
+                    .iter()
+                    .any(|leg| leg.instrument_id == instrument_id && leg.side != side)
+        })
     }
 
     /// Real point-in-time equity: cash plus every non-zero position marked at
@@ -3617,7 +4105,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 });
             }
         }
-        let resting_orders = self
+        let mut resting_orders = self
             .orders
             .values()
             .filter(|order| order.working())
@@ -3628,6 +4116,22 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 side: order.oms.intent.side,
             })
             .collect::<Vec<_>>();
+        // A working combination contributes one resting row *per leg*, because
+        // the aggregate kernel's self-trade check is per instrument and a
+        // working short leg is a real resting sell on that instrument however
+        // the group is labelled. Every one of those rows carries the same
+        // `order_id`, and the kernel counts *distinct* order identities against
+        // `max_open_orders`, so a four-leg combination stays one open order.
+        for order in self.combo_orders.values().filter(|order| order.working()) {
+            for leg in &order.oms.intent.legs {
+                resting_orders.push(RestingOrder {
+                    order_id: order.oms.order_id.clone(),
+                    account_id: order.oms.intent.account_id.clone(),
+                    instrument_id: leg.instrument_id.clone(),
+                    side: leg.side,
+                });
+            }
+        }
         // Real, computed only when `margin_rates` is configured (Slice 2c):
         // the *currently held* margin requirement, not a projection that
         // includes the candidate order -- the same "pre-trade observed, not
@@ -4207,6 +4711,37 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 (decision_id.clone(), PersistentRiskEvidence::from(evidence))
             })
             .collect();
+        let combo_orders = self
+            .combo_orders
+            .iter()
+            .map(|(order_id, order)| {
+                (
+                    order_id.clone(),
+                    PersistentComboOrder {
+                        intent: PersistentComboIntent::from(&order.oms.intent),
+                        state: order.oms.state.as_str().to_owned(),
+                        broker_order_id: order.broker_order_id.clone(),
+                        broker_order_versions: order.broker_order_versions.clone(),
+                        market: order
+                            .market
+                            .marks
+                            .iter()
+                            .map(PersistentMarketData::from)
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+        let combo_risk_evidence = self
+            .combo_risk_evidence
+            .iter()
+            .map(|(decision_id, evidence)| {
+                (
+                    decision_id.clone(),
+                    PersistentComboRiskEvidence::from(evidence),
+                )
+            })
+            .collect();
         let positions = self
             .portfolios
             .iter()
@@ -4270,6 +4805,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             cash: self.cash.to_string(),
             orders,
             risk_evidence,
+            combo_orders,
+            combo_risk_evidence,
             positions,
             execution_ids: self.execution_ids.iter().cloned().collect(),
             active_kill_switches: self.kill_switches.active_keys(),
@@ -4432,6 +4969,97 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             {
                 return Err(PaperError(
                     "persisted paper order does not match approved risk evidence".to_owned(),
+                ));
+            }
+        }
+        let mut combo_orders = BTreeMap::new();
+        for (order_id, persisted) in state.combo_orders {
+            let intent = ComboIntent::try_from(persisted.intent)?;
+            if intent.account_id != self.account.account_id || intent.environment != "PAPER" {
+                return Err(PaperError(
+                    "persisted paper combination has an incompatible account or environment"
+                        .to_owned(),
+                ));
+            }
+            let mut broker_order_versions = persisted.broker_order_versions;
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                validate_canonical_id("persisted combo broker_order_id", broker_order_id)?;
+                if broker_order_versions.is_empty() {
+                    broker_order_versions.push(broker_order_id.clone());
+                }
+            }
+            let mut unique_versions = BTreeSet::new();
+            for broker_order_id in &broker_order_versions {
+                validate_canonical_id("persisted combo broker_order_version", broker_order_id)?;
+                if !unique_versions.insert(broker_order_id) {
+                    return Err(PaperError(
+                        "persisted combination broker order versions are duplicated".to_owned(),
+                    ));
+                }
+            }
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                if !unique_versions.contains(broker_order_id) {
+                    return Err(PaperError(
+                        "persisted active combination broker ID is absent from versions".to_owned(),
+                    ));
+                }
+            }
+            let market = combo_market_from_persisted(persisted.market)?;
+            // The observation must still price exactly the legs it was stored
+            // against. A journal that lost a leg's mark, or gained one, cannot
+            // reproduce the decision that approved the combination.
+            market.validate_for(&intent)?;
+            let oms = OmsComboOrder::recover(
+                order_id.clone(),
+                intent,
+                parse_order_state(&persisted.state)?,
+            )?;
+            combo_orders.insert(
+                order_id,
+                PaperComboOrder {
+                    oms,
+                    broker_order_id: persisted.broker_order_id,
+                    broker_order_versions,
+                    market,
+                },
+            );
+        }
+        let mut combo_risk_evidence = BTreeMap::new();
+        for (decision_id, persisted) in state.combo_risk_evidence {
+            validate_canonical_id("persisted combo risk decision_id", &decision_id)?;
+            let evidence = PaperComboRiskEvidence::try_from(persisted)?;
+            if decision_id != evidence.decision.decision_id {
+                return Err(PaperError(
+                    "persisted combination risk decision identity does not match its key"
+                        .to_owned(),
+                ));
+            }
+            if evidence.decision.policy_version != self.risk_policy.version
+                || evidence.decision.actor != "paper_risk_engine"
+            {
+                return Err(PaperError(
+                    "persisted combination risk evidence is incompatible with supplied policy"
+                        .to_owned(),
+                ));
+            }
+            if combo_risk_evidence.contains_key(&decision_id) {
+                return Err(PaperError(
+                    "duplicate persisted combination risk evidence".to_owned(),
+                ));
+            }
+            combo_risk_evidence.insert(decision_id, evidence);
+        }
+        for order in combo_orders.values() {
+            let decision_id = format!("paper-combo-risk-{}", order.oms.intent.intent_id);
+            let evidence = combo_risk_evidence.get(&decision_id).ok_or_else(|| {
+                PaperError("persisted paper combination is missing risk evidence".to_owned())
+            })?;
+            if !evidence.decision.approved
+                || evidence.intent != order.oms.intent
+                || evidence.market != order.market
+            {
+                return Err(PaperError(
+                    "persisted paper combination does not match approved risk evidence".to_owned(),
                 ));
             }
         }
@@ -4633,6 +5261,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         }
         self.orders = orders;
         self.risk_evidence = risk_evidence;
+        self.combo_orders = combo_orders;
+        self.combo_risk_evidence = combo_risk_evidence;
         self.portfolios = portfolios;
         self.tax_lots = tax_lots;
         self.marks = marks;
@@ -5093,6 +5723,147 @@ impl TryFrom<PersistentIntent> for OrderIntent {
         result.validate()?;
         Ok(result)
     }
+}
+
+impl From<&ComboIntent> for PersistentComboIntent {
+    fn from(intent: &ComboIntent) -> Self {
+        Self {
+            intent_id: intent.intent_id.clone(),
+            account_id: intent.account_id.clone(),
+            strategy_id: intent.strategy_id.clone(),
+            correlation_id: intent.correlation_id.clone(),
+            legs: intent
+                .legs
+                .iter()
+                .map(|leg| PersistentComboLeg {
+                    instrument_id: leg.instrument_id.clone(),
+                    side: leg.side.as_str().to_owned(),
+                    ratio: leg.ratio,
+                    limit_price: leg.limit_price.to_string(),
+                })
+                .collect(),
+            combo_quantity: intent.combo_quantity.to_string(),
+            price_limit_kind: intent.price_limit.kind().to_owned(),
+            price_limit_amount: intent.price_limit.amount().to_string(),
+            time_in_force: intent.time_in_force.as_str().to_owned(),
+            rationale: intent.rationale.clone(),
+            created_at: intent.created_at.clone(),
+            strategy_version: intent.strategy_version.clone(),
+            configuration_version: intent.configuration_version.clone(),
+            environment: intent.environment.clone(),
+        }
+    }
+}
+
+impl TryFrom<PersistentComboIntent> for ComboIntent {
+    type Error = PaperError;
+
+    fn try_from(intent: PersistentComboIntent) -> Result<Self, Self::Error> {
+        let amount = decimal("persisted combo price limit", &intent.price_limit_amount)?;
+        let mut legs = Vec::with_capacity(intent.legs.len());
+        for leg in intent.legs {
+            legs.push(follon_domain::ComboIntentLeg {
+                instrument_id: leg.instrument_id,
+                side: match leg.side.as_str() {
+                    "BUY" => Side::Buy,
+                    "SELL" => Side::Sell,
+                    _ => return Err(PaperError("persisted combo leg side is invalid".to_owned())),
+                },
+                ratio: leg.ratio,
+                limit_price: decimal("persisted combo leg limit price", &leg.limit_price)?,
+            });
+        }
+        let result = Self {
+            intent_id: intent.intent_id,
+            account_id: intent.account_id,
+            strategy_id: intent.strategy_id,
+            correlation_id: intent.correlation_id,
+            legs,
+            combo_quantity: decimal("persisted combo quantity", &intent.combo_quantity)?,
+            price_limit: match intent.price_limit_kind.as_str() {
+                "MAXIMUM_DEBIT" => follon_domain::ComboPriceLimit::MaximumDebit(amount),
+                "MINIMUM_CREDIT" => follon_domain::ComboPriceLimit::MinimumCredit(amount),
+                _ => {
+                    return Err(PaperError(
+                        "persisted combo price limit kind is invalid".to_owned(),
+                    ))
+                }
+            },
+            time_in_force: match intent.time_in_force.as_str() {
+                "DAY" => TimeInForce::Day,
+                "GTC" => TimeInForce::GoodTilCancelled,
+                _ => {
+                    return Err(PaperError(
+                        "persisted combo time in force is invalid".to_owned(),
+                    ))
+                }
+            },
+            rationale: intent.rationale,
+            created_at: intent.created_at,
+            strategy_version: intent.strategy_version,
+            configuration_version: intent.configuration_version,
+            environment: intent.environment,
+        };
+        // Re-validated on the way back in, not trusted because it was once
+        // written: a journal is a file on disk and may have been edited.
+        result.validate()?;
+        Ok(result)
+    }
+}
+
+impl From<&PaperComboRiskEvidence> for PersistentComboRiskEvidence {
+    fn from(evidence: &PaperComboRiskEvidence) -> Self {
+        Self {
+            intent: PersistentComboIntent::from(&evidence.intent),
+            approved: evidence.decision.approved,
+            reason_codes: evidence.decision.reason_codes.clone(),
+            policy_version: evidence.decision.policy_version.clone(),
+            decided_at: evidence.decision.decided_at.clone(),
+            correlation_id: evidence.decision.correlation_id.clone(),
+            actor: evidence.decision.actor.clone(),
+            evaluated_limits: evidence.decision.evaluated_limits.clone(),
+            market: evidence
+                .market
+                .marks
+                .iter()
+                .map(PersistentMarketData::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistentComboRiskEvidence> for PaperComboRiskEvidence {
+    type Error = PaperError;
+
+    fn try_from(evidence: PersistentComboRiskEvidence) -> Result<Self, Self::Error> {
+        let intent = ComboIntent::try_from(evidence.intent)?;
+        let market = combo_market_from_persisted(evidence.market)?;
+        Ok(Self {
+            decision: RiskDecision {
+                decision_id: format!("paper-combo-risk-{}", intent.intent_id),
+                intent_id: intent.intent_id.clone(),
+                approved: evidence.approved,
+                reason_codes: evidence.reason_codes,
+                policy_version: evidence.policy_version,
+                decided_at: evidence.decided_at,
+                correlation_id: evidence.correlation_id,
+                actor: evidence.actor,
+                evaluated_limits: evidence.evaluated_limits,
+            },
+            intent,
+            market,
+        })
+    }
+}
+
+fn combo_market_from_persisted(
+    marks: Vec<PersistentMarketData>,
+) -> Result<PaperComboMarketData, PaperError> {
+    let mut restored = Vec::with_capacity(marks.len());
+    for mark in marks {
+        restored.push(PaperMarketData::try_from(mark)?);
+    }
+    Ok(PaperComboMarketData { marks: restored })
 }
 
 fn decimal(name: &str, value: &str) -> Result<Decimal, PaperError> {
@@ -5556,6 +6327,264 @@ mod tests {
         assert!(!decision
             .reason_codes
             .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+    }
+
+    #[test]
+    fn combo_submission_creates_one_acknowledged_order_for_the_whole_group() {
+        let mut service = service_permitting_shorts();
+        let outcome = service
+            .submit_combo_intent(
+                combo_intent("combo-000020", "2026-01-02T14:30:00Z"),
+                combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(
+            outcome.decision.approved,
+            "{:?}",
+            outcome.decision.reason_codes
+        );
+        assert_eq!(
+            outcome.order_id.as_deref(),
+            Some("combo-order-combo-000020")
+        );
+        assert_eq!(outcome.state, Some(OrderState::Acknowledged));
+
+        let order = service.combo_order("combo-order-combo-000020").unwrap();
+        assert_eq!(order.oms.intent.legs.len(), 2);
+        assert!(order.broker_order_id.is_some());
+        // One broker order for the whole group, not one per leg.
+        assert_eq!(order.broker_order_versions.len(), 1);
+        // And one open order, not two.
+        assert_eq!(service.dashboard().working_orders, 1);
+        assert!(service.orders.is_empty());
+    }
+
+    #[test]
+    fn combo_submission_is_idempotent_and_refuses_a_changed_retry() {
+        let mut service = service_permitting_shorts();
+        let intent = combo_intent("combo-000021", "2026-01-02T14:30:00Z");
+        let market = combo_market("2026-01-02T14:30:00Z");
+        let first = service
+            .submit_combo_intent(intent.clone(), market.clone(), "2026-01-02T14:30:02Z")
+            .unwrap();
+        let replay = service
+            .submit_combo_intent(intent.clone(), market.clone(), "2026-01-02T14:30:02Z")
+            .unwrap();
+        assert_eq!(first.order_id, replay.order_id);
+        assert_eq!(first.decision, replay.decision);
+        assert_eq!(service.combo_orders.len(), 1);
+
+        // The same identity with different economics is refused outright, not
+        // silently treated as the original.
+        let mut tampered = intent.clone();
+        tampered.combo_quantity = decimal("units", "5").unwrap();
+        assert!(service
+            .submit_combo_intent(tampered, market.clone(), "2026-01-02T14:30:02Z")
+            .is_err());
+
+        // And a retry that re-prices the original is refused too: a retry is a
+        // retry, not a new decision wearing an old identity.
+        let mut moved = market;
+        moved.marks[0].mark_price = decimal("mark", "7.51").unwrap();
+        assert!(service
+            .submit_combo_intent(intent, moved, "2026-01-02T14:30:02Z")
+            .is_err());
+    }
+
+    #[test]
+    fn combo_refusal_records_evidence_and_creates_no_order() {
+        let mut service = service_permitting_shorts();
+        service
+            .activate_kill_switch(KillSwitchScope::Global)
+            .unwrap();
+        let outcome = service
+            .submit_combo_intent(
+                combo_intent("combo-000022", "2026-01-02T14:30:00Z"),
+                combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(!outcome.decision.approved);
+        assert!(outcome.order_id.is_none());
+        assert!(service.combo_orders.is_empty());
+        // The refusal itself is durable evidence: a rejected combination is
+        // still a decision that was made and has to be auditable.
+        assert!(service
+            .combo_risk_evidence("paper-combo-risk-combo-000022")
+            .is_some());
+    }
+
+    #[test]
+    fn combo_transport_failure_leaves_the_group_unknown_and_disconnects() {
+        let account = account();
+        let adapter = IbkrPaperAdapter::new(&account).unwrap();
+        let mut faulted = FaultInjectingBroker::new(adapter);
+        faulted.inject(BrokerOperation::Submit, BrokerFault::Disconnect);
+        let mut service = PaperTradingService::new(
+            account,
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            faulted,
+        )
+        .unwrap();
+        let result = service.submit_combo_intent(
+            combo_intent("combo-000023", "2026-01-02T14:30:00Z"),
+            combo_market("2026-01-02T14:30:00Z"),
+            "2026-01-02T14:30:02Z",
+        );
+        // The outcome is genuinely unknown -- the request may or may not have
+        // reached the venue -- so it is never reported as a clean rejection.
+        assert!(result.is_err());
+        let order = service.combo_order("combo-order-combo-000023").unwrap();
+        assert_eq!(order.oms.state, OrderState::Unknown);
+        // And an UNKNOWN combination blocks the next decision of either kind,
+        // exactly as an UNKNOWN plain order does.
+        assert!(service.has_unknown_order());
+    }
+
+    #[test]
+    fn a_working_combination_is_visible_to_every_single_order_risk_counter() {
+        let mut service = service_permitting_shorts();
+        service
+            .submit_combo_intent(
+                combo_intent("combo-000024", "2026-01-02T14:30:00Z"),
+                combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+
+        // Open-order count, rate window, and reserved cash all see it.
+        assert_eq!(service.working_order_count(), 1);
+        assert_eq!(
+            service.recent_order_count("2026-01-02T14:30:30Z").unwrap(),
+            1
+        );
+        // 4 units * 2.50 net debit.
+        assert_eq!(
+            service.total_reserved_cash().unwrap(),
+            decimal("reserved", "10").unwrap()
+        );
+
+        // And self-trade: the combination's short far-strike leg is a real
+        // resting sell, so a plain buy on that instrument is a self-trade.
+        assert!(service.conflicts_with_working_order("inst.us_option.spy.far", Side::Buy));
+        assert!(!service.conflicts_with_working_order("inst.us_option.spy.far", Side::Sell));
+        // The long near-strike leg is the mirror image.
+        assert!(service.conflicts_with_working_order("inst.us_option.spy.near", Side::Sell));
+    }
+
+    #[test]
+    fn a_working_combination_cannot_reconcile_clean() {
+        let mut service = service_permitting_shorts();
+        service
+            .submit_combo_intent(
+                combo_intent("combo-000025", "2026-01-02T14:30:00Z"),
+                combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        let report = service.reconcile("2026-01-02T21:00:00Z").unwrap();
+        // Combination reconciliation does not exist yet. Rather than pass over
+        // a combination silently, reconciliation reports it -- so a session
+        // holding one cannot be counted toward the 30-clean-session gate.
+        assert!(!report.is_clean());
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.category == "UNRECONCILED_COMBINATION"));
+    }
+
+    #[test]
+    fn a_combination_survives_a_durable_journal_reopen() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-{}.ndjson",
+            std::process::id(),
+            "combo-recovery"
+        ));
+        let _ = fs::remove_file(&journal_path);
+        let account = account();
+        let mut service = PaperTradingService::open_durable(
+            account.clone(),
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        let intent = combo_intent("combo-000026", "2026-01-02T14:30:00Z");
+        let market = combo_market("2026-01-02T14:30:00Z");
+        service
+            .submit_combo_intent(intent.clone(), market.clone(), "2026-01-02T14:30:02Z")
+            .unwrap();
+        let before = service
+            .combo_order("combo-order-combo-000026")
+            .unwrap()
+            .clone();
+        drop(service);
+
+        let reopened = PaperTradingService::open_durable(
+            account.clone(),
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        let after = reopened.combo_order("combo-order-combo-000026").unwrap();
+        // The whole structure comes back exactly: every leg, its ratio, its
+        // protected price, the price-limit kind, and the per-leg observation
+        // that priced it.
+        assert_eq!(after.oms.intent, intent);
+        assert_eq!(after.market, market);
+        assert_eq!(after.oms.state, before.oms.state);
+        assert_eq!(after.broker_order_id, before.broker_order_id);
+        assert_eq!(
+            after.oms.intent.price_limit.kind(),
+            follon_domain::ComboPriceLimit::MaximumDebit(Decimal::ZERO).kind()
+        );
+        // And the reservation it implies survives with it, so a restart does
+        // not free cash the combination still has committed.
+        assert_eq!(
+            reopened.total_reserved_cash().unwrap(),
+            decimal("reserved", "10").unwrap()
+        );
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    /// An absent combination field deserializes as "no combinations".
+    ///
+    /// This checks the persisted *type*, not a reopened journal file, and the
+    /// distinction is real. `FilePaperJournal::open` additionally requires each
+    /// line to re-serialize byte-for-byte, so a file missing any field the
+    /// current serializer writes is rejected before `#[serde(default)]` can
+    /// apply. That is pre-existing behaviour, not a consequence of the
+    /// combination fields: deleting `tax_lots` -- which predates them -- from a
+    /// journal line fails exactly the same way, verified directly. So the
+    /// defaults make the type tolerant, which is what a future format change
+    /// needs, while whole-file compatibility across a schema change remains an
+    /// open question recorded in `docs/06-delivery/16-delivery-state.md`.
+    #[test]
+    fn an_absent_combination_field_deserializes_as_no_combinations() {
+        let without_combinations = serde_json::json!({
+            "configuration_fingerprint": "",
+            "account_id": "acct.paper.001",
+            "currency": "USD",
+            "cash": "100000.00000000",
+            "orders": {},
+            "risk_evidence": {},
+            "positions": {},
+            "execution_ids": [],
+            "active_kill_switches": [],
+            "incidents": {},
+            "last_reconciled_at": serde_json::Value::Null,
+            "last_reconciliation_clean": serde_json::Value::Null,
+            "paper_days": {},
+            "next_reconciliation": 0,
+        });
+        let state: PersistentPaperState = serde_json::from_value(without_combinations).unwrap();
+        assert!(state.combo_orders.is_empty());
+        assert!(state.combo_risk_evidence.is_empty());
     }
 
     #[test]

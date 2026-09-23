@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T04:26:36Z  
+**Measured at:** 2026-09-23T04:47:25Z  
 **Branch:** `main`  
-**HEAD:** `670d019` -- feat(domain): add the multi-leg ComboIntent contract -- E1.1 of the 5.6 combo risk-gating epic (2026-09-23T09:41:52+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `7f065cb` -- feat(paper,risk): assess a multi-leg combination against the full paper risk policy -- E1.2 (2026-09-23T09:57:31+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 318 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 326 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -100,7 +100,8 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 | --- | --- | --- |
 | E1.1 | `ComboIntent`, `ComboIntentLeg` and `ComboPriceLimit` in `core/domain`, with validation, exact net-price and gross-notional arithmetic, and per-leg position projection. `core/execution` now re-exports the price-limit contract instead of defining its own, so the planner and the risk gate cannot disagree. | **done** 2026-09-23 |
 | E1.2 | `PaperTradingService::evaluate_combo_risk` — the full paper risk policy restated for a combination, plus `PaperComboMarketData`, an explicit operator short-exposure permission, and `follon_risk::evaluate_portfolio_risk_with_candidates` so a combination's legs reach the aggregate kernel simultaneously. Assessment only; creates no order. | **done** 2026-09-23 |
-| E1.3 | Risk-gated `submit_combo_intent` in `core/paper`: kill switches, OMS lifecycle for the combination as one order, durable per-combo journal record, restart recovery | next |
+| E1.3a | Risk-gated `submit_combo_intent` in `core/paper`: `OmsComboOrder` (one order, one state, the single-order state machine reused unchanged), durable journal record and restart recovery, idempotent retry, native combo support in the `IbkrPaperAdapter` model, and integration into every risk counter | **done** 2026-09-23 |
+| E1.3b | Combination **fills, cancellation and reconciliation**. Until this lands, a working combination deliberately makes reconciliation unclean (`UNRECONCILED_COMBINATION`), so a session holding one cannot count toward the 30-clean-session gate. | next |
 | E1.4 | `core/live` parity for the same path | open |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
 
@@ -164,6 +165,52 @@ covered by a test named after it.
 - **An atomic group counts as one order** against the open-order and order-rate
   limits, in both the paper gate and the aggregate kernel. Counting legs would
   make an ordinary condor look like a burst of orders.
+
+**E1.3a design decisions a later slice must not silently reverse.**
+
+- **One combination is one OMS order with one state.** `OmsComboOrder` is a
+  sibling of `OmsOrder`, not a variant inside it, and reuses
+  `is_valid_transition` **unchanged** — so it inherits the property test that
+  already covers that state machine instead of needing a second, separately
+  verified copy. A per-leg state could express outcomes an atomic broker order
+  cannot produce.
+- **A combination is visible to every single-order risk counter.** Open orders,
+  the rate window, reserved cash, the `UNKNOWN` guard and self-trade all read
+  both maps through shared helpers. A combination invisible to the single-order
+  gate would be a hole in exactly the limits it is subject to. Removing its
+  legs from the self-trade check, and removing its cash reservation, were each
+  injected as deliberate defects and caught.
+- **Its legs are individually resting orders, but it is one open order.** The
+  aggregate kernel counts *distinct* `order_id`s against `max_open_orders`, so
+  a combination reports one resting row per leg (which the per-instrument
+  self-trade check needs) without looking like four orders.
+- **A transport failure leaves the combination `UNKNOWN`, never rejected.** The
+  request may or may not have reached the venue. Recording an unknown outcome
+  as a clean rejection was injected as a deliberate defect and caught.
+- **A working combination cannot reconcile clean.** Reconciliation for
+  combinations does not exist yet, so rather than pass over one silently it is
+  reported as `UNRECONCILED_COMBINATION`. The consequence is intended: a
+  session holding a working combination does not count toward the
+  30-clean-session gate, because a gate that counted sessions in which part of
+  the order flow was never checked would not measure what it claims to.
+- **`IbkrPaperAdapter` now accepts native combinations**, because the real
+  paper bridge it models (`adapters/brokers/ibkr::submit_paper_combo`) does. A
+  model that refused what the thing it models accepts would leave the whole
+  path untestable against anything but a rejection.
+
+**A pre-existing finding this slice surfaced, not a regression it caused.**
+Several `#[serde(default)]` fields in `PersistentPaperState` carried comments
+saying an older journal missing them would still restore. That is not reachable:
+`FilePaperJournal::open` also requires every line to re-serialize byte-for-byte,
+so a file missing *any* field the current serializer writes is rejected before a
+default can apply. Verified directly by deleting `tax_lots` — which predates
+this session entirely — from a journal line and watching it fail identically.
+The defaults do make the persisted *type* tolerant, which a future format change
+needs; whole-file compatibility across a schema change does not exist and is not
+claimed. The comments are corrected in place. **Open question for a later
+session:** whether PAPER journals should survive a schema change at all, or
+whether an explicit migration step is the honest answer. Deciding that is a
+durable-format decision and was out of scope here.
 
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
@@ -285,18 +332,27 @@ short — detail belongs in the conformance audit.
 - Landed **E1.2**. Rust workspace 305 → 318 passed, 0 failed. Three deliberate
   defects injected and caught; a fourth injection attempt changed no behaviour
   and was redone rather than recorded as a pass.
-- **Next action: E1.3 — the risk-gated submission path.** Two concrete
-  prerequisites, both discovered during E1.2 and neither optional:
-  1. `PaperTradingService::recent_order_count` looks each existing order's
-     decision up as `paper-risk-{intent_id}` and hard-errors when it is absent.
-     A combination's decision is stored under `paper-combo-risk-{intent_id}`, so
-     the moment a combo order exists, every *subsequent* single-order risk
-     evaluation fails with "paper order is missing its originating risk
-     evidence". Widen the lookup, and `PaperRiskEvidence` with it — it currently
-     holds an `OrderIntent` and a single `PaperMarketData`, neither of which
-     fits a combination.
-  2. `OmsOrder::from_approved_intent` takes an `OrderIntent`. The combination
-     must become one OMS order, not one per leg, so decide whether `OmsOrder`
-     grows a combination variant or `core/paper` keeps a parallel
-     `PaperComboOrder` record. The journal format follows from that choice, and
-     it is durable, so it is worth getting right before writing it.
+- Landed **E1.3a**. Rust workspace 318 → 326 passed, 0 failed. Both E1.2
+  prerequisites were resolved: the rate-window counter now reads combination
+  decisions from their own evidence map, and a combination became one
+  `OmsComboOrder` rather than a variant of `OmsOrder`. Three deliberate defects
+  injected and caught. A planned backward-compatibility test was replaced after
+  it turned out to be testing something untrue — see the persistence finding
+  above.
+- **Next action: E1.3b — combination fills, cancellation and reconciliation.**
+  Concrete starting points:
+  1. `apply_broker_event` resolves a `client_order_id` through `order_mut`,
+     which only knows `self.orders`. A broker event naming a combination
+     currently hard-errors. That is fail-closed and safe, but it is the first
+     thing E1.3b has to replace.
+  2. A combination fill arrives as per-leg executions against one broker order.
+     Decide how a partial fill of an *atomic* group is represented before
+     writing it: the group either fills in whole combination units or it does
+     not, so a leg-level partial is a broker anomaly, not an ordinary state.
+  3. `PaperComboOrder::reserved_cash` currently reserves the full net debit with
+     no fill reduction, which is correct only while combinations cannot fill. It
+     must subtract filled units the way `PaperOrder::reserved_cash` does, or a
+     partially filled combination will over-reserve. The code says so where it
+     is defined.
+  4. Removing the `UNRECONCILED_COMBINATION` issue is the last step of E1.3b,
+     not the first — it is what proves the rest landed.

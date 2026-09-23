@@ -11,10 +11,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 
 use follon_domain::{
-    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar, Decimal,
-    DecimalError, DomainError, EventEnvelope, EventPayload, Fill, NewsHeadline, OrderIntent,
-    OrderState, OrderStateChange, OrderType, PnlSnapshot, PositionSnapshot, RiskDecision,
-    SentimentVector, Side, TimeInForce,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar,
+    ComboIntent, Decimal, DecimalError, DomainError, EventEnvelope, EventPayload, Fill,
+    NewsHeadline, OrderIntent, OrderState, OrderStateChange, OrderType, PnlSnapshot,
+    PositionSnapshot, RiskDecision, SentimentVector, Side, TimeInForce,
 };
 use follon_instrument::{InstrumentRegistry, TradingCalendar};
 use follon_news::{
@@ -1633,6 +1633,106 @@ impl OmsOrder {
         if !is_valid_transition(self.state, next) {
             return Err(EngineError(format!(
                 "invalid OMS transition {} -> {}",
+                self.state.as_str(),
+                next.as_str()
+            )));
+        }
+        let change = OrderStateChange {
+            order_id: self.order_id.clone(),
+            previous_state: Some(self.state),
+            new_state: next,
+            reason: reason.into(),
+        };
+        self.state = next;
+        Ok(change)
+    }
+}
+
+/// A durable OMS order for one atomic multi-leg combination.
+///
+/// Deliberately a sibling of [`OmsOrder`] rather than a variant inside it. The
+/// two carry different intents but share one lifecycle, and that lifecycle is
+/// `is_valid_transition` **unchanged**: a combination is approved, submitted,
+/// acknowledged, partially filled, cancelled, rejected, expired or `UNKNOWN`
+/// exactly as a plain order is, because those states describe the broker
+/// conversation, not the instrument. Reusing the same state machine means the
+/// combination path inherits the property test that already covers it rather
+/// than needing a second, separately-verified copy.
+///
+/// One combination is **one** order with **one** state. It is never modelled as
+/// several orders that happen to be submitted together: an atomic group either
+/// executes in full or not at all, so a per-leg state would be able to express
+/// outcomes the broker cannot produce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OmsComboOrder {
+    /// Client-generated idempotency identity.
+    pub order_id: String,
+    /// Original approved combination intent.
+    pub intent: ComboIntent,
+    /// Current lifecycle state, shared with the single-order state machine.
+    pub state: OrderState,
+}
+
+impl OmsComboOrder {
+    /// The durable order identity a combination intent produces.
+    ///
+    /// A distinct prefix from `order-`, so a combination and a plain order can
+    /// never collide even if an operator reuses one identity for both.
+    pub fn order_id_for(intent_id: &str) -> String {
+        format!("combo-order-{intent_id}")
+    }
+
+    /// Creates an OMS combination order after, and only after, a risk approval.
+    pub fn from_approved_intent(
+        intent: ComboIntent,
+        decision: &RiskDecision,
+    ) -> Result<Self, EngineError> {
+        if !decision.approved || decision.intent_id != intent.intent_id {
+            return Err(EngineError(
+                "an OMS combination order requires a matching risk approval".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id: Self::order_id_for(&intent.intent_id),
+            intent,
+            state: OrderState::Created,
+        })
+    }
+
+    /// Rebuilds a previously persisted combination order.
+    ///
+    /// Recovery is explicit for the same reason it is on [`OmsOrder`]: a
+    /// restart may restore an order, but it must never invent a new client
+    /// identity or silently change a state.
+    pub fn recover(
+        order_id: impl Into<String>,
+        intent: ComboIntent,
+        state: OrderState,
+    ) -> Result<Self, EngineError> {
+        intent.validate()?;
+        let order_id = order_id.into();
+        validate_canonical_id("combo order_id", &order_id)?;
+        if order_id != Self::order_id_for(&intent.intent_id) {
+            return Err(EngineError(
+                "persisted OMS combination order ID does not match its intent identity".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id,
+            intent,
+            state,
+        })
+    }
+
+    /// Applies a legal lifecycle transition and returns the corresponding evidence.
+    pub fn transition(
+        &mut self,
+        next: OrderState,
+        reason: impl Into<String>,
+    ) -> Result<OrderStateChange, EngineError> {
+        if !is_valid_transition(self.state, next) {
+            return Err(EngineError(format!(
+                "invalid OMS combination transition {} -> {}",
                 self.state.as_str(),
                 next.as_str()
             )));
