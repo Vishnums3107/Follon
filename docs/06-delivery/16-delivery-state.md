@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T04:51:35Z  
+**Measured at:** 2026-09-23T05:12:29Z  
 **Branch:** `main`  
-**HEAD:** `14a6747` -- docs(audit): record items 46-47 and correct row 5.6, which no longer described the repository (2026-09-23T10:20:58+05:30)  
-**Uncommitted paths:** 0
+**HEAD:** `2f0d3e8` -- docs(delivery): restore a full measurement to the state block (2026-09-23T10:21:36+05:30)  
+**Uncommitted paths:** 5
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 326 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 338 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -101,8 +101,8 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 | E1.1 | `ComboIntent`, `ComboIntentLeg` and `ComboPriceLimit` in `core/domain`, with validation, exact net-price and gross-notional arithmetic, and per-leg position projection. `core/execution` now re-exports the price-limit contract instead of defining its own, so the planner and the risk gate cannot disagree. | **done** 2026-09-23 |
 | E1.2 | `PaperTradingService::evaluate_combo_risk` — the full paper risk policy restated for a combination, plus `PaperComboMarketData`, an explicit operator short-exposure permission, and `follon_risk::evaluate_portfolio_risk_with_candidates` so a combination's legs reach the aggregate kernel simultaneously. Assessment only; creates no order. | **done** 2026-09-23 |
 | E1.3a | Risk-gated `submit_combo_intent` in `core/paper`: `OmsComboOrder` (one order, one state, the single-order state machine reused unchanged), durable journal record and restart recovery, idempotent retry, native combo support in the `IbkrPaperAdapter` model, and integration into every risk counter | **done** 2026-09-23 |
-| E1.3b | Combination **fills, cancellation and reconciliation**. Until this lands, a working combination deliberately makes reconciliation unclean (`UNRECONCILED_COMBINATION`), so a session holding one cannot count toward the 30-clean-session gate. | next |
-| E1.4 | `core/live` parity for the same path | open |
+| E1.3b | Combination **fills, cancellation and reconciliation**: atomic `ComboExecution` evidence in whole units, per-leg accounting through the shared fill path, rollback-and-flag on unacceptable evidence, cancellation with its races, and full reconciliation against the broker snapshot. `UNRECONCILED_COMBINATION` is retired. | **done** 2026-09-23 |
+| E1.4 | `core/live` parity for the same path | next |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
 
 **E1.1 design decisions a later slice must not silently reverse.** Each is
@@ -211,6 +211,46 @@ claimed. The comments are corrected in place. **Open question for a later
 session:** whether PAPER journals should survive a schema change at all, or
 whether an explicit migration step is the honest answer. Deciding that is a
 durable-format decision and was out of scope here.
+
+**E1.3b design decisions a later slice must not silently reverse.**
+
+- **A combination fills in whole combination units, never in loose legs.** The
+  adapter contract is `BrokerEvent::ComboExecution`, one complete atomic group
+  carrying every approved leg at once, and the adapter is responsible for
+  assembling it. A leg-level partial is therefore not an ordinary state the OMS
+  models — it is a broker anomaly. `units` must be a whole number and each leg's
+  quantity must equal `units * approved ratio`, checked per leg against the
+  approved side, price and fee independently.
+- **Evidence that fails to apply rolls everything back and marks the
+  combination `UNKNOWN`.** `poll` drains broker evidence, so an event that fails
+  can never be re-fetched; aborting the batch would permanently lose every event
+  queued behind it. Instead each event is applied against a snapshot of orders,
+  portfolios, tax lots, strategy attribution, execution ids and cash, and a
+  failure restores all of them, records an `evidence_error` on the combination,
+  drives it to `UNKNOWN`, and continues with the rest of the batch.
+- **An `evidence_error` surfaces in reconciliation as
+  `COMBINATION_EXECUTION_ANOMALY`,** so a combination that received evidence the
+  OMS could not accept cannot quietly reconcile clean.
+- **Execution identity is checked three ways.** An exact replay of an already
+  applied execution is an idempotent no-op; the same execution identity carrying
+  *changed* evidence is refused; and an execution whose group id or any leg id
+  overlaps previously applied evidence is refused. Leg order is canonicalised
+  first, so a reordered exact replay is still recognised as a replay.
+- **Reserved cash shrinks as the combination fills.** It reserves the net debit
+  on `combo_quantity - filled_quantity`, so a partially filled combination stops
+  over-reserving against every later risk decision.
+- **Reconciliation now views both order maps through one iterator**, so a
+  combination is checked for a missing broker order, broker-id and version
+  mismatch, filled-unit mismatch and state mismatch exactly as a plain order is.
+  `IbkrPaperAdapter::snapshot` reports combinations in the same combination
+  units the OMS tracks, so the comparison is like-for-like rather than
+  contracts-against-units.
+- **`UNRECONCILED_COMBINATION` is gone**, and its removal is the evidence that
+  the rest of this slice landed rather than the goal of it.
+- **No panics.** `core/paper`'s production code contains zero `unwrap`/`expect`,
+  and this slice keeps it that way: two provably-unreachable lookups in the fill
+  path are resolved into refusals rather than asserted, because a future caller
+  that skips the dispatch check should get an error, not an abort mid-fill.
 
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
@@ -339,20 +379,23 @@ short — detail belongs in the conformance audit.
   injected and caught. A planned backward-compatibility test was replaced after
   it turned out to be testing something untrue — see the persistence finding
   above.
-- **Next action: E1.3b — combination fills, cancellation and reconciliation.**
-  Concrete starting points:
-  1. `apply_broker_event` resolves a `client_order_id` through `order_mut`,
-     which only knows `self.orders`. A broker event naming a combination
-     currently hard-errors. That is fail-closed and safe, but it is the first
-     thing E1.3b has to replace.
-  2. A combination fill arrives as per-leg executions against one broker order.
-     Decide how a partial fill of an *atomic* group is represented before
-     writing it: the group either fills in whole combination units or it does
-     not, so a leg-level partial is a broker anomaly, not an ordinary state.
-  3. `PaperComboOrder::reserved_cash` currently reserves the full net debit with
-     no fill reduction, which is correct only while combinations cannot fill. It
-     must subtract filled units the way `PaperOrder::reserved_cash` does, or a
-     partially filled combination will over-reserve. The code says so where it
-     is defined.
-  4. Removing the `UNRECONCILED_COMBINATION` issue is the last step of E1.3b,
-     not the first — it is what proves the rest landed.
+- Landed **E1.3b**, closing the whole `core/paper` side of the row 5.6 epic.
+  Rust workspace 326 → 338 passed, 0 failed. All four of E1.3a's recorded
+  starting points were resolved, in the order they were written down, and
+  `UNRECONCILED_COMBINATION` was retired last as planned. Three deliberate
+  defects injected and each caught by the test written for it: re-applying
+  overlapping execution evidence, filling past the approved unit count, and a
+  partially filled combination continuing to reserve its full debit.
+- Removed two `expect` panics the slice had introduced into the fill path.
+  `core/paper`'s production code contains zero `unwrap`/`expect`, and a fill
+  path in a trading system is the last place to start.
+- **Next action: E1.4 — `core/live` parity.** `core/live` still has no
+  combination type or method at all, which is the last structural gap in row
+  5.6. It is not a copy-paste of `core/paper`: controlled-LIVE carries the
+  signed-artifact and independent-review gates, a narrow price-protected canary
+  and an emergency stop, and every one of those has to apply to a combination
+  as a single unit rather than per leg. Read `core/live`'s existing
+  `submit_intent` and its canary/approval checks first, then mirror E1.2 and
+  E1.3 together — the `ComboIntent` contract, `OmsComboOrder` and the
+  `follon_risk` multi-candidate kernel are already shared, so only the
+  environment service is missing.

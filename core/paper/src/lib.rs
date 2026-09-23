@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use follon_accounting::{
-    Currency, FxBook, MarginPolicy, MarginPosition, TaxLot, TaxLotBook, TaxLotBookSnapshot,
-    TaxLotSelection,
+    Currency, FxBook, MarginPolicy, MarginPosition, ShortTaxLot, TaxLot, TaxLotBook,
+    TaxLotBookSnapshot, TaxLotSelection,
 };
 use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
@@ -29,7 +29,10 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+mod combinations;
 pub mod qualification;
+use combinations::PersistentComboExecutionState;
+pub use combinations::{BrokerComboExecution, BrokerComboExecutionLeg};
 
 pub use qualification::{
     GatewayQualificationError, GatewayQualificationMatrix, QualificationState, QualifiedCapability,
@@ -116,7 +119,7 @@ impl PaperAccount {
 /// Version 2 makes every stateful adapter operation explicitly account scoped,
 /// allowing a deployment composition to route several isolated broker accounts
 /// without making a client order id globally meaningful.
-pub const PAPER_BROKER_ADAPTER_CONTRACT_VERSION: u32 = 2;
+pub const PAPER_BROKER_ADAPTER_CONTRACT_VERSION: u32 = 3;
 
 /// Controlled deployment binding of a PAPER account to one adapter instance and venue.
 ///
@@ -362,6 +365,9 @@ pub enum BrokerSubmitResult {
 /// Normalized asynchronous broker evidence consumed by the paper OMS.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrokerEvent {
+    /// Complete atomic fill evidence in whole combination units (adapter contract v3).
+    /// Adapters must assemble and identify every leg before emitting this event.
+    ComboExecution(BrokerComboExecution),
     /// Broker acknowledgement, possibly arriving after reconnect.
     Acknowledged {
         /// OMS client idempotency identity.
@@ -729,6 +735,8 @@ struct IbkrOrder {
 struct IbkrCombo {
     broker_order_id: String,
     request: BrokerComboRequest,
+    state: OrderState,
+    filled_quantity: Decimal,
 }
 
 /// Deterministic local model of the Interactive Brokers paper-order contract.
@@ -921,6 +929,8 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
             IbkrCombo {
                 broker_order_id: broker_order_id.clone(),
                 request: request.clone(),
+                state: OrderState::Acknowledged,
+                filled_quantity: Decimal::ZERO,
             },
         );
         Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
@@ -937,6 +947,22 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
             return Err(PaperError(
                 "IBKR paper connection is unavailable; cancellation outcome is unknown".to_owned(),
             ));
+        }
+        if let Some(combo) = self.combos.get_mut(&request.client_order_id) {
+            if !matches!(
+                combo.state,
+                OrderState::Acknowledged | OrderState::PartiallyFilled
+            ) {
+                return Err(PaperError(
+                    "paper combination is already terminal".to_owned(),
+                ));
+            }
+            combo.state = OrderState::Cancelled;
+            self.pending_events.push_back(BrokerEvent::Cancelled {
+                client_order_id: request.client_order_id.clone(),
+                reason: "IBKR_PAPER_COMBO_CANCELLED".to_owned(),
+            });
+            return Ok(());
         }
         let order = self
             .orders
@@ -1025,6 +1051,12 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
                     state: order.state,
                     filled_quantity: order.filled_quantity,
                 })
+                .chain(self.combos.iter().map(|(id, order)| BrokerOrderSnapshot {
+                    client_order_id: id.clone(),
+                    broker_order_id: order.broker_order_id.clone(),
+                    state: order.state,
+                    filled_quantity: order.filled_quantity,
+                }))
                 .collect(),
             positions: self
                 .positions
@@ -1660,6 +1692,12 @@ pub struct PaperComboOrder {
     pub broker_order_versions: Vec<String>,
     /// Exact per-leg observation used for approval and cash reservation.
     pub market: PaperComboMarketData,
+    /// Independently accounted whole combination units, never a leg quantity.
+    pub filled_quantity: Decimal,
+    /// Accepted complete execution receipts, retained for exact retry validation.
+    executions: BTreeMap<String, BrokerComboExecution>,
+    /// Malformed/drained evidence cannot be cleared by a later status message.
+    evidence_error: Option<String>,
 }
 
 impl PaperComboOrder {
@@ -1680,11 +1718,7 @@ impl PaperComboOrder {
 
     /// Cash a working combination still has committed.
     ///
-    /// Only a net debit reserves cash, matching the gate that approved it. No
-    /// partial-fill reduction appears here because this slice submits but does
-    /// not yet fill a combination; when fills land, this must subtract them the
-    /// way [`PaperOrder::reserved_cash`] does, or a partially filled
-    /// combination will over-reserve.
+    /// Only the unfilled net debit reserves cash, matching the approval gate.
     fn reserved_cash(&self) -> Result<Decimal, PaperError> {
         if !self.working() {
             return Ok(Decimal::ZERO);
@@ -1694,7 +1728,12 @@ impl PaperComboOrder {
             return Ok(Decimal::ZERO);
         }
         net_price
-            .checked_mul(self.oms.intent.combo_quantity)
+            .checked_mul(
+                self.oms
+                    .intent
+                    .combo_quantity
+                    .checked_sub(self.filled_quantity)?,
+            )
             .map_err(Into::into)
     }
 }
@@ -1977,6 +2016,12 @@ struct PersistentTaxLotBook {
     applied_lot_ids: Vec<String>,
     applied_disposal_ids: Vec<String>,
     realized_by_currency: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    short_lots: BTreeMap<String, Vec<PersistentTaxLot>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    applied_short_lot_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    applied_cover_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2032,6 +2077,9 @@ struct PersistentComboOrder {
     /// One persisted mark per leg, reusing the single-instrument observation
     /// shape rather than inventing a second format to migrate later.
     market: Vec<PersistentMarketData>,
+    /// Versioned extension; absence retains the exact E1.3a serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_state: Option<PersistentComboExecutionState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2769,6 +2817,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 broker_order_id: None,
                 broker_order_versions: Vec::new(),
                 market,
+                filled_quantity: Decimal::ZERO,
+                executions: BTreeMap::new(),
+                evidence_error: None,
             },
         );
         self.combo_risk_evidence
@@ -2859,6 +2910,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     /// Requests cancellation. A transport failure leaves the order explicitly `UNKNOWN`.
     pub fn cancel_order(&mut self, order_id: &str) -> Result<(), PaperError> {
         self.ensure_persistence_healthy()?;
+        if self.combo_orders.contains_key(order_id) {
+            return self.cancel_combo_order(order_id);
+        }
         if !self.broker_connected {
             return Err(PaperError(
                 "paper broker session is disconnected; reconnect and reconcile before cancellation"
@@ -2993,6 +3047,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             // application leaves no partial mutation in memory, then keep
             // applying the remaining events in the batch.
             let orders_snapshot = self.orders.clone();
+            let combo_snapshot = self.combo_orders.clone();
+            let combo_id = event.client_order_id().to_owned();
             let portfolios_snapshot = self.portfolios.clone();
             let tax_lots_snapshot = self.tax_lots.clone();
             let strategy_attribution_snapshot = self.strategy_attribution.clone();
@@ -3000,11 +3056,23 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             let cash_snapshot = self.cash;
             if let Err(error) = self.apply_broker_event(event) {
                 self.orders = orders_snapshot;
+                self.combo_orders = combo_snapshot;
                 self.portfolios = portfolios_snapshot;
                 self.tax_lots = tax_lots_snapshot;
                 self.strategy_attribution = strategy_attribution_snapshot;
                 self.execution_ids = execution_ids_snapshot;
                 self.cash = cash_snapshot;
+                if let Some(order) = self.combo_orders.get_mut(&combo_id) {
+                    order.evidence_error = Some(error.0.clone());
+                    if order.oms.state != OrderState::Unknown
+                        && order.oms.state != OrderState::Filled
+                    {
+                        order
+                            .oms
+                            .transition(OrderState::Unknown, "COMBINATION_EXECUTION_ANOMALY")?;
+                    }
+                    self.persist()?;
+                }
                 apply_errors.push(error.0);
                 continue;
             }
@@ -3067,15 +3135,38 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 .or_default()
                 .push(broker_order);
         }
-        for (order_id, internal) in &self.orders {
+        let order_views = self
+            .orders
+            .iter()
+            .map(|(id, o)| {
+                (
+                    id,
+                    o.working(),
+                    &o.broker_order_id,
+                    &o.broker_order_versions,
+                    o.filled_quantity,
+                    o.oms.state,
+                )
+            })
+            .chain(self.combo_orders.iter().map(|(id, o)| {
+                (
+                    id,
+                    o.working(),
+                    &o.broker_order_id,
+                    &o.broker_order_versions,
+                    o.filled_quantity,
+                    o.oms.state,
+                )
+            }));
+        for (order_id, working, broker_order_id, versions, filled_quantity, state) in order_views {
             match broker_orders.get(order_id.as_str()) {
-                None if internal.working() => raw_issues.push((
+                None if working => raw_issues.push((
                     "MISSING_BROKER_ORDER",
                     order_id.clone(),
                     "internal working order is absent from broker snapshot".to_owned(),
                 )),
                 Some(brokers) => {
-                    let broker = internal.broker_order_id.as_ref().and_then(|current| {
+                    let broker = broker_order_id.as_ref().and_then(|current| {
                         brokers
                             .iter()
                             .copied()
@@ -3087,7 +3178,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                             order_id.clone(),
                             format!(
                                 "internal_current={:?},broker_versions={}",
-                                internal.broker_order_id,
+                                broker_order_id,
                                 brokers
                                     .iter()
                                     .map(|candidate| candidate.broker_order_id.as_str())
@@ -3096,11 +3187,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                             ),
                         ));
                     }
-                    if brokers.iter().any(|candidate| {
-                        !internal
-                            .broker_order_versions
-                            .contains(&candidate.broker_order_id)
-                    }) {
+                    if brokers
+                        .iter()
+                        .any(|candidate| !versions.contains(&candidate.broker_order_id))
+                    {
                         raw_issues.push((
                             "BROKER_ORDER_VERSION_MISMATCH",
                             order_id.clone(),
@@ -3114,24 +3204,21 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                                 .checked_add(candidate.filled_quantity)
                                 .map_err(PaperError::from)
                         })?;
-                    if internal.filled_quantity != broker_filled {
+                    if filled_quantity != broker_filled {
                         raw_issues.push((
                             "FILLED_QUANTITY_MISMATCH",
                             order_id.clone(),
-                            format!(
-                                "internal={},broker={broker_filled}",
-                                internal.filled_quantity,
-                            ),
+                            format!("internal={},broker={broker_filled}", filled_quantity,),
                         ));
                     }
                     if let Some(broker) = broker {
-                        if internal.oms.state != broker.state {
+                        if state != broker.state {
                             raw_issues.push((
                                 "ORDER_STATE_MISMATCH",
                                 order_id.clone(),
                                 format!(
                                     "internal={},broker={}",
-                                    internal.oms.state.as_str(),
+                                    state.as_str(),
                                     broker.state.as_str()
                                 ),
                             ));
@@ -3152,22 +3239,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 ));
             }
         }
-        // A working combination cannot yet be reconciled against a broker
-        // snapshot: this slice submits combinations but does not yet consume
-        // their fills, so there is no internal filled quantity or per-leg state
-        // to compare. That is recorded as a real issue rather than passed over.
-        // The consequence is deliberate -- a session holding a working
-        // combination does not reconcile clean, and so cannot count toward the
-        // 30-clean-PAPER-session gate. A gate that counted sessions in which
-        // part of the order flow was never checked would not be measuring what
-        // it claims to.
         for (order_id, internal) in &self.combo_orders {
-            if internal.working() {
+            if let Some(error) = &internal.evidence_error {
                 raw_issues.push((
-                    "UNRECONCILED_COMBINATION",
+                    "COMBINATION_EXECUTION_ANOMALY",
                     order_id.clone(),
-                    "combination reconciliation is not implemented; see conformance row 5.6"
-                        .to_owned(),
+                    error.clone(),
                 ));
             }
         }
@@ -3628,6 +3705,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     ) -> Result<RiskDecision, PaperError> {
         intent.validate()?;
         validate_utc_timestamp("paper combo risk decision time", decided_at)?;
+        if intent.combo_quantity.scaled() % follon_domain::DECIMAL_SCALE != 0 {
+            return Err(PaperError(
+                "PAPER combinations require whole combination units".to_owned(),
+            ));
+        }
         market.validate_for(intent)?;
         if intent.account_id != self.account.account_id {
             return Err(PaperError(
@@ -3920,10 +4002,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.orders
             .values()
             .any(|order| order.oms.state == OrderState::Unknown)
-            || self
-                .combo_orders
-                .values()
-                .any(|order| order.oms.state == OrderState::Unknown)
+            || self.combo_orders.values().any(|order| {
+                order.oms.state == OrderState::Unknown || order.evidence_error.is_some()
+            })
     }
 
     /// Cash committed by every working order of either kind.
@@ -4300,7 +4381,15 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     }
 
     fn apply_broker_event(&mut self, event: BrokerEvent) -> Result<(), PaperError> {
+        if self.combo_orders.contains_key(event.client_order_id()) {
+            return self.apply_combo_event(event);
+        }
         match event {
+            BrokerEvent::ComboExecution(_) => {
+                return Err(PaperError(
+                    "combo execution does not name a combination".to_owned(),
+                ))
+            }
             BrokerEvent::Acknowledged {
                 client_order_id,
                 broker_order_id,
@@ -4414,17 +4503,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     fee,
                     executed_at,
                 };
-                let portfolio = self.portfolios.entry(instrument_id).or_insert_with(|| {
-                    Portfolio::new(&self.account.account_id, &fill.instrument_id)
-                });
-                portfolio.apply_fill(&fill)?;
-                self.apply_tax_lot_fill(&fill)?;
-                self.apply_strategy_attribution_fill(&fill, &strategy_id)?;
-                let gross = fill.price.checked_mul(fill.quantity)?;
-                self.cash = match fill.side {
-                    Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
-                    Side::Sell => self.cash.checked_add(gross.checked_sub(fill.fee)?)?,
-                };
+                self.apply_accounted_fill(&fill, &strategy_id)?;
             }
             BrokerEvent::Cancelled {
                 client_order_id,
@@ -4572,42 +4651,92 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         Ok(())
     }
 
-    /// Applies one real fill to the independent FIFO tax-lot book: a buy
-    /// acquires a new lot at its exact all-in unit cost (price plus fee); a
-    /// sell disposes existing long lots first-in-first-out. `Portfolio`
-    /// already refuses a sell that would exceed the held long quantity
-    /// before this is reached, so a disposal here can never exceed available
-    /// lots. Lot selection is fixed at FIFO — the default a jurisdiction
-    /// without an operator election typically applies — rather than exposing
-    /// a configurable policy; this is a bounded simplification, not a
-    /// correctness gap; LIFO/highest-cost selection remains available to a
-    /// direct `TaxLotBook` caller (see `follon-accounting`) that needs it.
+    /// Applies a fill to the FIFO long/short books, closing opposite inventory
+    /// first. A crossing fill splits its fee exactly once; the remainder is
+    /// assigned to its opening portion, preserving total fees at fixed precision.
     fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), PaperError> {
         let currency = Currency::new(self.account.currency.clone())?;
+        let available = match fill.side {
+            Side::Buy => self
+                .tax_lots
+                .short_lots(&fill.instrument_id)
+                .iter()
+                .try_fold(Decimal::ZERO, |total, lot| {
+                    total.checked_add(lot.remaining_quantity)
+                })?,
+            Side::Sell => self
+                .tax_lots
+                .lots(&fill.instrument_id)
+                .iter()
+                .try_fold(Decimal::ZERO, |total, lot| {
+                    total.checked_add(lot.remaining_quantity)
+                })?,
+        };
+        let closing = available.min(fill.quantity);
+        let opening = fill.quantity.checked_sub(closing)?;
+        let close_fee = if closing == fill.quantity {
+            fill.fee
+        } else {
+            fill.fee.checked_mul(closing)?.checked_div(fill.quantity)?
+        };
+        if closing > Decimal::ZERO {
+            match fill.side {
+                Side::Buy => {
+                    self.tax_lots.cover(
+                        &format!("taxcover-{}", fill.execution_id),
+                        &fill.instrument_id,
+                        &currency,
+                        closing,
+                        fill.price,
+                        close_fee,
+                        &fill.executed_at,
+                        TaxLotSelection::Fifo,
+                    )?;
+                }
+                Side::Sell => {
+                    self.tax_lots.dispose(
+                        &format!("taxdisposal-{}", fill.execution_id),
+                        &fill.instrument_id,
+                        &currency,
+                        closing,
+                        fill.price,
+                        close_fee,
+                        &fill.executed_at,
+                        TaxLotSelection::Fifo,
+                    )?;
+                }
+            }
+        }
+        if opening == Decimal::ZERO {
+            return Ok(());
+        }
+        let open_fee = fill.fee.checked_sub(close_fee)?;
         match fill.side {
             Side::Buy => {
-                let gross = fill.price.checked_mul(fill.quantity)?;
-                let unit_cost = gross.checked_add(fill.fee)?.checked_div(fill.quantity)?;
+                let gross = fill.price.checked_mul(opening)?;
+                let unit_cost = gross.checked_add(open_fee)?.checked_div(opening)?;
                 self.tax_lots.acquire(TaxLot {
                     lot_id: format!("taxlot-{}", fill.execution_id),
                     instrument_id: fill.instrument_id.clone(),
                     currency,
                     opened_at: fill.executed_at.clone(),
-                    remaining_quantity: fill.quantity,
+                    remaining_quantity: opening,
                     unit_cost,
                 })?;
             }
             Side::Sell => {
-                self.tax_lots.dispose(
-                    &format!("taxdisposal-{}", fill.execution_id),
-                    &fill.instrument_id,
-                    &currency,
-                    fill.quantity,
-                    fill.price,
-                    fill.fee,
-                    &fill.executed_at,
-                    TaxLotSelection::Fifo,
-                )?;
+                self.tax_lots.open_short(ShortTaxLot {
+                    lot_id: format!("taxshort-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency,
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: opening,
+                    unit_proceeds: fill
+                        .price
+                        .checked_mul(opening)?
+                        .checked_sub(open_fee)?
+                        .checked_div(opening)?,
+                })?;
             }
         }
         Ok(())
@@ -4722,6 +4851,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                         state: order.oms.state.as_str().to_owned(),
                         broker_order_id: order.broker_order_id.clone(),
                         broker_order_versions: order.broker_order_versions.clone(),
+                        execution_state: order.execution_state(),
                         market: order
                             .market
                             .marks
@@ -4774,6 +4904,25 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .collect();
         let tax_lot_snapshot = self.tax_lots.snapshot();
         let tax_lots = PersistentTaxLotBook {
+            short_lots: tax_lot_snapshot
+                .short_lots
+                .into_iter()
+                .map(|(instrument, lots)| {
+                    (
+                        instrument,
+                        lots.into_iter()
+                            .map(|lot| PersistentTaxLot {
+                                lot_id: lot.lot_id,
+                                opened_at: lot.opened_at,
+                                remaining_quantity: lot.remaining_quantity.to_string(),
+                                unit_cost: lot.unit_proceeds.to_string(),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            applied_short_lot_ids: tax_lot_snapshot.applied_short_lot_ids.into_iter().collect(),
+            applied_cover_ids: tax_lot_snapshot.applied_cover_ids.into_iter().collect(),
             lots: tax_lot_snapshot
                 .lots
                 .into_iter()
@@ -5014,15 +5163,17 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 intent,
                 parse_order_state(&persisted.state)?,
             )?;
-            combo_orders.insert(
-                order_id,
-                PaperComboOrder {
-                    oms,
-                    broker_order_id: persisted.broker_order_id,
-                    broker_order_versions,
-                    market,
-                },
-            );
+            let mut order = PaperComboOrder {
+                oms,
+                broker_order_id: persisted.broker_order_id,
+                broker_order_versions,
+                market,
+                filled_quantity: Decimal::ZERO,
+                executions: BTreeMap::new(),
+                evidence_error: None,
+            };
+            order.restore_executions(persisted.execution_state)?;
+            combo_orders.insert(order_id, order);
         }
         let mut combo_risk_evidence = BTreeMap::new();
         for (decision_id, persisted) in state.combo_risk_evidence {
@@ -5067,7 +5218,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         for (instrument_id, persisted) in state.positions {
             portfolios.insert(
                 instrument_id.clone(),
-                Portfolio::recover(
+                if self.risk_policy.short_exposure.is_some() {
+                    Portfolio::recover_signed
+                } else {
+                    Portfolio::recover
+                }(
                     &self.account.account_id,
                     instrument_id,
                     decimal("persisted position quantity", &persisted.quantity)?,
@@ -5107,12 +5262,32 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             applied_lot_ids: state.tax_lots.applied_lot_ids.into_iter().collect(),
             applied_disposal_ids: state.tax_lots.applied_disposal_ids.into_iter().collect(),
             realized_by_currency,
-            // `core/paper`'s `Portfolio` is long-only, so this journal format
-            // never carries short-lot data; an empty short-side ledger is
-            // correct, not a gap.
-            short_lots: BTreeMap::new(),
-            applied_short_lot_ids: BTreeSet::new(),
-            applied_cover_ids: BTreeSet::new(),
+            short_lots: state
+                .tax_lots
+                .short_lots
+                .into_iter()
+                .map(|(instrument_id, lots)| {
+                    let lots = lots
+                        .into_iter()
+                        .map(|lot| {
+                            Ok(ShortTaxLot {
+                                lot_id: lot.lot_id,
+                                instrument_id: instrument_id.clone(),
+                                currency: account_currency.clone(),
+                                opened_at: lot.opened_at,
+                                remaining_quantity: decimal(
+                                    "short lot quantity",
+                                    &lot.remaining_quantity,
+                                )?,
+                                unit_proceeds: decimal("short lot proceeds", &lot.unit_cost)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, PaperError>>()?;
+                    Ok((instrument_id, lots))
+                })
+                .collect::<Result<_, PaperError>>()?,
+            applied_short_lot_ids: state.tax_lots.applied_short_lot_ids.into_iter().collect(),
+            applied_cover_ids: state.tax_lots.applied_cover_ids.into_iter().collect(),
         })?;
         let mut execution_ids = BTreeSet::new();
         for execution_id in state.execution_ids {
@@ -5121,6 +5296,18 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 return Err(PaperError(
                     "paper journal contains duplicate execution identity".to_owned(),
                 ));
+            }
+        }
+        let mut combo_execution_ids = BTreeSet::new();
+        for order in combo_orders.values() {
+            for execution in order.executions.values() {
+                for id in std::iter::once(&execution.execution_id)
+                    .chain(execution.legs.iter().map(|leg| &leg.execution_id))
+                {
+                    if !execution_ids.contains(id) || !combo_execution_ids.insert(id) {
+                        return Err(PaperError("persisted combination execution is missing or duplicated in account receipts".to_owned()));
+                    }
+                }
             }
         }
         let mut marks = BTreeMap::new();
@@ -5373,6 +5560,15 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             &order_rate_window_seconds,
             &self.kill_switches.version,
         ];
+        let short_bound = self
+            .risk_policy
+            .short_exposure
+            .as_ref()
+            .map(|policy| policy.max_short_quantity.to_string());
+        if let Some(bound) = &short_bound {
+            parts.push("paper-short-exposure-v1");
+            parts.push(bound);
+        }
         if !self.broker_route_fingerprint.is_empty() {
             parts.push("paper-broker-route-fingerprint-v1");
             parts.push(&self.broker_route_fingerprint);
@@ -5963,6 +6159,7 @@ fn parse_kill_switch_scope(value: &str) -> Result<KillSwitchScope, PaperError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("combo_lifecycle_tests.rs");
     use follon_instrument::StaticTradingCalendar;
 
     fn account() -> PaperAccount {
@@ -6475,7 +6672,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_combination_cannot_reconcile_clean() {
+    fn a_working_combination_reconciles_against_its_independent_broker_order() {
         let mut service = service_permitting_shorts();
         service
             .submit_combo_intent(
@@ -6485,14 +6682,13 @@ mod tests {
             )
             .unwrap();
         let report = service.reconcile("2026-01-02T21:00:00Z").unwrap();
-        // Combination reconciliation does not exist yet. Rather than pass over
-        // a combination silently, reconciliation reports it -- so a session
-        // holding one cannot be counted toward the 30-clean-session gate.
-        assert!(!report.is_clean());
-        assert!(report
+        assert!(report.is_clean(), "{:?}", report.issues);
+        service.broker.combos.clear();
+        let missing = service.reconcile("2026-01-02T21:00:01Z").unwrap();
+        assert!(missing
             .issues
             .iter()
-            .any(|issue| issue.category == "UNRECONCILED_COMBINATION"));
+            .any(|issue| issue.category == "MISSING_BROKER_ORDER"));
     }
 
     #[test]

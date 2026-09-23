@@ -1988,12 +1988,33 @@ impl Portfolio {
         average_cost: Decimal,
         realized_pnl: Decimal,
     ) -> Result<Self, EngineError> {
+        if quantity < Decimal::ZERO {
+            return Err(EngineError(
+                "persisted long-only portfolio is short".to_owned(),
+            ));
+        }
+        Self::recover_signed(
+            account_id,
+            instrument_id,
+            quantity,
+            average_cost,
+            realized_pnl,
+        )
+    }
+
+    /// Restores a signed position for a caller with an explicit short-exposure policy.
+    pub fn recover_signed(
+        account_id: impl Into<String>,
+        instrument_id: impl Into<String>,
+        quantity: Decimal,
+        average_cost: Decimal,
+        realized_pnl: Decimal,
+    ) -> Result<Self, EngineError> {
         let account_id = account_id.into();
         let instrument_id = instrument_id.into();
         validate_canonical_id("portfolio account_id", &account_id)?;
         validate_canonical_id("portfolio instrument_id", &instrument_id)?;
-        if quantity < Decimal::ZERO
-            || average_cost < Decimal::ZERO
+        if average_cost < Decimal::ZERO
             || quantity == Decimal::ZERO && average_cost != Decimal::ZERO
         {
             return Err(EngineError("persisted portfolio is invalid".to_owned()));
@@ -2046,6 +2067,81 @@ impl Portfolio {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Applies authoritative signed execution evidence; authorization belongs to risk.
+    /// Existing long-only callers continue to use `apply_fill`.
+    pub fn apply_signed_fill(&mut self, fill: &Fill) -> Result<(), EngineError> {
+        if fill.instrument_id != self.instrument_id
+            || fill.quantity <= Decimal::ZERO
+            || fill.price <= Decimal::ZERO
+            || fill.fee < Decimal::ZERO
+        {
+            return Err(EngineError("invalid signed portfolio fill".to_owned()));
+        }
+        let signed = match fill.side {
+            Side::Buy => fill.quantity,
+            Side::Sell => Decimal::ZERO.checked_sub(fill.quantity)?,
+        };
+        let held = if self.quantity < Decimal::ZERO {
+            Decimal::ZERO.checked_sub(self.quantity)?
+        } else {
+            self.quantity
+        };
+        let closing = (self.quantity > Decimal::ZERO && signed < Decimal::ZERO)
+            || (self.quantity < Decimal::ZERO && signed > Decimal::ZERO);
+        let next = self.quantity.checked_add(signed)?;
+        let (average_cost, realized_pnl) = if closing {
+            let closed = held.min(fill.quantity);
+            let close_fee = if closed == fill.quantity {
+                fill.fee
+            } else {
+                fill.fee.checked_mul(closed)?.checked_div(fill.quantity)?
+            };
+            let gain = if self.quantity > Decimal::ZERO {
+                fill.price.checked_sub(self.average_cost)?
+            } else {
+                self.average_cost.checked_sub(fill.price)?
+            };
+            let realized = self
+                .realized_pnl
+                .checked_add(gain.checked_mul(closed)?.checked_sub(close_fee)?)?;
+            let cost = if fill.quantity < held {
+                self.average_cost
+            } else if fill.quantity == held {
+                Decimal::ZERO
+            } else {
+                let opening_fee = fill
+                    .fee
+                    .checked_sub(close_fee)?
+                    .checked_div(fill.quantity.checked_sub(closed)?)?;
+                match fill.side {
+                    Side::Buy => fill.price.checked_add(opening_fee)?,
+                    Side::Sell => fill.price.checked_sub(opening_fee)?,
+                }
+            };
+            (cost, realized)
+        } else {
+            let gross = fill.price.checked_mul(fill.quantity)?;
+            let value = match fill.side {
+                Side::Buy => gross.checked_add(fill.fee)?,
+                Side::Sell => gross.checked_sub(fill.fee)?,
+            };
+            (
+                self.average_cost
+                    .checked_mul(held)?
+                    .checked_add(value)?
+                    .checked_div(held.checked_add(fill.quantity)?)?,
+                self.realized_pnl,
+            )
+        };
+        if average_cost < Decimal::ZERO {
+            return Err(EngineError("signed portfolio cost is negative".to_owned()));
+        }
+        self.quantity = next;
+        self.average_cost = average_cost;
+        self.realized_pnl = realized_pnl;
         Ok(())
     }
 
