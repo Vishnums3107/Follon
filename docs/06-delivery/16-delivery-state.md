@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T05:53:02Z  
+**Measured at:** 2026-09-23T06:04:01Z  
 **Branch:** `main`  
-**HEAD:** `5a75b67` -- feat(paper): fill, cancel and reconcile an atomic combination -- E1.3b closes the core/paper side of row 5.6 (2026-09-23T10:42:48+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `bab0261` -- feat(live): assess a multi-leg combination against the controlled-LIVE risk policy -- E1.4a (2026-09-23T11:23:21+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 347 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 354 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -103,8 +103,8 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 | E1.3a | Risk-gated `submit_combo_intent` in `core/paper`: `OmsComboOrder` (one order, one state, the single-order state machine reused unchanged), durable journal record and restart recovery, idempotent retry, native combo support in the `IbkrPaperAdapter` model, and integration into every risk counter | **done** 2026-09-23 |
 | E1.3b | Combination **fills, cancellation and reconciliation**: atomic `ComboExecution` evidence in whole units, per-leg accounting through the shared fill path, rollback-and-flag on unacceptable evidence, cancellation with its races, and full reconciliation against the broker snapshot. `UNRECONCILED_COMBINATION` is retired. | **done** 2026-09-23 |
 | E1.4a | `core/live` combination contract and risk gate: `LiveComboMarketData`, `evaluate_combo_risk` (every PAPER rule plus the canary ceilings, the deployed-capital ceiling and the unresolved-incident block), `combo_intent_fingerprint` binding an approval to the exact structure, and its own short-exposure permission. Assessment only. | **done** 2026-09-23 |
-| E1.4b | `core/live` canary **submission** path: approval binding and consumption, `LiveComboOrder`, the canary submission counter, durable audit before the irreversible broker call, and restart recovery | next |
-| E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | open |
+| E1.4b | `core/live` canary **submission** path: `submit_canary_combo_intent`, `LiveComboOrder`, a rejecting `LiveBrokerAdapter::submit_combo` default, approval binding and consumption via `combo_intent_fingerprint`, the canary submission counter, durable audit before the irreversible broker call, restart recovery, and integration into every risk counter | **done** 2026-09-23 |
+| E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | next |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
 
 **E1.1 design decisions a later slice must not silently reverse.** Each is
@@ -292,6 +292,32 @@ durable-format decision and was out of scope here.
   `ComboIntent` contract, `OmsComboOrder`, and the multi-candidate aggregate
   kernel — are shared; the gate that applies them is not.
 
+**E1.4b design decisions a later slice must not silently reverse.**
+
+- **A combination consumes one approval and one canary slot, not one per leg.**
+  Counting legs would exhaust an operator's canary budget on a single ordinary
+  four-leg structure.
+- **The approval must carry `combo_intent_fingerprint`, and the two fingerprint
+  functions are domain-separated by their prefixes.** An approval issued for a
+  plain order can never authorize a combination, or the reverse, even when both
+  carry the same intent identity. Removing the fingerprint check was injected as
+  a deliberate defect and the test caught it.
+- **A transport failure keeps the approval spent and the canary counter
+  incremented.** An attempt was made and its outcome is unknown; releasing
+  either would let one approval authorize a second attempt at a trade that may
+  already be live. Releasing them was injected as a deliberate defect and the
+  test caught it.
+- **`LiveBrokerAdapter::submit_combo` defaults to refusing.** An adapter that
+  cannot execute a combination atomically rejects the whole request before
+  transmitting any leg; the OMS never works around that by splitting the group.
+- **The durable audit record precedes the irreversible broker call**, exactly as
+  it does for a plain order, and the consumed canary slot survives a restart —
+  a reopen must not hand an operator a fresh canary budget.
+- **A working combination is visible to every single-order risk counter**: open
+  orders, the rate window, reserved cash, the `UNKNOWN` guard and self-trade all
+  read both maps. Its legs count individually for self-trade, because a working
+  short leg is a real resting sell however the group is labelled.
+
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
@@ -435,19 +461,19 @@ short — detail belongs in the conformance audit.
   than attempted whole. Two deliberate defects injected and caught: charging the
   canary ceiling the net instead of the gross, and an approval fingerprint that
   stopped covering the legs.
-- **Next action: E1.4b — the controlled-LIVE canary submission path.** Mirror
-  `submit_canary_intent`, which is stricter than PAPER's `submit_intent` in
-  ways that all matter:
-  1. `require_canary_active(decided_at)` must gate it — a combination is not
-     exempt from the activation window or run mode.
-  2. It must consume a registered, unconsumed, unexpired approval whose
-     `intent_fingerprint` equals `combo_intent_fingerprint(&intent)`. That
-     function already exists and is tested; `LiveApproval` needs to be able to
-     carry a combination fingerprint, which is the one contract question to
-     settle first.
-  3. `canary_submissions` must increment once per combination, not once per
-     leg, and the durable audit record must precede the irreversible broker
-     call exactly as it does for a plain order.
-  4. `LiveBrokerAdapter` has no `submit_combo`; add it with a rejecting
-     default, mirroring `PaperBrokerAdapter`, so an adapter that cannot execute
-     an atomic combination refuses before any leg is transmitted.
+- Landed **E1.4b**, the controlled-LIVE canary submission path. Rust workspace
+  347 → 354 passed, 0 failed. `LiveApproval` needed no change after all: it
+  already carries a 64-hex fingerprint, and `combo_intent_fingerprint` is
+  domain-separated from `intent_fingerprint` by its prefix, so an approval for
+  a plain order cannot authorize a combination. Two deliberate defects injected
+  and caught: releasing the approval and canary slot on a transport failure, and
+  dropping the fingerprint check entirely.
+- **Next action: E1.4c — controlled-LIVE combination fills, cancellation and
+  reconciliation**, the E1.3b equivalent. `core/paper/src/combinations.rs` is
+  the model to follow, but not to copy: LIVE has no `evidence_error` concept
+  yet, its reconciliation reports `LiveReconciliationIssue` rather than
+  PAPER's type, and an unexplained incident there blocks further canary
+  submissions through `UNRESOLVED_INCIDENTS_REQUIRE_REVIEW` — which is the
+  right place to surface a combination whose evidence could not be applied.
+  When it lands, row 5.6 has no structural gap left and only E1.5 (the
+  desktop/gRPC surface) remains.

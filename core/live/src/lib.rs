@@ -16,16 +16,19 @@ use follon_accounting::{
     Currency, FxBook, MarginPolicy, MarginPosition, TaxLot, TaxLotBook, TaxLotBookSnapshot,
     TaxLotSelection,
 };
-use follon_control_plane::{EngineError, OmsOrder, Portfolio};
+use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
     price_deviation_bps, validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill,
-    OrderIntent, OrderState, RiskDecision, Side,
+    OrderIntent, OrderState, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 
 mod combinations;
 
-pub use combinations::{combo_intent_fingerprint, LiveComboMarketData};
+pub use combinations::{
+    combo_intent_fingerprint, LiveBrokerComboLeg, LiveBrokerComboRequest, LiveComboMarketData,
+    LiveComboOrder,
+};
 use follon_risk::{CandidateOrder, PortfolioRiskSnapshot, RestingOrder, RiskPosition};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
 use fs2::FileExt;
@@ -833,6 +836,20 @@ pub trait LiveBrokerAdapter {
         &mut self,
         request: &LiveBrokerOrderRequest,
     ) -> Result<LiveBrokerSubmitResult, LiveError>;
+    /// Submits an atomic multi-leg combination.
+    ///
+    /// The default refuses. An adapter that cannot execute a combination
+    /// atomically must reject the whole request *before* transmitting any leg:
+    /// there is no acceptable partial outcome for a group whose legs only make
+    /// sense together, and the OMS never works around this by splitting it.
+    fn submit_combo(
+        &mut self,
+        _request: &LiveBrokerComboRequest,
+    ) -> Result<LiveBrokerSubmitResult, LiveError> {
+        Err(LiveError(
+            "live broker adapter does not support native combinations".to_owned(),
+        ))
+    }
     /// Requests cancellation by client idempotency identity.
     fn cancel(&mut self, client_order_id: &str) -> Result<(), LiveError>;
     /// Requests a price-only replacement. The result arrives through [`LiveBrokerEvent`].
@@ -1268,6 +1285,13 @@ struct PersistentLiveState {
     /// strategy-attribution ledger that did not yet exist.
     #[serde(default)]
     strategy_attribution: BTreeMap<String, BTreeMap<String, String>>,
+    /// Atomic multi-leg combination orders. Absent in a document written
+    /// before the combination path existed; an empty map is exactly correct
+    /// for one. As in `core/paper`, this default makes the persisted *type*
+    /// tolerant and does not on its own let an older journal **file** reopen --
+    /// the reader also requires each line to re-serialize byte-for-byte.
+    #[serde(default)]
+    combo_orders: BTreeMap<String, PersistentLiveComboOrder>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1299,6 +1323,48 @@ struct PersistentReconciliationIssue {
     category: String,
     subject: String,
     detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentLiveComboOrder {
+    intent: PersistentComboIntent,
+    approval_id: String,
+    state: String,
+    /// One persisted mark per leg, reusing the single-instrument observation
+    /// shape rather than inventing a second format to migrate.
+    market: Vec<PersistentMarketData>,
+    decision: PersistentRiskDecision,
+    broker_order_id: Option<String>,
+    #[serde(default)]
+    broker_order_versions: Vec<String>,
+    filled_quantity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentComboIntent {
+    intent_id: String,
+    account_id: String,
+    strategy_id: String,
+    correlation_id: String,
+    legs: Vec<PersistentComboLeg>,
+    combo_quantity: String,
+    /// `MAXIMUM_DEBIT` or `MINIMUM_CREDIT`, matching `ComboPriceLimit::kind`.
+    price_limit_kind: String,
+    price_limit_amount: String,
+    time_in_force: String,
+    rationale: String,
+    created_at: String,
+    strategy_version: String,
+    configuration_version: String,
+    environment: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentComboLeg {
+    instrument_id: String,
+    side: String,
+    ratio: u32,
+    limit_price: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1581,6 +1647,13 @@ pub struct LiveTradingService<B> {
     broker_connected: bool,
     cash: Decimal,
     orders: BTreeMap<String, LiveOrder>,
+    /// Atomic multi-leg combinations, tracked separately from `orders` because
+    /// a combination is one order over several instruments and does not fit the
+    /// single-instrument shape of [`LiveOrder`]. Every risk counter that reads
+    /// `orders` reads this map too -- a combination invisible to the
+    /// single-order gate would be a hole in exactly the limits it is subject
+    /// to, with real capital behind it.
+    combo_orders: BTreeMap<String, LiveComboOrder>,
     approvals: BTreeMap<String, RegisteredLiveApproval>,
     portfolios: BTreeMap<String, Portfolio>,
     /// Independent FIFO long-lot cost-basis ledger, kept in lockstep with
@@ -1664,6 +1737,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             broker,
             broker_connected: false,
             orders: BTreeMap::new(),
+            combo_orders: BTreeMap::new(),
             approvals: BTreeMap::new(),
             portfolios: BTreeMap::new(),
             tax_lots: TaxLotBook::default(),
@@ -2759,14 +2833,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             .try_fold(Decimal::ZERO, |total, portfolio| {
                 total.checked_add(portfolio.position_snapshot().realized_pnl)
             })?;
-        let reserved_cash = self
-            .orders
-            .values()
-            .try_fold(Decimal::ZERO, |total, order| {
-                total
-                    .checked_add(order.reserved_cash()?)
-                    .map_err(LiveError::from)
-            })?;
+        let reserved_cash = self.total_reserved_cash()?;
         let available_cash = self.cash.checked_sub(reserved_cash)?;
         let estimated_notional = intent.quantity.checked_mul(market.mark_price)?;
         let requested_price_deviation_bps = intent
@@ -2787,21 +2854,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         // wall-clock reality, so counting against it would let a caller understate
         // its own submission rate and silently bypass `MAX_ORDER_RATE_EXCEEDED` by
         // backdating `created_at` on new intents.
-        let recent_order_count =
-            self.orders
-                .values()
-                .try_fold(0u32, |count, order| -> Result<u32, LiveError> {
-                    let order_decided_at =
-                        OffsetDateTime::parse(&order.decision.decided_at, &Rfc3339)
-                            .map_err(|error| LiveError(error.to_string()))?;
-                    Ok(
-                        if order_decided_at > rate_window_start && order_decided_at <= decision_at {
-                            count + 1
-                        } else {
-                            count
-                        },
-                    )
-                })?;
+        let recent_order_count = self.recent_order_count(rate_window_start, decision_at)?;
         let mut reasons = self.kill_switches.rejection_reasons(intent);
         if intent.quantity > self.policy.max_order_quantity {
             reasons.push("MAX_ORDER_QUANTITY_EXCEEDED".to_owned());
@@ -2812,11 +2865,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if requested_price_deviation_bps > self.policy.max_price_deviation_bps {
             reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
-        if self.orders.values().any(|order| {
-            order.working()
-                && order.oms.intent.instrument_id == intent.instrument_id
-                && order.oms.intent.side != intent.side
-        }) {
+        if self.conflicts_with_working_order(&intent.instrument_id, intent.side) {
             reasons.push("SELF_TRADE_RISK".to_owned());
         }
         if recent_order_count >= self.policy.max_order_rate {
@@ -2828,20 +2877,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if !shadow && self.canary_submissions >= self.policy.canary_max_orders {
             reasons.push("CANARY_ORDER_COUNT_EXCEEDED".to_owned());
         }
-        if !shadow
-            && self
-                .orders
-                .values()
-                .any(|order| order.oms.state == OrderState::Unknown)
-        {
+        if !shadow && self.has_unknown_order() {
             reasons.push("UNKNOWN_ORDER_REQUIRES_RECONCILIATION".to_owned());
         }
         if !shadow && self.unresolved_incident_count() > 0 {
             reasons.push("UNRESOLVED_INCIDENTS_REQUIRE_REVIEW".to_owned());
         }
-        if self.orders.values().filter(|order| order.working()).count()
-            >= self.policy.max_open_orders
-        {
+        if self.working_order_count() >= self.policy.max_open_orders {
             reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
         }
         if self.policy.breaches_position_limit(projected_position)? {
@@ -3768,6 +3810,30 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .daily_baseline_date
                 .as_ref()
                 .map(|_| self.daily_baseline_equity.to_string()),
+            combo_orders: self
+                .combo_orders
+                .iter()
+                .map(|(order_id, order)| {
+                    (
+                        order_id.clone(),
+                        PersistentLiveComboOrder {
+                            intent: PersistentComboIntent::from(&order.oms.intent),
+                            approval_id: order.approval_id.clone(),
+                            state: order.oms.state.as_str().to_owned(),
+                            market: order
+                                .market
+                                .marks
+                                .iter()
+                                .map(PersistentMarketData::from)
+                                .collect(),
+                            decision: PersistentRiskDecision::from(&order.decision),
+                            broker_order_id: order.broker_order_id.clone(),
+                            broker_order_versions: order.broker_order_versions.clone(),
+                            filled_quantity: order.filled_quantity.to_string(),
+                        },
+                    )
+                })
+                .collect(),
             strategy_attribution: self
                 .strategy_attribution
                 .iter()
@@ -4101,7 +4167,84 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 ));
             }
         }
+        let mut combo_orders = BTreeMap::new();
+        for (order_id, persisted) in state.combo_orders {
+            let intent = ComboIntent::try_from(persisted.intent)?;
+            if intent.account_id != self.account.account_id || intent.environment != "LIVE" {
+                return Err(LiveError(
+                    "persisted live combination has an incompatible account or environment"
+                        .to_owned(),
+                ));
+            }
+            validate_canonical_id("persisted combo approval_id", &persisted.approval_id)?;
+            let mut broker_order_versions = persisted.broker_order_versions;
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                validate_canonical_id("persisted combo broker_order_id", broker_order_id)?;
+                if broker_order_versions.is_empty() {
+                    broker_order_versions.push(broker_order_id.clone());
+                }
+            }
+            let mut unique_versions = BTreeSet::new();
+            for broker_order_id in &broker_order_versions {
+                validate_canonical_id("persisted combo broker_order_version", broker_order_id)?;
+                if !unique_versions.insert(broker_order_id) {
+                    return Err(LiveError(
+                        "persisted combination broker order versions are duplicated".to_owned(),
+                    ));
+                }
+            }
+            if let Some(broker_order_id) = &persisted.broker_order_id {
+                if !unique_versions.contains(broker_order_id) {
+                    return Err(LiveError(
+                        "persisted active combination broker ID is absent from versions".to_owned(),
+                    ));
+                }
+            }
+            let mut marks = Vec::with_capacity(persisted.market.len());
+            for mark in persisted.market {
+                marks.push(LiveMarketData::try_from(mark)?);
+            }
+            let market = LiveComboMarketData { marks };
+            // The observation must still price exactly the legs it was stored
+            // against. A journal that lost a leg's mark, or gained one, cannot
+            // reproduce the decision that approved the combination.
+            market.validate_for(&intent)?;
+            let filled_quantity =
+                decimal("persisted combo filled units", &persisted.filled_quantity)?;
+            if filled_quantity < Decimal::ZERO || filled_quantity > intent.combo_quantity {
+                return Err(LiveError(
+                    "persisted combination filled units are invalid".to_owned(),
+                ));
+            }
+            let decision = LiveRiskDecision::try_from(persisted.decision)?;
+            if decision.decision_id != format!("live-combo-risk-{}", intent.intent_id)
+                || decision.policy_version != self.policy.version
+                || !decision.approved
+            {
+                return Err(LiveError(
+                    "persisted combination decision does not authorize this order".to_owned(),
+                ));
+            }
+            let oms = OmsComboOrder::recover(
+                order_id.clone(),
+                intent,
+                parse_order_state(&persisted.state)?,
+            )?;
+            combo_orders.insert(
+                order_id,
+                LiveComboOrder {
+                    oms,
+                    approval_id: persisted.approval_id,
+                    market,
+                    decision,
+                    broker_order_id: persisted.broker_order_id,
+                    broker_order_versions,
+                    filled_quantity,
+                },
+            );
+        }
         self.orders = orders;
+        self.combo_orders = combo_orders;
         self.approvals = approvals;
         self.portfolios = portfolios;
         self.tax_lots = tax_lots;
@@ -4567,8 +4710,8 @@ impl TryFrom<PersistentIntent> for OrderIntent {
                 .map(|price| decimal("persisted live limit price", price))
                 .transpose()?,
             time_in_force: match value.time_in_force.as_str() {
-                "DAY" => follon_domain::TimeInForce::Day,
-                "GTC" => follon_domain::TimeInForce::GoodTilCancelled,
+                "DAY" => TimeInForce::Day,
+                "GTC" => TimeInForce::GoodTilCancelled,
                 _ => {
                     return Err(LiveError(
                         "persisted live time in force is invalid".to_owned(),
@@ -4607,6 +4750,92 @@ impl TryFrom<PersistentMarketData> for LiveMarketData {
         };
         market.validate()?;
         Ok(market)
+    }
+}
+
+impl From<&ComboIntent> for PersistentComboIntent {
+    fn from(intent: &ComboIntent) -> Self {
+        Self {
+            intent_id: intent.intent_id.clone(),
+            account_id: intent.account_id.clone(),
+            strategy_id: intent.strategy_id.clone(),
+            correlation_id: intent.correlation_id.clone(),
+            legs: intent
+                .legs
+                .iter()
+                .map(|leg| PersistentComboLeg {
+                    instrument_id: leg.instrument_id.clone(),
+                    side: leg.side.as_str().to_owned(),
+                    ratio: leg.ratio,
+                    limit_price: leg.limit_price.to_string(),
+                })
+                .collect(),
+            combo_quantity: intent.combo_quantity.to_string(),
+            price_limit_kind: intent.price_limit.kind().to_owned(),
+            price_limit_amount: intent.price_limit.amount().to_string(),
+            time_in_force: intent.time_in_force.as_str().to_owned(),
+            rationale: intent.rationale.clone(),
+            created_at: intent.created_at.clone(),
+            strategy_version: intent.strategy_version.clone(),
+            configuration_version: intent.configuration_version.clone(),
+            environment: intent.environment.clone(),
+        }
+    }
+}
+
+impl TryFrom<PersistentComboIntent> for ComboIntent {
+    type Error = LiveError;
+
+    fn try_from(intent: PersistentComboIntent) -> Result<Self, Self::Error> {
+        let amount = decimal("persisted combo price limit", &intent.price_limit_amount)?;
+        let mut legs = Vec::with_capacity(intent.legs.len());
+        for leg in intent.legs {
+            legs.push(follon_domain::ComboIntentLeg {
+                instrument_id: leg.instrument_id,
+                side: match leg.side.as_str() {
+                    "BUY" => Side::Buy,
+                    "SELL" => Side::Sell,
+                    _ => return Err(LiveError("persisted combo leg side is invalid".to_owned())),
+                },
+                ratio: leg.ratio,
+                limit_price: decimal("persisted combo leg limit price", &leg.limit_price)?,
+            });
+        }
+        let result = Self {
+            intent_id: intent.intent_id,
+            account_id: intent.account_id,
+            strategy_id: intent.strategy_id,
+            correlation_id: intent.correlation_id,
+            legs,
+            combo_quantity: decimal("persisted combo quantity", &intent.combo_quantity)?,
+            price_limit: match intent.price_limit_kind.as_str() {
+                "MAXIMUM_DEBIT" => follon_domain::ComboPriceLimit::MaximumDebit(amount),
+                "MINIMUM_CREDIT" => follon_domain::ComboPriceLimit::MinimumCredit(amount),
+                _ => {
+                    return Err(LiveError(
+                        "persisted combo price limit kind is invalid".to_owned(),
+                    ))
+                }
+            },
+            time_in_force: match intent.time_in_force.as_str() {
+                "DAY" => TimeInForce::Day,
+                "GTC" => TimeInForce::GoodTilCancelled,
+                _ => {
+                    return Err(LiveError(
+                        "persisted combo time in force is invalid".to_owned(),
+                    ))
+                }
+            },
+            rationale: intent.rationale,
+            created_at: intent.created_at,
+            strategy_version: intent.strategy_version,
+            configuration_version: intent.configuration_version,
+            environment: intent.environment,
+        };
+        // Re-validated on the way back in, not trusted because it was once
+        // written: a journal is a file on disk and may have been edited.
+        result.validate()?;
+        Ok(result)
     }
 }
 
@@ -4757,7 +4986,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use follon_domain::{OrderType, TimeInForce};
+    use follon_domain::OrderType;
     use follon_instrument::StaticTradingCalendar;
 
     use super::*;
@@ -4768,6 +4997,8 @@ mod tests {
     struct TestBroker {
         connected: bool,
         submitted: u32,
+        /// Models an adapter with no native atomic combination support.
+        reject_combos: bool,
         events: Vec<LiveBrokerEvent>,
         snapshot: LiveBrokerAccountSnapshot,
     }
@@ -4777,6 +5008,7 @@ mod tests {
             Self {
                 connected: false,
                 submitted: 0,
+                reject_combos: false,
                 events: Vec::new(),
                 snapshot: LiveBrokerAccountSnapshot {
                     orders: Vec::new(),
@@ -4804,6 +5036,27 @@ mod tests {
             request: &LiveBrokerOrderRequest,
         ) -> Result<LiveBrokerSubmitResult, LiveError> {
             assert!(self.connected);
+            self.submitted += 1;
+            let broker_order_id = format!("broker-{}", request.client_order_id);
+            self.snapshot.orders.push(LiveBrokerOrderSnapshot {
+                client_order_id: request.client_order_id.clone(),
+                broker_order_id: broker_order_id.clone(),
+                state: OrderState::Acknowledged,
+                filled_quantity: Decimal::ZERO,
+            });
+            Ok(LiveBrokerSubmitResult::Acknowledged { broker_order_id })
+        }
+
+        fn submit_combo(
+            &mut self,
+            request: &LiveBrokerComboRequest,
+        ) -> Result<LiveBrokerSubmitResult, LiveError> {
+            assert!(self.connected);
+            if self.reject_combos {
+                return Err(LiveError(
+                    "live broker adapter does not support native combinations".to_owned(),
+                ));
+            }
             self.submitted += 1;
             let broker_order_id = format!("broker-{}", request.client_order_id);
             self.snapshot.orders.push(LiveBrokerOrderSnapshot {
@@ -5412,6 +5665,337 @@ mod tests {
         // Assessment only, until E1.4b lands a submission path.
         assert!(service.orders.is_empty());
         assert_eq!(service.broker_mut().submitted, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    fn combo_approval_for(
+        service: &LiveTradingService<TestBroker>,
+        intent: &ComboIntent,
+    ) -> LiveApproval {
+        LiveApproval {
+            approval_id: "approval.live.001".to_owned(),
+            intent_id: intent.intent_id.clone(),
+            intent_fingerprint: combo_intent_fingerprint(intent).expect("combo fingerprint"),
+            configuration_fingerprint: service.configuration_fingerprint(),
+            requested_by: "operator.requester.001".to_owned(),
+            approved_by: "operator.approver.001".to_owned(),
+            approved_at: "2026-01-02T14:30:00Z".to_owned(),
+            expires_at: "2026-01-02T15:00:00Z".to_owned(),
+        }
+    }
+
+    /// Registers the approval, connects, and returns a canary service ready to
+    /// submit exactly this combination.
+    fn canary_ready(path: &Path, intent: &ComboIntent) -> LiveTradingService<TestBroker> {
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, path, policy_permitting_shorts());
+        let approval = combo_approval_for(&service, intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        service
+    }
+
+    #[test]
+    fn live_combo_submission_consumes_one_approval_and_one_canary_slot() {
+        let path = journal_path("combo-submit");
+        let intent = combo_intent("intent.live.combo.100");
+        let mut service = canary_ready(&path, &intent);
+        let outcome = service
+            .submit_canary_combo_intent(
+                intent.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("bounded combination submission");
+        assert!(matches!(
+            outcome,
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let order = service
+            .combo_order("combo-order-intent.live.combo.100")
+            .expect("durable combination");
+        assert_eq!(order.oms.intent.legs.len(), 2);
+        // One broker order for the whole group, not one per leg.
+        assert_eq!(order.broker_order_versions.len(), 1);
+        assert_eq!(service.broker_mut().submitted, 1);
+        // One canary slot, not one per leg: counting legs would exhaust an
+        // operator's canary budget on a single ordinary structure.
+        assert_eq!(service.canary_submissions, 1);
+        // And the approval is spent.
+        assert!(service.approvals["approval.live.001"].consumed);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An approval bound to a plain order cannot authorize a combination.
+    ///
+    /// The two fingerprint functions are domain-separated by their prefixes, so
+    /// this holds even when both intents carry the same identity.
+    #[test]
+    fn live_combo_refuses_an_approval_bound_to_a_different_shape_or_structure() {
+        let path = journal_path("combo-approval-binding");
+        let combination = combo_intent("intent.live.combo.101");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        // An approval carrying the *plain order* fingerprint for the same id.
+        let plain = OrderIntent {
+            intent_id: combination.intent_id.clone(),
+            correlation_id: combination.correlation_id.clone(),
+            ..intent("LIVE", "intent.live.placeholder")
+        };
+        let mut mismatched = combo_approval_for(&service, &combination);
+        mismatched.intent_fingerprint = intent_fingerprint(&plain).expect("plain fingerprint");
+        service
+            .register_approval(mismatched, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("registration");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("connection");
+        assert!(service
+            .submit_canary_combo_intent(
+                combination.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .is_err());
+        assert!(service.combo_orders.is_empty());
+        assert_eq!(service.broker_mut().submitted, 0);
+        let _ = fs::remove_file(&path);
+
+        // And an approval bound to a *different combination* is refused too.
+        let other_path = journal_path("combo-approval-structure");
+        let mut altered = combo_intent("intent.live.combo.101");
+        altered.legs[0].limit_price = amount("7");
+        altered.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount("2.50"));
+        let mut service = canary_ready(&other_path, &altered);
+        assert!(service
+            .submit_canary_combo_intent(
+                combination,
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .is_err());
+        let _ = fs::remove_file(&other_path);
+    }
+
+    #[test]
+    fn live_combo_submission_requires_an_active_canary_and_a_connected_session() {
+        // Shadow mode records decisions but must never submit.
+        let shadow_path = journal_path("combo-shadow-submit");
+        let intent = combo_intent("intent.live.combo.102");
+        let mut shadow = test_service_with_policy(
+            LiveRunMode::Shadow,
+            &shadow_path,
+            policy_permitting_shorts(),
+        );
+        assert!(shadow
+            .submit_canary_combo_intent(
+                intent.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .is_err());
+        let _ = fs::remove_file(&shadow_path);
+
+        // A canary that has not connected must not submit either.
+        let path = journal_path("combo-disconnected");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        let approval = combo_approval_for(&service, &intent);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("approval");
+        assert!(service
+            .submit_canary_combo_intent(
+                intent,
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .is_err());
+        assert_eq!(service.broker_mut().submitted, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_combo_submission_is_idempotent_and_refuses_a_changed_retry() {
+        let path = journal_path("combo-idempotent");
+        let intent = combo_intent("intent.live.combo.103");
+        let mut service = canary_ready(&path, &intent);
+        service
+            .submit_canary_combo_intent(
+                intent.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("first submission");
+        service
+            .submit_canary_combo_intent(
+                intent.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("idempotent repeat");
+        // The repeat reached no broker and consumed no second canary slot.
+        assert_eq!(service.broker_mut().submitted, 1);
+        assert_eq!(service.canary_submissions, 1);
+
+        // A retry that re-prices the original is refused: a retry is a retry,
+        // not a new decision wearing an old identity.
+        let mut moved = combo_market();
+        moved.marks[0].mark_price = amount("7.51");
+        assert!(service
+            .submit_canary_combo_intent(
+                intent,
+                moved,
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_working_live_combination_is_visible_to_every_single_order_risk_counter() {
+        let path = journal_path("combo-counters");
+        let intent = combo_intent("intent.live.combo.104");
+        let mut service = canary_ready(&path, &intent);
+        service
+            .submit_canary_combo_intent(
+                intent,
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("submission");
+
+        assert_eq!(service.working_order_count(), 1);
+        // 2 units * 2.50 net debit.
+        assert_eq!(
+            service.total_reserved_cash().expect("reserved"),
+            amount("5")
+        );
+        // The combination's short far-strike leg is a real resting sell, so a
+        // plain buy on that instrument is a self-trade.
+        assert!(service.conflicts_with_working_order("inst.us_option.spy.far", Side::Buy));
+        assert!(!service.conflicts_with_working_order("inst.us_option.spy.far", Side::Sell));
+        assert!(service.conflicts_with_working_order("inst.us_option.spy.near", Side::Sell));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_live_combination_survives_a_durable_journal_reopen() {
+        let path = journal_path("combo-recovery");
+        let intent = combo_intent("intent.live.combo.105");
+        let market = combo_market();
+        let mut service = canary_ready(&path, &intent);
+        service
+            .submit_canary_combo_intent(
+                intent.clone(),
+                market.clone(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("submission");
+        let before = service
+            .combo_order("combo-order-intent.live.combo.105")
+            .expect("durable combination")
+            .clone();
+        drop(service);
+
+        let account = account();
+        let policy = policy_permitting_shorts();
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("switches");
+        let activation = activation(LiveRunMode::Canary, &account, &policy, &switches);
+        let reopened = LiveTradingService::open_durable(
+            account,
+            policy,
+            activation,
+            switches,
+            TestBroker::new(),
+            &path,
+            "2026-01-02T15:00:00Z",
+        )
+        .expect("reopen");
+        let after = reopened
+            .combo_order("combo-order-intent.live.combo.105")
+            .expect("recovered combination");
+        // The whole structure comes back exactly: every leg, its ratio, its
+        // protected price, the price-limit kind, and the per-leg observation
+        // that priced it.
+        assert_eq!(after.oms.intent, intent);
+        assert_eq!(after.market, market);
+        assert_eq!(after.oms.state, before.oms.state);
+        assert_eq!(after.broker_order_id, before.broker_order_id);
+        assert_eq!(after.approval_id, "approval.live.001");
+        // And the reservation it implies survives with it, so a restart does
+        // not free capital the combination still has committed.
+        assert_eq!(
+            reopened.total_reserved_cash().expect("reserved"),
+            amount("5")
+        );
+        // The consumed canary slot survives too: a restart must not hand an
+        // operator a fresh canary budget.
+        assert_eq!(reopened.canary_submissions, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An adapter that cannot execute an atomic combination refuses the whole
+    /// request, and the attempt is recorded rather than erased.
+    #[test]
+    fn live_combo_transport_failure_leaves_the_group_unknown_and_keeps_the_approval_spent() {
+        let path = journal_path("combo-transport");
+        let intent = combo_intent("intent.live.combo.106");
+        let mut service = canary_ready(&path, &intent);
+        service.broker_mut().reject_combos = true;
+        let result = service.submit_canary_combo_intent(
+            intent,
+            combo_market(),
+            "approval.live.001",
+            "2026-01-02T14:30:02Z",
+            "operator.requester.001",
+        );
+        assert!(result.is_err());
+        let order = service
+            .combo_order("combo-order-intent.live.combo.106")
+            .expect("durable combination");
+        assert_eq!(order.oms.state, OrderState::Unknown);
+        // The attempt happened. Releasing the approval or rewinding the canary
+        // counter would let one approval authorize a second attempt at a trade
+        // whose outcome is unknown.
+        assert!(service.approvals["approval.live.001"].consumed);
+        assert_eq!(service.canary_submissions, 1);
+        assert!(service.has_unknown_order());
         let _ = fs::remove_file(&path);
     }
 

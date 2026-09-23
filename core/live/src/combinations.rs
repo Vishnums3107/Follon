@@ -204,32 +204,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             .try_fold(Decimal::ZERO, |total, portfolio| {
                 total.checked_add(portfolio.position_snapshot().realized_pnl)
             })?;
-        let reserved_cash = self
-            .orders
-            .values()
-            .try_fold(Decimal::ZERO, |total, order| {
-                total
-                    .checked_add(order.reserved_cash()?)
-                    .map_err(LiveError::from)
-            })?;
+        let reserved_cash = self.total_reserved_cash()?;
         let available_cash = self.cash.checked_sub(reserved_cash)?;
         let rate_window_start =
             decision_at - time::Duration::seconds(self.policy.order_rate_window_seconds as i64);
-        let recent_order_count =
-            self.orders
-                .values()
-                .try_fold(0u32, |count, order| -> Result<u32, LiveError> {
-                    let order_decided_at =
-                        OffsetDateTime::parse(&order.decision.decided_at, &Rfc3339)
-                            .map_err(|error| LiveError(error.to_string()))?;
-                    Ok(
-                        if order_decided_at > rate_window_start && order_decided_at <= decision_at {
-                            count + 1
-                        } else {
-                            count
-                        },
-                    )
-                })?;
+        let recent_order_count = self.recent_order_count(rate_window_start, decision_at)?;
 
         let gross_notional = intent.gross_notional()?;
         let net_price = intent.protected_net_price()?;
@@ -275,11 +254,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             // Self-trade is assessed per leg against every working order, and a
             // breach on any one leg rejects the whole structure: the group is
             // atomic, so there is no version of it that omits the offending leg.
-            if self.orders.values().any(|order| {
-                order.working()
-                    && order.oms.intent.instrument_id == leg.instrument_id
-                    && order.oms.intent.side != leg.side
-            }) {
+            if self.conflicts_with_working_order(&leg.instrument_id, leg.side) {
                 reasons.push("SELF_TRADE_RISK".to_owned());
             }
             leg_evidence.push(format!(
@@ -316,20 +291,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if !shadow && self.canary_submissions >= self.policy.canary_max_orders {
             reasons.push("CANARY_ORDER_COUNT_EXCEEDED".to_owned());
         }
-        if !shadow
-            && self
-                .orders
-                .values()
-                .any(|order| order.oms.state == OrderState::Unknown)
-        {
+        if !shadow && self.has_unknown_order() {
             reasons.push("UNKNOWN_ORDER_REQUIRES_RECONCILIATION".to_owned());
         }
         if !shadow && self.unresolved_incident_count() > 0 {
             reasons.push("UNRESOLVED_INCIDENTS_REQUIRE_REVIEW".to_owned());
         }
-        if self.orders.values().filter(|order| order.working()).count()
-            >= self.policy.max_open_orders
-        {
+        if self.working_order_count() >= self.policy.max_open_orders {
             reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
         }
         if net_debit > available_cash {
@@ -478,5 +446,443 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             &candidates,
         )?;
         Ok(Some((decision, margin_used)))
+    }
+}
+
+/// Normalized LIVE combination submission request, created only by the
+/// controlled OMS after a risk approval and a consumed operator approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveBrokerComboRequest {
+    /// OMS client idempotency key for the whole group.
+    pub client_order_id: String,
+    /// Configured live account identity.
+    pub account_id: String,
+    /// Exact combination legs, executed as one atomic group.
+    pub legs: Vec<LiveBrokerComboLeg>,
+    /// Protection amount the operator approved, whose direction is fixed by
+    /// the combination's own price-limit kind.
+    pub limit_price: Decimal,
+    /// `MAXIMUM_DEBIT` or `MINIMUM_CREDIT`, carried explicitly so an adapter
+    /// never has to infer the direction of the protection from its sign.
+    pub price_limit_kind: String,
+}
+
+/// One leg of a LIVE combination request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveBrokerComboLeg {
+    /// Canonical instrument identity.
+    pub instrument_id: String,
+    /// Approved side.
+    pub side: Side,
+    /// Approved contracts per combination unit.
+    pub ratio: u32,
+    /// Exact contract quantity, ratio already applied, so no adapter has to
+    /// re-derive it from a unit count.
+    pub quantity: Decimal,
+    /// Approved protected price for this leg.
+    pub limit_price: Decimal,
+}
+
+impl LiveBrokerComboRequest {
+    fn from_combo_order(order: &OmsComboOrder) -> Result<Self, LiveError> {
+        let mut legs = Vec::with_capacity(order.intent.legs.len());
+        for leg in &order.intent.legs {
+            legs.push(LiveBrokerComboLeg {
+                instrument_id: leg.instrument_id.clone(),
+                side: leg.side,
+                ratio: leg.ratio,
+                quantity: order.intent.leg_quantity(leg)?,
+                limit_price: leg.limit_price,
+            });
+        }
+        Ok(Self {
+            client_order_id: order.order_id.clone(),
+            account_id: order.intent.account_id.clone(),
+            legs,
+            limit_price: order.intent.price_limit.amount(),
+            price_limit_kind: order.intent.price_limit.kind().to_owned(),
+        })
+    }
+
+    fn validate(&self) -> Result<(), LiveError> {
+        validate_canonical_id("live combo client_order_id", &self.client_order_id)?;
+        validate_canonical_id("live combo account_id", &self.account_id)?;
+        if !follon_domain::COMBO_LEG_BOUNDS.contains(&self.legs.len())
+            || self.limit_price <= Decimal::ZERO
+        {
+            return Err(LiveError(
+                "live combination request must carry a bounded leg set and positive protection"
+                    .to_owned(),
+            ));
+        }
+        for leg in &self.legs {
+            validate_canonical_id("live combo leg instrument_id", &leg.instrument_id)?;
+            if !follon_domain::COMBO_LEG_RATIO_BOUNDS.contains(&leg.ratio)
+                || leg.quantity <= Decimal::ZERO
+                || leg.limit_price <= Decimal::ZERO
+            {
+                return Err(LiveError("live combination leg is invalid".to_owned()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Durable internal OMS record for one canary combination order.
+#[derive(Clone, Debug)]
+pub struct LiveComboOrder {
+    /// Legal OMS lifecycle state for the whole group.
+    pub oms: OmsComboOrder,
+    /// Single-use approval consumed by this combination.
+    pub approval_id: String,
+    /// Exact per-leg observation used for risk and cash reservation.
+    pub market: LiveComboMarketData,
+    /// Immutable risk outcome that authorized this exact combination.
+    pub decision: LiveRiskDecision,
+    /// Broker identity after it becomes known. One identity for the whole
+    /// group: an atomic combination is a single broker order, not one per leg.
+    pub broker_order_id: Option<String>,
+    /// Every broker-native order identity issued for this immutable OMS order.
+    pub broker_order_versions: Vec<String>,
+    /// Exact filled combination units, in whole units.
+    pub filled_quantity: Decimal,
+}
+
+impl LiveComboOrder {
+    fn working(&self) -> bool {
+        !matches!(
+            self.oms.state,
+            OrderState::RiskRejected
+                | OrderState::Filled
+                | OrderState::Cancelled
+                | OrderState::Rejected
+                | OrderState::Expired
+        )
+    }
+
+    /// Cash a working combination still has committed.
+    ///
+    /// Only a net debit reserves cash, matching the gate that approved it, and
+    /// it shrinks with filled units so a partially filled combination stops
+    /// over-reserving against every later decision.
+    fn reserved_cash(&self) -> Result<Decimal, LiveError> {
+        if !self.working() {
+            return Ok(Decimal::ZERO);
+        }
+        let net_price = self.oms.intent.protected_net_price()?;
+        if net_price <= Decimal::ZERO {
+            return Ok(Decimal::ZERO);
+        }
+        net_price
+            .checked_mul(
+                self.oms
+                    .intent
+                    .combo_quantity
+                    .checked_sub(self.filled_quantity)?,
+            )
+            .map_err(Into::into)
+    }
+}
+
+impl<B: LiveBrokerAdapter> LiveTradingService<B> {
+    /// Submits one atomic multi-leg combination under one consumed approval.
+    ///
+    /// The combination analogue of [`Self::submit_canary_intent`], and subject
+    /// to every control that path is: the canary activation window, a connected
+    /// broker session, a registered single-use approval that binds this exact
+    /// structure, the full combination risk gate, and a durable audit record
+    /// written *before* the irreversible broker call.
+    ///
+    /// The approval must carry `combo_intent_fingerprint(&intent)`. That
+    /// function is domain-separated from `intent_fingerprint`, so an approval
+    /// issued for a plain order can never authorize a combination, or the
+    /// reverse.
+    pub fn submit_canary_combo_intent(
+        &mut self,
+        intent: ComboIntent,
+        market: LiveComboMarketData,
+        approval_id: &str,
+        decided_at: &str,
+        actor: &str,
+    ) -> Result<LiveSubmitOutcome, LiveError> {
+        self.ensure_audit_healthy()?;
+        self.require_canary_active(decided_at)?;
+        validate_canonical_id("live combo submit actor", actor)?;
+        validate_canonical_id("live combo approval_id", approval_id)?;
+        if !self.broker_connected {
+            return Err(LiveError(
+                "live canary broker session is not connected".to_owned(),
+            ));
+        }
+        if intent.environment != "LIVE" || intent.account_id != self.account.account_id {
+            return Err(LiveError(
+                "canary accepts only matching LIVE account combinations".to_owned(),
+            ));
+        }
+        intent.validate()?;
+        market.validate_for(&intent)?;
+
+        let expected_fingerprint = combo_intent_fingerprint(&intent)?;
+        let order_id = OmsComboOrder::order_id_for(&intent.intent_id);
+        if let Some(existing) = self.combo_orders.get(&order_id) {
+            if existing.oms.intent != intent
+                || existing.approval_id != approval_id
+                || existing.market != market
+                || existing.decision.decided_at != decided_at
+            {
+                return Err(LiveError(
+                    "live combination idempotency key was reused with different data".to_owned(),
+                ));
+            }
+            return Ok(LiveSubmitOutcome::CanaryOrder {
+                decision: existing.decision.clone(),
+                order_id,
+                state: existing.oms.state,
+            });
+        }
+
+        let registered = self.approvals.get(approval_id).ok_or_else(|| {
+            LiveError("live canary combination lacks a registered approval".to_owned())
+        })?;
+        if registered.consumed
+            || registered.approval.intent_id != intent.intent_id
+            || registered.approval.intent_fingerprint != expected_fingerprint
+            || registered.approval.configuration_fingerprint != self.configuration_fingerprint()
+            || registered.approval.approved_at.as_str() > decided_at
+            || registered.approval.expires_at.as_str() <= decided_at
+        {
+            return Err(LiveError(
+                "live approval is expired, consumed, or does not bind this exact combination"
+                    .to_owned(),
+            ));
+        }
+
+        let decision = self.evaluate_combo_risk(&intent, &market, decided_at, false)?;
+        if !decision.approved {
+            self.persist(
+                "live.combo.risk.rejected.v1",
+                actor,
+                decided_at,
+                &intent.correlation_id,
+            )?;
+            return Ok(LiveSubmitOutcome::RiskRejected { decision });
+        }
+
+        let core_decision = RiskDecision {
+            decision_id: decision.decision_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            approved: true,
+            reason_codes: decision.reason_codes.clone(),
+            policy_version: self.policy.version.clone(),
+            decided_at: decided_at.to_owned(),
+            correlation_id: intent.correlation_id.clone(),
+            actor: "live_risk_engine".to_owned(),
+            evaluated_limits: decision.evaluated_limits.clone(),
+        };
+        let mut oms = OmsComboOrder::from_approved_intent(intent, &core_decision)?;
+        oms.transition(OrderState::Approved, "LIVE_COMBO_RISK_APPROVED")?;
+        oms.transition(
+            OrderState::PendingSubmit,
+            "LIVE_CANARY_COMBO_SUBMISSION_REQUESTED",
+        )?;
+        let request = LiveBrokerComboRequest::from_combo_order(&oms)?;
+        request.validate()?;
+        let correlation_id = oms.intent.correlation_id.clone();
+        self.combo_orders.insert(
+            oms.order_id.clone(),
+            LiveComboOrder {
+                oms,
+                approval_id: approval_id.to_owned(),
+                market,
+                decision: decision.clone(),
+                broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                filled_quantity: Decimal::ZERO,
+            },
+        );
+        self.approvals
+            .get_mut(approval_id)
+            .ok_or_else(|| {
+                LiveError("registered live approval disappeared before consumption".to_owned())
+            })?
+            .consumed = true;
+        // One combination is one canary submission, not one per leg. Counting
+        // legs would exhaust an operator's canary budget on a single ordinary
+        // four-leg structure.
+        self.canary_submissions = self
+            .canary_submissions
+            .checked_add(1)
+            .ok_or_else(|| LiveError("live canary submission counter overflowed".to_owned()))?;
+        // The durable audit record precedes the irreversible external call.
+        self.persist(
+            "live.combo.pending_submission.v1",
+            actor,
+            decided_at,
+            &correlation_id,
+        )?;
+
+        match self.broker.submit_combo(&request) {
+            Ok(LiveBrokerSubmitResult::Acknowledged { broker_order_id }) => {
+                validate_canonical_id("live combo broker_order_id", &broker_order_id)?;
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order
+                    .oms
+                    .transition(OrderState::Submitted, "LIVE_CANARY_COMBO_SUBMISSION_SENT")?;
+                order
+                    .oms
+                    .transition(OrderState::Acknowledged, "LIVE_BROKER_COMBO_ACKNOWLEDGED")?;
+                order.broker_order_id = Some(broker_order_id.clone());
+                order.broker_order_versions.push(broker_order_id);
+                let state = order.oms.state;
+                self.persist(
+                    "live.combo.acknowledged.v1",
+                    actor,
+                    decided_at,
+                    &correlation_id,
+                )?;
+                Ok(LiveSubmitOutcome::CanaryOrder {
+                    decision,
+                    order_id: request.client_order_id,
+                    state,
+                })
+            }
+            Ok(LiveBrokerSubmitResult::Rejected { reason }) => {
+                validate_reason("live combo rejection reason", &reason)?;
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order
+                    .oms
+                    .transition(OrderState::Submitted, "LIVE_CANARY_COMBO_SUBMISSION_SENT")?;
+                order.oms.transition(OrderState::Rejected, reason)?;
+                let state = order.oms.state;
+                self.persist("live.combo.rejected.v1", actor, decided_at, &correlation_id)?;
+                Ok(LiveSubmitOutcome::CanaryOrder {
+                    decision,
+                    order_id: request.client_order_id,
+                    state,
+                })
+            }
+            Ok(LiveBrokerSubmitResult::Unknown { reason }) => {
+                validate_reason("live combo unknown-outcome reason", &reason)?;
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order.oms.transition(OrderState::Unknown, reason)?;
+                self.persist("live.combo.unknown.v1", actor, decided_at, &correlation_id)?;
+                Ok(LiveSubmitOutcome::CanaryOrder {
+                    decision,
+                    order_id: request.client_order_id,
+                    state: OrderState::Unknown,
+                })
+            }
+            Err(error) => {
+                // An adapter that cannot execute an atomic combination returns
+                // an error here, and that is a *transport* outcome like any
+                // other: the request may or may not have reached the venue, so
+                // the combination goes to UNKNOWN and the session is marked
+                // disconnected rather than assumed untouched. The approval
+                // stays consumed and the canary counter stays incremented --
+                // an attempt was made, and pretending otherwise would let one
+                // approval authorize a second attempt.
+                let order = self.combo_order_mut(&request.client_order_id)?;
+                order
+                    .oms
+                    .transition(OrderState::Unknown, "LIVE_COMBO_TRANSPORT_OUTCOME_UNKNOWN")?;
+                self.broker_connected = false;
+                self.persist("live.combo.unknown.v1", actor, decided_at, &correlation_id)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// The durable combination order for one client identity, if known.
+    pub fn combo_order(&self, order_id: &str) -> Option<&LiveComboOrder> {
+        self.combo_orders.get(order_id)
+    }
+
+    pub(super) fn combo_order_mut(
+        &mut self,
+        order_id: &str,
+    ) -> Result<&mut LiveComboOrder, LiveError> {
+        self.combo_orders
+            .get_mut(order_id)
+            .ok_or_else(|| LiveError("unknown live OMS combination order".to_owned()))
+    }
+
+    /// Non-terminal orders of both kinds. A combination counts once.
+    pub(super) fn working_order_count(&self) -> usize {
+        self.orders.values().filter(|order| order.working()).count()
+            + self
+                .combo_orders
+                .values()
+                .filter(|order| order.working())
+                .count()
+    }
+
+    /// Cash committed by every working order of either kind.
+    pub(super) fn total_reserved_cash(&self) -> Result<Decimal, LiveError> {
+        let mut reserved = Decimal::ZERO;
+        for order in self.orders.values() {
+            reserved = reserved.checked_add(order.reserved_cash()?)?;
+        }
+        for order in self.combo_orders.values() {
+            reserved = reserved.checked_add(order.reserved_cash()?)?;
+        }
+        Ok(reserved)
+    }
+
+    /// Whether any order of either kind is in the `UNKNOWN` safety state.
+    pub(super) fn has_unknown_order(&self) -> bool {
+        self.orders
+            .values()
+            .any(|order| order.oms.state == OrderState::Unknown)
+            || self
+                .combo_orders
+                .values()
+                .any(|order| order.oms.state == OrderState::Unknown)
+    }
+
+    /// Whether a working order of either kind would trade against `side` on
+    /// `instrument_id`.
+    ///
+    /// A combination's legs count individually: a working short leg is a real
+    /// resting sell on that instrument however the group is labelled.
+    pub(super) fn conflicts_with_working_order(&self, instrument_id: &str, side: Side) -> bool {
+        self.orders.values().any(|order| {
+            order.working()
+                && order.oms.intent.instrument_id == instrument_id
+                && order.oms.intent.side != side
+        }) || self.combo_orders.values().any(|order| {
+            order.working()
+                && order
+                    .oms
+                    .intent
+                    .legs
+                    .iter()
+                    .any(|leg| leg.instrument_id == instrument_id && leg.side != side)
+        })
+    }
+
+    /// Counts orders of both kinds whose own risk decision falls inside the
+    /// rate window. A combination counts once.
+    pub(super) fn recent_order_count(
+        &self,
+        rate_window_start: OffsetDateTime,
+        decision_at: OffsetDateTime,
+    ) -> Result<u32, LiveError> {
+        let within = |decided_at: &str| -> Result<bool, LiveError> {
+            let parsed = OffsetDateTime::parse(decided_at, &Rfc3339)
+                .map_err(|error| LiveError(error.to_string()))?;
+            Ok(parsed > rate_window_start && parsed <= decision_at)
+        };
+        let mut count = 0u32;
+        for order in self.orders.values() {
+            if within(&order.decision.decided_at)? {
+                count += 1;
+            }
+        }
+        for order in self.combo_orders.values() {
+            if within(&order.decision.decided_at)? {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 }
