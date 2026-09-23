@@ -18,8 +18,8 @@ use follon_accounting::{
 };
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
-    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
-    OrderState, OrderType, RiskDecision, Side, TimeInForce,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill,
+    OrderIntent, OrderState, OrderType, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 use follon_risk::{CandidateOrder, PortfolioRiskSnapshot, RestingOrder, RiskPosition};
@@ -1170,13 +1170,44 @@ impl KillSwitchRegistry {
     }
 
     fn rejection_reasons(&self, intent: &OrderIntent) -> Vec<String> {
-        let scopes = [
+        self.reasons_for(
+            &intent.account_id,
+            &intent.strategy_id,
+            std::slice::from_ref(&intent.instrument_id),
+        )
+    }
+
+    /// Kill-switch reasons for a combination.
+    ///
+    /// An instrument switch on *any* leg blocks the whole combination. There is
+    /// no partial execution to fall back on — the group is atomic — so a single
+    /// halted leg halts the structure.
+    fn combo_rejection_reasons(&self, intent: &ComboIntent) -> Vec<String> {
+        let instruments = intent
+            .legs
+            .iter()
+            .map(|leg| leg.instrument_id.clone())
+            .collect::<Vec<_>>();
+        self.reasons_for(&intent.account_id, &intent.strategy_id, &instruments)
+    }
+
+    fn reasons_for(
+        &self,
+        account_id: &str,
+        strategy_id: &str,
+        instrument_ids: &[String],
+    ) -> Vec<String> {
+        let mut scopes = vec![
             KillSwitchScope::Global,
-            KillSwitchScope::Account(intent.account_id.clone()),
-            KillSwitchScope::Strategy(intent.strategy_id.clone()),
-            KillSwitchScope::Instrument(intent.instrument_id.clone()),
+            KillSwitchScope::Account(account_id.to_owned()),
+            KillSwitchScope::Strategy(strategy_id.to_owned()),
         ];
-        scopes
+        scopes.extend(
+            instrument_ids
+                .iter()
+                .map(|instrument_id| KillSwitchScope::Instrument(instrument_id.clone())),
+        );
+        let mut reasons = scopes
             .iter()
             .filter(|scope| self.active.contains(*scope))
             .map(|scope| {
@@ -1185,7 +1216,9 @@ impl KillSwitchRegistry {
                     scope.as_key().to_ascii_uppercase().replace(':', "_")
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        reasons.dedup();
+        reasons
     }
 }
 
@@ -1273,6 +1306,47 @@ pub struct PaperRiskPolicy {
     /// Slice-1 aggregate portfolio-risk composition; `None` preserves today's
     /// behavior exactly.
     pub portfolio_risk: Option<PortfolioRiskComposition>,
+    /// Operator permission for net short exposure; `None` refuses every short,
+    /// which is the behavior every configuration had before this field existed.
+    pub short_exposure: Option<ShortExposurePolicy>,
+}
+
+/// Operator permission for net short exposure, absent by default.
+///
+/// The short-sell guard exists because an uncovered short has unbounded loss.
+/// A defined-risk combination bounds that loss with its own long leg — but
+/// `core/paper` sees canonical instrument identities only. It holds no option
+/// reference data, so it cannot *prove* that a short leg is covered by the long
+/// one, and this repository does not approve risk on an assumption it cannot
+/// check. So it does not try to infer coverage. Shorting stays refused unless
+/// an operator explicitly permits it and states an absolute bound, and that
+/// bound is enforced per instrument exactly like the long-side limit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShortExposurePolicy {
+    /// Maximum absolute net short quantity permitted per instrument.
+    pub max_short_quantity: Decimal,
+}
+
+impl PaperRiskPolicy {
+    /// Whether a projected per-instrument position breaches this policy.
+    ///
+    /// Shared by the single-order and combination gates so a combination leg is
+    /// judged by exactly the rule a plain order on the same instrument would
+    /// meet — neither stricter nor looser.
+    fn breaches_position_limit(&self, projected: Decimal) -> Result<bool, PaperError> {
+        if projected > self.max_position_quantity {
+            return Ok(true);
+        }
+        if projected < Decimal::ZERO {
+            return Ok(match self.short_exposure.as_ref() {
+                None => true,
+                Some(permission) => {
+                    Decimal::ZERO.checked_sub(projected)? > permission.max_short_quantity
+                }
+            });
+        }
+        Ok(false)
+    }
 }
 
 impl PaperRiskPolicy {
@@ -1294,6 +1368,18 @@ impl PaperRiskPolicy {
             || self.order_rate_window_seconds == 0
         {
             return Err(PaperError("invalid paper risk policy".to_owned()));
+        }
+        if self
+            .short_exposure
+            .as_ref()
+            .is_some_and(|permission| permission.max_short_quantity <= Decimal::ZERO)
+        {
+            // A permission that permits nothing is a configuration mistake, not
+            // a stricter policy: `None` already expresses "no shorting", so a
+            // zero bound can only mean the operator meant to set a real one.
+            return Err(PaperError(
+                "paper short-exposure permission must state a positive bound".to_owned(),
+            ));
         }
         if let Some(composition) = &self.portfolio_risk {
             composition.policy.validate()?;
@@ -1354,6 +1440,68 @@ impl PaperMarketData {
             ));
         }
         Ok(())
+    }
+}
+
+/// One mark per leg of a combination, evaluated as a single observation.
+///
+/// Kept as a collection of [`PaperMarketData`] rather than a new shape so the
+/// durable journal record can reuse the existing per-mark serialisation without
+/// a second format to migrate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaperComboMarketData {
+    /// Exactly one validated mark per combination leg, in leg order.
+    pub marks: Vec<PaperMarketData>,
+}
+
+impl PaperComboMarketData {
+    /// Validates the observation set against the combination it prices.
+    ///
+    /// Every leg must be quoted. A combination priced from a partial set would
+    /// have to guess at least one leg's notional, and guessing is exactly what
+    /// a pre-trade gate exists to prevent.
+    pub fn validate_for(&self, intent: &ComboIntent) -> Result<(), PaperError> {
+        if self.marks.len() != intent.legs.len() {
+            return Err(PaperError(
+                "paper combo observation must carry exactly one mark per leg".to_owned(),
+            ));
+        }
+        for mark in &self.marks {
+            mark.validate()?;
+        }
+        for leg in &intent.legs {
+            if self.mark_for(&leg.instrument_id).is_none() {
+                return Err(PaperError(format!(
+                    "paper combo observation is missing a mark for {}",
+                    leg.instrument_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The validated mark for one leg instrument, if present.
+    pub fn mark_for(&self, instrument_id: &str) -> Option<&PaperMarketData> {
+        self.marks
+            .iter()
+            .find(|mark| mark.instrument_id == instrument_id)
+    }
+
+    /// The oldest observation time across every leg.
+    ///
+    /// Freshness for a combination is the freshness of its *stalest* leg: the
+    /// group executes atomically, so one stale leg makes the whole priced
+    /// structure stale. Taking the newest would let a single fresh quote
+    /// launder an arbitrarily old one beside it.
+    pub fn oldest_observed_at(&self) -> Result<&str, PaperError> {
+        self.marks
+            .iter()
+            .map(|mark| mark.observed_at.as_str())
+            // Canonical second-precision UTC (`validate_utc_timestamp`) sorts
+            // lexicographically in exactly timestamp order, so no parsing is
+            // needed to find the oldest.
+            .min()
+            .ok_or_else(|| PaperError("paper combo observation is empty".to_owned()))
     }
 }
 
@@ -2906,42 +3054,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             Side::Buy => context.position_quantity.checked_add(intent.quantity)?,
             Side::Sell => context.position_quantity.checked_sub(intent.quantity)?,
         };
-        let decision_time = OffsetDateTime::parse(decided_at, &Rfc3339)
-            .map_err(|error| PaperError(error.to_string()))?;
-        let rate_window_start = decision_time
-            - time::Duration::seconds(self.risk_policy.order_rate_window_seconds as i64);
-        // Rate-window membership is keyed off each order's own risk *decision* time
-        // (`RiskDecision::decided_at`, sourced from `risk_evidence`), not the
-        // caller-supplied `OrderIntent::created_at`. `created_at` is stamped by the
-        // strategy/operator that originated the intent and is not otherwise
-        // constrained to reflect wall-clock reality, so counting against it would
-        // let a caller understate its own submission rate and silently bypass
-        // `MAX_ORDER_RATE_EXCEEDED` by backdating `created_at` on new intents.
-        let recent_order_count =
-            self.orders
-                .values()
-                .try_fold(0u32, |count, order| -> Result<u32, PaperError> {
-                    let decision_id = format!("paper-risk-{}", order.oms.intent.intent_id);
-                    let order_decided_at = self
-                        .risk_evidence
-                        .get(&decision_id)
-                        .map(|evidence| evidence.decision.decided_at.as_str())
-                        .ok_or_else(|| {
-                            PaperError(
-                                "paper order is missing its originating risk evidence".to_owned(),
-                            )
-                        })?;
-                    let order_decided_at = OffsetDateTime::parse(order_decided_at, &Rfc3339)
-                        .map_err(|error| PaperError(error.to_string()))?;
-                    Ok(
-                        if order_decided_at > rate_window_start && order_decided_at <= decision_time
-                        {
-                            count + 1
-                        } else {
-                            count
-                        },
-                    )
-                })?;
+        let recent_order_count = self.recent_order_count(decided_at)?;
         let mut reasons = self.kill_switches.rejection_reasons(intent);
         if intent.quantity > self.risk_policy.max_order_quantity {
             reasons.push("MAX_ORDER_QUANTITY_EXCEEDED".to_owned());
@@ -2975,8 +3088,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if context.open_orders >= self.risk_policy.max_open_orders {
             reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
         }
-        if projected_position > self.risk_policy.max_position_quantity
-            || projected_position < Decimal::ZERO
+        if self
+            .risk_policy
+            .breaches_position_limit(projected_position)?
         {
             reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
         }
@@ -3063,6 +3177,302 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         })
     }
 
+    /// Assesses a multi-leg combination against the full paper risk policy.
+    ///
+    /// This is assessment only: it creates no order, contacts no broker, and
+    /// leaves the OMS untouched. It exists as a separate entry point rather
+    /// than a variant of the single-order gate because a combination is one
+    /// economic unit with several instruments, and almost every rule has to be
+    /// restated in those terms — the notional is the *gross* of all legs, the
+    /// price collar is per leg against that leg's own mark, and the position
+    /// projection is per instrument.
+    ///
+    /// Two things are deliberately *not* restated, because a combination is one
+    /// order: it counts once against the open-order limit and once against the
+    /// order-rate limit.
+    pub fn evaluate_combo_risk(
+        &mut self,
+        intent: &ComboIntent,
+        market: &PaperComboMarketData,
+        decided_at: &str,
+    ) -> Result<RiskDecision, PaperError> {
+        intent.validate()?;
+        validate_utc_timestamp("paper combo risk decision time", decided_at)?;
+        market.validate_for(intent)?;
+        if intent.account_id != self.account.account_id {
+            return Err(PaperError(
+                "paper combo intent account does not match service".to_owned(),
+            ));
+        }
+        // Staleness is a hard error rather than a rejection reason, matching
+        // `submit_intent`: a decision made against an observation the policy
+        // considers unusable is not a "no", it is not a decision at all, and
+        // must not be recorded as evidence of one.
+        let observed_at = OffsetDateTime::parse(market.oldest_observed_at()?, &Rfc3339)
+            .map_err(|error| PaperError(error.to_string()))?;
+        let decision_time = OffsetDateTime::parse(decided_at, &Rfc3339)
+            .map_err(|error| PaperError(error.to_string()))?;
+        let age = (decision_time - observed_at).whole_seconds();
+        if age < 0
+            || u64::try_from(age).unwrap_or(u64::MAX) > self.risk_policy.max_market_data_age_seconds
+        {
+            return Err(PaperError(
+                "paper combo observation is stale or later than the risk decision".to_owned(),
+            ));
+        }
+
+        // Unconditional, exactly as the single-order gate does it: the mark
+        // cache, the peak-equity high-water-mark and the daily-loss baseline
+        // must not depend on whether aggregate composition happens to be
+        // configured, or enabling it later would start from an artificially
+        // favourable baseline.
+        for mark in &market.marks {
+            self.marks
+                .insert(mark.instrument_id.clone(), mark.mark_price);
+        }
+        let observed_equity = self.current_equity()?;
+        if observed_equity > self.peak_equity {
+            self.peak_equity = observed_equity;
+        }
+        let decision_date = &decided_at[..10];
+        if self.daily_baseline_date.as_deref() != Some(decision_date) {
+            self.daily_baseline_date = Some(decision_date.to_owned());
+            self.daily_baseline_equity = observed_equity;
+        }
+
+        let reserved_cash = self.orders.values().try_fold(
+            Decimal::ZERO,
+            |total, order| -> Result<Decimal, PaperError> {
+                total
+                    .checked_add(order.reserved_cash()?)
+                    .map_err(Into::into)
+            },
+        )?;
+        let available_cash = self.cash.checked_sub(reserved_cash)?;
+        let realized_pnl = self
+            .portfolios
+            .values()
+            .try_fold(Decimal::ZERO, |total, portfolio| {
+                total.checked_add(portfolio.position_snapshot().realized_pnl)
+            })?;
+        let open_orders = self.orders.values().filter(|order| order.working()).count();
+        let recent_order_count = self.recent_order_count(decided_at)?;
+
+        let gross_notional = intent.gross_notional()?;
+        let net_price = intent.protected_net_price()?;
+        // A debit is cash out the door now; a credit is not cash in that may be
+        // spent, so only a debit is charged against available cash. The short
+        // leg's obligation is covered by the gross-notional and aggregate
+        // limits, not by this check.
+        let net_debit = if net_price > Decimal::ZERO {
+            net_price.checked_mul(intent.combo_quantity)?
+        } else {
+            Decimal::ZERO
+        };
+
+        let mut reasons = self.kill_switches.combo_rejection_reasons(intent);
+
+        // Each leg's own contract quantity is what the broker sees, so the
+        // per-order quantity limit binds the largest leg rather than the
+        // combination unit count. A ten-lot butterfly is not a ten-lot order.
+        let mut largest_leg_quantity = Decimal::ZERO;
+        let mut widest_leg_deviation_bps = Decimal::ZERO;
+        let mut leg_evidence = Vec::with_capacity(intent.legs.len());
+        for leg in &intent.legs {
+            let mark = market.mark_for(&leg.instrument_id).ok_or_else(|| {
+                PaperError(format!(
+                    "paper combo observation is missing a mark for {}",
+                    leg.instrument_id
+                ))
+            })?;
+            let leg_quantity = intent.leg_quantity(leg)?;
+            largest_leg_quantity = largest_leg_quantity.max(leg_quantity);
+            let deviation_bps = price_deviation_bps(mark.mark_price, leg.limit_price)?;
+            widest_leg_deviation_bps = widest_leg_deviation_bps.max(deviation_bps);
+
+            let held = self
+                .portfolios
+                .get(&leg.instrument_id)
+                .map(|portfolio| portfolio.position_snapshot().quantity)
+                .unwrap_or(Decimal::ZERO);
+            let projected = held.checked_add(intent.projected_leg_delta(leg)?)?;
+            if self.risk_policy.breaches_position_limit(projected)? {
+                reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
+            }
+            // Self-trade is assessed per leg against every working order, and a
+            // breach on any one leg rejects the whole structure: the group is
+            // atomic, so there is no version of it that omits the offending leg.
+            if self.orders.values().any(|order| {
+                order.working()
+                    && order.oms.intent.instrument_id == leg.instrument_id
+                    && order.oms.intent.side != leg.side
+            }) {
+                reasons.push("SELF_TRADE_RISK".to_owned());
+            }
+            leg_evidence.push(format!(
+                "{}:{}:{}:{}:{}:{}",
+                leg.instrument_id,
+                leg.side.as_str(),
+                leg_quantity,
+                leg.limit_price,
+                mark.mark_price,
+                deviation_bps
+            ));
+        }
+
+        if largest_leg_quantity > self.risk_policy.max_order_quantity {
+            reasons.push("MAX_ORDER_QUANTITY_EXCEEDED".to_owned());
+        }
+        if gross_notional > self.risk_policy.max_order_notional {
+            reasons.push("MAX_ORDER_NOTIONAL_EXCEEDED".to_owned());
+        }
+        if widest_leg_deviation_bps > self.risk_policy.max_price_deviation_bps {
+            reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
+        }
+        if recent_order_count >= self.risk_policy.max_order_rate {
+            reasons.push("MAX_ORDER_RATE_EXCEEDED".to_owned());
+        }
+        if self
+            .orders
+            .values()
+            .any(|order| order.oms.state == OrderState::Unknown)
+        {
+            reasons.push("UNKNOWN_ORDER_REQUIRES_RECONCILIATION".to_owned());
+        }
+        if self.unexplained_incident_count() > 0 {
+            reasons.push("UNEXPLAINED_INCIDENTS_REQUIRE_REVIEW".to_owned());
+        }
+        if open_orders >= self.risk_policy.max_open_orders {
+            reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
+        }
+        if net_debit > available_cash {
+            reasons.push("INSUFFICIENT_INTERNAL_CASH".to_owned());
+        }
+        let realized_loss = if realized_pnl < Decimal::ZERO {
+            Decimal::ZERO.checked_sub(realized_pnl)?
+        } else {
+            Decimal::ZERO
+        };
+        if realized_loss > self.risk_policy.max_realized_loss {
+            reasons.push("MAX_REALIZED_LOSS_EXCEEDED".to_owned());
+        }
+
+        let mut portfolio_risk_limits = String::new();
+        if let Some(composition) = self.risk_policy.portfolio_risk.as_ref() {
+            if let Some((decision, margin_used)) =
+                self.combo_portfolio_risk_decision(composition, intent, market, decided_at)?
+            {
+                reasons.extend(
+                    decision
+                        .reason_codes
+                        .into_iter()
+                        // `SELF_TRADE_RISK` is already detected per leg above
+                        // from the same working-order state.
+                        .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
+                );
+                portfolio_risk_limits = format!(
+                    ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
+                    decision.policy_version,
+                    decision.metrics.gross_exposure,
+                    decision.metrics.net_exposure,
+                    decision.metrics.leverage_bps,
+                    decision.metrics.concentration_bps,
+                    self.peak_equity,
+                    decision.metrics.drawdown_bps,
+                    self.daily_baseline_equity,
+                    observed_equity.checked_sub(self.daily_baseline_equity)?,
+                    margin_used,
+                    decision.metrics.margin_utilization_bps,
+                );
+            }
+        }
+
+        reasons.sort();
+        reasons.dedup();
+        let approved = reasons.is_empty();
+        if approved {
+            reasons.push("APPROVED".to_owned());
+        }
+        Ok(RiskDecision {
+            // A distinct prefix from the single-order gate's `paper-risk-`, so
+            // a combination decision can never be mistaken for, or collide
+            // with, a plain order's decision under the same intent identity.
+            decision_id: format!("paper-combo-risk-{}", intent.intent_id),
+            intent_id: intent.intent_id.clone(),
+            approved,
+            reason_codes: reasons,
+            policy_version: self.risk_policy.version.clone(),
+            decided_at: decided_at.to_owned(),
+            correlation_id: intent.correlation_id.clone(),
+            actor: "paper_risk_engine".to_owned(),
+            evaluated_limits: format!(
+                "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}]{}",
+                intent.legs.len(),
+                intent.combo_quantity,
+                intent.price_limit.kind(),
+                intent.price_limit.amount(),
+                net_price,
+                net_debit,
+                gross_notional,
+                largest_leg_quantity,
+                widest_leg_deviation_bps,
+                self.risk_policy.max_order_quantity,
+                self.risk_policy.max_order_notional,
+                self.risk_policy.max_price_deviation_bps,
+                self.risk_policy.max_open_orders,
+                self.risk_policy.max_position_quantity,
+                self.risk_policy.max_realized_loss,
+                self.risk_policy.max_market_data_age_seconds,
+                self.risk_policy.max_order_rate,
+                self.risk_policy.order_rate_window_seconds,
+                recent_order_count,
+                available_cash,
+                market.oldest_observed_at()?,
+                leg_evidence.join("|"),
+                portfolio_risk_limits,
+            ),
+        })
+    }
+
+    /// Counts orders whose own risk decision falls inside the rate window.
+    ///
+    /// Rate-window membership is keyed off each order's own risk *decision*
+    /// time (`RiskDecision::decided_at`, sourced from `risk_evidence`), not the
+    /// caller-supplied `OrderIntent::created_at`. `created_at` is stamped by
+    /// the strategy or operator that originated the intent and is not otherwise
+    /// constrained to reflect wall-clock reality, so counting against it would
+    /// let a caller understate its own submission rate and silently bypass
+    /// `MAX_ORDER_RATE_EXCEEDED` by backdating `created_at` on new intents.
+    fn recent_order_count(&self, decided_at: &str) -> Result<u32, PaperError> {
+        let decision_time = OffsetDateTime::parse(decided_at, &Rfc3339)
+            .map_err(|error| PaperError(error.to_string()))?;
+        let rate_window_start = decision_time
+            - time::Duration::seconds(self.risk_policy.order_rate_window_seconds as i64);
+        self.orders
+            .values()
+            .try_fold(0u32, |count, order| -> Result<u32, PaperError> {
+                let decision_id = format!("paper-risk-{}", order.oms.intent.intent_id);
+                let order_decided_at = self
+                    .risk_evidence
+                    .get(&decision_id)
+                    .map(|evidence| evidence.decision.decided_at.as_str())
+                    .ok_or_else(|| {
+                        PaperError(
+                            "paper order is missing its originating risk evidence".to_owned(),
+                        )
+                    })?;
+                let order_decided_at = OffsetDateTime::parse(order_decided_at, &Rfc3339)
+                    .map_err(|error| PaperError(error.to_string()))?;
+                Ok(
+                    if order_decided_at > rate_window_start && order_decided_at <= decision_time {
+                        count + 1
+                    } else {
+                        count
+                    },
+                )
+            })
+    }
+
     /// Real point-in-time equity: cash plus every non-zero position marked at
     /// its cached observed mark, falling back to average cost when this
     /// instrument has never been independently quoted. Shared by peak-equity
@@ -3102,6 +3512,39 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         market: &PaperMarketData,
         decided_at: &str,
     ) -> Result<Option<(follon_risk::PortfolioRiskDecision, Decimal)>, PaperError> {
+        let Some((snapshot, margin_used)) = self.portfolio_risk_state(composition, decided_at)?
+        else {
+            return Ok(None);
+        };
+        let candidate = self.risk_candidate(
+            composition,
+            &intent.intent_id,
+            &intent.account_id,
+            &intent.strategy_id,
+            &intent.instrument_id,
+            intent.side,
+            intent.quantity,
+            market.mark_price,
+        )?;
+        let decision = follon_risk::evaluate_portfolio_risk_with_candidates(
+            &composition.policy,
+            &snapshot,
+            std::slice::from_ref(&candidate),
+        )?;
+        Ok(Some((decision, margin_used)))
+    }
+
+    /// Builds the real aggregate-risk snapshot from service state, without any
+    /// candidate.
+    ///
+    /// Extracted so the single-order and combination paths observe exactly the
+    /// same portfolio, equity, peak, daily baseline and margin figures; the
+    /// only difference between them is which candidates are then added.
+    fn portfolio_risk_state(
+        &self,
+        composition: &PortfolioRiskComposition,
+        decided_at: &str,
+    ) -> Result<Option<(PortfolioRiskSnapshot, Decimal)>, PaperError> {
         let equity = self.current_equity()?;
         if equity <= Decimal::ZERO {
             return Ok(None);
@@ -3264,12 +3707,31 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             resting_orders,
             recent_order_count: 0,
         };
-        let bucket = composition.instrument_buckets.get(&intent.instrument_id);
-        let candidate = CandidateOrder {
-            intent_id: intent.intent_id.clone(),
-            account_id: intent.account_id.clone(),
-            strategy_id: intent.strategy_id.clone(),
-            instrument_id: intent.instrument_id.clone(),
+        Ok(Some((snapshot, margin_used)))
+    }
+
+    /// Builds one aggregate-risk candidate row, classified by the operator's
+    /// attested bucket table. Shared by the single-order and combination paths
+    /// so a combination leg is classified exactly as the same instrument would
+    /// be on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn risk_candidate(
+        &self,
+        composition: &PortfolioRiskComposition,
+        intent_id: &str,
+        account_id: &str,
+        strategy_id: &str,
+        instrument_id: &str,
+        side: Side,
+        quantity: Decimal,
+        mark_price: Decimal,
+    ) -> Result<CandidateOrder, PaperError> {
+        let bucket = composition.instrument_buckets.get(instrument_id);
+        Ok(CandidateOrder {
+            intent_id: intent_id.to_owned(),
+            account_id: account_id.to_owned(),
+            strategy_id: strategy_id.to_owned(),
+            instrument_id: instrument_id.to_owned(),
             asset_class: bucket
                 .map(|bucket| bucket.asset_class.clone())
                 .unwrap_or_else(|| "unclassified".to_owned()),
@@ -3279,15 +3741,57 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             currency: bucket
                 .map(|bucket| bucket.currency.clone())
                 .unwrap_or_else(|| self.account.currency.clone()),
-            side: intent.side,
-            quantity: intent.quantity,
-            mark_price: market.mark_price,
+            side,
+            quantity,
+            mark_price,
             multiplier: Decimal::from_integer(1)?,
             delta: Decimal::ZERO,
             gamma: Decimal::ZERO,
+        })
+    }
+
+    /// The composed aggregate-risk decision for a whole combination.
+    ///
+    /// Every leg is submitted to the kernel as a simultaneous candidate, so
+    /// bucket, concentration and exposure limits see the structure as it will
+    /// actually exist after an atomic fill. Assessing legs one at a time would
+    /// approve a group that breaches a limit only jointly — see
+    /// `follon_risk::evaluate_portfolio_risk_with_candidates`.
+    fn combo_portfolio_risk_decision(
+        &self,
+        composition: &PortfolioRiskComposition,
+        intent: &ComboIntent,
+        market: &PaperComboMarketData,
+        decided_at: &str,
+    ) -> Result<Option<(follon_risk::PortfolioRiskDecision, Decimal)>, PaperError> {
+        let Some((snapshot, margin_used)) = self.portfolio_risk_state(composition, decided_at)?
+        else {
+            return Ok(None);
         };
-        let decision =
-            follon_risk::evaluate_portfolio_risk(&composition.policy, &snapshot, Some(&candidate))?;
+        let mut candidates = Vec::with_capacity(intent.legs.len());
+        for leg in &intent.legs {
+            let mark = market.mark_for(&leg.instrument_id).ok_or_else(|| {
+                PaperError(format!(
+                    "paper combo observation is missing a mark for {}",
+                    leg.instrument_id
+                ))
+            })?;
+            candidates.push(self.risk_candidate(
+                composition,
+                &intent.intent_id,
+                &intent.account_id,
+                &intent.strategy_id,
+                &leg.instrument_id,
+                leg.side,
+                intent.leg_quantity(leg)?,
+                mark.mark_price,
+            )?);
+        }
+        let decision = follon_risk::evaluate_portfolio_risk_with_candidates(
+            &composition.policy,
+            &snapshot,
+            &candidates,
+        )?;
         Ok(Some((decision, margin_used)))
     }
 
@@ -4713,7 +5217,32 @@ mod tests {
             max_order_rate: 20,
             order_rate_window_seconds: 60,
             portfolio_risk: None,
+            short_exposure: None,
         }
+    }
+
+    /// The same policy with net short exposure explicitly permitted, bounded at
+    /// 1,000 per instrument. Combination tests that need a short leg use this;
+    /// none of them may quietly widen `policy()` instead.
+    fn policy_permitting_shorts() -> PaperRiskPolicy {
+        PaperRiskPolicy {
+            short_exposure: Some(ShortExposurePolicy {
+                max_short_quantity: decimal("short bound", "1000").unwrap(),
+            }),
+            ..policy()
+        }
+    }
+
+    fn service_permitting_shorts() -> PaperTradingService<IbkrPaperAdapter> {
+        let account = account();
+        let adapter = IbkrPaperAdapter::new(&account).unwrap();
+        PaperTradingService::new(
+            account,
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            adapter,
+        )
+        .unwrap()
     }
 
     fn service() -> PaperTradingService<IbkrPaperAdapter> {
@@ -4822,6 +5351,365 @@ mod tests {
             mark_price: decimal("mark", price).unwrap(),
             observed_at: observed_at.to_owned(),
         }
+    }
+
+    /// A long call vertical on two distinct option instruments: buy the near
+    /// strike at 7.50, sell the far strike at 5.00, for a 2.50 net debit per
+    /// combination unit.
+    fn combo_intent(intent_id: &str, created_at: &str) -> ComboIntent {
+        ComboIntent {
+            intent_id: intent_id.to_owned(),
+            account_id: "acct.paper.001".to_owned(),
+            strategy_id: "strategy.paper.001".to_owned(),
+            correlation_id: format!("corr-{intent_id}"),
+            legs: vec![
+                follon_domain::ComboIntentLeg {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    side: Side::Buy,
+                    ratio: 1,
+                    limit_price: decimal("near", "7.50").unwrap(),
+                },
+                follon_domain::ComboIntentLeg {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    side: Side::Sell,
+                    ratio: 1,
+                    limit_price: decimal("far", "5").unwrap(),
+                },
+            ],
+            combo_quantity: decimal("units", "4").unwrap(),
+            price_limit: follon_domain::ComboPriceLimit::MaximumDebit(
+                decimal("cap", "2.50").unwrap(),
+            ),
+            time_in_force: TimeInForce::Day,
+            rationale: "paper combo acceptance test".to_owned(),
+            created_at: created_at.to_owned(),
+            strategy_version: "strategy-paper-v1".to_owned(),
+            configuration_version: "config-paper-v1".to_owned(),
+            environment: "PAPER".to_owned(),
+        }
+    }
+
+    /// Marks that sit exactly on each leg's own limit price, so the per-leg
+    /// price collar reads zero deviation unless a test moves one.
+    fn combo_market(observed_at: &str) -> PaperComboMarketData {
+        PaperComboMarketData {
+            marks: vec![
+                PaperMarketData {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    mark_price: decimal("mark", "7.50").unwrap(),
+                    observed_at: observed_at.to_owned(),
+                },
+                PaperMarketData {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    mark_price: decimal("mark", "5").unwrap(),
+                    observed_at: observed_at.to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn combo_risk_approves_a_priced_vertical_and_records_exact_evidence() {
+        let mut service = service_permitting_shorts();
+        let decision = service
+            .evaluate_combo_risk(
+                &combo_intent("combo-000001", "2026-01-02T14:30:00Z"),
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+        assert_eq!(decision.reason_codes, vec!["APPROVED".to_owned()]);
+        // A combination decision must never collide with a plain order's.
+        assert_eq!(decision.decision_id, "paper-combo-risk-combo-000001");
+        assert!(decision.evaluated_limits.contains("combo_legs=2"));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_price_limit_kind=MAXIMUM_DEBIT"));
+        // 4 units * (1 * 7.50 + 1 * 5.00) = 50 gross; net debit 4 * 2.50 = 10.
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_gross_notional=50.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_net_debit=10.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_protected_net_price=2.50000000"));
+    }
+
+    #[test]
+    fn combo_risk_charges_the_order_notional_limit_the_gross_not_the_net() {
+        let mut service = service_permitting_shorts();
+        // 400 units: gross 400 * 12.50 = 5,000... raise it until gross crosses
+        // the 50,000 policy limit while the *net* stays far below it. Net here
+        // is 4,001 * 2.50 = 10,002.50, which a net-based check would approve.
+        let mut intent = combo_intent("combo-000002", "2026-01-02T14:30:00Z");
+        intent.combo_quantity = decimal("units", "4001").unwrap();
+        let decision = service
+            .evaluate_combo_risk(
+                &intent,
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_ORDER_NOTIONAL_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_gross_notional=50012.50000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_net_debit=10002.50000000"));
+    }
+
+    #[test]
+    fn combo_risk_collars_each_leg_against_its_own_mark() {
+        let mut service = service_permitting_shorts();
+        let intent = combo_intent("combo-000003", "2026-01-02T14:30:00Z");
+        let mut market = combo_market("2026-01-02T14:30:00Z");
+        // Move only the second leg's mark. The first leg is still exactly on
+        // its own mark, so a single blended or first-leg-only collar would
+        // miss this entirely.
+        market.marks[1].mark_price = decimal("mark", "4").unwrap();
+        let decision = service
+            .evaluate_combo_risk(&intent, &market, "2026-01-02T14:30:02Z")
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"PRICE_COLLAR_EXCEEDED".to_owned()));
+        // 5.00 requested against a 4.00 mark is 2,500 bps, far past the 100 bps
+        // policy limit, and it is the *widest* leg that is recorded.
+        assert!(decision
+            .evaluated_limits
+            .contains("widest_leg_deviation_bps=2500.00000000"));
+    }
+
+    /// A combination's short leg is refused unless an operator permitted it.
+    ///
+    /// This is the default. `core/paper` holds no option reference data, so it
+    /// cannot prove that the short far-strike leg is covered by the long near
+    /// one, and it does not assume it. Almost every real spread has a short
+    /// leg, so the practical effect is that spreads require an explicit,
+    /// bounded operator permission — which is the intended behaviour, not an
+    /// oversight.
+    #[test]
+    fn combo_risk_refuses_a_short_leg_until_an_operator_permits_it() {
+        let mut default_service = service();
+        let decision = default_service
+            .evaluate_combo_risk(
+                &combo_intent("combo-000004", "2026-01-02T14:30:00Z"),
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+
+        // The same structure, with the permission present, is approved.
+        let mut permitting = service_permitting_shorts();
+        let decision = permitting
+            .evaluate_combo_risk(
+                &combo_intent("combo-000004", "2026-01-02T14:30:00Z"),
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+    }
+
+    #[test]
+    fn combo_risk_projects_each_leg_against_its_own_position_bound() {
+        let mut service = service_permitting_shorts();
+        // 2,000 units: the long leg projects +2,000 against a 1,000 long limit
+        // and the short leg projects -2,000 against a 1,000 short bound. Both
+        // legs breach, and the per-instrument projection is what sees it.
+        let mut oversized = combo_intent("combo-000005", "2026-01-02T14:30:00Z");
+        oversized.combo_quantity = decimal("units", "2000").unwrap();
+        let decision = service
+            .evaluate_combo_risk(
+                &oversized,
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(decision
+            .reason_codes
+            .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+
+        // Exactly at both bounds is permitted; the guard is a ceiling, not an
+        // off-by-one refusal.
+        let mut exact = combo_intent("combo-000012", "2026-01-02T14:30:00Z");
+        exact.combo_quantity = decimal("units", "1000").unwrap();
+        let decision = service
+            .evaluate_combo_risk(
+                &exact,
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(!decision
+            .reason_codes
+            .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+    }
+
+    #[test]
+    fn short_permission_must_state_a_positive_bound() {
+        let invalid = PaperRiskPolicy {
+            short_exposure: Some(ShortExposurePolicy {
+                max_short_quantity: Decimal::ZERO,
+            }),
+            ..policy()
+        };
+        // `None` already means "no shorting", so a zero bound can only be a
+        // configuration mistake and fails closed rather than silently agreeing.
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn combo_risk_binds_the_quantity_limit_to_the_largest_leg_not_the_unit_count() {
+        let mut service = service_permitting_shorts();
+        // 60 combination units, but the near leg carries a ratio of 2, so the
+        // broker sees a 120-contract order against a 100 limit. Counting units
+        // alone would approve it.
+        let mut intent = combo_intent("combo-000006", "2026-01-02T14:30:00Z");
+        intent.combo_quantity = decimal("units", "60").unwrap();
+        intent.legs[0].ratio = 2;
+        intent.legs[0].limit_price = decimal("near", "6").unwrap();
+        intent.price_limit =
+            follon_domain::ComboPriceLimit::MaximumDebit(decimal("cap", "7").unwrap());
+        let mut market = combo_market("2026-01-02T14:30:00Z");
+        market.marks[0].mark_price = decimal("mark", "6").unwrap();
+        let decision = service
+            .evaluate_combo_risk(&intent, &market, "2026-01-02T14:30:02Z")
+            .unwrap();
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_ORDER_QUANTITY_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("largest_leg_quantity=120.00000000"));
+    }
+
+    #[test]
+    fn combo_risk_charges_only_the_net_debit_against_available_cash() {
+        let mut service = service_permitting_shorts();
+        // A credit structure takes no cash out, so it must not be refused for
+        // insufficient cash however large its gross notional is.
+        let mut credit = combo_intent("combo-000007", "2026-01-02T14:30:00Z");
+        credit.legs[0].side = Side::Sell;
+        credit.legs[1].side = Side::Buy;
+        credit.price_limit =
+            follon_domain::ComboPriceLimit::MinimumCredit(decimal("floor", "2").unwrap());
+        let decision = service
+            .evaluate_combo_risk(
+                &credit,
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(!decision
+            .reason_codes
+            .contains(&"INSUFFICIENT_INTERNAL_CASH".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_net_debit=0.00000000"));
+
+        // A debit structure larger than the 100,000 account does not.
+        let mut expensive = combo_intent("combo-000008", "2026-01-02T14:30:00Z");
+        expensive.combo_quantity = decimal("units", "50000").unwrap();
+        let decision = service
+            .evaluate_combo_risk(
+                &expensive,
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(decision
+            .reason_codes
+            .contains(&"INSUFFICIENT_INTERNAL_CASH".to_owned()));
+    }
+
+    #[test]
+    fn combo_risk_is_halted_by_a_kill_switch_on_any_single_leg() {
+        let mut service = service_permitting_shorts();
+        service
+            .activate_kill_switch(KillSwitchScope::Instrument(
+                "inst.us_option.spy.far".to_owned(),
+            ))
+            .unwrap();
+        let decision = service
+            .evaluate_combo_risk(
+                &combo_intent("combo-000009", "2026-01-02T14:30:00Z"),
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"KILL_SWITCH_INSTRUMENT_INST.US_OPTION.SPY.FAR".to_owned()));
+    }
+
+    #[test]
+    fn combo_risk_refuses_an_incomplete_or_stale_observation() {
+        let mut service = service_permitting_shorts();
+        let intent = combo_intent("combo-000010", "2026-01-02T14:30:00Z");
+
+        // One leg unquoted: the gate cannot price the structure and must not
+        // guess.
+        let mut partial = combo_market("2026-01-02T14:30:00Z");
+        partial.marks.truncate(1);
+        assert!(service
+            .evaluate_combo_risk(&intent, &partial, "2026-01-02T14:30:02Z")
+            .is_err());
+
+        // One leg quoted twice, the other not at all: the count matches but
+        // the coverage does not.
+        let mut duplicated = combo_market("2026-01-02T14:30:00Z");
+        duplicated.marks[1] = duplicated.marks[0].clone();
+        assert!(service
+            .evaluate_combo_risk(&intent, &duplicated, "2026-01-02T14:30:02Z")
+            .is_err());
+
+        // Freshness is the *stalest* leg's. One fresh quote beside an old one
+        // must not launder it.
+        let mut half_stale = combo_market("2026-01-02T14:30:00Z");
+        half_stale.marks[0].observed_at = "2026-01-02T14:20:00Z".to_owned();
+        assert!(service
+            .evaluate_combo_risk(&intent, &half_stale, "2026-01-02T14:30:02Z")
+            .is_err());
+
+        // And an observation from after the decision is refused outright.
+        assert!(service
+            .evaluate_combo_risk(
+                &intent,
+                &combo_market("2026-01-02T14:31:00Z"),
+                "2026-01-02T14:30:02Z"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn combo_risk_creates_no_order_and_contacts_no_broker() {
+        let mut service = service_permitting_shorts();
+        let decision = service
+            .evaluate_combo_risk(
+                &combo_intent("combo-000011", "2026-01-02T14:30:00Z"),
+                &combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+        // Assessment only, until E1.3 lands a submission path.
+        assert!(service.order("order-combo-000011").is_none());
+        assert_eq!(service.dashboard().working_orders, 0);
+        assert_eq!(service.dashboard().positions.len(), 0);
     }
 
     fn paper_session(exchange_date: &str) -> PaperTradingSession {

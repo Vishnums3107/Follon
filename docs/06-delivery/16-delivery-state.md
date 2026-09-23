@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T04:11:07Z  
+**Measured at:** 2026-09-23T04:26:36Z  
 **Branch:** `main`  
-**HEAD:** `b358088` -- docs(delivery): add a machine-measured resume-here state document and session-status tool (2026-09-23T09:35:35+05:30)  
-**Uncommitted paths:** 2
+**HEAD:** `670d019` -- feat(domain): add the multi-leg ComboIntent contract -- E1.1 of the 5.6 combo risk-gating epic (2026-09-23T09:41:52+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 305 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 318 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -99,8 +99,8 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E1.1 | `ComboIntent`, `ComboIntentLeg` and `ComboPriceLimit` in `core/domain`, with validation, exact net-price and gross-notional arithmetic, and per-leg position projection. `core/execution` now re-exports the price-limit contract instead of defining its own, so the planner and the risk gate cannot disagree. | **done** 2026-09-23 |
-| E1.2 | Aggregate risk evaluation for a combo in the paper risk gate: gross notional against the order-notional limit, per-leg price collar against each leg's mark, projected position per instrument, self-trade across all legs, cash reservation for the net debit | next |
-| E1.3 | Risk-gated `submit_combo_intent` in `core/paper`: kill switches, OMS lifecycle for the combination as one order, durable per-combo journal record, restart recovery | open |
+| E1.2 | `PaperTradingService::evaluate_combo_risk` — the full paper risk policy restated for a combination, plus `PaperComboMarketData`, an explicit operator short-exposure permission, and `follon_risk::evaluate_portfolio_risk_with_candidates` so a combination's legs reach the aggregate kernel simultaneously. Assessment only; creates no order. | **done** 2026-09-23 |
+| E1.3 | Risk-gated `submit_combo_intent` in `core/paper`: kill switches, OMS lifecycle for the combination as one order, durable per-combo journal record, restart recovery | next |
 | E1.4 | `core/live` parity for the same path | open |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
 
@@ -127,6 +127,43 @@ covered by a test named after it.
   operator approved a debit structure; a credit one is a different trade.
   Removing the sign guard was injected as a deliberate defect and the test
   caught it.
+
+**E1.2 design decisions a later slice must not silently reverse.**
+
+- **The order-notional limit is charged the gross, not the net.** Charging the
+  net was injected as a deliberate defect and the test caught it.
+- **The price collar is per leg, against that leg's own mark.** A blended or
+  first-leg-only collar misses a mispriced second leg entirely. First-leg-only
+  was injected as a deliberate defect and the test caught it — after a *first*
+  injection attempt that failed to change behaviour and was therefore no
+  verification at all. An injection that does not fail a test proves nothing
+  about the test; it means the injection was wrong.
+- **Only a net debit is charged against available cash.** A credit structure
+  takes no cash out. The short leg's obligation is covered by the gross-notional
+  and aggregate limits, not by the cash check.
+- **The per-order quantity limit binds the largest leg, not the unit count.** A
+  60-unit combination with a ratio-2 leg is a 120-contract order to the broker.
+- **A kill switch on any single leg halts the whole combination.** The group is
+  atomic; there is no version of it that omits the halted leg. Self-trade is
+  assessed the same way.
+- **Freshness is the stalest leg's.** One fresh quote beside an old one must not
+  launder it, and a stale observation is a hard error, not a rejection reason —
+  a decision made against an unusable observation is not a "no", it is not a
+  decision, and must not be recorded as evidence of one.
+- **Net short exposure stays refused unless an operator explicitly permits it
+  with a stated bound** (`PaperRiskPolicy::short_exposure`, `None` everywhere
+  today, so no existing configuration changed). This one deserves attention,
+  because it is the slice's least obvious consequence: the paper gate forbids
+  every net short position, and almost every real spread has a short leg, so in
+  practice **spreads require that permission**. `core/paper` holds no option
+  reference data and cannot prove a short leg is covered by its long one, so it
+  does not assume it. Adding the field made the compiler demand a decision at
+  all three construction sites rather than defaulting one in silently. Flipping
+  the absent-permission case to "allow" was injected as a deliberate defect and
+  the test caught it.
+- **An atomic group counts as one order** against the open-order and order-rate
+  limits, in both the paper gate and the aggregate kernel. Counting legs would
+  make an ordinary condor look like a burst of orders.
 
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
@@ -245,12 +282,21 @@ short — detail belongs in the conformance audit.
 - Landed **E1.1**. Rust workspace 296 → 305 passed, 0 failed. Two deliberate
   defects were injected and each was caught by the test written for it before
   the slice was relied on.
-- **Next action: E1.2.** Extend `core/paper`'s `evaluate_risk` to assess a
-  `ComboIntent` as one economic unit. It must reuse the existing single-leg
-  rules rather than re-implement them: kill switches, `MAX_ORDER_NOTIONAL`
-  (against `gross_notional`, not the net), `PRICE_COLLAR` per leg against that
-  leg's own mark, `POSITION_LIMIT` against each leg's `projected_leg_delta`,
-  `SELF_TRADE_RISK` across every leg, and `INSUFFICIENT_INTERNAL_CASH` against
-  the net debit. Combo market data is many marks, one per leg, so
-  `PaperMarketData` needs a multi-instrument companion — decide that shape
-  first, since E1.3's journal record persists it.
+- Landed **E1.2**. Rust workspace 305 → 318 passed, 0 failed. Three deliberate
+  defects injected and caught; a fourth injection attempt changed no behaviour
+  and was redone rather than recorded as a pass.
+- **Next action: E1.3 — the risk-gated submission path.** Two concrete
+  prerequisites, both discovered during E1.2 and neither optional:
+  1. `PaperTradingService::recent_order_count` looks each existing order's
+     decision up as `paper-risk-{intent_id}` and hard-errors when it is absent.
+     A combination's decision is stored under `paper-combo-risk-{intent_id}`, so
+     the moment a combo order exists, every *subsequent* single-order risk
+     evaluation fails with "paper order is missing its originating risk
+     evidence". Widen the lookup, and `PaperRiskEvidence` with it — it currently
+     holds an `OrderIntent` and a single `PaperMarketData`, neither of which
+     fits a combination.
+  2. `OmsOrder::from_approved_intent` takes an `OrderIntent`. The combination
+     must become one OMS order, not one per leg, so decide whether `OmsOrder`
+     grows a combination variant or `core/paper` keeps a parallel
+     `PaperComboOrder` record. The journal format follows from that choice, and
+     it is durable, so it is worth getting right before writing it.

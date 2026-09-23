@@ -514,6 +514,10 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
         // operator adopts the CLI/journal configuration path (see
         // `follon_paper::PortfolioRiskComposition`).
         portfolio_risk: None,
+        // Net short exposure stays refused from the desktop. Permitting it is a
+        // deliberate operator decision with a stated bound, and this host has
+        // no operator-authenticated surface on which to take one.
+        short_exposure: None,
     };
     let kill_switches = KillSwitchRegistry::new(document.kill_switch_version)
         .map_err(|error| format!("kill switch registry: {error}"))?;

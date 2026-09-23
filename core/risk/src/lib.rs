@@ -489,6 +489,31 @@ pub fn evaluate_portfolio_risk(
     snapshot: &PortfolioRiskSnapshot,
     candidate: Option<&CandidateOrder>,
 ) -> Result<PortfolioRiskDecision, RiskError> {
+    match candidate {
+        Some(order) => {
+            evaluate_portfolio_risk_with_candidates(policy, snapshot, std::slice::from_ref(order))
+        }
+        None => evaluate_portfolio_risk_with_candidates(policy, snapshot, &[]),
+    }
+}
+
+/// Evaluates several simultaneous candidate legs as one atomic group.
+///
+/// A multi-leg combination executes atomically or not at all, so its legs have
+/// to be assessed *together*: two legs that each sit under a concentration or
+/// bucket limit on their own can breach it jointly, and evaluating them one at
+/// a time would approve exactly that. Every candidate is therefore added to the
+/// position set before any aggregate metric is computed.
+///
+/// The group still counts as **one** order against the open-order and
+/// order-rate limits, because the OMS submits and tracks an atomic combination
+/// as a single order. Counting legs there would make an ordinary four-leg
+/// structure look like a rate breach.
+pub fn evaluate_portfolio_risk_with_candidates(
+    policy: &PortfolioRiskPolicy,
+    snapshot: &PortfolioRiskSnapshot,
+    candidates: &[CandidateOrder],
+) -> Result<PortfolioRiskDecision, RiskError> {
     policy.validate()?;
     if snapshot.equity <= Decimal::ZERO
         || snapshot.peak_equity <= Decimal::ZERO
@@ -500,7 +525,7 @@ pub fn evaluate_portfolio_risk(
     }
     let mut positions = snapshot.positions.clone();
     let mut reasons = Vec::new();
-    if let Some(order) = candidate {
+    for order in candidates {
         order.validate()?;
         if policy.restricted_instruments.contains(&order.instrument_id) {
             reasons.push("RESTRICTED_INSTRUMENT".to_owned());
@@ -572,12 +597,17 @@ pub fn evaluate_portfolio_risk(
     if absolute(metrics.total_gamma)? > policy.max_abs_gamma {
         reasons.push("MAX_GAMMA_EXCEEDED".to_owned());
     }
-    if snapshot.resting_orders.len() + usize::from(candidate.is_some()) > policy.max_open_orders {
+    // One atomic group is one order here, however many legs it carries -- see
+    // this function's own contract. `!is_empty()` rather than `len()` is what
+    // makes that true, and it is exactly the previous single-candidate
+    // behaviour when the group holds zero or one candidate.
+    if snapshot.resting_orders.len() + usize::from(!candidates.is_empty()) > policy.max_open_orders
+    {
         reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
     }
     if snapshot
         .recent_order_count
-        .saturating_add(u32::from(candidate.is_some()))
+        .saturating_add(u32::from(!candidates.is_empty()))
         > policy.max_order_rate
     {
         reasons.push("MAX_ORDER_RATE_EXCEEDED".to_owned());
@@ -870,6 +900,123 @@ mod tests {
                 "missing {code}"
             );
         }
+    }
+
+    /// Two legs that each pass on their own but breach jointly.
+    ///
+    /// This is the whole reason an atomic group has to be evaluated together.
+    /// Evaluating a combination one leg at a time would approve exactly the
+    /// exposure the sector limit exists to refuse, because neither leg reaches
+    /// it alone and the group executes atomically -- there is no moment at
+    /// which only one of them is filled.
+    #[test]
+    fn simultaneous_candidate_legs_breach_a_bucket_limit_neither_leg_reaches_alone() {
+        let mut policy = policy();
+        // Concentration is largest-position/gross, so a single-position book is
+        // always 100% concentrated. Relaxing it here isolates the sector limit
+        // as the only binding constraint, which is what this test is about.
+        policy.max_concentration_bps = amount("10000");
+        let snapshot = PortfolioRiskSnapshot {
+            equity: amount("50000"),
+            peak_equity: amount("50000"),
+            daily_pnl: Decimal::ZERO,
+            margin_used: Decimal::ZERO,
+            positions: vec![],
+            resting_orders: vec![],
+            recent_order_count: 0,
+        };
+        let leg = |instrument: &str, side: Side| CandidateOrder {
+            intent_id: "intent.combo".to_owned(),
+            account_id: "account.main".to_owned(),
+            strategy_id: "strategy.alpha".to_owned(),
+            instrument_id: instrument.to_owned(),
+            asset_class: "equity".to_owned(),
+            sector: "technology".to_owned(),
+            currency: "USD".to_owned(),
+            side,
+            quantity: amount("250"),
+            mark_price: amount("100"),
+            multiplier: amount("1"),
+            delta: Decimal::ZERO,
+            gamma: Decimal::ZERO,
+        };
+        let legs = vec![
+            leg("instrument.near", Side::Buy),
+            leg("instrument.far", Side::Sell),
+        ];
+
+        // 25,000 of technology gross each -- under the 40,000 sector limit.
+        for single in &legs {
+            let decision = evaluate_portfolio_risk(&policy, &snapshot, Some(single))
+                .expect("single-leg decision");
+            assert!(
+                decision.approved,
+                "leg {} should pass alone: {:?}",
+                single.instrument_id, decision.reason_codes
+            );
+        }
+
+        // 50,000 together, which the same limit refuses. Note that a *net*
+        // view would see zero here: the legs are opposite sides. Gross is what
+        // the limit is written against, and gross is what an atomic group
+        // actually puts on.
+        let decision = evaluate_portfolio_risk_with_candidates(&policy, &snapshot, &legs)
+            .expect("group decision");
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"SECTOR_LIMIT_EXCEEDED:technology".to_owned()));
+        assert_eq!(decision.metrics.gross_exposure, amount("50000"));
+        assert_eq!(decision.metrics.net_exposure, Decimal::ZERO);
+    }
+
+    /// An atomic group is one order against the open-order and rate limits.
+    ///
+    /// A four-leg structure is one broker submission and one OMS order, so
+    /// counting its legs against a rate limit would make an ordinary condor
+    /// look like a burst of orders.
+    #[test]
+    fn an_atomic_group_counts_as_one_order_not_one_per_leg() {
+        let mut policy = policy();
+        policy.max_open_orders = 1;
+        policy.max_order_rate = 1;
+        let snapshot = PortfolioRiskSnapshot {
+            equity: amount("1000000"),
+            peak_equity: amount("1000000"),
+            daily_pnl: Decimal::ZERO,
+            margin_used: Decimal::ZERO,
+            positions: vec![],
+            resting_orders: vec![],
+            recent_order_count: 0,
+        };
+        let legs: Vec<CandidateOrder> = (0..4)
+            .map(|index| CandidateOrder {
+                intent_id: "intent.condor".to_owned(),
+                account_id: "account.main".to_owned(),
+                strategy_id: "strategy.alpha".to_owned(),
+                instrument_id: format!("instrument.leg{index}"),
+                asset_class: "equity".to_owned(),
+                sector: "technology".to_owned(),
+                currency: "USD".to_owned(),
+                side: if index % 2 == 0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                },
+                quantity: amount("10"),
+                mark_price: amount("100"),
+                multiplier: amount("1"),
+                delta: Decimal::ZERO,
+                gamma: Decimal::ZERO,
+            })
+            .collect();
+        let decision = evaluate_portfolio_risk_with_candidates(&policy, &snapshot, &legs)
+            .expect("group decision");
+        assert!(
+            decision.approved,
+            "four legs are one order: {:?}",
+            decision.reason_codes
+        );
     }
 
     #[test]
