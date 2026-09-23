@@ -5,7 +5,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "benchmark_schema_version",
+    "model_evaluation_schema_version",
     "benchmark_id",
     "model_identifier",
     "evaluation_dataset_id",
@@ -19,7 +19,7 @@
     "evaluated_at"
   ],
   "properties": {
-    "benchmark_schema_version": {
+    "model_evaluation_schema_version": {
       "type": "integer",
       "enum": [1]
     },

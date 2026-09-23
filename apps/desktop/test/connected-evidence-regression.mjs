@@ -121,7 +121,7 @@ assert.throws(
 
 // D. ModelEvaluationBenchmark (AI-06)
 const validBenchmark = {
-  benchmark_schema_version: 1,
+  model_evaluation_schema_version: 1,
   benchmark_id: "eval.model.gemini-pro",
   model_identifier: "gemini-1.5-pro",
   evaluation_dataset_id: "ds.eval.research-ops.v1",

@@ -29,7 +29,13 @@ not merely deferred) delta: 2026-09-18; short-side tax-lot support added to
 `core/accounting::TaxLotBook` and wired into `core/backtest::
 AdvancedBacktestAccount`'s real fill path, including proportional fee-split
 crossing-fill handling, closing the row 5.8 gap recorded since item 32
-delta: 2026-09-18.
+delta: 2026-09-18; CI static-analysis/supply-chain hardening (a real Semgrep
+SAST job, every GitHub Action pinned from a mutable tag to its resolved
+commit, a Dependabot cooldown period, and a genuine nginx dashboard-proxy
+host-header-spoofing fix the new SAST pass itself found) and three
+independent property/model-test slices -- the OMS order-lifecycle state
+machine, the options exercise/assignment settlement function, and
+multi-account portfolio aggregation -- delta: 2026-09-20.
 Source reviewed: all 29 pages of the original `Solo Trading Operating System
 Master Plan.pdf`.** This is the controlling
 requirement-to-evidence record. It does not turn planned work, a local mechanism,
@@ -65,6 +71,24 @@ Status terms used below:
 - **Deferred by plan**: the master plan intentionally sequences or freezes it.
 
 ## Verification snapshot
+
+A 2026-09-20 session investigated row 5.6's EMS options-combination gap in
+depth and found the real remaining scope is a bounded-but-real multi-session
+epic, not a same-session wiring fix (see row 5.6's own "Assessed 2026-09-20"
+remainder text); rather than land that half-finished, the session instead
+closed four smaller, fully bounded gaps: item 41 (real Semgrep SAST in CI,
+every GitHub Action pinned to a resolved commit SHA, a Dependabot cooldown
+period, and a genuine nginx host-header-spoofing fix the new SAST tooling
+itself found), item 42 (a first `proptest`-based model test for the OMS
+order-lifecycle state machine, `core/control-plane/tests/
+oms_lifecycle_proptest.rs`), item 43 (a second, independent property-test
+slice for the options exercise/assignment settlement function, `core/options/
+tests/option_lifecycle_settlement_proptest.rs`), and item 44 (a third slice
+for multi-account portfolio aggregation, `core/accounting/tests/
+multi_account_aggregation_proptest.rs`) -- all three property-test slices
+independently verified to actually catch a deliberately injected defect
+before being relied on, not merely written to run. See items 41-44 for full
+detail.
 
 The same 2026-09-18 session, having closed the entire 5.7 Slice 2 backlog
 (item 39), moved to row 5.8's own long-standing recorded gap: item 40 added a
@@ -345,7 +369,7 @@ kept current, which is itself corrected here rather than left stale):
 | 5.3 Python strategy SDK | Implemented local replay boundary | Isolated worker handshake, strategy/version identity, bundle hashing, deterministic bar-to-intent contract, point-in-time historical queries, deterministic SMA/EMA helpers, immutable portfolio snapshots, bounded saved state with fingerprints, bounded custom metrics, example strategy, schemas, and Strategy Studio projection are implemented. The Rust replay host sends the strict history/portfolio/cash/state frame to Python workers, applies replayed fills to the host-owned portfolio view, and rejects tampered fingerprints, look-ahead metrics, malformed metrics, or protocol drift. Strategy code cannot access broker adapters or credentials. | Direct Python fill/risk callbacks, a deployed gRPC strategy-worker host, and production worker deployment remain external integration work. |
 | 5.4 Professional backtester | Implemented CLI projection; runner-internal accounting remains bounded | Event-driven replay, exact decimal accounting, spread, adverse slippage, attributed commission/exchange/regulatory charges, latency, per-bar partial-fill caps, persistent working orders, post-cost limit protection, sessions/halts, dividends/splits, point-in-time universe membership, long/short accounting, borrow availability/recall calculation, exact borrow/cash-debit financing, multi-currency FX, initial-margin capital checks, delisting settlement, immutable reports/manifests, experiment records, and Backtest Explorer capability evidence are implemented and tested. Every CLI backtest derives a hashed advanced-account result from the same canonical event stream and refuses publication when its capital or lifecycle checks fail. Explicit economics use `advanced_account`; older configurations use a deterministic fully-paid profile derived from immutable reference data. | Multi-account allocation and proof against production-size performance targets remain. The in-run `BacktestRunner` ledger is retained for backward-compatible event construction, so an operator must consume the advanced-account sidecar for advanced economics. |
 | 5.5 OMS | Implemented for current market/limit scope | Stable client identities, idempotency, legal state transitions, cancel/replace, out-of-order evidence, UNKNOWN handling, restart recovery, reconciliation, and causal audit events exist in simulation/PAPER/controlled-LIVE. Execution Blotter renders the lifecycle. `core/paper::evaluate_risk` and `core/live::evaluate_risk` (the exact functions every PAPER/controlled-LIVE order intent passes through before an `OmsOrder` is created) now reject a same-instrument opposite-side order against an existing working order (`SELF_TRADE_RISK`) and reject submissions beyond a configured rolling-window rate (`MAX_ORDER_RATE_EXCEEDED`), closing a prior gap where those two pre-trade-risk-doc checks existed only in the disconnected `core/risk` evidence engine and never actually gated a real order. The desktop order ticket's submit/cancel/close-position commands are no longer permanently wired to an inert `TradingCommandState::unavailable()` stub: `apps/desktop/src-tauri/src/paper_gateway.rs` is a real `RiskOmsGateway` backed by an in-process `follon_paper::PaperTradingService`, so when an operator points `FOLLON_DESKTOP_PAPER_CONFIG` at a valid PAPER configuration file the desktop actually submits, cancels, and closes real PAPER orders through the genuine risk/kill-switch/audit-journal path (see the UX row below and the dated entry in "Locally closed gaps"). | It is not a claim of complete OMS coverage for every future order type, asset class, or live broker. Without `FOLLON_DESKTOP_PAPER_CONFIG` configured, the desktop command surface remains unavailable exactly as before. |
-| 5.6 EMS | Implemented as broker-neutral planning and local TCA; capital gate open | `core/execution` implements immediate, exact TWAP, forecast-volume VWAP, POV/participation, urgency-weighted arrival price, sequential display-size Iceberg, deterministic weighted AlgoWheel with schedule tie-breaking, strict post-only passive cancel/replace with monotonic chase collars, capability-gated multi-venue smart routing (`smart_route_with_capabilities`), stop/stop-limit bracket children, monotonic trailing stops, exact basket legs, and atomic ratio/net-price-protected options combinations. Content-addressed `ExecutionPlanEvidence` records bind parent order, scheduled slices, route decisions, frozen arrival/target benchmarks, and a SHA-256 fingerprint. `follon-tca` produces immutable parent-order implementation-shortfall reports against frozen benchmarks. Quantity conservation and safety boundaries are tested; the versioned gRPC service exposes scheduled execution, cancel-before-replace passive plans, and synchronized net-price-protected option combinations without discarding venue/order-kind/stop fields. | Options-combination atomicity requires a native-combo adapter or rejection before transmitting any leg. TCA relies on operator-supplied frozen evidence and does not validate a broker statement. Every vendor transport still needs independent human review and broker-backed PAPER/LIVE acceptance. |
+| 5.6 EMS | Implemented as broker-neutral planning and local TCA; capital gate open | `core/execution` implements immediate, exact TWAP, forecast-volume VWAP, POV/participation, urgency-weighted arrival price, sequential display-size Iceberg, deterministic weighted AlgoWheel with schedule tie-breaking, strict post-only passive cancel/replace with monotonic chase collars, capability-gated multi-venue smart routing (`smart_route_with_capabilities`), stop/stop-limit bracket children, monotonic trailing stops, exact basket legs, and atomic ratio/net-price-protected options combinations. Content-addressed `ExecutionPlanEvidence` records bind parent order, scheduled slices, route decisions, frozen arrival/target benchmarks, and a SHA-256 fingerprint. `follon-tca` produces immutable parent-order implementation-shortfall reports against frozen benchmarks. Quantity conservation and safety boundaries are tested; the versioned gRPC service exposes scheduled execution, cancel-before-replace passive plans, and synchronized net-price-protected option combinations without discarding venue/order-kind/stop fields. | **Assessed 2026-09-20, superseding this row's original remainder text.** The literal sentence "requires a native-combo adapter or rejection before transmitting any leg" is already satisfied at the adapter boundary: `PaperBrokerAdapter::submit_combo`'s default rejects with "broker adapter does not support native combos" (`core/paper/src/lib.rs`), and `IbkrControlledLiveAdapter`/the PAPER IBKR bridge override it with a real atomic BAG-order transport (item 15). The real, previously unrecorded gap is one level up: `PaperBrokerRegistry::submit_combo` only calls `request.validate()` and forwards straight to the adapter -- it is never reached from `PaperTradingService::submit_intent`'s risk-gated path (`evaluate_risk`, kill switches, self-trade/rate-limit checks, `OmsOrder` lifecycle, journal). A repository-wide search found no caller of it outside `core/paper` itself: it is dead code from the perspective of any real order-intent flow. `core/live` has no combo type or method at all. Closing this requires a risk-gated combo entry point in both `core/paper` and `core/live` -- a new multi-leg intent type, an aggregate-notional/price-collar risk check, a durable per-combo OMS/journal record, and parity for `core/live` -- assessed this pass as a bounded-but-real multi-session epic (comparable in shape to the four-slice row 5.7 composition gap, items 35-39), not a same-session wiring fix, so it was deliberately not attempted half-finished here. TCA relies on operator-supplied frozen evidence and does not validate a broker statement. Every vendor transport still needs independent human review and broker-backed PAPER/LIVE acceptance. |
 | 5.7 Risk engine | Implemented portfolio kernel; the entire Slice 2 aggregate-composition backlog is closed -- gross/net/leverage/concentration/bucket (Slice 1), drawdown (Slice 2a), daily loss (Slice 2b), margin utilization (Slice 2c), and strategy-bucket limits (Slice 2d) are all now composed into the real order path | `core/risk` evaluates gross/net, leverage, concentration, daily loss, drawdown, margin utilization, delta/gamma, instrument permissions/restrictions, sector/asset/currency/strategy buckets, open orders, order rate, self-trade, and kill state. A fresh FX snapshot can only create an ordinary local candidate with retained snapshot/version/value-date evidence; it still receives the same aggregate risk decision. The kernel returns exact reason codes, is exposed over gRPC, and is visible in Risk Cockpit capability mapping. Self-trade prevention and order-rate limiting are independently duplicated directly inside the actual PAPER/controlled-LIVE order-gating path (`core/paper`/`core/live` `evaluate_risk`, see 5.5). As of item 35, that same real order-gating path also calls the unmodified `evaluate_portfolio_risk` kernel itself (not just two of its individual checks) behind an opt-in `portfolio_risk` configuration block, with a real per-service `PortfolioRiskSnapshot` built from actual positions/working orders/observed marks. As of item 36, that snapshot's `peak_equity` is a real, durable running high-water-mark (`PaperTradingService`/`LiveTradingService::peak_equity`), making `MAX_DRAWDOWN_EXCEEDED` a genuine computed decision rather than a permanently inert one. As of item 37, that same snapshot's `daily_pnl` is a real, durable session-start equity baseline (`PaperTradingService`/`LiveTradingService::daily_baseline_equity`, reset at the first risk evaluation of each new UTC calendar day), making `MAX_DAILY_LOSS_EXCEEDED` a genuine computed decision rather than a permanently inert one. As of item 38, that same snapshot's `margin_used` is a real value computed by calling the unmodified `core/accounting::value_margin_account` against an operator-authored per-asset-class margin rate, making `MAX_MARGIN_UTILIZATION_EXCEEDED` a genuine computed decision rather than a permanently inert one. As of item 39, every held position is split into one real `RiskPosition` row per strategy (plus an honest "unattributed" remainder), sourced from a new durable per-strategy attribution ledger (`PaperTradingService`/`LiveTradingService::strategy_attribution`), making `STRATEGY_LIMIT_EXCEEDED` a genuine computed decision rather than a permanently inert one. | **Status side by side, row 5.7 remainder (2026-09-18, item 39):**<br>**Before (pre-item-39):** "Strategy-bucket checks remain **not** composed: `strategy_limits` stays empty because `Portfolio` (`core/control-plane`, shared by `core/paper`/`core/live`/`core/backtest`) has no `strategy_id` field at all... closing this gap is a `Portfolio`-level architectural redesign... not a bounded wiring task like margin utilization, daily loss, or drawdown were."<br>**After (post-item-39):** That assessment's conclusion changed on closer investigation, and the correction is recorded rather than quietly overwritten: `Portfolio`/`PositionSnapshot` were never touched. `core/paper`/`core/live` each gained a new, deliberately separate per-strategy attribution ledger (`strategy_attribution: BTreeMap<instrument_id, BTreeMap<strategy_id, signed_quantity>>`), updated from the same real-fill code path as `TaxLotBook`, and durably persisted the same way. `portfolio_risk_decision` now splits each instrument's aggregate position into one real `RiskPosition` row per strategy that has ever traded it, plus an "unattributed" remainder row so the split can never mis-state total gross/net exposure -- only how it is attributed. `strategy_limits` is a real, operator-configurable bucket-limit map now (previously always empty). **Every item in the Slice 2 backlog first identified in item 35 is now closed**: peak-equity/drawdown (item 36), daily-loss baseline (item 37), margin utilization (item 38), and strategy-bucket attribution (item 39). No further aggregate-risk-kernel composition work remains queued for `core/paper`/`core/live`; production policy calibration, latency/load evidence, independent validation, live-feed staleness history, and clean broker-backed operating sessions remain external. |
 | 5.8 Portfolio/accounting | Implemented multi-currency/margin kernel with long *and* short tax-lot coverage; external statement gate open | `core/accounting` provides per-currency balanced double entry, idempotent projection, fresh direct/inverse FX, spot-snapshot-only cash conversion, multi-currency cash/long/short valuation, initial/maintenance margin, excess liquidity, margin-call projection, FIFO/LIFO/highest-cost tax-lot disposal, and exact cash-debit/short-borrow financing accrual. `follon-operations reconcile-statement` ingests broker CSV statements and reconciles internal cash/positions. PostgreSQL has deferred balanced-journal constraints; gRPC exposes valuation; Portfolio/Journal surface the capability. A `HighestCost` disposal tie between two lots of identical unit cost is now broken by oldest acquisition first, matching the documented policy exactly instead of an incidental lot-identity string order. `core/paper`, `core/live`, and the plain `core/backtest::BacktestLedger` now all call `TaxLotBook::acquire`/`dispose` from their one real-fill code path (see items 32-34), each maintaining an independent FIFO cost-basis ledger in lockstep with every real fill; the two durable services persist and recover it across journal restarts. As of item 40, `TaxLotBook` also models the short side (`open_short`/`cover`, mirroring `acquire`/`dispose` exactly), and `core/backtest::AdvancedBacktestAccount` -- the long/short-capable advanced projection previously left unwired -- now calls it from its own real-fill path, including a crossing fill (one execution that closes an existing long/short and opens the opposite side) split into a closing leg and an opening leg with the fill's fee divided proportionally between them. | Tax outputs are deterministic accounting facts, not jurisdiction-specific tax advice. Lot selection is fixed at FIFO, not operator-configurable, everywhere it is wired. `AdvancedBacktestAccount`'s own average-cost `realized_pnl` and the new FIFO tax-lot `realized_pnl` are intentionally different figures (the former ignores fees, the latter is fee-inclusive) -- an existing, already-documented distinction for `core/paper`/`core/live`, not a new inconsistency. Multi-prime allocation and qualifying production reconciliation history remain external/integration work. |
 | 5.9 Risk cockpit | Implemented for planned aggregate fields; operating gate open | The cockpit maps portfolio exposure, leverage/drawdown/margin/Greeks and bucket controls alongside kill switches, working/UNKNOWN orders, incidents, broker/reconciliation health, attribution, and evidence links. | Real alert delivery/on-call ownership, live-feed heartbeat history, and operated production evidence remain external. |
@@ -401,7 +425,7 @@ does not expose privileged mutations through the read-only evidence server.
 | --- | --- | --- |
 | Deterministic replay and exact accounting | Implemented | Repeatability, canonical serialization, exact decimal, cumulative fill/accounting, and artifact immutability tests exist. |
 | OMS/risk invariants | Implemented for current scope | Rejected intent creates no order; illegal transitions fail; fills cannot exceed quantity; duplicate IDs and broker evidence are bounded; kill-switch and recovery tests exist. |
-| Property/model/fault testing | Partial | Unit, integration, end-to-end, malformed-input, fault-injection, restart, reconnect, out-of-order, latency, partial-fill, and tamper tests exist. A comprehensive state-model/property test program for every planned asset/order type is not complete. |
+| Property/model/fault testing | Partial | Unit, integration, end-to-end, malformed-input, fault-injection, restart, reconnect, out-of-order, latency, partial-fill, and tamper tests exist. As of item 42 (2026-09-20), a real `proptest`-based model test (`core/control-plane/tests/oms_lifecycle_proptest.rs`) exists for the OMS order-lifecycle state machine, checked against an independently-authored edge-list model, not the implementation's own private validator. As of item 43 (2026-09-20), a second, independently designed property-test slice (`core/options/tests/option_lifecycle_settlement_proptest.rs`) checks `settle_expired_option_position`'s economic invariants -- exact position closure, cash/underlying conservation under both settlement methods, outcome classification, and determinism. As of item 44 (2026-09-20), a third slice (`core/accounting/tests/multi_account_aggregation_proptest.rs`) checks `aggregate_account_portfolios`'s own documented invariants -- cash/position conservation across contributing accounts and order-independence. A comprehensive state-model/property test program for every planned asset/order type (EMS scheduling/combination legality, the rest of `core/accounting`'s margin/tax-lot/financing functions) remains incomplete; these are three bounded slices. |
 | Shadow/canary operation | Mechanism implemented; external gate | Shadow prevents broker submit and canary limits capital/action. No production operating history exists. |
 | Risk decision p99 under 5 ms | Local measurement mechanism implemented; production proof unproven | `follon-risk-benchmark` runs a versioned, frozen portfolio policy/snapshot/candidate with explicit warmup, measured iteration count, threshold, source hash, and p99 observation. A retained benchmark on representative deployment hardware and production load/availability evidence are still required. |
 | 99.9% session availability | Unproven | No qualifying production session history exists. |
@@ -416,7 +440,7 @@ does not expose privileged mutations through the read-only evidence server.
 | Secret ingress | Implemented interfaces; deployment gate | Managed-command/password/connection-string file boundaries and zeroizing broker material exist. Production mode refuses a direct database URL and requires a TLS connection string. A production vault/keychain, rotation operation, and custody evidence remain external. |
 | Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
-| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. Complete SAST/DAST coverage and security-operation ownership are not evidenced. |
+| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. DAST (an authenticated dynamic scan against a running deployment) and named security-operation ownership remain external. |
 | Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. |
 | MFA, short sessions, revocation, customer RBAC and tenant isolation | Implemented kernel/schema; deployment gate | Argon2id, password policy/rotation, TOTP with bounded challenges, hashed one-time recovery codes, lockout, opaque hashed 15-minute sessions, security-version revocation, five roles, tenant authorization, and PostgreSQL RLS schema are tested. Production enrollment, out-of-band delivery, support, and customer acceptance remain external. |
 | TLS and encryption at rest | TLS topology implemented; custody gate | Production Compose requires gRPC mTLS and a client-certificate dashboard proxy, pinned reviewed images, certificate secret files, and PostgreSQL `sslmode=require`. Certificate issuance/rotation, encrypted volume/KMS ownership, and deployed proof remain external. |
@@ -1461,6 +1485,235 @@ These are mandatory master-plan acceptance conditions and are currently open:
       `core/live` -- not a new inconsistency introduced here. This closes the specific gap 5.8 has recorded
       since item 32; it does not change borrow/recall/financing modeling (already implemented and unaffected)
       or any external gate.
+41. CI static-analysis and supply-chain hardening, and a genuine finding the new tooling caught and fixed
+    itself (2026-09-20, Security conformance). Closes the specific "Complete SAST/DAST coverage... not
+    evidenced" gap that row has recorded since the audit's first version, for the SAST half.
+    - **What is now real.** A `sast` job in `.github/workflows/ci.yml` runs Semgrep 1.177.0 against the whole
+      tracked tree with the `p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, and `p/secrets` registry
+      rulesets and `--error` (build-failing, matching this workflow's existing `-D warnings`/`--deny yanked`
+      strictness, not an advisory-only report). Two rules are excluded with a documented reason
+      (`--exclude-rule`): `rust.lang.security.temp-dir.temp-dir` and `rust.lang.security.args.args` both fired
+      exclusively on this repository's own `#[test]`-only fixture paths and ordinary local-file CLI argument
+      parsing (verified by reading every one of their 42 combined hits before excluding either), not a real
+      insecure-temp-file or injection pattern -- confirmed by first running the scan locally, reading each
+      finding's actual source location, and only then choosing the CI configuration, not the reverse. Every
+      `uses:` reference across all five CI jobs (`actions/checkout`, `gitleaks/gitleaks-action`,
+      `actions/dependency-review-action`, `dtolnay/rust-toolchain`, `actions/setup-node`,
+      `actions/setup-python`, `actions/upload-artifact`) is now pinned to the exact commit SHA its previous
+      mutable tag currently resolves to (resolved via the real GitHub API, not guessed), with a `# vX.Y.Z`
+      comment for traceability, closing the `yaml.github-actions.security.github-actions-mutable-action-tag`
+      finding (16 occurrences) Semgrep raised. `.github/dependabot.yml` gained a `cooldown` block
+      (`default-days: 7`, `semver-major-days: 21`, `semver-minor-days: 10`, `semver-patch-days: 7`) on all
+      four ecosystems, closing the `dependabot-missing-cooldown` finding (4 occurrences).
+    - **A real defect the new tooling found and fixed, not a rule silenced to get a clean run.** The Semgrep
+      `nginx` ruleset flagged `infra/nginx.dashboard.conf:35` (`generic.nginx.security.request-host-used`,
+      CWE-290): `proxy_set_header Host $host;` forwards the inbound request's own, attacker-controlled Host
+      header straight to the dashboard backend. `apps/desktop/server.py` was checked and does not read the
+      Host header for anything (no vhost routing, no redirect construction), so the fix is a fixed, known-good
+      value matching the `proxy_pass` target exactly (`proxy_set_header Host dashboard:8080;`) rather than an
+      operator-configurable template -- this removes the untrusted-input pattern entirely instead of merely
+      validating it. Also confirmed `actions/dependency-review-action@v4` was already a latent bug before this
+      entry: that repository has no bare `v4` tag (only exact `v4.x.y` releases), so the existing line would
+      have failed to resolve if its `vars.DEPENDENCY_REVIEW_ENABLED == 'true'` guard were ever flipped on; it
+      is now pinned to the real `v4.9.0` commit.
+    - **Independently verified, not merely written.** The exact CI Semgrep command was run locally against the
+      real tree before and after each fix: 63 findings across 5 categories at first trial, down to the 2
+      documented, justified exclusions plus 4 genuine fixes (nginx, GitHub Actions pins, Dependabot cooldown),
+      ending at **0 findings, exit code 0**. `cargo fmt --all -- --check`, `cargo clippy --workspace
+      --all-targets -- -D warnings`, and `cargo test --workspace --all-targets` (captured to a file and
+      checked by a real `$?`, not piped through `grep`, per the lesson item 40 already recorded) all remained
+      clean after the unrelated changes in this same entry's session (see item 42). `python -c "import yaml"`
+      parsed both edited YAML files without error.
+    - **Bounded scope, stated plainly.** DAST (an authenticated dynamic scan against a running deployment,
+      e.g. an OWASP ZAP baseline run against the `infra/compose.dev.yml` topology proven live in item 29) is
+      explicitly not attempted here -- it needs a running target and its own review, not a CI-config change,
+      and is recorded as still open in the Security conformance table. Semgrep's registry rulesets are not
+      pinned to a fixed ruleset revision (only the CLI version, 1.177.0, is pinned), so, like `cargo audit`,
+      this job can start failing on unchanged code when the registry adds a new rule -- an accepted,
+      already-precedented tradeoff for advisory/scanning CI jobs in this workflow, not an oversight.
+42. A first property/model-test slice for the OMS order-lifecycle state machine (2026-09-20, Reliability and
+    quality conformance). A first bounded slice of the "comprehensive state-model/property test program... not
+    complete" gap that row has recorded since the audit's first version; the full program remains open.
+    - **What is now real.** `core/control-plane/tests/oms_lifecycle_proptest.rs` adds `proptest` (1.11.0) as a
+      dev-dependency and tests `OmsOrder::transition` against an independently-authored from -> allowed-to
+      edge table covering all 15 `OrderState` variants, deliberately written separately from (not copied from,
+      and with no access to) the crate's own private `is_valid_transition` match block, so a future edit to
+      one without the other is a real regression signal instead of the test only confirming the
+      implementation agrees with itself. The property test generates random sequences of 1-39 attempted
+      transitions per case (proptest's default 256 cases) and asserts, at every step: the real transition's
+      Ok/Err outcome matches the model's legal/illegal verdict exactly; the order's state after the attempt
+      equals what the model predicts; a rejected transition never mutates state (the atomicity invariant); and
+      neither `order_id` nor the original `intent` ever changes across any attempted transition, legal or not.
+      Two further deterministic tests assert `Filled` has no legal outgoing transition at all, not even to
+      `UNKNOWN` (an absolute-terminal invariant distinct from `Cancelled`/`Rejected`/`Expired`, which do permit
+      a late-evidence transition to `UNKNOWN`), and that the independent model itself covers every declared
+      `OrderState` variant, including the two never reached by the current `from_approved_intent`/`transition`
+      implementation (`PendingRisk`, `RiskRejected`'s own further transitions).
+    - **Proven to actually catch a divergence, not merely written to run.** Before finalizing, one edge
+      (`Created -> RiskRejected`) was deliberately deleted from the model and the suite re-run: it failed
+      immediately with a real proptest-shrunk minimal counterexample (`candidates = [RiskRejected]`), then the
+      edge was restored and the suite re-run clean, along with deleting the resulting
+      `oms_lifecycle_proptest.proptest-regressions` artifact rather than committing it. This is the same
+      discipline item 40 already established for verification: a test that has not been shown to fail on a
+      real defect is not yet evidence that it can catch one.
+    - **Independently verified.** `cargo test -p follon-control-plane --test oms_lifecycle_proptest` passed (3
+      tests). The full workspace suite (captured to a file, checked by a real `$?`) went from 282 to **285
+      passed, 0 failed, 3 ignored** in the main workspace, and the separate `apps/desktop/src-tauri` Tauri
+      workspace was independently re-run and remained **17 passed, 0 failed**, confirming this entry's changes
+      (scoped to `core/control-plane` only) did not touch it. `cargo fmt --all -- --check` and `cargo clippy
+      --workspace --all-targets -- -D warnings` both stayed clean.
+    - **Bounded scope, stated plainly.** This covers one state machine (`core/control-plane::OmsOrder`, shared
+      by `core/paper`/`core/live`/replay). It is not model/property coverage for options exercise/assignment,
+      EMS scheduling/combination legality, multi-currency accounting invariants, or any other planned
+      asset/order type -- those remain open, exactly as the Reliability conformance row now states.
+43. A second property-test slice, for the options exercise/assignment settlement function (2026-09-20,
+    Reliability and quality conformance). Closes the "options exercise/assignment" example named in item 42's
+    own remainder text; the wider program (EMS scheduling/combination legality, multi-currency accounting)
+    remains open.
+    - **What is now real.** `core/options/tests/option_lifecycle_settlement_proptest.rs` adds `proptest` as a
+      dev-dependency to `core/options` and checks `settle_expired_option_position` -- a pure function, not a
+      persistent state machine, so its properties are economic invariants independently derived from the
+      documented contract (`OptionLifecycleOutcome`/`OptionSettlementMethod` doc comments) rather than an
+      edge-list model: (1) every settlement closes the position exactly
+      (`option_quantity_delta == -signed_contract_quantity`) and intrinsic value is never negative; (2) cash
+      settlement never moves the underlying, expiry always zeroes both deltas, and physical settlement's
+      underlying and cash deltas always run in exactly opposite directions -- nothing is ever delivered and
+      paid for in the same direction, and nothing is ever free; (3) the three outcomes (`Expired`/`Exercised`/
+      `Assigned`) classify consistently against intrinsic value, the automatic-exercise threshold, and
+      position sign; (4) settlement is a pure, deterministic function of its inputs. Two deterministic tests
+      cover pre-expiration and zero-quantity rejection.
+    - **Proven to actually catch a divergence, not merely written to run.** Before finalizing, the physical
+      settlement cash-sign negation was deliberately deleted (`cash_delta = underlying_quantity_delta *
+      strike` instead of its negation) and the suite re-run: `settlement_method_conservation_holds` failed
+      immediately with a real proptest-shrunk counterexample (a short call, strike 100, multiplier 100,
+      quantity -2, underlying 200 -- both deltas landing at the same sign instead of opposite), then the fix
+      was restored and the suite re-run clean, along with deleting the resulting
+      `option_lifecycle_settlement_proptest.proptest-regressions` artifact rather than committing it -- the
+      same discipline items 40 and 42 already established. A first mutation attempt (swapping the Call/Put
+      physical-delivery branches) was tried first and found *not* caught by this property set, since the
+      opposite-sign conservation check holds regardless of which branch computed the delta; that miss is
+      recorded here rather than quietly discarded, and is exactly why the cash-sign-negation mutation was
+      tried next as a check the properties as written could actually fail on.
+    - **Independently verified.** `cargo test -p follon-options --test option_lifecycle_settlement_proptest`
+      passed (6 tests). `cargo fmt --all` reformatted the new file's import ordering (one automatic fixup,
+      confirmed to touch no other file via `git status`); `cargo fmt --all -- --check` and `cargo clippy
+      --workspace --all-targets -- -D warnings` were both clean afterward. The full workspace suite (captured
+      to a file, checked by a real `$?`) went from 285 to **291 passed, 0 failed, 3 ignored**.
+    - **Bounded scope, stated plainly.** This covers one pure settlement function, not the full options
+      lifecycle (chain construction, Greeks, multi-leg expiry scenarios already have their own example-based
+      tests, not property tests) or any other planned asset/order type.
+44. A third property-test slice, for multi-account portfolio aggregation (2026-09-20, Reliability and quality
+    conformance). Advances the "multi-currency accounting" example named in items 42-43's own remainder text;
+    the wider program (EMS scheduling/combination legality, the rest of `core/accounting`'s margin/tax-lot/
+    financing functions) remains open.
+    - **What is now real.** `core/accounting/tests/multi_account_aggregation_proptest.rs` adds `proptest` as a
+      dev-dependency to `core/accounting` and checks `aggregate_account_portfolios` -- a pure, deterministic
+      projection, like item 43's settlement function, not a persistent state machine -- against two invariants
+      the function's own doc comment already commits to ("deterministic irrespective of input snapshot order")
+      plus one this test adds explicitly: conservation. Generated 1-5 accounts drawing from a small fixed
+      universe of two cash currencies and two instruments (kept fixed-per-instrument, not randomized, so every
+      contributing account agrees on asset class/currency/multiplier by construction -- the property under
+      test is conservation on the success path, not the pre-existing disagreement-rejection path, which already
+      had its own unit test). Checked: aggregated cash per currency equals the exact sum contributed by every
+      account that held it; an aggregated position's quantity and market value equal the exact sum across
+      every contributing account, and its `contributing_account_ids` is exactly that account set, sorted; a
+      currency or instrument no account held is absent from the result entirely, not zeroed; and re-running
+      aggregation against the same accounts rotated into a different order produces a byte-for-byte identical
+      result. Three deterministic tests cover the documented rejection paths: duplicate `account_id`,
+      mismatched `as_of`, and an empty account list.
+    - **Proven to actually catch a divergence, not merely written to run.** Before finalizing, the market-value
+      accumulator was deliberately changed from summing (`checked_add`) to overwriting (keeping only the last
+      contributing account's value) and the suite re-run: both `aggregation_conserves_cash_and_position_totals`
+      and `aggregation_is_order_independent` failed immediately with a real proptest-shrunk two-account
+      counterexample showing the exact wrong total, then the fix was restored and the suite re-run clean,
+      along with deleting the resulting `multi_account_aggregation_proptest.proptest-regressions` artifact --
+      the same discipline items 40, 42, and 43 already established.
+    - **Independently verified.** `cargo test -p follon-accounting --test multi_account_aggregation_proptest`
+      passed (5 tests). `cargo fmt --all` reformatted one line in the new file (confirmed via `git status` to
+      touch no other file); `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D
+      warnings` were both clean afterward. The full workspace suite (captured to a file, checked by a real
+      `$?`) went from 291 to **296 passed, 0 failed, 3 ignored**.
+    - **Bounded scope, stated plainly.** This covers one pure aggregation function operating on
+      already-reconciled, already-marked account snapshots; it says nothing about margin valuation
+      (`value_margin_account`), tax-lot disposal, financing accrual, or FX conversion correctness, all of
+      which remain example-tested only, and it does not touch, and is not evidence for, cross-account
+      allocation or transfer, which the roadmap keeps frozen regardless.
+45. Fabricated-evidence remediation, round two: the 32 "advanced evidence" fixtures never had real backing, and
+    fixing it surfaced two further real bugs (2026-09-20). This is the same zero-synthetic-data violation items
+    23-24 already found and fixed once (2026-09-10) -- recurring in a subsystem that remediation never reached.
+    - **What was wrong.** `tools/build_advanced_evidence_fixtures.py` is 32 hand-typed Python dict literals (for
+      example a `"return_bps": "1420.00"` invented for `experiment-lineage.json`), one per DUR/SOLO/RES/DATA
+      evidence category, each validated only against its own JSON Schema -- never derived from any computation.
+      A repository-wide search confirmed **29 of the 32 have zero real Rust or Python backing anywhere in the
+      codebase**: SOLO-04 Market Scanner, DATA-03 News Revision Timeline, and RES-02 Strategy Composition
+      Studio -- all three named in item 22 as "100% typed and populated" -- are not partially-implemented
+      features; nothing computes them at all. The remaining 3 (`strategy-capsule-manifest`,
+      `decision-reconstruction`, `data-rights-and-semantics-receipt`) do have real Rust modules
+      (`core/control-plane::capsule`/`::provenance`, `core/market-data::rights`), but no CLI subcommand invokes
+      any of them either, so all 32 were equally fake in the actual pipeline output. `tools/
+      generate_pipeline_evidence.py`'s step 16g copied all 32 straight into `var/` -- the directory every other
+      genuinely-computed artifact publishes to and the dashboard reads as real, dated evidence -- and the
+      desktop rendered them through the same `appendAdvancedEvidenceRows` mechanism as real evidence, with
+      professional-sounding panel copy ("Screen instruments against versioned indicators... with ranked
+      reasons"). Items 21/22's own claims ("32 canonical advanced evidence fixtures... published," "zero
+      unavailable evidence panels," "100% typed and populated") were true only because the data was invented,
+      not because real evidence existed.
+    - **The fix.** Step 16g no longer copies the 32 fixtures into `var/`; `build_advanced_evidence_fixtures.py`
+      still runs (it is a legitimate schema-conformance test, validating 32 example documents against their
+      contracts) but its output stays in `tests/fixtures/config/advanced/`, which is what it actually is.
+      Verified this needed zero dashboard code changes: `appendAdvancedEvidenceRows`'s existing, already-tested
+      empty-state path (`"No typed market-scanner candidate records are published."` etc.) is exactly what a
+      missing category was always designed to fall back to. Confirmed live, not just by reading code: rebuilt
+      `web-dist`, ran the real `apps/desktop/server.py` against a freshly regenerated `var/`, and drove a
+      headless browser to `/workspace/command-center`, `/workspace/news-cockpit`, and `/workspace/
+      strategy-studio` -- all three panels now render their honest empty state, zero console errors, zero
+      failed requests. `tools/generate_pipeline_evidence.py`'s own honest final count dropped from the
+      previously-claimed **75** to **42** genuinely-computed or genuinely-copied artifacts.
+    - **A real defect the fix's own live verification found: a schema-field collision was silently hiding
+      genuine evidence.** With the fake `model-evaluation-benchmark.json` gone, the live dashboard snapshot
+      still showed a `model_evaluation_benchmark` category -- but the *only* file in `var/` containing its
+      discriminator field, `benchmark_schema_version`, was `follon-risk-benchmark.json`: the real, genuinely
+      computed local risk-latency benchmark (p99 microseconds against the local threshold), evidence for the
+      roadmap's own "risk-check p99 below 5 ms" service objective. `apps/desktop/server.py`'s
+      `ADVANCED_EVIDENCE_SCHEMAS` table happened to reuse the bare field name `benchmark_schema_version` for
+      the fabricated `model_evaluation_benchmark` category -- the *only* collision among 39 otherwise-unique
+      discriminators -- so the real risk-benchmark file was misclassified into the wrong category server-side,
+      then silently dropped by the TypeScript boundary's strict re-validation (right guard, wrong outcome: the
+      code was already written not to trust a classification blindly, it just could not detect that the
+      classification itself was wrong). Net effect, confirmed live before the fix: the "Local risk-evaluator
+      benchmark" panel in Execution Blotter rendered **empty** despite the real evidence existing on disk. Renamed
+      the fabricated schema's field to `model_evaluation_schema_version` (`contracts/json-schema/v1/
+      model-evaluation-benchmark.schema.json`, `tools/build_advanced_evidence_fixtures.py`, `apps/desktop/
+      server.py`, `apps/desktop/src/evidence.ts`, `apps/desktop/test/connected-evidence-regression.mjs`) and
+      added a comment on `ADVANCED_EVIDENCE_SCHEMAS` requiring every future discriminator to stay unique against
+      this table *and* the other bare `benchmark_schema_version` check in `classify_artifact`. Confirmed live:
+      the panel now shows the real artifact, `p99=44µs`, `threshold=5000µs`, "Within local threshold."
+    - **A second real defect the fix's own verification found: the pipeline was silently corrupting a checked-in
+      test fixture on every run.** `generate_pipeline_evidence.py`'s Step 15 ran `follon-live-status` directly
+      against `tests/fixtures/live/journal-v1.ndjson` -- a git-tracked fixture, not a `var/` output.
+      `follon-live-status` durably appends a `live.service.restarted.v1` audit event to whatever journal it
+      opens (correct, intentional behavior for a real LIVE journal: every open must be recorded), so every
+      pipeline run silently appended two lines to the checked-in fixture. Caught by `git status` showing an
+      unexpected modification to a file this entry never intended to touch, not by inspection. Fixed by copying
+      the fixture into `var/follon-live-journal.ndjson` first and pointing the command at the copy, matching
+      every other step's write-to-`var/`-only discipline. Verified by running the full pipeline twice more
+      afterward: `git status` on the fixture stayed clean both times, and `follon-live-dashboard.json` still
+      produced the correct projection (`audit_sequence: 14`, from the copy's own append) unchanged in substance.
+    - **Independently verified.** The full desktop suite (`npm run test:evidence`, 12 regression files) and
+      `python apps/desktop/test/server_contract.py` (18 tests) both passed clean after every change in this
+      entry, including the field rename and the fixture-copy fix. `cargo fmt --all -- --check` and `cargo test
+      --workspace --all-targets` (captured to a file, checked by a real `$?`) stayed clean throughout --
+      untouched by this entry's changes, which are Python/TypeScript/JSON Schema only.
+    - **Corrected elsewhere.** `docs/06-delivery/12-dashboard-feature-integration-status.md` and `docs/06-
+      delivery/13-step-by-step-implementation-matrix.md` both repeated the "32 canonical advanced fixtures...
+      75 immutable evidence artifacts... zero unavailable evidence panels" claim; both are corrected in the
+      same pass as this entry.
+    - **Bounded scope, stated plainly.** This entry stops a false claim; it does not build the 29 missing
+      features. Market Scanner, News Revision Timeline, Strategy Composition Studio, Capital Allocation Plan,
+      Adapter Qualification, and the other 24 unbacked categories remain entirely unimplemented, now honestly
+      reflected as empty dashboard panels rather than populated with invented numbers. Building real
+      computation for any of them is separate, substantial, per-category product work -- comparable in shape to
+      row 5.6's EMS combo-risk-gating epic (item 5.6's own remainder text), not a wiring task.
 
 ## Business-readiness decision
 

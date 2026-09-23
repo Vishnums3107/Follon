@@ -120,6 +120,15 @@ _AUTH_FAILURES_LOCK = Lock()
 # one of the reviewed v1 schemas.  The browser validates the complete contract
 # again before rendering it; this lightweight registry keeps the read-only
 # projection bounded without treating arbitrary JSON as operational evidence.
+#
+# Every discriminator field here must be unique across this table AND across
+# every other schema_version-style field checked elsewhere in this file (see
+# the `classify_artifact`/`benchmark_schema_version`+`p99_micros` check
+# below): a real `follon-risk-benchmark.json` artifact was previously
+# misclassified as `model_evaluation_benchmark` because both once used the
+# bare field name `benchmark_schema_version`, silently dropping the real
+# risk-latency evidence from the dashboard (found and fixed 2026-09-20, see
+# docs/06-delivery/14-master-plan-conformance-audit.md item 45).
 ADVANCED_EVIDENCE_SCHEMAS: tuple[tuple[str, str, str], ...] = (
     ("hypothesis_schema_version", "research_hypothesis", "research"),
     ("lineage_schema_version", "experiment_lineage", "research"),
@@ -144,7 +153,7 @@ ADVANCED_EVIDENCE_SCHEMAS: tuple[tuple[str, str, str], ...] = (
     ("champion_challenger_schema_version", "champion_challenger_evaluation", "research"),
     ("planner_schema_version", "capability_execution_planner", "execution-risk"),
     ("diagnosis_schema_version", "operations_diagnosis_runbook", "operations"),
-    ("benchmark_schema_version", "model_evaluation_benchmark", "operations"),
+    ("model_evaluation_schema_version", "model_evaluation_benchmark", "operations"),
     ("capsule_schema_version", "strategy_capsule_manifest", "research"),
     ("expansion_schema_version", "multi_asset_expansion_plan", "execution-risk"),
     ("reconstruction_schema_version", "decision_reconstruction", "execution-risk"),

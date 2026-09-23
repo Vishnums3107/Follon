@@ -311,12 +311,26 @@ def main() -> None:
     )
 
     # 15. Controlled Live Status Dashboard
+    #
+    # `follon-live-status` durably appends a `live.service.restarted.v1` audit
+    # event to whatever journal it opens -- intentional for a real LIVE
+    # journal (every open must be recorded), but this pipeline's input is a
+    # checked-in, immutable test fixture, not a live journal. Opening it
+    # in place silently mutated `tests/fixtures/live/journal-v1.ndjson` by
+    # two lines on every pipeline run (found and fixed 2026-09-20, see
+    # docs/06-delivery/14-master-plan-conformance-audit.md item 45). Copy it
+    # into var/ first, matching every other step's write-to-var/-only
+    # discipline, so the fixture stays a frozen input.
+    live_journal_copy = VAR_DIR / "follon-live-journal.ndjson"
+    live_journal_copy.write_bytes(
+        (REPOSITORY_ROOT / "tests" / "fixtures" / "live" / "journal-v1.ndjson").read_bytes()
+    )
     live_dash = VAR_DIR / "follon-live-dashboard.json"
     run_step(
         "Step 15: Projecting Controlled-Live Monitoring Snapshot",
         [
             "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-live-status", "--",
-            "tests/fixtures/live/journal-v1.ndjson",
+            str(live_journal_copy),
             str(live_dash),
             "--opened-at", "2026-08-11T13:30:00Z",
             "--config", "tests/fixtures/config/live-v1.json",
@@ -446,17 +460,25 @@ def main() -> None:
         targets=[privacy_receipt],
     )
 
-    # 16g. Advanced Evidence Verification and Workspace Synchronization (DUR-01 through DUR-12)
+    # 16g. Advanced Evidence Contract Validation (DUR-01 through DUR-12)
+    #
+    # `build_advanced_evidence_fixtures.py` validates 32 hand-authored example
+    # documents against their JSON schemas -- a legitimate contract test. It
+    # does NOT compute real evidence: no domain crate or CLI backs 29 of the
+    # 32 categories at all, and the 3 that do (`strategy-capsule-manifest`,
+    # `decision-reconstruction`, `data-rights-and-semantics-receipt`) are not
+    # invoked here either. These are schema-validation fixtures, not evidence,
+    # so they stay in tests/fixtures/ and are deliberately not copied into
+    # var/, which the desktop dashboard reads as real, dated evidence. Doing
+    # so previously violated the dashboard's own zero-synthetic-data invariant
+    # (see docs/06-delivery/14-master-plan-conformance-audit.md item 45) the
+    # same way items 23-24 already found and fixed once before.
     run_step(
-        "Step 16g: Validating and Publishing Advanced Evidence Fixtures",
+        "Step 16g: Validating Advanced Evidence Fixture Contracts",
         [
             sys.executable, "tools/build_advanced_evidence_fixtures.py",
         ],
     )
-    adv_fixtures_dir = REPOSITORY_ROOT / "tests" / "fixtures" / "config" / "advanced"
-    for fixture_file in sorted(adv_fixtures_dir.glob("*.json")):
-        target_in_var = VAR_DIR / fixture_file.name
-        target_in_var.write_bytes(fixture_file.read_bytes())
 
 
     # 17. News Sentiment NLP Stream

@@ -4,15 +4,35 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 10
+      semver-patch-days: 7
   - package-ecosystem: npm
     directory: "/apps/desktop"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 10
+      semver-patch-days: 7
   - package-ecosystem: pip
     directory: "/python/strategy-sdk"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 10
+      semver-patch-days: 7
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 10
+      semver-patch-days: 7
