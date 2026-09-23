@@ -18,10 +18,14 @@ use follon_accounting::{
 };
 use follon_control_plane::{EngineError, OmsOrder, Portfolio};
 use follon_domain::{
-    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, Decimal, Fill, OrderIntent,
-    OrderState, RiskDecision, Side,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill,
+    OrderIntent, OrderState, RiskDecision, Side,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
+
+mod combinations;
+
+pub use combinations::{combo_intent_fingerprint, LiveComboMarketData};
 use follon_risk::{CandidateOrder, PortfolioRiskSnapshot, RestingOrder, RiskPosition};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
 use fs2::FileExt;
@@ -209,6 +213,50 @@ pub struct LiveRiskPolicy {
     /// Slice-1 aggregate portfolio-risk composition; `None` preserves today's
     /// behavior exactly.
     pub portfolio_risk: Option<PortfolioRiskComposition>,
+    /// Operator permission for net short exposure; `None` refuses every short,
+    /// which is the behavior every configuration had before this field existed.
+    pub short_exposure: Option<ShortExposurePolicy>,
+}
+
+/// Operator permission for net short exposure at the controlled-live boundary.
+///
+/// Absent by default, and for the same reason it is absent by default in
+/// `core/paper`: the short-sell guard exists because an uncovered short has
+/// unbounded loss, and `core/live` holds no option reference data, so it cannot
+/// *prove* that a combination's short leg is covered by its long one. It does
+/// not assume it. Shorting stays refused unless an operator explicitly permits
+/// it and states an absolute per-instrument bound.
+///
+/// This is deliberately a separate type from `follon_paper::ShortExposurePolicy`
+/// rather than a shared one. The two environments are configured, reviewed and
+/// approved independently, and permitting shorts in PAPER must never be capable
+/// of permitting them with real capital as a side effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShortExposurePolicy {
+    /// Maximum absolute net short quantity permitted per instrument.
+    pub max_short_quantity: Decimal,
+}
+
+impl LiveRiskPolicy {
+    /// Whether a projected per-instrument position breaches this policy.
+    ///
+    /// Shared by the single-order and combination gates so a combination leg is
+    /// judged by exactly the rule a plain order on the same instrument would
+    /// meet -- neither stricter nor looser.
+    fn breaches_position_limit(&self, projected: Decimal) -> Result<bool, LiveError> {
+        if projected > self.max_position_quantity {
+            return Ok(true);
+        }
+        if projected < Decimal::ZERO {
+            return Ok(match self.short_exposure.as_ref() {
+                None => true,
+                Some(permission) => {
+                    Decimal::ZERO.checked_sub(projected)? > permission.max_short_quantity
+                }
+            });
+        }
+        Ok(false)
+    }
 }
 
 impl LiveRiskPolicy {
@@ -232,6 +280,18 @@ impl LiveRiskPolicy {
             || self.order_rate_window_seconds == 0
         {
             return Err(LiveError("invalid controlled-live risk policy".to_owned()));
+        }
+        if self
+            .short_exposure
+            .as_ref()
+            .is_some_and(|permission| permission.max_short_quantity <= Decimal::ZERO)
+        {
+            // `None` already expresses "no shorting", so a zero bound can only
+            // be a configuration mistake, and fails closed rather than silently
+            // agreeing with itself.
+            return Err(LiveError(
+                "live short-exposure permission must state a positive bound".to_owned(),
+            ));
         }
         if let Some(composition) = &self.portfolio_risk {
             composition.policy.validate()?;
@@ -872,21 +932,55 @@ impl LiveKillSwitchRegistry {
     }
 
     fn rejection_reasons(&self, intent: &OrderIntent) -> Vec<String> {
-        [
+        self.reasons_for(
+            &intent.account_id,
+            &intent.strategy_id,
+            std::slice::from_ref(&intent.instrument_id),
+        )
+    }
+
+    /// Kill-switch reasons for a combination.
+    ///
+    /// An instrument switch on *any* leg halts the whole combination. There is
+    /// no partial execution to fall back on -- the group is atomic -- so a
+    /// single halted leg halts the structure.
+    fn combo_rejection_reasons(&self, intent: &ComboIntent) -> Vec<String> {
+        let instruments = intent
+            .legs
+            .iter()
+            .map(|leg| leg.instrument_id.clone())
+            .collect::<Vec<_>>();
+        self.reasons_for(&intent.account_id, &intent.strategy_id, &instruments)
+    }
+
+    fn reasons_for(
+        &self,
+        account_id: &str,
+        strategy_id: &str,
+        instrument_ids: &[String],
+    ) -> Vec<String> {
+        let mut scopes = vec![
             LiveKillSwitchScope::Global,
-            LiveKillSwitchScope::Account(intent.account_id.clone()),
-            LiveKillSwitchScope::Strategy(intent.strategy_id.clone()),
-            LiveKillSwitchScope::Instrument(intent.instrument_id.clone()),
-        ]
-        .iter()
-        .filter(|scope| self.active.contains(*scope))
-        .map(|scope| {
-            format!(
-                "KILL_SWITCH_{}",
-                scope.as_key().to_ascii_uppercase().replace(':', "_")
-            )
-        })
-        .collect()
+            LiveKillSwitchScope::Account(account_id.to_owned()),
+            LiveKillSwitchScope::Strategy(strategy_id.to_owned()),
+        ];
+        scopes.extend(
+            instrument_ids
+                .iter()
+                .map(|instrument_id| LiveKillSwitchScope::Instrument(instrument_id.clone())),
+        );
+        let mut reasons = scopes
+            .iter()
+            .filter(|scope| self.active.contains(*scope))
+            .map(|scope| {
+                format!(
+                    "KILL_SWITCH_{}",
+                    scope.as_key().to_ascii_uppercase().replace(':', "_")
+                )
+            })
+            .collect::<Vec<_>>();
+        reasons.dedup();
+        reasons
     }
 }
 
@@ -2750,9 +2844,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         {
             reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
         }
-        if projected_position > self.policy.max_position_quantity
-            || projected_position < Decimal::ZERO
-        {
+        if self.policy.breaches_position_limit(projected_position)? {
             reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
         }
         if intent.side == Side::Buy && estimated_notional > available_cash {
@@ -2891,6 +2983,79 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         market: &LiveMarketData,
         decided_at: &str,
     ) -> Result<Option<(follon_risk::PortfolioRiskDecision, Decimal)>, LiveError> {
+        let Some((snapshot, margin_used)) = self.portfolio_risk_state(composition, decided_at)?
+        else {
+            return Ok(None);
+        };
+        let candidate = self.risk_candidate(
+            composition,
+            &intent.intent_id,
+            &intent.account_id,
+            &intent.strategy_id,
+            &intent.instrument_id,
+            intent.side,
+            intent.quantity,
+            market.mark_price,
+        )?;
+        let decision = follon_risk::evaluate_portfolio_risk_with_candidates(
+            &composition.policy,
+            &snapshot,
+            std::slice::from_ref(&candidate),
+        )?;
+        Ok(Some((decision, margin_used)))
+    }
+
+    /// Builds one aggregate-risk candidate row, classified by the operator's
+    /// attested bucket table. Shared by the single-order and combination paths
+    /// so a combination leg is classified exactly as the same instrument would
+    /// be on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn risk_candidate(
+        &self,
+        composition: &PortfolioRiskComposition,
+        intent_id: &str,
+        account_id: &str,
+        strategy_id: &str,
+        instrument_id: &str,
+        side: Side,
+        quantity: Decimal,
+        mark_price: Decimal,
+    ) -> Result<CandidateOrder, LiveError> {
+        let bucket = composition.instrument_buckets.get(instrument_id);
+        Ok(CandidateOrder {
+            intent_id: intent_id.to_owned(),
+            account_id: account_id.to_owned(),
+            strategy_id: strategy_id.to_owned(),
+            instrument_id: instrument_id.to_owned(),
+            asset_class: bucket
+                .map(|bucket| bucket.asset_class.clone())
+                .unwrap_or_else(|| "unclassified".to_owned()),
+            sector: bucket
+                .map(|bucket| bucket.sector.clone())
+                .unwrap_or_else(|| "unclassified".to_owned()),
+            currency: bucket
+                .map(|bucket| bucket.currency.clone())
+                .unwrap_or_else(|| self.account.currency.clone()),
+            side,
+            quantity,
+            mark_price,
+            multiplier: Decimal::from_integer(1)?,
+            delta: Decimal::ZERO,
+            gamma: Decimal::ZERO,
+        })
+    }
+
+    /// Builds the real aggregate-risk snapshot from service state, without any
+    /// candidate.
+    ///
+    /// Extracted so the single-order and combination paths observe exactly the
+    /// same portfolio, equity, peak, daily baseline and margin figures; the only
+    /// difference between them is which candidates are then added.
+    fn portfolio_risk_state(
+        &self,
+        composition: &PortfolioRiskComposition,
+        decided_at: &str,
+    ) -> Result<Option<(PortfolioRiskSnapshot, Decimal)>, LiveError> {
         let equity = self.current_equity()?;
         if equity <= Decimal::ZERO {
             return Ok(None);
@@ -3053,31 +3218,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             resting_orders,
             recent_order_count: 0,
         };
-        let bucket = composition.instrument_buckets.get(&intent.instrument_id);
-        let candidate = CandidateOrder {
-            intent_id: intent.intent_id.clone(),
-            account_id: intent.account_id.clone(),
-            strategy_id: intent.strategy_id.clone(),
-            instrument_id: intent.instrument_id.clone(),
-            asset_class: bucket
-                .map(|bucket| bucket.asset_class.clone())
-                .unwrap_or_else(|| "unclassified".to_owned()),
-            sector: bucket
-                .map(|bucket| bucket.sector.clone())
-                .unwrap_or_else(|| "unclassified".to_owned()),
-            currency: bucket
-                .map(|bucket| bucket.currency.clone())
-                .unwrap_or_else(|| self.account.currency.clone()),
-            side: intent.side,
-            quantity: intent.quantity,
-            mark_price: market.mark_price,
-            multiplier: Decimal::from_integer(1)?,
-            delta: Decimal::ZERO,
-            gamma: Decimal::ZERO,
-        };
-        let decision =
-            follon_risk::evaluate_portfolio_risk(&composition.policy, &snapshot, Some(&candidate))?;
-        Ok(Some((decision, margin_used)))
+        Ok(Some((snapshot, margin_used)))
     }
 
     fn apply_broker_event(&mut self, event: LiveBrokerEvent) -> Result<(), LiveError> {
@@ -4748,6 +4889,19 @@ mod tests {
             max_order_rate: 20,
             order_rate_window_seconds: 60,
             portfolio_risk: None,
+            short_exposure: None,
+        }
+    }
+
+    /// The same policy with net short exposure explicitly permitted, bounded at
+    /// 10 per instrument. Combination tests that need a short leg use this;
+    /// none of them may quietly widen `policy()` instead.
+    fn policy_permitting_shorts() -> LiveRiskPolicy {
+        LiveRiskPolicy {
+            short_exposure: Some(ShortExposurePolicy {
+                max_short_quantity: amount("10"),
+            }),
+            ..policy()
         }
     }
 
@@ -4901,6 +5055,364 @@ mod tests {
             approved_at: "2026-01-02T14:30:00Z".to_owned(),
             expires_at: "2026-01-02T15:00:00Z".to_owned(),
         }
+    }
+
+    /// A long call vertical: buy the near strike at 7.50, sell the far at 5.00,
+    /// for a 2.50 net debit per combination unit. Two units, so 25 gross
+    /// notional and a 5 net debit against the test account's 50 canary ceiling
+    /// and 100 deployed-capital ceiling.
+    fn combo_intent(intent_id: &str) -> ComboIntent {
+        ComboIntent {
+            intent_id: intent_id.to_owned(),
+            account_id: "acct.live.001".to_owned(),
+            strategy_id: "strategy.live.001".to_owned(),
+            correlation_id: format!("corr-{intent_id}"),
+            legs: vec![
+                follon_domain::ComboIntentLeg {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    side: Side::Buy,
+                    ratio: 1,
+                    limit_price: amount("7.50"),
+                },
+                follon_domain::ComboIntentLeg {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    side: Side::Sell,
+                    ratio: 1,
+                    limit_price: amount("5"),
+                },
+            ],
+            combo_quantity: amount("2"),
+            price_limit: follon_domain::ComboPriceLimit::MaximumDebit(amount("2.50")),
+            time_in_force: TimeInForce::Day,
+            rationale: "controlled-live combination test".to_owned(),
+            created_at: "2026-01-02T14:30:00Z".to_owned(),
+            strategy_version: "strategy-live-v1".to_owned(),
+            configuration_version: "config-live-v1".to_owned(),
+            environment: "LIVE".to_owned(),
+        }
+    }
+
+    /// Marks sitting exactly on each leg's own limit price, so the per-leg
+    /// collar reads zero deviation unless a test moves one.
+    fn combo_market() -> LiveComboMarketData {
+        LiveComboMarketData {
+            marks: vec![
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    mark_price: amount("7.50"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    mark_price: amount("5"),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn live_combo_risk_approves_a_priced_vertical_and_records_exact_evidence() {
+        let path = journal_path("combo-approve");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        let decision = service
+            .evaluate_combo_risk(
+                &combo_intent("intent.live.combo.001"),
+                &combo_market(),
+                "2026-01-02T14:30:02Z",
+                false,
+            )
+            .expect("combination assessment");
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+        // A combination decision must never collide with a plain order's.
+        assert_eq!(
+            decision.decision_id,
+            "live-combo-risk-intent.live.combo.001"
+        );
+        assert!(decision.evaluated_limits.contains("combo_legs=2"));
+        // 2 units * (7.50 + 5.00) = 25 gross; net debit 2 * 2.50 = 5.
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_gross_notional=25.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_net_debit=5.00000000"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The canary notional ceiling is charged the gross, not the net.
+    ///
+    /// This is the controlled-LIVE decision that matters most in this slice.
+    /// The canary exists to bound how much capital one controlled-LIVE order
+    /// can put at risk, and a two-sided structure puts both legs at risk until
+    /// it is closed. Charging the net would let an arbitrarily large spread
+    /// through an arbitrarily small canary ceiling -- 5 of net debit against a
+    /// 50 ceiling here, while the structure actually commits 75 of gross.
+    #[test]
+    fn live_combo_canary_ceiling_is_charged_the_gross_not_the_net() {
+        let path = journal_path("combo-canary-notional");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        let mut intent = combo_intent("intent.live.combo.002");
+        // 6 units: 75 gross, past the 50 canary ceiling, while the net debit is
+        // only 15 and would pass a net-based check comfortably.
+        intent.combo_quantity = amount("6");
+        let decision = service
+            .evaluate_combo_risk(&intent, &combo_market(), "2026-01-02T14:30:02Z", false)
+            .expect("combination assessment");
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"CANARY_NOTIONAL_EXCEEDED".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_gross_notional=75.00000000"));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_net_debit=15.00000000"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Shadow mode relaxes exactly the canary checks and nothing else.
+    #[test]
+    fn live_combo_shadow_relaxes_only_the_canary_ceilings() {
+        let path = journal_path("combo-shadow");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Shadow, &path, policy_permitting_shorts());
+        let mut intent = combo_intent("intent.live.combo.003");
+        intent.combo_quantity = amount("6");
+        let decision = service
+            .evaluate_combo_risk(&intent, &combo_market(), "2026-01-02T14:30:02Z", true)
+            .expect("shadow assessment");
+        assert!(!decision
+            .reason_codes
+            .contains(&"CANARY_NOTIONAL_EXCEEDED".to_owned()));
+        // But a real limit still binds: 75 gross is under the 100 order-notional
+        // ceiling, so confirm shadow did not simply approve everything.
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+
+        let mut oversized = combo_intent("intent.live.combo.004");
+        oversized.combo_quantity = amount("10");
+        let decision = service
+            .evaluate_combo_risk(&oversized, &combo_market(), "2026-01-02T14:30:02Z", true)
+            .expect("shadow assessment");
+        assert!(decision
+            .reason_codes
+            .contains(&"MAX_ORDER_NOTIONAL_EXCEEDED".to_owned()));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The deployed-capital ceiling is charged the net debit.
+    ///
+    /// Unlike the canary ceiling, this one measures cash actually committed,
+    /// and a credit structure commits none. Charging it the gross would refuse
+    /// combinations that deploy no capital at all.
+    #[test]
+    fn live_combo_deployed_capital_ceiling_is_charged_the_net_debit() {
+        let path = journal_path("combo-deployed");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        // A credit structure deploys nothing, so it must not be refused for the
+        // deployed-capital ceiling however large its gross is.
+        let mut credit = combo_intent("intent.live.combo.005");
+        credit.legs[0].side = Side::Sell;
+        credit.legs[1].side = Side::Buy;
+        credit.price_limit = follon_domain::ComboPriceLimit::MinimumCredit(amount("2"));
+        let decision = service
+            .evaluate_combo_risk(&credit, &combo_market(), "2026-01-02T14:30:02Z", false)
+            .expect("credit assessment");
+        assert!(!decision
+            .reason_codes
+            .contains(&"DEPLOYED_CAPITAL_CEILING_EXCEEDED".to_owned()));
+        assert!(!decision
+            .reason_codes
+            .contains(&"INSUFFICIENT_INTERNAL_CASH".to_owned()));
+        assert!(decision
+            .evaluated_limits
+            .contains("combo_net_debit=0.00000000"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A combination's short leg is refused until an operator permits it.
+    ///
+    /// Controlled-LIVE holds no option reference data either, so it cannot
+    /// prove the short far-strike leg is covered by the long near one, and does
+    /// not assume it. The permission is a separate type from `core/paper`'s on
+    /// purpose: permitting shorts in PAPER must never permit them with real
+    /// capital as a side effect.
+    #[test]
+    fn live_combo_refuses_a_short_leg_until_an_operator_permits_it() {
+        let path = journal_path("combo-short");
+        let mut default_service = test_service(LiveRunMode::Canary, &path);
+        let decision = default_service
+            .evaluate_combo_risk(
+                &combo_intent("intent.live.combo.006"),
+                &combo_market(),
+                "2026-01-02T14:30:02Z",
+                false,
+            )
+            .expect("assessment");
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+
+        let permitting_path = journal_path("combo-short-permitted");
+        let mut permitting = test_service_with_policy(
+            LiveRunMode::Canary,
+            &permitting_path,
+            policy_permitting_shorts(),
+        );
+        let decision = permitting
+            .evaluate_combo_risk(
+                &combo_intent("intent.live.combo.006"),
+                &combo_market(),
+                "2026-01-02T14:30:02Z",
+                false,
+            )
+            .expect("assessment");
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&permitting_path);
+    }
+
+    #[test]
+    fn live_combo_is_halted_by_a_kill_switch_on_any_single_leg() {
+        let path = journal_path("combo-kill");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        service
+            .activate_kill_switch(
+                LiveKillSwitchScope::Instrument("inst.us_option.spy.far".to_owned()),
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("kill switch");
+        let decision = service
+            .evaluate_combo_risk(
+                &combo_intent("intent.live.combo.007"),
+                &combo_market(),
+                "2026-01-02T14:30:02Z",
+                false,
+            )
+            .expect("assessment");
+        assert!(!decision.approved);
+        assert!(decision
+            .reason_codes
+            .contains(&"KILL_SWITCH_INSTRUMENT_INST.US_OPTION.SPY.FAR".to_owned()));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_combo_refuses_an_incomplete_or_stale_observation() {
+        let path = journal_path("combo-observation");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        let intent = combo_intent("intent.live.combo.008");
+
+        // One leg unquoted: the gate cannot price the structure and must not
+        // guess, least of all with real capital behind it.
+        let mut partial = combo_market();
+        partial.marks.truncate(1);
+        assert!(service
+            .evaluate_combo_risk(&intent, &partial, "2026-01-02T14:30:02Z", false)
+            .is_err());
+
+        // One leg quoted twice, the other not at all: the count matches but the
+        // coverage does not.
+        let mut duplicated = combo_market();
+        duplicated.marks[1] = duplicated.marks[0].clone();
+        assert!(service
+            .evaluate_combo_risk(&intent, &duplicated, "2026-01-02T14:30:02Z", false)
+            .is_err());
+
+        // Freshness is the stalest leg's: one fresh quote must not launder an
+        // old one beside it.
+        let mut half_stale = combo_market();
+        half_stale.marks[0].observed_at = "2026-01-02T14:20:00Z".to_owned();
+        assert!(service
+            .evaluate_combo_risk(&intent, &half_stale, "2026-01-02T14:30:02Z", false)
+            .is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An approval fingerprint binds the exact structure, leg by leg.
+    ///
+    /// An operator approves a specific combination. If the fingerprint covered
+    /// less than every leg's instrument, side, ratio and protected price, an
+    /// approval for a two-leg debit spread could be consumed by a materially
+    /// different trade.
+    #[test]
+    fn live_combo_fingerprint_binds_every_leg_of_the_approved_structure() {
+        let base = combo_intent("intent.live.combo.009");
+        let fingerprint = combo_intent_fingerprint(&base).expect("fingerprint");
+        assert_eq!(
+            fingerprint,
+            combo_intent_fingerprint(&combo_intent("intent.live.combo.009")).expect("stable")
+        );
+
+        let mutate = |apply: &dyn Fn(&mut ComboIntent)| {
+            let mut altered = combo_intent("intent.live.combo.009");
+            apply(&mut altered);
+            combo_intent_fingerprint(&altered).expect("fingerprint")
+        };
+        // Every one of these is a different trade and must produce a different
+        // fingerprint.
+        // These two also move the price limit, because a ratio or leg-price
+        // change moves the protected net price with it and `ComboIntent` would
+        // otherwise refuse the mutated intent as exceeding its own cap. The
+        // point of each mutation is that it is a *different valid trade*, not
+        // an invalid one.
+        assert_ne!(
+            fingerprint,
+            mutate(&|i| {
+                i.legs[0].ratio = 2;
+                i.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount("10"));
+            })
+        );
+        assert_ne!(
+            fingerprint,
+            mutate(&|i| {
+                i.legs[0].limit_price = amount("8");
+                i.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount("3"));
+            })
+        );
+        assert_ne!(fingerprint, mutate(&|i| i.combo_quantity = amount("3")));
+        assert_ne!(
+            fingerprint,
+            mutate(&|i| i.legs[0].instrument_id = "inst.us_option.spy.other".to_owned())
+        );
+        assert_ne!(
+            fingerprint,
+            mutate(&|i| {
+                i.legs[0].side = Side::Sell;
+                i.legs[1].side = Side::Buy;
+                i.price_limit = follon_domain::ComboPriceLimit::MinimumCredit(amount("2"));
+            })
+        );
+        // Swapping the two legs is a different document, not the same one.
+        assert_ne!(fingerprint, mutate(&|i| i.legs.swap(0, 1)));
+    }
+
+    #[test]
+    fn live_combo_assessment_creates_no_order_and_consumes_no_approval() {
+        let path = journal_path("combo-inert");
+        let mut service =
+            test_service_with_policy(LiveRunMode::Canary, &path, policy_permitting_shorts());
+        let decision = service
+            .evaluate_combo_risk(
+                &combo_intent("intent.live.combo.010"),
+                &combo_market(),
+                "2026-01-02T14:30:02Z",
+                false,
+            )
+            .expect("assessment");
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+        // Assessment only, until E1.4b lands a submission path.
+        assert!(service.orders.is_empty());
+        assert_eq!(service.broker_mut().submitted, 0);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

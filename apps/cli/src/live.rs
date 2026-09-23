@@ -324,6 +324,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_order_rate: configuration.risk.max_order_rate,
         order_rate_window_seconds: configuration.risk.order_rate_window_seconds,
         portfolio_risk,
+        // Not exposed through the controlled-live configuration contract:
+        // permitting net short exposure with real capital is a deliberate,
+        // separately-reviewed operator decision, not something a configuration
+        // file should be able to turn on implicitly.
+        short_exposure: None,
     };
     let switches = LiveKillSwitchRegistry::new(configuration.kill_switch_version)?;
     let activation = LiveActivation::for_configuration(

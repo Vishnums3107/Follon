@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T05:12:29Z  
+**Measured at:** 2026-09-23T05:53:02Z  
 **Branch:** `main`  
-**HEAD:** `2f0d3e8` -- docs(delivery): restore a full measurement to the state block (2026-09-23T10:21:36+05:30)  
-**Uncommitted paths:** 5
+**HEAD:** `5a75b67` -- feat(paper): fill, cancel and reconcile an atomic combination -- E1.3b closes the core/paper side of row 5.6 (2026-09-23T10:42:48+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 338 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 347 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -102,7 +102,9 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 | E1.2 | `PaperTradingService::evaluate_combo_risk` — the full paper risk policy restated for a combination, plus `PaperComboMarketData`, an explicit operator short-exposure permission, and `follon_risk::evaluate_portfolio_risk_with_candidates` so a combination's legs reach the aggregate kernel simultaneously. Assessment only; creates no order. | **done** 2026-09-23 |
 | E1.3a | Risk-gated `submit_combo_intent` in `core/paper`: `OmsComboOrder` (one order, one state, the single-order state machine reused unchanged), durable journal record and restart recovery, idempotent retry, native combo support in the `IbkrPaperAdapter` model, and integration into every risk counter | **done** 2026-09-23 |
 | E1.3b | Combination **fills, cancellation and reconciliation**: atomic `ComboExecution` evidence in whole units, per-leg accounting through the shared fill path, rollback-and-flag on unacceptable evidence, cancellation with its races, and full reconciliation against the broker snapshot. `UNRECONCILED_COMBINATION` is retired. | **done** 2026-09-23 |
-| E1.4 | `core/live` parity for the same path | next |
+| E1.4a | `core/live` combination contract and risk gate: `LiveComboMarketData`, `evaluate_combo_risk` (every PAPER rule plus the canary ceilings, the deployed-capital ceiling and the unresolved-incident block), `combo_intent_fingerprint` binding an approval to the exact structure, and its own short-exposure permission. Assessment only. | **done** 2026-09-23 |
+| E1.4b | `core/live` canary **submission** path: approval binding and consumption, `LiveComboOrder`, the canary submission counter, durable audit before the irreversible broker call, and restart recovery | next |
+| E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | open |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
 
 **E1.1 design decisions a later slice must not silently reverse.** Each is
@@ -252,6 +254,44 @@ durable-format decision and was out of scope here.
   path are resolved into refusals rather than asserted, because a future caller
   that skips the dispatch check should get an error, not an abort mid-fill.
 
+**E1.4a design decisions a later slice must not silently reverse.**
+
+- **The canary notional ceiling is charged the gross, not the net.** This is the
+  slice's most consequential decision. The canary exists to bound how much
+  capital one controlled-LIVE order can put at risk, and a two-sided structure
+  puts both legs at risk until it is closed, so a net view would let an
+  arbitrarily large spread through an arbitrarily small ceiling. Charging the
+  net was injected as a deliberate defect and the test caught it.
+- **The deployed-capital ceiling is charged the net debit, not the gross.** It
+  measures cash actually committed, and a credit structure commits none.
+  Charging it the gross would refuse combinations that deploy no capital at all.
+  The two ceilings measure different things and are deliberately charged
+  differently.
+- **The approval fingerprint binds every leg** — instrument, side, ratio and
+  protected price — plus the unit count, price-limit kind and amount, and the
+  leg count itself. Legs are hashed in declared order rather than sorted,
+  because leg order is part of what the operator approved. Dropping the legs
+  from the fingerprint was injected as a deliberate defect and the test caught
+  it: without them, one approval could be consumed by a materially different
+  trade.
+- **`shadow` relaxes exactly the canary checks and nothing else**, matching
+  `evaluate_risk`'s own convention — the canary ceilings, the `UNKNOWN`-order
+  block and the unresolved-incident block. A test asserts that a shadow
+  assessment still refuses a genuine order-notional breach, so "shadow" can
+  never quietly become "approve everything".
+- **`LiveRiskPolicy::short_exposure` is a separate type from
+  `follon_paper::ShortExposurePolicy`, not a shared one.** The two environments
+  are configured, reviewed and approved independently, and permitting shorts in
+  PAPER must never be capable of permitting them with real capital as a side
+  effect. `None` at both construction sites, so no existing configuration
+  changed.
+- **`core/live/src/combinations.rs` is a separate implementation of the same
+  rules, not shared code with `core/paper`.** The environments carry separate
+  policies and separate review, and a change that loosened PAPER must not be
+  able to loosen LIVE as a side effect. The genuinely common parts — the
+  `ComboIntent` contract, `OmsComboOrder`, and the multi-candidate aggregate
+  kernel — are shared; the gate that applies them is not.
+
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
@@ -389,13 +429,25 @@ short — detail belongs in the conformance audit.
 - Removed two `expect` panics the slice had introduced into the fill path.
   `core/paper`'s production code contains zero `unwrap`/`expect`, and a fill
   path in a trading system is the last place to start.
-- **Next action: E1.4 — `core/live` parity.** `core/live` still has no
-  combination type or method at all, which is the last structural gap in row
-  5.6. It is not a copy-paste of `core/paper`: controlled-LIVE carries the
-  signed-artifact and independent-review gates, a narrow price-protected canary
-  and an emergency stop, and every one of those has to apply to a combination
-  as a single unit rather than per leg. Read `core/live`'s existing
-  `submit_intent` and its canary/approval checks first, then mirror E1.2 and
-  E1.3 together — the `ComboIntent` contract, `OmsComboOrder` and the
-  `follon_risk` multi-candidate kernel are already shared, so only the
-  environment service is missing.
+- Landed **E1.4a**, the `core/live` combination contract and risk gate. Rust
+  workspace 338 → 347 passed, 0 failed. E1.4 turned out to be E1.2+E1.3a+E1.3b's
+  worth of work for LIVE, so it was cut into three landable sub-slices rather
+  than attempted whole. Two deliberate defects injected and caught: charging the
+  canary ceiling the net instead of the gross, and an approval fingerprint that
+  stopped covering the legs.
+- **Next action: E1.4b — the controlled-LIVE canary submission path.** Mirror
+  `submit_canary_intent`, which is stricter than PAPER's `submit_intent` in
+  ways that all matter:
+  1. `require_canary_active(decided_at)` must gate it — a combination is not
+     exempt from the activation window or run mode.
+  2. It must consume a registered, unconsumed, unexpired approval whose
+     `intent_fingerprint` equals `combo_intent_fingerprint(&intent)`. That
+     function already exists and is tested; `LiveApproval` needs to be able to
+     carry a combination fingerprint, which is the one contract question to
+     settle first.
+  3. `canary_submissions` must increment once per combination, not once per
+     leg, and the durable audit record must precede the irreversible broker
+     call exactly as it does for a plain order.
+  4. `LiveBrokerAdapter` has no `submit_combo`; add it with a rejecting
+     default, mirroring `PaperBrokerAdapter`, so an adapter that cannot execute
+     an atomic combination refuses before any leg is transmitted.
