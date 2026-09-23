@@ -2050,13 +2050,12 @@ fn trailing_price(
 }
 
 /// Net-price protection for a synchronized listed-option combination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComboPriceLimit {
-    /// Total debit per combination may not exceed this positive amount.
-    MaximumDebit(Decimal),
-    /// Total credit per combination may not be below this positive amount.
-    MinimumCredit(Decimal),
-}
+///
+/// Re-exported from `core/domain` rather than defined here: pre-trade risk
+/// assesses a combination's protected net price before any plan exists, so the
+/// contract has to sit below the planner. Call sites that imported it from this
+/// crate are unaffected.
+pub use follon_domain::ComboPriceLimit;
 
 /// One ratio leg in a synchronized option combination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2142,26 +2141,11 @@ pub fn plan_option_combo(
             limit_price: leg.limit_price,
         });
     }
-    match price_limit {
-        ComboPriceLimit::MaximumDebit(limit) => {
-            if limit <= Decimal::ZERO
-                || protected_net_price < Decimal::ZERO
-                || protected_net_price > limit
-            {
-                return Err(ExecutionError(
-                    "option combination exceeds maximum debit".to_owned(),
-                ));
-            }
-        }
-        ComboPriceLimit::MinimumCredit(limit) => {
-            let credit = Decimal::ZERO.checked_sub(protected_net_price)?;
-            if limit <= Decimal::ZERO || credit < limit {
-                return Err(ExecutionError(
-                    "option combination is below minimum credit".to_owned(),
-                ));
-            }
-        }
-    }
+    // One definition of the protection check, shared with the risk gate, so a
+    // combination cannot pass one and fail the other.
+    price_limit
+        .check_net_price(protected_net_price)
+        .map_err(|error| ExecutionError(error.0))?;
     Ok(OptionComboPlan {
         combo_id: combo_id.to_owned(),
         combo_quantity,

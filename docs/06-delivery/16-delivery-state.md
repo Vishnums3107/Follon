@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T04:03:24Z  
+**Measured at:** 2026-09-23T04:11:07Z  
 **Branch:** `main`  
-**HEAD:** `33933ec` -- feat(risk): close the 5.7 core/risk composition backlog; add short-lot tax tracking to AdvancedBacktestAccount (2026-09-18T16:21:18+05:30)  
-**Uncommitted paths:** 24
+**HEAD:** `b358088` -- docs(delivery): add a machine-measured resume-here state document and session-status tool (2026-09-23T09:35:35+05:30)  
+**Uncommitted paths:** 2
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 296 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 305 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -98,11 +98,35 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 
 | Slice | Scope | State |
 | --- | --- | --- |
-| E1.1 | A multi-leg `ComboIntent` domain type with validation and canonical serialisation | open |
-| E1.2 | Aggregate risk evaluation for a combo: net notional, per-leg and aggregate price collar, position projection across legs | open |
-| E1.3 | Risk-gated `submit_combo_intent` in `core/paper`: kill switches, OMS lifecycle, durable per-combo journal record, restart recovery | open |
+| E1.1 | `ComboIntent`, `ComboIntentLeg` and `ComboPriceLimit` in `core/domain`, with validation, exact net-price and gross-notional arithmetic, and per-leg position projection. `core/execution` now re-exports the price-limit contract instead of defining its own, so the planner and the risk gate cannot disagree. | **done** 2026-09-23 |
+| E1.2 | Aggregate risk evaluation for a combo in the paper risk gate: gross notional against the order-notional limit, per-leg price collar against each leg's mark, projected position per instrument, self-trade across all legs, cash reservation for the net debit | next |
+| E1.3 | Risk-gated `submit_combo_intent` in `core/paper`: kill switches, OMS lifecycle for the combination as one order, durable per-combo journal record, restart recovery | open |
 | E1.4 | `core/live` parity for the same path | open |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
+
+**E1.1 design decisions a later slice must not silently reverse.** Each is
+covered by a test named after it.
+
+- **A combination is never decomposed into independently marketable legs.** The
+  adapter either executes every leg atomically or rejects before transmitting
+  any of them. This is why the risk gate assesses the combination as one
+  economic unit and the OMS will track it as one order.
+- **One leg is refused.** A single-leg "combination" is a plain order, and the
+  plain-order path carries strictly more risk coverage, so it must not be
+  reachable through `ComboIntent`.
+- **Duplicate instruments are refused, not netted.** Netting would change the
+  economics the operator approved and would defeat the per-instrument position
+  projection the risk gate performs.
+- **`gross_notional` sums leg magnitudes; it does not net them.** On the test's
+  vertical spread that is 50, where a net-price view reports 10. The short leg
+  is a real obligation until the combination is closed, so an aggregate limit
+  has to see it. Netting here was injected as a deliberate defect and the test
+  caught it.
+- **A maximum-debit protection refuses a combination that prices to a credit**,
+  even though a credit is "cheaper" than any debit cap, and vice versa. The
+  operator approved a debit structure; a credit one is a different trade.
+  Removing the sign guard was injected as a deliberate defect and the test
+  caught it.
 
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
@@ -218,3 +242,15 @@ short — detail belongs in the conformance audit.
 - Recorded the operator's three direction decisions under **Settled
   direction**: keep Follon's own engine, trade before selling, checkpoint the
   tree. E1 is now live work.
+- Landed **E1.1**. Rust workspace 296 → 305 passed, 0 failed. Two deliberate
+  defects were injected and each was caught by the test written for it before
+  the slice was relied on.
+- **Next action: E1.2.** Extend `core/paper`'s `evaluate_risk` to assess a
+  `ComboIntent` as one economic unit. It must reuse the existing single-leg
+  rules rather than re-implement them: kill switches, `MAX_ORDER_NOTIONAL`
+  (against `gross_notional`, not the net), `PRICE_COLLAR` per leg against that
+  leg's own mark, `POSITION_LIMIT` against each leg's `projected_leg_delta`,
+  `SELF_TRADE_RISK` across every leg, and `INSUFFICIENT_INTERNAL_CASH` against
+  the net debit. Combo market data is many marks, one per leg, so
+  `PaperMarketData` needs a multi-instrument companion — decide that shape
+  first, since E1.3's journal record persists it.
