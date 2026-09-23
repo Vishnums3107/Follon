@@ -56,22 +56,22 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T04:47:25Z  
+**Measured at:** 2026-09-23T04:50:57Z  
 **Branch:** `main`  
-**HEAD:** `7f065cb` -- feat(paper,risk): assess a multi-leg combination against the full paper risk policy -- E1.2 (2026-09-23T09:57:31+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `6c498da` -- feat(paper,control-plane): risk-gate and submit an atomic multi-leg combination -- E1.3a (2026-09-23T10:18:34+05:30)  
+**Uncommitted paths:** 1
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 326 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) -- skipped by --fast | **SKIPPED** | -- | -- | -- | -- |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
-| Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
+| Rust lints (`cargo clippy --workspace --all-targets -D warnings`) -- skipped by --fast | **SKIPPED** | -- | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
 | Python suite (`pytest`) | **PASS** | 0 | 42 | 0 | 0 |
-| Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
+| Desktop evidence regressions (`npm run test:evidence`) -- skipped by --fast | **SKIPPED** | -- | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
-**All 7 executed suite(s) green.**
+**All 4 executed suite(s) green; 3 skipped.**
 
 <!-- END GENERATED STATUS -- tools/session_status.py -->
 
