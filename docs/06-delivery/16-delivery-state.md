@@ -56,17 +56,17 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T17:14:42Z  
+**Measured at:** 2026-09-24T17:34:58Z  
 **Branch:** `main`  
-**HEAD:** `b6cfcd0` -- test(execution): property tests for algo-wheel allocation -- E3.2d (2026-09-24T22:35:03+05:30)  
-**Uncommitted paths:** 5
+**HEAD:** `7afbf98` -- fix(execution): keep passive replacements clamped to a hard limit on the tick grid -- E3.2e (2026-09-24T22:45:03+05:30)  
+**Uncommitted paths:** 23
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 415 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 422 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
-| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
+| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
 | Python suite (`pytest`) | **PASS** | 0 | 48 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
@@ -445,7 +445,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
 | E3.2 | Property/model/fault coverage beyond the eight landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, and passive repricing). Remaining candidates: smart routing, margin/financing functions | Reliability |
-| E3.6 | No pre-trade check validates an order's limit price against the instrument's `tick_size`, so an off-grid limit passes PAPER and controlled-LIVE risk and reaches the broker, to be rejected there. Found while landing E3.2e (audit item 60). | 5.5 / 5.7 |
+| E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
 | E3.5 | Market-data gap-repair operation | 5.2 |
@@ -568,8 +568,19 @@ short — detail belongs in the conformance audit.
 - Rust workspace **411 → 415 passed**, 0 failed, 3 ignored; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
-- **Next action:** E3.6, the pre-trade tick check, because it is a live-order
-  correctness gap. After that, the remaining E3.2 candidates (smart routing,
+- Landed **E3.6**, with the tick source chosen by the operator
+  (configuration). PAPER and controlled-LIVE risk refuse an unlisted
+  instrument or an off-grid limit. The table is required in every
+  configuration boundary: CLI, gRPC route, desktop and the three JSON Schemas.
+  It is also bound into both configuration fingerprints. Both checked-in
+  journals were regenerated with the real status binaries, differing only in
+  that fingerprint. A new `cargo test` opens each journal under its
+  configuration, so this drift no longer surfaces only in the pipeline. Eleven
+  deliberate defects were injected and caught (audit item 61).
+- Rust workspace **415 → 422 passed**, 0 failed, 3 ignored; Tauri host
+  **28 → 29**. The final `python tools/session_status.py` measurement recorded
+  all seven suites green, and the full evidence pipeline exited 0.
+- **Next action:** the remaining E3.2 candidates (smart routing,
   margin/financing) or E3.5 market-data gap repair. E2.1b's only remainder is
   verifying a capsule on a second, clean machine. The top external priority is
   unchanged: the 30 clean PAPER sessions.

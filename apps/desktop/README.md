@@ -39,6 +39,18 @@ so almost any spread with a short leg — is refused unless the operator-authore
 
 The UI never grants that permission itself.
 
+The same file must list the venue tick size of every instrument the operator
+may trade. An order for an unlisted instrument is refused with
+`INSTRUMENT_TICK_SIZE_UNCONFIGURED`, and a limit price off its instrument's
+grid with `LIMIT_PRICE_OFF_TICK_GRID`, before anything reaches the broker:
+
+```json
+"instrument_tick_sizes": { "inst.us_equity.aapl": "0.01" }
+```
+
+Combination net prices are not tick-checked; venues price combinations on
+their own increments.
+
 The packaged client reads its versioned evidence API from the loopback service
 at `http://127.0.0.1:8080`. The service grants cross-origin access only to the
 exact Tauri asset origins; it must be running before the native client.

@@ -64,6 +64,10 @@ struct PaperRiskDocument {
     /// existing configuration keeps today's behavior exactly.
     #[serde(default)]
     portfolio_risk: Option<PortfolioRiskDocument>,
+    /// Required venue tick size per tradable instrument, as exact decimal
+    /// strings. An order for an unlisted instrument, or a limit off its grid,
+    /// is refused before it can reach the broker.
+    instrument_tick_sizes: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // short exposure is a deliberate operator decision, not something a
         // configuration file should be able to turn on implicitly.
         short_exposure: None,
+        instrument_tick_sizes: decimal_map(configuration.risk.instrument_tick_sizes)?,
     };
     let mut brokers = PaperBrokerRegistry::new();
     if schema_version == 1 {

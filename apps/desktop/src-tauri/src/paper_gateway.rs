@@ -697,6 +697,10 @@ struct DesktopPaperConfiguration {
     max_market_data_age_seconds: u64,
     max_order_rate: u32,
     order_rate_window_seconds: u64,
+    /// Required tick size per tradable instrument, in the same shape as the
+    /// version-1 `paper-command-route` document. An order for an unlisted
+    /// instrument, or a limit off its grid, is refused before the broker.
+    instrument_tick_sizes: std::collections::BTreeMap<String, String>,
     /// Optional, explicitly bounded net-short permission, in the same shape
     /// as the version-1 `paper-command-route` document. Absent means every
     /// net short position -- and so almost every spread with a short leg --
@@ -791,6 +795,16 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
                 })
             })
             .transpose()?,
+        instrument_tick_sizes: document
+            .instrument_tick_sizes
+            .iter()
+            .map(|(instrument_id, tick)| {
+                Ok::<_, String>((
+                    instrument_id.clone(),
+                    decimal("instrument_tick_sizes", tick)?,
+                ))
+            })
+            .collect::<Result<_, _>>()?,
     };
     let kill_switches = KillSwitchRegistry::new(document.kill_switch_version)
         .map_err(|error| format!("kill switch registry: {error}"))?;
@@ -850,6 +864,11 @@ mod tests {
                     "max_market_data_age_seconds": 300,
                     "max_order_rate": 20,
                     "order_rate_window_seconds": 60,
+                    "instrument_tick_sizes": {{
+                        "inst.us_equity.aapl": "0.01",
+                        "inst.opt.spy.c500": "0.01",
+                        "inst.opt.spy.c505": "0.01"
+                    }},
                     {extra}
                     "kill_switch_version": "kill.desktop.test.v1",
                     "journal_path": {:?}
@@ -972,6 +991,24 @@ mod tests {
         assert_eq!(receipt.status, CommandStatus::RiskRejected);
         assert!(receipt.order_id.is_none());
         assert!(receipt.message.contains("PRICE_COLLAR_EXCEEDED"));
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn submit_order_off_the_configured_tick_grid_is_refused_before_the_broker() {
+        let (gateway, scratch, _journal) = test_gateway("submit-off-grid");
+        // 149.995 is inside the collar around the 150.00 reference but off the
+        // configured 0.01 grid, so only the tick check can refuse it.
+        let receipt = gateway
+            .submit_order(order_intent(
+                "intent.desktop.tick.001",
+                OrderType::Limit,
+                Some("149.99500000"),
+            ))
+            .expect("a risk rejection is a normal, successful outcome");
+        assert_eq!(receipt.status, CommandStatus::RiskRejected);
+        assert!(receipt.order_id.is_none());
+        assert!(receipt.message.contains("LIMIT_PRICE_OFF_TICK_GRID"));
         cleanup(scratch);
     }
 

@@ -662,6 +662,8 @@ struct PaperCommandRouteDocument {
     max_market_data_age_seconds: u64,
     max_order_rate: u32,
     order_rate_window_seconds: u64,
+    /// Required tick size per tradable instrument (exact decimal strings).
+    instrument_tick_sizes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     short_exposure: Option<PaperCommandShortExposureDocument>,
     kill_switch_version: String,
@@ -786,6 +788,16 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
                 })
             })
             .transpose()?,
+        instrument_tick_sizes: document
+            .instrument_tick_sizes
+            .iter()
+            .map(|(instrument_id, tick)| {
+                Ok((
+                    instrument_id.clone(),
+                    route_decimal("instrument_tick_sizes", tick)?,
+                ))
+            })
+            .collect::<Result<_, String>>()?,
     };
     let broker = IbkrPaperAdapter::new(&account)
         .map_err(|error| format!("PAPER command-route adapter: {error}"))?;
@@ -982,6 +994,7 @@ mod tests {
             "max_market_data_age_seconds": 5,
             "max_order_rate": 20,
             "order_rate_window_seconds": 60,
+            "instrument_tick_sizes": { "inst.us_equity.spy": "0.01" },
             "short_exposure": { "max_short_quantity": "1000" },
             "kill_switch_version": "kills.grpc.paper.v1",
             "adapter_kind": "IBKR_PAPER_MODEL",

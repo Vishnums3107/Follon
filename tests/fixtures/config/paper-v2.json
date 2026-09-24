@@ -24,7 +24,10 @@
     "max_realized_loss": "10000",
     "max_market_data_age_seconds": 5,
     "max_order_rate": 20,
-    "order_rate_window_seconds": 60
+    "order_rate_window_seconds": 60,
+    "instrument_tick_sizes": {
+      "inst.us_equity.spy": "0.01"
+    }
   },
   "kill_switch_version": "paper-kills-v1"
 }

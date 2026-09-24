@@ -321,6 +321,11 @@ fn canary_service(combo: &ComboIntent) -> (LiveTradingService<ModelBroker>, std:
         short_exposure: Some(ShortExposurePolicy {
             max_short_quantity: dec("1000"),
         }),
+        // Combinations are not tick-checked; the policy still needs a listing.
+        instrument_tick_sizes: std::collections::BTreeMap::from([(
+            "inst.us_equity.spy".to_owned(),
+            dec("0.01"),
+        )]),
     };
     let switches = LiveKillSwitchRegistry::new("live-kills-proptest-v1").unwrap();
     let activation = LiveActivation::for_configuration(

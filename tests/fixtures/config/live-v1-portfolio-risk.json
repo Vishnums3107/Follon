@@ -24,6 +24,9 @@
     "max_market_data_age_seconds": 60,
     "max_order_rate": 20,
     "order_rate_window_seconds": 60,
+    "instrument_tick_sizes": {
+      "inst.us_equity.spy": "0.01"
+    },
     "portfolio_risk": {
       "policy_version": "portfolio-risk-v1",
       "max_gross_exposure": "5000",

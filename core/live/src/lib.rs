@@ -219,6 +219,26 @@ pub struct LiveRiskPolicy {
     /// Operator permission for net short exposure; `None` refuses every short,
     /// which is the behavior every configuration had before this field existed.
     pub short_exposure: Option<ShortExposurePolicy>,
+    /// Venue tick size per tradable instrument. A plain order for an
+    /// instrument that is not listed is refused, and so is a limit price off
+    /// its instrument's grid, before a broker can reject it.
+    pub instrument_tick_sizes: BTreeMap<String, Decimal>,
+}
+
+impl LiveRiskPolicy {
+    /// The tick-grid rejection for one plain order, if any.
+    fn tick_rejection(
+        &self,
+        instrument_id: &str,
+        limit_price: Option<Decimal>,
+    ) -> Option<&'static str> {
+        match self.instrument_tick_sizes.get(instrument_id) {
+            None => Some("INSTRUMENT_TICK_SIZE_UNCONFIGURED"),
+            Some(tick) => limit_price
+                .is_some_and(|price| price.scaled() % tick.scaled() != 0)
+                .then_some("LIMIT_PRICE_OFF_TICK_GRID"),
+        }
+    }
 }
 
 /// Operator permission for net short exposure at the controlled-live boundary.
@@ -283,6 +303,22 @@ impl LiveRiskPolicy {
             || self.order_rate_window_seconds == 0
         {
             return Err(LiveError("invalid controlled-live risk policy".to_owned()));
+        }
+        // An empty table would refuse every order; that is a configuration
+        // mistake, not a stricter policy.
+        if self.instrument_tick_sizes.is_empty()
+            || self
+                .instrument_tick_sizes
+                .iter()
+                .any(|(instrument_id, tick)| {
+                    validate_canonical_id("tick-size instrument_id", instrument_id).is_err()
+                        || *tick <= Decimal::ZERO
+                })
+        {
+            return Err(LiveError(
+                "controlled-live risk policy needs a positive tick size per listed instrument"
+                    .to_owned(),
+            ));
         }
         if self
             .short_exposure
@@ -2960,6 +2996,12 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if requested_price_deviation_bps > self.policy.max_price_deviation_bps {
             reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
+        if let Some(reason) = self
+            .policy
+            .tick_rejection(&intent.instrument_id, intent.limit_price)
+        {
+            reasons.push(reason.to_owned());
+        }
         if self.conflicts_with_working_order(&intent.instrument_id, intent.side) {
             reasons.push("SELF_TRADE_RISK".to_owned());
         }
@@ -3047,7 +3089,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             reasons.push("APPROVED".to_owned());
         }
         let evaluated_limits = format!(
-            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}{}",
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={}{}",
             self.policy.max_order_quantity,
             self.policy.max_order_notional,
             self.policy.max_price_deviation_bps,
@@ -3068,6 +3110,10 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             estimated_notional,
             projected_position,
             available_cash,
+            self.policy
+                .instrument_tick_sizes
+                .get(&intent.instrument_id)
+                .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string),
             portfolio_risk_limits,
         );
         Ok(LiveRiskDecision {
@@ -4737,6 +4783,16 @@ fn configuration_fingerprint(
             parts.push(part);
         }
     }
+    // Always present: every configuration now lists its tick sizes, and an
+    // approval or journal bound to one tick table must not carry to another.
+    let tick_sizes = policy
+        .instrument_tick_sizes
+        .iter()
+        .map(|(instrument_id, tick)| format!("{instrument_id}:{tick}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    parts.push("live-instrument-ticks-v1");
+    parts.push(&tick_sizes);
     hash_fingerprint_parts(&parts)
 }
 
@@ -5538,6 +5594,15 @@ mod tests {
             order_rate_window_seconds: 60,
             portfolio_risk: None,
             short_exposure: None,
+            instrument_tick_sizes: [
+                "inst.us_equity.spy",
+                "inst.us_equity.qqq",
+                "inst.us_option.spy.near",
+                "inst.us_option.spy.far",
+            ]
+            .into_iter()
+            .map(|instrument| (instrument.to_owned(), amount("0.01")))
+            .collect(),
         }
     }
 
@@ -6616,6 +6681,85 @@ mod tests {
         assert_eq!(service.broker_mut().submitted, 0);
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn controlled_live_refuses_off_grid_limits_and_unlisted_instruments() {
+        let path = journal_path("tick-grid");
+        let mut service = test_service(LiveRunMode::Shadow, &path);
+        let mut off_grid = intent("SHADOW", "intent.shadow.tick.001");
+        off_grid.order_type = OrderType::Limit;
+        // 5 bps from the mark, well inside the collar: only the grid is wrong.
+        off_grid.limit_price = Some(amount("10.005"));
+        let LiveSubmitOutcome::ShadowRecorded { decision } = service
+            .record_shadow_intent(
+                off_grid,
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow evidence")
+        else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert_eq!(
+            decision.reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        assert!(decision
+            .evaluated_limits
+            .contains("instrument_tick_size=0.01"));
+
+        let mut unlisted = intent("SHADOW", "intent.shadow.tick.002");
+        unlisted.instrument_id = "inst.us_equity.iwm".to_owned();
+        let mut iwm = market();
+        iwm.instrument_id = "inst.us_equity.iwm".to_owned();
+        let LiveSubmitOutcome::ShadowRecorded { decision } = service
+            .record_shadow_intent(
+                unlisted,
+                iwm,
+                "2026-01-02T14:30:01Z",
+                "operator.requester.001",
+            )
+            .expect("shadow evidence")
+        else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert_eq!(
+            decision.reason_codes,
+            vec!["INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()]
+        );
+        assert_eq!(service.broker_mut().submitted, 0);
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn a_live_tick_table_is_validated_and_bound_into_the_configuration_fingerprint() {
+        assert!(policy().validate().is_ok());
+        for broken in [
+            BTreeMap::new(),
+            BTreeMap::from([("inst.us_equity.spy".to_owned(), Decimal::ZERO)]),
+            BTreeMap::from([("INST.SPY".to_owned(), amount("0.01"))]),
+        ] {
+            let policy = LiveRiskPolicy {
+                instrument_tick_sizes: broken.clone(),
+                ..policy()
+            };
+            assert!(policy.validate().is_err(), "accepted tick table {broken:?}");
+        }
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").unwrap();
+        let mut coarser = policy();
+        coarser
+            .instrument_tick_sizes
+            .insert("inst.us_equity.spy".to_owned(), amount("0.05"));
+        assert_ne!(
+            configuration_fingerprint(&account(), &policy(), &switches),
+            configuration_fingerprint(&account(), &coarser, &switches),
+            "an approval must not carry across a changed tick table"
+        );
     }
 
     #[test]

@@ -2280,6 +2280,57 @@ These are mandatory master-plan acceptance conditions and are currently open:
 
       No external gate moved.
 
+61. PAPER and controlled-LIVE risk refuse a plain order that is off its instrument's tick grid (2026-09-24,
+    rows 5.5 and 5.7; E3.6). This closes the gap item 60 recorded.
+    - **What is now real.** `PaperRiskPolicy` and `LiveRiskPolicy` gain a required `instrument_tick_sizes`
+      table, the configuration source the operator chose. `evaluate_risk` refuses an order in two cases:
+      `INSTRUMENT_TICK_SIZE_UNCONFIGURED` when the instrument is not listed, including a market order, since
+      its reference data is unknown; and `LIMIT_PRICE_OFF_TICK_GRID` when the limit is not an exact multiple
+      of the tick. No order is created and nothing reaches a broker. Each decision's persisted evidence now
+      records `instrument_tick_size`. A policy whose table is empty, has a non-positive tick, or has a
+      non-canonical instrument id fails validation.
+    - **Bound into the configuration fingerprint.** The table is always part of the PAPER and LIVE
+      configuration fingerprints. A journal therefore cannot be reopened under a different tick table, and a
+      controlled-LIVE approval bound to one table does not carry to another.
+    - **Every configuration boundary changed together.** The JSON Schemas `paper-configuration`,
+      `live-configuration` and `paper-command-route` require the table. Each is a one-line insertion in the
+      schema's compact style, and a document without the table is refused. The same holds for all six
+      configuration fixtures, the PAPER and LIVE CLI loaders, the versioned gRPC command route, and the
+      desktop `FOLLON_DESKTOP_PAPER_CONFIG` gateway, whose README now documents the table. Fixtures list
+      `inst.us_equity.spy` at 0.01, the instrument the portfolio-risk fixtures already use.
+    - **Journal fixtures regenerated, not edited.** The fingerprint change correctly made both checked-in
+      journals refuse their configurations, and pipeline step 14a failed exactly as intended. Both were
+      regenerated with the current `follon-paper-status` and `follon-live-status` binaries against their
+      updated configurations. Compared field by field with the old first records, only
+      `configuration_fingerprint` and the entry hash differ. The old LIVE fixture also carried twelve
+      `live.service.restarted.v1` records left by the in-place mutation that item 45 fixed; a clean
+      regeneration no longer contains them.
+    - **This drift is now caught by `cargo test`.** The format checks from item 51 only parse each fixture,
+      so a changed configuration with a stale journal still passed `cargo test` and failed only the
+      pipeline, which is not one of the measured suites. The new
+      `apps/cli/tests/checked_in_journal_configuration.rs` opens copies of both fixtures under their
+      configurations through the real status binaries. It passes on the regenerated fixtures and fails on
+      the previous ones.
+    - **Verified against injected defects.** Eleven were injected and each was caught:
+      - PAPER and LIVE each skipping the check, accepting unlisted instruments, never finding a limit off
+        grid, accepting an empty table, or leaving the table out of the configuration fingerprint (ten);
+      - the PAPER CLI dropping the configured table.
+
+      New tests: two PAPER and one LIVE refusal test with on-grid and market-order controls; a validation
+      and fingerprint test in each crate; an end-to-end desktop gateway refusal; and the two fixture tests.
+    - **Measured result.** The Rust workspace rose from 415 to 422 passed / 0 failed / 3 ignored, and
+      the Tauri host from 28 to 29. The first `python tools/session_status.py` run failed `cargo fmt` on the
+      unformatted route-loader edit. It was formatted, every suite was re-measured, and the final run measured
+      all seven suites green. The full evidence pipeline exited 0.
+    - **Bounded remainder.**
+      - Combination net prices are not tick-checked. Venues price combinations on their own increments, and
+        no combination increment is modelled.
+      - Tick sizes are operator-attested configuration, not broker contract details, so a wrong table is
+        enforced as written.
+      - Quantities are not checked against `lot_size`.
+
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

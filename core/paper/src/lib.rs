@@ -1432,6 +1432,10 @@ pub struct PaperRiskPolicy {
     /// Operator permission for net short exposure; `None` refuses every short,
     /// which is the behavior every configuration had before this field existed.
     pub short_exposure: Option<ShortExposurePolicy>,
+    /// Venue tick size per tradable instrument. A plain order for an
+    /// instrument that is not listed is refused, and so is a limit price off
+    /// its instrument's grid, before a broker can reject it.
+    pub instrument_tick_sizes: BTreeMap<String, Decimal>,
 }
 
 /// Operator permission for net short exposure, absent by default.
@@ -1451,6 +1455,20 @@ pub struct ShortExposurePolicy {
 }
 
 impl PaperRiskPolicy {
+    /// The tick-grid rejection for one plain order, if any.
+    fn tick_rejection(
+        &self,
+        instrument_id: &str,
+        limit_price: Option<Decimal>,
+    ) -> Option<&'static str> {
+        match self.instrument_tick_sizes.get(instrument_id) {
+            None => Some("INSTRUMENT_TICK_SIZE_UNCONFIGURED"),
+            Some(tick) => limit_price
+                .is_some_and(|price| price.scaled() % tick.scaled() != 0)
+                .then_some("LIMIT_PRICE_OFF_TICK_GRID"),
+        }
+    }
+
     /// Whether a projected per-instrument position breaches this policy.
     ///
     /// Shared by the single-order and combination gates so a combination leg is
@@ -1491,6 +1509,21 @@ impl PaperRiskPolicy {
             || self.order_rate_window_seconds == 0
         {
             return Err(PaperError("invalid paper risk policy".to_owned()));
+        }
+        // An empty table would refuse every order; that is a configuration
+        // mistake, not a stricter policy.
+        if self.instrument_tick_sizes.is_empty()
+            || self
+                .instrument_tick_sizes
+                .iter()
+                .any(|(instrument_id, tick)| {
+                    validate_canonical_id("tick-size instrument_id", instrument_id).is_err()
+                        || *tick <= Decimal::ZERO
+                })
+        {
+            return Err(PaperError(
+                "paper risk policy needs a positive tick size per listed instrument".to_owned(),
+            ));
         }
         if self
             .short_exposure
@@ -3580,6 +3613,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if requested_price_deviation_bps > self.risk_policy.max_price_deviation_bps {
             reasons.push("PRICE_COLLAR_EXCEEDED".to_owned());
         }
+        if let Some(reason) = self
+            .risk_policy
+            .tick_rejection(&intent.instrument_id, intent.limit_price)
+        {
+            reasons.push(reason.to_owned());
+        }
         if self.conflicts_with_working_order(&intent.instrument_id, intent.side) {
             reasons.push("SELF_TRADE_RISK".to_owned());
         }
@@ -3660,7 +3699,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={}{}",
+                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={}{}",
                 self.risk_policy.max_order_quantity,
                 self.risk_policy.max_order_notional,
                 self.risk_policy.max_price_deviation_bps,
@@ -3679,6 +3718,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 estimated_notional,
                 projected_position,
                 context.available_cash,
+                self.risk_policy
+                    .instrument_tick_sizes
+                    .get(&intent.instrument_id)
+                    .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string),
                 portfolio_risk_limits,
             ),
         })
@@ -5579,6 +5622,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 parts.push(part);
             }
         }
+        // Always present: every configuration now lists its tick sizes, and a
+        // journal or decision made under one tick table must not be reopened
+        // under another.
+        let tick_sizes = render_tick_sizes(&self.risk_policy.instrument_tick_sizes);
+        parts.push("paper-instrument-ticks-v1");
+        parts.push(&tick_sizes);
         hash_fingerprint_parts(&parts)
     }
 
@@ -5588,6 +5637,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .filter(|incident| incident.unexplained())
             .count() as u32
     }
+}
+
+fn render_tick_sizes(tick_sizes: &BTreeMap<String, Decimal>) -> String {
+    tick_sizes
+        .iter()
+        .map(|(instrument_id, tick)| format!("{instrument_id}:{tick}"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn hash_fingerprint_parts(parts: &[&str]) -> String {
@@ -6186,7 +6243,20 @@ mod tests {
             order_rate_window_seconds: 60,
             portfolio_risk: None,
             short_exposure: None,
+            instrument_tick_sizes: test_tick_sizes(),
         }
+    }
+
+    fn test_tick_sizes() -> BTreeMap<String, Decimal> {
+        [
+            "inst.us_equity.spy",
+            "inst.us_equity.qqq",
+            "inst.us_option.spy.near",
+            "inst.us_option.spy.far",
+        ]
+        .into_iter()
+        .map(|instrument| (instrument.to_owned(), decimal("tick", "0.01").unwrap()))
+        .collect()
     }
 
     /// The same policy with net short exposure explicitly permitted, bounded at
@@ -6431,6 +6501,119 @@ mod tests {
         assert!(decision
             .evaluated_limits
             .contains("combo_net_debit=10002.50000000"));
+    }
+
+    #[test]
+    fn an_order_off_its_instruments_tick_grid_is_refused_before_the_broker() {
+        let mut service = service();
+        let mut off_grid = intent("intent-tick-001", "2026-01-02T14:30:00Z");
+        off_grid.order_type = OrderType::Limit;
+        off_grid.limit_price = Some(decimal("limit", "100.005").unwrap());
+        let outcome = service
+            .submit_intent(
+                off_grid,
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:01Z",
+            )
+            .unwrap();
+        assert!(!outcome.decision.approved);
+        assert_eq!(
+            outcome.decision.reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        assert!(
+            outcome.order_id.is_none(),
+            "an off-grid order reached the OMS"
+        );
+        assert!(outcome
+            .decision
+            .evaluated_limits
+            .contains("instrument_tick_size=0.01"));
+
+        let mut on_grid = intent("intent-tick-002", "2026-01-02T14:30:00Z");
+        on_grid.order_type = OrderType::Limit;
+        on_grid.limit_price = Some(decimal("limit", "100.01").unwrap());
+        assert!(
+            service
+                .submit_intent(
+                    on_grid,
+                    market("2026-01-02T14:30:00Z"),
+                    "2026-01-02T14:30:02Z"
+                )
+                .unwrap()
+                .decision
+                .approved,
+            "an on-grid limit was refused"
+        );
+    }
+
+    #[test]
+    fn an_order_for_an_instrument_without_a_configured_tick_is_refused() {
+        let mut service = service();
+        let mut unlisted = intent("intent-tick-003", "2026-01-02T14:30:00Z");
+        unlisted.instrument_id = "inst.us_equity.iwm".to_owned();
+        let mut iwm = market("2026-01-02T14:30:00Z");
+        iwm.instrument_id = "inst.us_equity.iwm".to_owned();
+        // A market order carries no limit, but its instrument is still unknown
+        // reference data, so it fails closed.
+        let outcome = service
+            .submit_intent(unlisted, iwm, "2026-01-02T14:30:01Z")
+            .unwrap();
+        assert!(!outcome.decision.approved);
+        assert_eq!(
+            outcome.decision.reason_codes,
+            vec!["INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()]
+        );
+        assert!(outcome
+            .decision
+            .evaluated_limits
+            .contains("instrument_tick_size=UNCONFIGURED"));
+
+        // A listed instrument's market order is unaffected.
+        assert!(
+            service
+                .submit_intent(
+                    intent("intent-tick-004", "2026-01-02T14:30:00Z"),
+                    market("2026-01-02T14:30:00Z"),
+                    "2026-01-02T14:30:02Z"
+                )
+                .unwrap()
+                .decision
+                .approved
+        );
+    }
+
+    #[test]
+    fn a_tick_size_table_must_be_nonempty_positive_and_canonical() {
+        assert!(policy().validate().is_ok());
+        for broken in [
+            BTreeMap::new(),
+            BTreeMap::from([("inst.us_equity.spy".to_owned(), Decimal::ZERO)]),
+            BTreeMap::from([("INST.SPY".to_owned(), decimal("tick", "0.01").unwrap())]),
+        ] {
+            let policy = PaperRiskPolicy {
+                instrument_tick_sizes: broken.clone(),
+                ..policy()
+            };
+            assert!(policy.validate().is_err(), "accepted tick table {broken:?}");
+        }
+        let mut coarser = policy();
+        coarser.instrument_tick_sizes.insert(
+            "inst.us_equity.spy".to_owned(),
+            decimal("tick", "0.05").unwrap(),
+        );
+        let coarser_service = PaperTradingService::new(
+            account(),
+            coarser,
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account()).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            service().configuration_fingerprint(),
+            coarser_service.configuration_fingerprint(),
+            "a journal must not reopen under a changed tick table"
+        );
     }
 
     #[test]
