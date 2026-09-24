@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T16:56:49Z  
+**Measured at:** 2026-09-24T17:04:43Z  
 **Branch:** `main`  
-**HEAD:** `5b98c56` -- feat(evidence): seal portable strategy capsules from a replayed evaluation -- E2.1b (2026-09-24T22:17:28+05:30)  
-**Uncommitted paths:** 11
+**HEAD:** `d050774` -- feat(evidence): sign strategy capsules and verify against a trusted key -- E2.1d (2026-09-24T22:27:29+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 407 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 411 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
@@ -444,7 +444,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | ID | Gap | Conformance row |
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
-| E3.2 | Property/model/fault coverage beyond the six landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles and EMS scheduling legality). Remaining candidates: algo-wheel allocation, passive repricing, smart routing, margin/financing functions | Reliability |
+| E3.2 | Property/model/fault coverage beyond the seven landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, and algo-wheel allocation). Remaining candidates: passive repricing, smart routing, margin/financing functions | Reliability |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
 | E3.5 | Market-data gap-repair operation | 5.2 |
@@ -541,10 +541,23 @@ short — detail belongs in the conformance audit.
 - Rust workspace **405 → 407 passed**, 0 failed, 3 ignored; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green, and the full evidence pipeline exited 0.
-- **Next action:** remaining E3.2 candidates or E3.5 market-data gap repair.
-  E2.1b's only remainder is verifying a capsule on a second, clean machine,
-  which needs another machine. The top external priority is unchanged: the 30
-  clean PAPER sessions.
+- Landed **E3.2d**: `core/execution/tests/algo_wheel_proptest.rs` checks
+  every wheel plan against an oracle rebuilt from an integer weight split and
+  directly planned branches, merged by (offset, branch, position). It also
+  checks that a single full-weight branch is transparent, and that malformed,
+  nested, empty and zero-weight wheels are refused. Eight deliberate defects
+  were injected and each was caught; seven of them preserve conservation, so
+  `validate_against` alone would have caught none of those seven. One catch
+  overturned an assumption: a zero-weight *last* branch receives the rounding
+  remainder, so the explicit zero-weight check is not redundant (audit item
+  59). Stress-run 20 times on fresh seeds with no failure.
+- Rust workspace **407 → 411 passed**, 0 failed, 3 ignored; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
+- **Next action:** remaining E3.2 candidates (passive repricing, smart
+  routing, margin/financing) or E3.5 market-data gap repair. E2.1b's only
+  remainder is verifying a capsule on a second, clean machine. The top
+  external priority is unchanged: the 30 clean PAPER sessions.
 
 ### 2026-09-24 — session 4
 

@@ -2191,6 +2191,43 @@ These are mandatory master-plan acceptance conditions and are currently open:
 
       No external gate moved.
 
+59. A seventh property-test slice: algo-wheel allocation (2026-09-24, Reliability and quality conformance;
+    E3.2d). This closes the "algo-wheel allocation" candidate named in item 56's remainder.
+    - **What is now real.** `core/execution/tests/algo_wheel_proptest.rs` has four properties.
+      - Every wheel plan equals an oracle plan built without the wheel planner. The oracle splits the parent
+        in integer 1e-8 units (each branch but the last gets the floor of `quantity * weight / 10000`, and the
+        last absorbs the remainder). It plans each branch directly with the parent's limit, merges children
+        by (offset, branch, position), renumbers them from `.child.0001`, and sums the branches' unallocated
+        quantity. Either both plan identically or both refuse. Of 256 cases, 165 compare two real plans and 127
+        of those contain children at the same offset, so the tie-break is exercised rather than vacuous.
+      - A single full-weight branch is transparent.
+      - Weights that do not sum to exactly 10000 are refused.
+      - Nested wheels, empty wheels and zero weights are refused.
+
+      Branches draw from every non-wheel algorithm: immediate, TWAP, VWAP, participation, arrival price and
+      iceberg.
+    - **Verified against injected defects.** Eight were injected and each failed a property:
+      - tie-breaking by child position before branch;
+      - giving the weight remainder to the first branch;
+      - branches dropping the parent's limit;
+      - renumbering from zero;
+      - accepting weights that do not sum to 10000;
+      - accepting nested wheels;
+      - accepting zero weights;
+      - taking the unallocated quantity from the last branch only.
+
+      Only the last of these breaks conservation, so `validate_against` alone would have caught none of the
+      other seven. The zero-weight catch was checked rather than assumed, because the weight split refuses a
+      zero share and the explicit check looked redundant. It is not: a zero-weight branch in *last* position
+      receives the rounding remainder, so without the check a branch the operator gave no weight to would
+      trade (the minimal case was 40 × 1e-8 units at weights 562/9438/0, which leaves 1 unit to the zero branch).
+      Seeds recorded only by injected runs were deleted, not committed.
+    - **Measured result.** The Rust workspace rose from 407 to 411 passed / 0 failed / 3 ignored; the
+      final `python tools/session_status.py` run measured all seven suites green, and the suite was
+      stress-run 20 times at 512 cases each on fresh seeds without failure.
+    - **Bounded remainder.** Passive repricing, smart routing, and the margin/financing functions of
+      `core/accounting` still lack property coverage. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
