@@ -924,7 +924,11 @@ impl TaxLotBook {
             .map_err(|error| AccountingError(error.0))?;
         validate_utc_timestamp("short tax lot opened_at", &lot.opened_at)
             .map_err(|error| AccountingError(error.0))?;
-        if lot.remaining_quantity <= Decimal::ZERO || lot.unit_proceeds <= Decimal::ZERO {
+        // `unit_proceeds` is net of the opening fee, so it is zero or negative
+        // when the commission met or exceeded the premium. That is a real,
+        // broker-executed short and must be recordable; only the quantity has
+        // to be positive.
+        if lot.remaining_quantity <= Decimal::ZERO {
             return Err(AccountingError(
                 "invalid short tax lot economics".to_owned(),
             ));
@@ -1163,7 +1167,8 @@ impl TaxLotBook {
                 }
                 validate_utc_timestamp("short tax lot opened_at", &lot.opened_at)
                     .map_err(|e| AccountingError(e.0))?;
-                if lot.remaining_quantity <= Decimal::ZERO || lot.unit_proceeds <= Decimal::ZERO {
+                // Net proceeds may be zero or negative; see `open_short`.
+                if lot.remaining_quantity <= Decimal::ZERO {
                     return Err(AccountingError(
                         "persisted short tax lot economics are invalid".to_owned(),
                     ));

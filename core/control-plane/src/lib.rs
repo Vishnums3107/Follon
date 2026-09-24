@@ -2014,7 +2014,9 @@ impl Portfolio {
         let instrument_id = instrument_id.into();
         validate_canonical_id("portfolio account_id", &account_id)?;
         validate_canonical_id("portfolio instrument_id", &instrument_id)?;
-        if average_cost < Decimal::ZERO
+        // Negative only for a short, where it is net opening proceeds per unit
+        // (see `apply_signed_fill`).
+        if (quantity >= Decimal::ZERO && average_cost < Decimal::ZERO)
             || quantity == Decimal::ZERO && average_cost != Decimal::ZERO
         {
             return Err(EngineError("persisted portfolio is invalid".to_owned()));
@@ -2136,7 +2138,13 @@ impl Portfolio {
                 self.realized_pnl,
             )
         };
-        if average_cost < Decimal::ZERO {
+        // A long position's cost (price plus fee) can never be negative. A
+        // short position's average is its net opening proceeds per unit, which
+        // is negative when the commission exceeded the premium -- a real,
+        // broker-executed trade (a 1-lot, one-cent option with a one-dollar
+        // minimum commission) that the OMS must be able to record rather than
+        // reject as an execution anomaly.
+        if next > Decimal::ZERO && average_cost < Decimal::ZERO {
             return Err(EngineError("signed portfolio cost is negative".to_owned()));
         }
         self.quantity = next;

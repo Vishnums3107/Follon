@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T05:46:27Z  
+**Measured at:** 2026-09-24T06:10:40Z  
 **Branch:** `main`  
-**HEAD:** `2172de4` -- test(paper): model-based property test for the atomic combination lifecycle -- E3.2a (2026-09-24T10:49:05+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `e6702f2` -- test(live): model-based property test for the atomic combination lifecycle -- E3.2b (2026-09-24T11:16:51+05:30)  
+**Uncommitted paths:** 9
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 385 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 395 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
@@ -586,6 +586,20 @@ short — detail belongs in the conformance audit.
   the service.
 - Rust workspace **384 → 385 passed**, 0 failed, 3 ignored; the final
   `python tools/session_status.py` measurement recorded all seven suites green.
+- **The E3.2a property test found a real accounting defect** on a later
+  random seed (it had passed its first runs). Opening a short where the
+  commission met or exceeded the premium — a 1-lot, one-cent option under a
+  one-dollar minimum — was refused by both `Portfolio::apply_signed_fill`
+  ("signed portfolio cost is negative") and `TaxLotBook::open_short` ("invalid
+  short tax lot economics"). The broker really executed that trade, so the OMS
+  rolled it back, drove the combination to `UNKNOWN` and raised an anomaly;
+  reconciliation could never be clean. Both now accept a short whose net
+  opening proceeds are zero or negative, on apply and on restore; a long's
+  cost still cannot be negative. Shared by PAPER and LIVE, single and
+  combination paths. Regression tests in `core/control-plane` and
+  `core/accounting` fail without the fix, and the shrunk seed is committed.
+  The three property suites were then stress-run on fresh seeds (25 × PAPER,
+  25 × scheduling, 8 × LIVE) with no failure.
 - **Next action: E3.2c** — EMS scheduling legality in `core/execution`. The top external priority is unchanged:
   the 30 clean PAPER sessions, which need a configured IBKR paper account, not
   code. Run `python tools/generate_pipeline_evidence.py` at least once per

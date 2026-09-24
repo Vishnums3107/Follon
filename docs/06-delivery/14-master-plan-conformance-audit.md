@@ -2029,6 +2029,31 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** EMS scheduling legality in `core/execution` still lacks a property test. No
       external gate moved.
 
+55. A real accounting defect found by item 53's property test: a short whose commission meets or exceeds its
+    premium could not be recorded (2026-09-24, accounting correctness; PAPER and LIVE).
+    - **What was wrong.** A short's average cost and its tax lot's `unit_proceeds` are net of the opening fee,
+      so both are zero or negative when the fee is at least the premium -- for example a 1-lot, one-cent
+      option under a one-dollar minimum commission. `Portfolio::apply_signed_fill` refused a negative average
+      ("signed portfolio cost is negative") and `TaxLotBook::open_short` refused non-positive proceeds
+      ("invalid short tax lot economics"). The broker genuinely executed the trade, so the OMS rolled the
+      evidence back, drove the combination to `UNKNOWN`, and raised `COMBINATION_EXECUTION_ANOMALY`: a real
+      fill the system could never reconcile. The same code serves PAPER and LIVE, plain and combination fills.
+    - **How it was found.** Item 53's test passed its first runs; a later run drew the case and shrank it to
+      two short legs at 1.00 with a 1.00 fee on one. The test was right and the code was wrong. Item 53's
+      measured pass was true for the seeds it ran; it is not corrected, only superseded.
+    - **The fix.** `apply_signed_fill` refuses a negative average only when the resulting position is long,
+      where cost is price plus fee and can never be negative; `Portfolio::recover_signed` applies the same rule
+      on restore. `TaxLotBook::open_short` and `TaxLotBook::recover` accept zero or negative net proceeds and
+      still require a positive quantity. Realized P&L on close or cover is unchanged arithmetic
+      (`proceeds - cost - fee`). No persisted format changed.
+    - **Regression coverage.** `core/control-plane/tests/short_fee_exceeds_premium.rs` and
+      `core/accounting/tests/short_fee_exceeds_premium.rs` record, restore and close such a short and assert the
+      exact realized P&L, and confirm a long still cannot restore with a negative cost. Both failed before the
+      fix, as did the PAPER property test on its committed shrunk seed
+      (`core/paper/tests/combo_lifecycle_proptest.proptest-regressions`). Afterwards the three property suites
+      were stress-run on fresh seeds -- 25 runs of the PAPER model, 25 of the scheduling properties, 8 of the
+      LIVE model -- with no failure.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
