@@ -1920,6 +1920,64 @@ These are mandatory master-plan acceptance conditions and are currently open:
       a real combination, the options-acceptance gate, and every external PAPER/LIVE, security, legal, and
       operational gate remain open, so this is not a production-readiness claim.
 
+51. The stale-journal-fixture defect of item 34 recurred, and is now caught by `cargo test`
+    (2026-09-24, reliability; evidence pipeline).
+    - **What happened.** E1.3a–E1.4c added `combo_orders`, `combo_risk_evidence` and short-lot tax-lot
+      members to the persisted PAPER and LIVE state. `FilePaperJournal::open` and `LiveAuditJournal::open`
+      correctly refuse any line they cannot re-serialize byte for byte, so the checked-in
+      `tests/fixtures/paper/journal-v2.ndjson` and `tests/fixtures/live/journal-v1.ndjson` stopped loading
+      and `tools/generate_pipeline_evidence.py` failed at step 14a. Item 34 had recorded that the pipeline is
+      the only thing that loads these files; it is not one of the seven suites `tools/session_status.py`
+      measures, and no session between items 46 and 50 ran it, so the break went unnoticed for four
+      sessions. No earlier entry claimed a pipeline pass in that window; this corrects no false claim.
+    - **Regenerated, not edited.** Following item 34 exactly: the PAPER fixture from one
+      `follon-paper-status` run against a fresh path with the unchanged `tests/fixtures/config/paper-v2.json`;
+      the LIVE fixture from twelve sequential `follon-live-status` opens against a fresh path with the
+      unchanged `tests/fixtures/config/live-v1.json` and `--opened-at 2026-08-11T13:30:00Z`, reproducing the
+      original `initialized` + 12 `restarted` sequence and timestamps. Configuration fingerprints match the
+      originals; the only differences are the new empty fields and the hash chain that covers them. The full
+      pipeline then exited 0, and neither fixture was modified by the run.
+    - **Recurrence now fails the workspace suite.** `core/paper/tests/checked_in_journal_fixture.rs` and
+      `core/live/tests/checked_in_journal_fixture.rs` open a temporary copy of each fixture. Both were run
+      against the stale fixtures and failed with an actionable message, then passed on the regenerated ones.
+    - **A pipeline overclaim removed.** Its closing line printed "All 12 Enduring Capabilities (DUR-01 through
+      DUR-12) & Release Readiness fully demonstrated" unconditionally, contradicting its own step-16g comment.
+      That was false and is replaced with a statement of what was measured: every step exited 0.
+
+52. The first advanced-evidence category computed from real data: decision reconstruction
+    (2026-09-24, DUR provenance; E2.1a).
+    - **Computed, not typed.** `follon-operations decision-reconstruction` reads the step-2 backtest event
+      journal and its manifest, refuses a journal that does not hash to the manifest's `events_sha256`,
+      binds the manifest's own `configuration_hash`, and walks the latest `execution.fill.v1` event's
+      causation chain. On the real journal that is a seven-node `VERIFIED` chain from market bar through
+      intent, risk decision, OMS transitions and audit to the fill. `--verified-at` is explicit, so a re-run
+      over the same journal reproduces the same document. Pipeline step 16h publishes
+      `var/decision-reconstruction.json`; it validates against
+      `contracts/json-schema/v1/decision-reconstruction.schema.json` and the desktop's strict
+      `parseDecisionReconstruction`, so its panel now renders real evidence.
+    - **Exact persisted bytes.** There is no decoder from a journal line back to `EventEnvelope`, so
+      `provenance` gained `ProvenanceRecord`: the envelope metadata reconstruction needs plus a SHA-256 of
+      the exact line. A line that is not canonical sorted-key JSON is refused rather than re-canonicalized,
+      a repeated event identity is refused, and a test proves a persisted line hashes exactly like the
+      envelope it encodes.
+    - **A latent defect fixed.** `DecisionReconstruction::to_json` built JSON with `format!` and no escaping,
+      so a quote in any journal string would have published an invalid document. It now serializes through
+      `serde_json`.
+    - **Seven deliberate defects were injected and observed to fail before restoration:** unescaped journal
+      strings; re-hashing a non-canonical line; last-wins on a repeated identity; hashing bytes other than
+      those persisted; skipping the manifest check; targeting the first fill instead of the latest; and
+      binding the wrong manifest hash.
+    - **Measured result.** Together with item 51, the Rust workspace rose from 371 to 383 passed / 0 failed /
+      3 ignored; the final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0.
+    - **Bounded remainder.** `strategy-capsule-manifest` (E2.1b) still needs a real bundle, lockfile and
+      evaluation receipt to hash and cite, and still has an unescaped `to_json`.
+      `data-rights-and-semantics-receipt` (E2.1c) is not wiring work: its `semantic_parity_score_bps` is an
+      input nothing measures, and publishing a configured value would present operator-typed data as
+      evidence. The target-entity classifier still labels every `risk.decision.v1` as `risk_rejection` and
+      does not recognize `portfolio.position_updated.v1`; the default fill target is unaffected. No external
+      gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

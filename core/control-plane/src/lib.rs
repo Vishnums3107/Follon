@@ -28,7 +28,7 @@ pub mod provenance;
 pub use capsule::{CapsuleExportDisposition, StrategyCapsuleManifest, StrategyCapsuleVerifier};
 pub use provenance::{
     CausalEdge, CausalNode, DecisionProvenanceGraphBuilder, DecisionReconstruction,
-    ProvenanceIntegrityStatus,
+    ProvenanceIntegrityStatus, ProvenanceRecord,
 };
 
 /// Error returned by the deterministic trading kernel.

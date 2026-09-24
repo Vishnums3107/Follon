@@ -465,9 +465,10 @@ def main() -> None:
     # `build_advanced_evidence_fixtures.py` validates 32 hand-authored example
     # documents against their JSON schemas -- a legitimate contract test. It
     # does NOT compute real evidence: no domain crate or CLI backs 29 of the
-    # 32 categories at all, and the 3 that do (`strategy-capsule-manifest`,
-    # `decision-reconstruction`, `data-rights-and-semantics-receipt`) are not
-    # invoked here either. These are schema-validation fixtures, not evidence,
+    # 32 categories at all. Of the 3 that do, only `decision-reconstruction`
+    # is computed (step 16h, below, from the real step-2 journal);
+    # `strategy-capsule-manifest` and `data-rights-and-semantics-receipt` are
+    # not yet invoked. These are schema-validation fixtures, not evidence,
     # so they stay in tests/fixtures/ and are deliberately not copied into
     # var/, which the desktop dashboard reads as real, dated evidence. Doing
     # so previously violated the dashboard's own zero-synthetic-data invariant
@@ -478,6 +479,27 @@ def main() -> None:
         [
             sys.executable, "tools/build_advanced_evidence_fixtures.py",
         ],
+    )
+
+    # 16h. Decision provenance reconstruction (DUR-01), computed, not typed.
+    #
+    # Walks the causal chain of the latest fill in the real step-2 backtest
+    # journal. The CLI refuses a journal that does not hash to its manifest's
+    # `events_sha256`, binds the manifest's own `configuration_hash`, and
+    # hashes each node's exact persisted line. `--verified-at` is explicit so
+    # a re-run over the same journal reproduces the same document.
+    reconstruction_target = VAR_DIR / "decision-reconstruction.json"
+    run_step(
+        "Step 16h: Reconstructing Decision Provenance from the Backtest Journal",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-operations", "--",
+            "decision-reconstruction",
+            str(VAR_DIR / "follon-backtest-artifact.events.ndjson"),
+            str(VAR_DIR / "follon-backtest-artifact.manifest.json"),
+            str(reconstruction_target),
+            "--verified-at", "2026-09-07T12:00:00Z",
+        ],
+        targets=[reconstruction_target],
     )
 
 
@@ -640,7 +662,11 @@ def main() -> None:
             print(f"  * {art.name:<45} | {size_kb:7.2f} KB | SHA256: {digest}...")
 
     print(f"\nSuccessfully populated {len([a for a in artifacts if a.is_file()])} immutable evidence artifacts in {VAR_DIR}.")
-    print("All 12 Enduring Capabilities (DUR-01 through DUR-12) & Release Readiness fully demonstrated.")
+    # Deliberately not a capability claim: most advanced-evidence categories
+    # still have no computation behind them (see step 16g), and no step here
+    # moves an external gate. Report only what was measured.
+    print("Every pipeline step exited 0. This is local engineering evidence; it closes no external gate "
+          "(see docs/06-delivery/16-delivery-state.md).")
 
 
 if __name__ == "__main__":

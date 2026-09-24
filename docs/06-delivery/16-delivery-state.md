@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T04:41:53Z  
+**Measured at:** 2026-09-24T05:00:39Z  
 **Branch:** `main`  
-**HEAD:** `bb43803` -- feat(api): submit a risk-gated atomic PAPER combination -- E1.5a (2026-09-24T09:39:32+05:30)  
-**Uncommitted paths:** 13
+**HEAD:** `937673a` -- feat(desktop): submit a risk-gated atomic PAPER combination -- E1.5b (2026-09-24T10:12:05+05:30)  
+**Uncommitted paths:** 10
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 371 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 383 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
@@ -415,11 +415,15 @@ durable-format decision and was out of scope here.
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
 They are legitimate *schema-conformance examples* and are no longer copied into
 `var/`. The gap is that 29 of the 32 have no computation anywhere in the
-repository, so 29 dashboard panels correctly render an empty state.
+repository. One category is now computed by the pipeline
+(`decision-reconstruction`); the other 31 panels correctly render an empty
+state.
 
 | Slice | Scope | State |
 | --- | --- | --- |
-| E2.1 | Three categories already have real Rust modules but no CLI subcommand wiring them into the pipeline: `strategy-capsule-manifest` (`core/control-plane::capsule`), `decision-reconstruction` (`core/control-plane::provenance`), `data-rights-and-semantics-receipt` (`core/market-data::rights`). Bounded, highest value per hour. | open |
+| E2.1a | `decision-reconstruction`: `follon-operations decision-reconstruction` walks the latest fill's causal chain in the real step-2 backtest journal, refuses a journal that does not hash to its manifest's `events_sha256`, binds the manifest's `configuration_hash`, and hashes each node's exact persisted line. Pipeline step 16h. | **done** 2026-09-24 |
+| E2.1b | `strategy-capsule-manifest` (`core/control-plane::capsule`). The verifier checks supplied hashes but builds no manifest; wiring it honestly needs a real bundle, configuration, lockfile and evaluation receipt to hash and cite, and `to_json` still builds JSON by hand without escaping (fix it the way E2.1a fixed `provenance`). | open |
+| E2.1c | `data-rights-and-semantics-receipt` (`core/market-data::rights`). **Not wiring work.** `certify_receipt` takes `semantic_parity_score_bps` as an input, and nothing in the repository measures one. Feeding it a configured number would publish an operator-typed value as measured evidence, which rule 1 forbids. It needs a real parity computation first, which makes it E2.2-class. | blocked on a real measurement |
 | E2.2+ | The remaining 29 categories are separate per-category product work, not wiring. Each needs its own real computation before its panel may show anything. | open, unsequenced |
 
 The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monitor`,
@@ -533,11 +537,36 @@ short — detail belongs in the conformance audit.
   measurement recorded all seven suites green.
 - Corrected in place a pre-existing false README sentence claiming the desktop
   exposed no cancellation or position close; the ticket has had both.
-- **Next action: E2.1** — wire the three categories that already have real
-  Rust modules (`strategy-capsule-manifest`, `decision-reconstruction`,
-  `data-rights-and-semantics-receipt`) into the evidence pipeline. The top
-  external priority is unchanged: the 30 clean PAPER sessions, which need a
-  configured IBKR paper account, not code.
+- **Found the evidence pipeline broken since session 1.** Running
+  `tools/generate_pipeline_evidence.py` failed at step 14a: the checked-in
+  PAPER and LIVE journal fixtures predate fields E1.3a–E1.4c added to the
+  persisted state, and the byte-for-byte reopen check correctly refuses them —
+  the exact defect audit item 34 fixed once before. No session had run the
+  pipeline since, because it is not one of the seven measured suites. Both
+  fixtures were regenerated with the current CLI binaries against their
+  unchanged configs (never hand-edited); their configuration fingerprints
+  match. New `cargo test` checks in `core/paper` and `core/live` load each
+  fixture, so the workspace suite now catches this; each was verified to fail
+  against the stale fixture. The pipeline's closing line also claimed "all 12
+  Enduring Capabilities fully demonstrated", which nothing measured; it now
+  reports only that every step exited 0.
+- Landed **E2.1a**: `decision-reconstruction` is the first advanced-evidence
+  category computed from real data (pipeline step 16h). `provenance` gained
+  `ProvenanceRecord`, so reconstruction works from exact persisted journal
+  lines, and its hand-built `to_json` was replaced with escaped `serde_json`
+  output. Seven deliberate defects were injected and caught. The published
+  document validates against its JSON Schema and the desktop's strict parser.
+- Rust workspace rose **371 → 383 passed**, 0 failed, 3 ignored; the full
+  evidence pipeline exits 0 again. The final `python tools/session_status.py`
+  measurement recorded all seven suites green.
+- Assessed the rest of E2.1: **E2.1b** (capsule manifest) needs real inputs to
+  hash; **E2.1c** (data-rights receipt) is blocked, because its parity score
+  would have to be typed in, not measured.
+- **Next action: E2.1b** if a real strategy bundle, lockfile and evaluation
+  receipt can be cited; otherwise E3. The top external priority is unchanged:
+  the 30 clean PAPER sessions, which need a configured IBKR paper account, not
+  code. Run `python tools/generate_pipeline_evidence.py` at least once per
+  session that touches a persisted format.
 
 ### 2026-09-24 — session 3
 
