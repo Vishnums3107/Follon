@@ -56,18 +56,18 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T06:10:40Z  
+**Measured at:** 2026-09-24T10:26:12Z  
 **Branch:** `main`  
-**HEAD:** `e6702f2` -- test(live): model-based property test for the atomic combination lifecycle -- E3.2b (2026-09-24T11:16:51+05:30)  
-**Uncommitted paths:** 9
+**HEAD:** `64bef5c` -- test(execution): property tests for EMS scheduling legality -- E3.2c (2026-09-24T11:41:42+05:30)  
+**Uncommitted paths:** 12
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 395 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 405 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 43 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 48 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -415,14 +415,14 @@ durable-format decision and was out of scope here.
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
 They are legitimate *schema-conformance examples* and are no longer copied into
 `var/`. The gap is that 29 of the 32 have no computation anywhere in the
-repository. One category is now computed by the pipeline
-(`decision-reconstruction`); the other 31 panels correctly render an empty
-state.
+repository. Two categories are now computed by the pipeline
+(`decision-reconstruction` and `strategy-capsule-manifest`); the other 30
+panels correctly render an empty state.
 
 | Slice | Scope | State |
 | --- | --- | --- |
 | E2.1a | `decision-reconstruction`: `follon-operations decision-reconstruction` walks the latest fill's causal chain in the real step-2 backtest journal, refuses a journal that does not hash to its manifest's `events_sha256`, binds the manifest's `configuration_hash`, and hashes each node's exact persisted line. Pipeline step 16h. | **done** 2026-09-24 |
-| E2.1b | `strategy-capsule-manifest` (`core/control-plane::capsule`). **Product work, not wiring** (assessed 2026-09-24). The verifier only checks hashes a caller supplies and then returns the caller's own claimed disposition; it builds no manifest. The pipeline's only evaluated strategy is compiled into the Rust backtest binary, and no portable strategy bundle, dependency lockfile or evaluation receipt exists anywhere to hash or cite. It needs a capsule-packaging step first. `to_json` also still builds JSON by hand without escaping. | open, E2.2-class |
+| E2.1b | `strategy-capsule-manifest`: the SDK's `bundle_lock` writes a dependency lock from the same enumeration as the bundle hash; `follon-backtest capsule-package` rebuilds the archive (the exact byte stream that hash covers), binds it to a real `--python-worker` evaluation and its configuration, replays the capsule's own copies under `-S` with no inherited import path, and seals `VERIFIED_PORTABLE` only if the replay reproduces the completion manifest byte for byte. `capsule-verify` re-checks and replays. Pipeline step 16i. Not signed and not yet verified on a second machine (audit item 57). | **done** 2026-09-24 |
 | E2.1c | `data-rights-and-semantics-receipt` (`core/market-data::rights`). **Not wiring work.** `certify_receipt` takes `semantic_parity_score_bps` as an input, and nothing in the repository measures one. Feeding it a configured number would publish an operator-typed value as measured evidence, which rule 1 forbids. It needs a real parity computation first, which makes it E2.2-class. | blocked on a real measurement |
 | E2.2+ | The remaining 29 categories are separate per-category product work, not wiring. Each needs its own real computation before its panel may show anything. | open, unsequenced |
 
@@ -510,6 +510,32 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-24 — session 5
+
+- Baseline at `64bef5c`: all seven suites green (Rust 395 passed / 0 failed /
+  3 ignored, Python 43).
+- Landed **E2.1b**, reversing session 4's "product work" assessment on closer
+  reading: the SDK bundle hash, the `--python-worker` evaluation path and the
+  completion manifest already existed. What was missing was a portable archive,
+  a lock, packaging and a replay. The new `follon_strategy_sdk.bundle_lock`
+  writes the lock. `follon-backtest capsule-package` builds and binds the
+  capsule, then replays the capsule's own copies under `-S` with no inherited
+  import path, and seals `VERIFIED_PORTABLE` only on a byte-identical
+  reproduction. `capsule-verify` re-checks and replays. The old verifier, which
+  echoed the caller's disposition, is gone, and `to_json` now escapes.
+  Pipeline step 16i publishes `var/strategy-capsule/`, which validates against
+  the schema and the desktop parser.
+- Sixteen deliberate defects were injected and each was caught. The first pass
+  missed one because a test masked it (audit item 57). It was fixed and
+  re-injected.
+- Rust workspace **395 → 405 passed**, 0 failed, 3 ignored; Python **43 → 48**.
+  The final `python tools/session_status.py` measurement recorded all seven
+  suites green, and the full evidence pipeline exited 0.
+- **Next action:** remaining E3.2 candidates or E3.5 market-data gap repair.
+  E2.1b's own remainder is signing the manifest and verifying a capsule on a
+  second, clean machine. The top external priority is unchanged: the 30 clean
+  PAPER sessions.
 
 ### 2026-09-24 — session 4
 

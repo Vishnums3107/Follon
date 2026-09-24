@@ -102,6 +102,43 @@ verifies the worker's bundle hash, strategy identity, and version before
 accepting a callback. Any protocol error, changed hash, or context-mismatched
 intent fails the backtest before it can be treated as a decision artifact.
 
+## Portable strategy capsules
+
+A capsule packages one real Python-worker evaluation so it can be re-run and
+checked elsewhere. First lock the bundle (the lock records the runtime, the
+entry point, and every strategy and SDK source file's size and digest, and
+prints the bundle hash), then evaluate with that hash exactly as above:
+
+```powershell
+$env:FOLLON_STRATEGY_SDK_PATH = (Resolve-Path python/strategy-sdk/src)
+$env:PYTHONPATH = $env:FOLLON_STRATEGY_SDK_PATH # only for the lock command
+$bundleHash = python -m follon_strategy_sdk.bundle_lock --bundle-root python/examples --strategy-file python/examples/worker_buy_once_strategy.py --class-name WorkerBuyOnceStrategy --output var/dependency.lock
+cargo run -p follon-cli --bin follon-backtest -- tests/fixtures/historical-bars/spy-one-minute.csv var/python-backtest.json --python-worker C:\path\to\python.exe python/examples/worker_buy_once_strategy.py WorkerBuyOnceStrategy python/examples strategy-example-001 strategy-example-v1 $bundleHash
+cargo run -p follon-cli --bin follon-backtest -- capsule-package --bundle-root python/examples --sdk-root python/strategy-sdk/src/follon_strategy_sdk --lock var/dependency.lock --config tests/fixtures/config/backtest-v1.json --evaluation var/python-backtest.json --bars tests/fixtures/historical-bars/spy-one-minute.csv --python C:\path\to\python.exe --packaged-at 2026-09-07T12:00:00Z --output var/strategy-capsule
+cargo run -p follon-cli --bin follon-backtest -- capsule-verify var/strategy-capsule --bars tests/fixtures/historical-bars/spy-one-minute.csv --python C:\path\to\python.exe
+```
+
+`capsule-package` rebuilds the strategy archive from the two trees and refuses
+it unless it opens exactly as the lock describes, hashes to the bundle hash the
+evaluation recorded, and was evaluated with the given configuration. It then
+extracts the archive to a fresh temporary directory and replays it with the
+interpreter's `-S` flag, the extracted SDK as the only import root, and that
+directory as the working directory. `FOLLON_STRATEGY_SDK_PATH`, the caller's
+directory, and installed site packages are all out of reach. The capsule is
+written, with the `VERIFIED_PORTABLE` disposition, only if that replay
+reproduces the evaluation's completion manifest byte for byte. A strategy that
+imports anything it did not vendor therefore fails here, with the interpreter's
+own error naming the missing module. `capsule-verify` re-checks every digest
+from the capsule's files and replays it again.
+
+The capsule directory holds `strategy-bundle.bin` (the exact byte stream the
+bundle hash is computed over), `dependency.lock`, `configuration.json`,
+`evaluation-receipt.json` (the completion manifest), and
+`capsule-manifest.json`. Market data is referenced by content hash and never
+carried. `VERIFIED_PORTABLE` covers only the recorded runtime target. The
+manifest is not signed, and no capsule has yet been verified on a second
+machine.
+
 ## PAPER operations status and kill switch
 
 `follon-paper-status` opens a fail-closed PAPER-only journal, validates the

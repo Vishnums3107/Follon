@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -25,7 +26,12 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def run_step(description: str, cmd: list[str], targets: list[Path] | None = None) -> None:
+def run_step(
+    description: str,
+    cmd: list[str],
+    targets: list[Path] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     if targets:
         for target in targets:
             try:
@@ -34,7 +40,13 @@ def run_step(description: str, cmd: list[str], targets: list[Path] | None = None
                 pass
     print(f"\n[+] {description}")
     print(f"    Command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=str(REPOSITORY_ROOT), capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        cwd=str(REPOSITORY_ROOT),
+        capture_output=True,
+        text=True,
+        env=None if env is None else {**os.environ, **env},
+    )
     if result.returncode != 0:
         print(f"[-] FAILED (exit code {result.returncode})")
         if result.stdout:
@@ -48,6 +60,7 @@ def run_step(description: str, cmd: list[str], targets: list[Path] | None = None
         for line in result.stdout.strip().splitlines()[:5]:
             print(f"    {line}")
     print("    [OK]")
+    return result
 
 
 def main() -> None:
@@ -465,10 +478,11 @@ def main() -> None:
     # `build_advanced_evidence_fixtures.py` validates 32 hand-authored example
     # documents against their JSON schemas -- a legitimate contract test. It
     # does NOT compute real evidence: no domain crate or CLI backs 29 of the
-    # 32 categories at all. Of the 3 that do, only `decision-reconstruction`
-    # is computed (step 16h, below, from the real step-2 journal);
-    # `strategy-capsule-manifest` and `data-rights-and-semantics-receipt` are
-    # not yet invoked. These are schema-validation fixtures, not evidence,
+    # 32 categories at all. Of the 3 that do, `decision-reconstruction` is
+    # computed in step 16h from the real step-2 journal and
+    # `strategy-capsule-manifest` in step 16i from a real Python-worker
+    # evaluation; `data-rights-and-semantics-receipt` is not invoked, because
+    # nothing measures its parity score. These are schema-validation fixtures, not evidence,
     # so they stay in tests/fixtures/ and are deliberately not copied into
     # var/, which the desktop dashboard reads as real, dated evidence. Doing
     # so previously violated the dashboard's own zero-synthetic-data invariant
@@ -500,6 +514,77 @@ def main() -> None:
             "--verified-at", "2026-09-07T12:00:00Z",
         ],
         targets=[reconstruction_target],
+    )
+
+    # 16i. Portable strategy capsule (DUR-07, ASSET-04), sealed only after a
+    # sandboxed replay of its own contents reproduces a real evaluation.
+    #
+    # (i) The SDK locks the example worker strategy bundle. (ii) The Python
+    # worker is evaluated through the real backtest runner, which verifies the
+    # worker's announced bundle hash and records it in the artifact. (iii)
+    # `capsule-package` rebuilds the archive from the trees, checks it against
+    # the lock and the evaluation, replays the capsule's own copies with no
+    # site packages or inherited import path, and seals the manifest only if
+    # the replay reproduces the completion manifest byte for byte. (iv)
+    # `capsule-verify` re-checks the sealed capsule from disk and replays it
+    # again. `--packaged-at` is explicit so a re-run reproduces the manifest.
+    python = str(Path(sys.executable).resolve())
+    sdk_source = REPOSITORY_ROOT / "python" / "strategy-sdk" / "src"
+    evaluation_dir = VAR_DIR / "strategy-evaluation"
+    capsule_dir = VAR_DIR / "strategy-capsule"
+    for stale in (evaluation_dir, capsule_dir):
+        shutil.rmtree(stale, ignore_errors=True)
+    evaluation_dir.mkdir(parents=True)
+    capsule_lock = evaluation_dir / "dependency.lock"
+    locked = run_step(
+        "Step 16i(i): Locking the Python worker strategy bundle",
+        [
+            python, "-m", "follon_strategy_sdk.bundle_lock",
+            "--bundle-root", "python/examples",
+            "--strategy-file", "python/examples/worker_buy_once_strategy.py",
+            "--class-name", "WorkerBuyOnceStrategy",
+            "--output", str(capsule_lock),
+        ],
+        env={"PYTHONPATH": str(sdk_source)},
+    )
+    bundle_hash = locked.stdout.strip()
+    evaluation_artifact = evaluation_dir / "python-worker-backtest.json"
+    run_step(
+        "Step 16i(ii): Evaluating the locked strategy through the isolated Python worker",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "tests/fixtures/historical-bars/spy-one-minute.csv",
+            str(evaluation_artifact),
+            "--python-worker", python,
+            "python/examples/worker_buy_once_strategy.py", "WorkerBuyOnceStrategy",
+            "python/examples", "strategy-example-001", "strategy-example-v1", bundle_hash,
+        ],
+        env={"FOLLON_STRATEGY_SDK_PATH": str(sdk_source)},
+    )
+    run_step(
+        "Step 16i(iii): Sealing the portable strategy capsule after a sandboxed replay",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "capsule-package",
+            "--bundle-root", "python/examples",
+            "--sdk-root", str(sdk_source / "follon_strategy_sdk"),
+            "--lock", str(capsule_lock),
+            "--config", "tests/fixtures/config/backtest-v1.json",
+            "--evaluation", str(evaluation_artifact),
+            "--bars", "tests/fixtures/historical-bars/spy-one-minute.csv",
+            "--python", python,
+            "--packaged-at", "2026-09-07T12:00:00Z",
+            "--output", str(capsule_dir),
+        ],
+    )
+    run_step(
+        "Step 16i(iv): Independently re-verifying and replaying the sealed capsule",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "capsule-verify", str(capsule_dir),
+            "--bars", "tests/fixtures/historical-bars/spy-one-minute.csv",
+            "--python", python,
+        ],
     )
 
 

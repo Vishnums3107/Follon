@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use follon_accounting::{Currency, FxBook, FxQuote, MarginPolicy, MarginRate};
 use follon_backtest::{
@@ -18,8 +19,9 @@ use follon_backtest::{
 };
 use follon_cli::{sha256_text, write_immutable};
 use follon_control_plane::{
-    import_historical_bars, BuyOnceStrategy, DeterministicFillModel, HistoricalBar,
-    MarketPreconditions, ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity,
+    build_strategy_bundle, extract_strategy_bundle, import_historical_bars, read_strategy_capsule,
+    BuyOnceStrategy, CapsuleContents, DeterministicFillModel, HistoricalBar, MarketPreconditions,
+    ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity, StrategyWorkerSandbox,
     StrategyWorkerServicesConfig,
 };
 use follon_domain::{
@@ -39,7 +41,7 @@ const BUILTIN_STRATEGY_SOURCE: &str = include_str!("../../../core/control-plane/
 
 enum StrategyMode {
     Builtin,
-    Python(PythonWorkerArguments),
+    Python(Box<PythonWorkerArguments>),
 }
 
 struct PythonWorkerArguments {
@@ -50,27 +52,38 @@ struct PythonWorkerArguments {
     strategy_id: String,
     strategy_version: String,
     bundle_hash: String,
+    /// Present only for a capsule replay; see [`StrategyWorkerSandbox`].
+    sandbox: Option<StrategyWorkerSandbox>,
 }
 
 impl PythonWorkerArguments {
+    /// Interpreter arguments for the worker protocol.
+    ///
+    /// A sandboxed worker also runs with `-S`, so no `site` directory is on
+    /// its path: a capsule whose strategy imports anything it did not vendor
+    /// fails its replay instead of silently resolving against whatever
+    /// happens to be installed.
     fn protocol_arguments(&self) -> Vec<OsString> {
-        [
-            "-m",
-            "follon_strategy_sdk.worker",
-            "--strategy-file",
-            &self.strategy_file,
-            "--class-name",
-            &self.class_name,
-            "--bundle-root",
-            &self.bundle_root,
-            "--strategy-id",
-            &self.strategy_id,
-            "--strategy-version",
-            &self.strategy_version,
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect()
+        let isolation: &[&str] = if self.sandbox.is_some() { &["-S"] } else { &[] };
+        isolation
+            .iter()
+            .copied()
+            .chain([
+                "-m",
+                "follon_strategy_sdk.worker",
+                "--strategy-file",
+                &self.strategy_file,
+                "--class-name",
+                &self.class_name,
+                "--bundle-root",
+                &self.bundle_root,
+                "--strategy-id",
+                &self.strategy_id,
+                "--strategy-version",
+                &self.strategy_version,
+            ])
+            .map(OsString::from)
+            .collect()
     }
 }
 
@@ -321,18 +334,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match subcommand.as_str() {
             "adversarial" => return run_adversarial(&raw_args[1..]),
             "counterfactual" => return run_counterfactual(&raw_args[1..]),
+            "capsule-package" => return run_capsule_package(&raw_args[1..]),
+            "capsule-verify" => return run_capsule_verify(&raw_args[1..]),
             _ => {}
         }
     }
     let arguments = parse_arguments(raw_args)?;
-    let configuration = load_runtime_configuration(&arguments.configuration_path)?;
-    let document = &configuration.document;
     if let Some(parent) = arguments.artifact_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let outputs = evaluate_backtest(
+        &arguments.input_path,
+        &arguments.configuration_path,
+        arguments.action_path.as_deref(),
+        arguments.strategy_mode,
+    )?;
+    let event_path = arguments.artifact_path.with_extension("events.ndjson");
+    let report_path = arguments.artifact_path.with_extension("report.md");
+    let manifest_path = arguments.artifact_path.with_extension("manifest.json");
+    write_immutable(&arguments.artifact_path, &outputs.artifact_json)?;
+    write_immutable(&event_path, &outputs.event_stream)?;
+    write_immutable(&report_path, &outputs.report)?;
+    let advanced_artifact_path = arguments
+        .artifact_path
+        .with_extension("advanced-account.json");
+    let advanced_report_path = arguments.artifact_path.with_extension("advanced-report.md");
+    write_immutable(&advanced_artifact_path, &outputs.advanced_artifact)?;
+    write_immutable(&advanced_report_path, &outputs.advanced_report)?;
+    write_immutable(&manifest_path, &outputs.completion_manifest)?;
+    if let Some(experiment) = arguments.experiment {
+        let record = ExperimentRecord::from_artifact(
+            experiment.experiment_id,
+            experiment.run_id,
+            BTreeMap::new(),
+            &outputs.completed.artifact,
+        )?;
+        let mut store = FileExperimentStore::open(experiment.catalog_path)?;
+        store.record(record)?;
+    }
+    eprintln!("artifact: {}", arguments.artifact_path.display());
+    eprintln!("event stream: {}", event_path.display());
+    eprintln!("report: {}", report_path.display());
+    eprintln!("completion manifest: {}", manifest_path.display());
+    eprintln!(
+        "advanced account artifact: {}",
+        advanced_artifact_path.display()
+    );
+    eprintln!(
+        "advanced account report: {}",
+        advanced_report_path.display()
+    );
+    eprintln!(
+        "artifact fingerprint: {}",
+        outputs.completed.artifact.fingerprint()
+    );
+    eprintln!("configuration hash: {}", outputs.configuration_hash);
+    Ok(())
+}
 
-    let bars = import_historical_bars(&fs::read_to_string(&arguments.input_path)?)?;
-    let corporate_actions = match &arguments.action_path {
+/// Every output of one deterministic backtest, held in memory.
+///
+/// `main` publishes these as immutable files; a capsule replay instead
+/// compares `completion_manifest` byte for byte with a sealed receipt.
+struct EvaluationOutputs {
+    completed: CompletedBacktest,
+    configuration_hash: String,
+    artifact_json: String,
+    event_stream: String,
+    report: String,
+    advanced_artifact: String,
+    advanced_report: String,
+    completion_manifest: String,
+}
+
+fn evaluate_backtest(
+    input_path: &Path,
+    configuration_path: &Path,
+    action_path: Option<&Path>,
+    strategy_mode: StrategyMode,
+) -> Result<EvaluationOutputs, Box<dyn std::error::Error>> {
+    let configuration = load_runtime_configuration(configuration_path)?;
+    let document = &configuration.document;
+
+    let bars = import_historical_bars(&fs::read_to_string(input_path)?)?;
+    let corporate_actions = match action_path {
         Some(path) => import_corporate_actions(&fs::read_to_string(path)?)?,
         None => Vec::new(),
     };
@@ -348,7 +433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &dataset_bars,
         &corporate_actions,
     )?;
-    let (strategy_bundle_hash, strategy_id, strategy_version) = match &arguments.strategy_mode {
+    let (strategy_bundle_hash, strategy_id, strategy_version) = match &strategy_mode {
         StrategyMode::Builtin => (
             format!("{:x}", Sha256::digest(BUILTIN_STRATEGY_SOURCE.as_bytes())),
             document.strategy.strategy_id.clone(),
@@ -401,7 +486,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bars,
         corporate_actions,
     };
-    let completed = match arguments.strategy_mode {
+    let completed = match strategy_mode {
         StrategyMode::Builtin => {
             let mut strategy = BuyOnceStrategy::new(
                 &document.account.account_id,
@@ -421,15 +506,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 strategy_bundle_hash,
                 environment: "SIMULATION".to_owned(),
             };
-            let mut strategy = ProcessStrategyWorker::spawn_with_services(
-                &worker.program,
-                worker.protocol_arguments(),
-                identity,
-                StrategyWorkerServicesConfig {
-                    currency: document.account.currency.clone(),
-                    initial_cash: configuration.initial_cash,
-                },
-            )?;
+            let services = StrategyWorkerServicesConfig {
+                currency: document.account.currency.clone(),
+                initial_cash: configuration.initial_cash,
+            };
+            let mut strategy = match &worker.sandbox {
+                Some(sandbox) => ProcessStrategyWorker::spawn_sandboxed_with_services(
+                    &worker.program,
+                    worker.protocol_arguments(),
+                    identity,
+                    services,
+                    sandbox,
+                )?,
+                None => ProcessStrategyWorker::spawn_with_services(
+                    &worker.program,
+                    worker.protocol_arguments(),
+                    identity,
+                    services,
+                )?,
+            };
             runner.run(&mut strategy, &input, &market)?
         }
     };
@@ -438,23 +533,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &input.corporate_actions,
         &configuration.advanced_account,
     )?;
-    let event_path = arguments.artifact_path.with_extension("events.ndjson");
-    let report_path = arguments.artifact_path.with_extension("report.md");
-    let manifest_path = arguments.artifact_path.with_extension("manifest.json");
     let artifact_json = completed.artifact.canonical_json();
     let event_stream = completed.canonical_events.join("\n") + "\n";
     let report = completed.artifact.markdown_report();
-    write_immutable(&arguments.artifact_path, &artifact_json)?;
-    write_immutable(&event_path, &event_stream)?;
-    write_immutable(&report_path, &report)?;
     let advanced_artifact = advanced_report.canonical_json();
     let advanced_report_text = advanced_report.markdown_report();
-    let advanced_artifact_path = arguments
-        .artifact_path
-        .with_extension("advanced-account.json");
-    let advanced_report_path = arguments.artifact_path.with_extension("advanced-report.md");
-    write_immutable(&advanced_artifact_path, &advanced_artifact)?;
-    write_immutable(&advanced_report_path, &advanced_report_text)?;
     let advanced_manifest = format!(
         "{{\"artifact_sha256\":\"{}\",\"report_sha256\":\"{}\"}}",
         sha256_text(&advanced_artifact),
@@ -471,32 +554,268 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sha256_text(&report),
         completed.artifact.specification_fingerprint,
     );
-    write_immutable(&manifest_path, &completion_manifest)?;
-    if let Some(experiment) = arguments.experiment {
-        let record = ExperimentRecord::from_artifact(
-            experiment.experiment_id,
-            experiment.run_id,
-            BTreeMap::new(),
-            &completed.artifact,
-        )?;
-        let mut store = FileExperimentStore::open(experiment.catalog_path)?;
-        store.record(record)?;
+    Ok(EvaluationOutputs {
+        completed,
+        configuration_hash: configuration.content_hash,
+        artifact_json,
+        event_stream,
+        report,
+        advanced_artifact,
+        advanced_report: advanced_report_text,
+        completion_manifest,
+    })
+}
+
+/// `follon-backtest capsule-package`: seals a portable capsule around a real
+/// Python-worker evaluation.
+///
+/// Nothing is taken on trust. The strategy archive is rebuilt from the bundle
+/// and SDK trees and must open exactly as the SDK's lock describes. It must
+/// hash to the bundle hash the evaluation's own specification recorded, which
+/// is the hash the worker announced and the runner verified. The
+/// configuration must hash to what the evaluation and its completion manifest
+/// recorded, and the completion manifest must hash-bind the artifact. The
+/// capsule's own copies are then replayed in a sandbox, and a manifest is
+/// sealed only if that replay reproduces the completion manifest byte for
+/// byte. The evaluation must have run without corporate actions, because the
+/// replay supplies none.
+fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (positional, flags) = parse_flag_values(
+        arguments,
+        &[
+            "--bundle-root",
+            "--sdk-root",
+            "--lock",
+            "--config",
+            "--evaluation",
+            "--bars",
+            "--python",
+            "--packaged-at",
+            "--output",
+        ],
+    )?;
+    if !positional.is_empty() {
+        return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> --python <interpreter> --packaged-at <utc> --output <dir>".into());
     }
-    eprintln!("artifact: {}", arguments.artifact_path.display());
-    eprintln!("event stream: {}", event_path.display());
-    eprintln!("report: {}", report_path.display());
-    eprintln!("completion manifest: {}", manifest_path.display());
-    eprintln!(
-        "advanced account artifact: {}",
-        advanced_artifact_path.display()
+    let flag = |name: &str| flags[name].as_str();
+
+    let lock_bytes = fs::read(flag("--lock"))?;
+    let lock = follon_control_plane::StrategyBundleLock::parse(&lock_bytes)?;
+    let archive = build_strategy_bundle(
+        Path::new(flag("--bundle-root")),
+        Path::new(flag("--sdk-root")),
+        &lock.runtime,
+    )?;
+    let configuration_path = PathBuf::from(flag("--config"));
+    let configuration_bytes = fs::read(&configuration_path)?;
+    load_runtime_configuration(&configuration_path)?;
+    let evaluation_path = PathBuf::from(flag("--evaluation"));
+    let artifact_bytes = fs::read(&evaluation_path)?;
+    let receipt_bytes = fs::read(evaluation_path.with_extension("manifest.json"))?;
+    let contents = CapsuleContents::new(lock_bytes, archive, configuration_bytes, receipt_bytes)?;
+
+    let receipt: serde_json::Value = serde_json::from_slice(contents.receipt())?;
+    if receipt
+        .get("artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(format!("{:x}", Sha256::digest(&artifact_bytes)).as_str())
+    {
+        return Err("the completion manifest does not bind this evaluation artifact".into());
+    }
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact_bytes)?;
+    let specification = artifact
+        .get("specification")
+        .ok_or("evaluation artifact has no specification")?;
+    let recorded = |field: &str| {
+        specification
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("evaluation specification has no {field}"))
+    };
+    if recorded("strategy_bundle_hash")? != contents.lock.strategy_bundle_hash {
+        return Err("the evaluation was not run with this strategy bundle".into());
+    }
+    if recorded("configuration_hash")? != format!("{:x}", Sha256::digest(contents.configuration()))
+    {
+        return Err("the evaluation was not run with this configuration".into());
+    }
+    let dataset = |field: &str| {
+        specification
+            .get("dataset")
+            .and_then(|dataset| dataset.get(field))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("evaluation dataset has no {field}"))
+    };
+    let replay_command = format!(
+        "follon-backtest capsule-verify <capsule-dir> --bars <{} {} bars, dataset content hash {}> --python <{} interpreter>",
+        dataset("dataset_id")?,
+        dataset("dataset_version")?,
+        dataset("content_hash")?,
+        contents.lock.runtime,
     );
-    eprintln!(
-        "advanced account report: {}",
-        advanced_report_path.display()
+
+    let reproduced = replay_capsule(&contents, Path::new(flag("--bars")), flag("--python"))?;
+    let manifest = contents.seal(
+        flag("--packaged-at"),
+        &replay_command,
+        reproduced.as_bytes(),
+    )?;
+    let output = PathBuf::from(flag("--output"));
+    contents.write_sealed(&manifest, &output)?;
+    let sealed = read_strategy_capsule(&output)?;
+    println!(
+        "{} {}",
+        sealed.manifest.capsule_id,
+        sealed.manifest.export_disposition.as_str()
     );
-    eprintln!("artifact fingerprint: {}", completed.artifact.fingerprint());
-    eprintln!("configuration hash: {}", configuration.content_hash);
+    eprintln!("capsule: {}", output.display());
+    eprintln!("bundle hash: {}", sealed.manifest.bundle_sha256);
+    eprintln!(
+        "evaluation receipt: {}",
+        sealed.manifest.evaluation_receipt_id
+    );
     Ok(())
+}
+
+/// `follon-backtest capsule-verify`: re-checks a sealed capsule and replays it.
+///
+/// Every static binding is recomputed from the capsule's files, then the
+/// capsule's own strategy and SDK are replayed in a sandbox. Success means the
+/// replay reproduced the sealed evaluation receipt byte for byte.
+fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (positional, flags) = parse_flag_values(arguments, &["--bars", "--python"])?;
+    let [capsule_directory] = positional.as_slice() else {
+        return Err(
+            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> --python <interpreter>"
+                .into(),
+        );
+    };
+    let sealed = read_strategy_capsule(Path::new(capsule_directory))?;
+    let reproduced = replay_capsule(
+        &sealed.contents,
+        Path::new(&flags["--bars"]),
+        &flags["--python"],
+    )?;
+    if reproduced.as_bytes() != sealed.contents.receipt() {
+        return Err("capsule replay did not reproduce its evaluation receipt".into());
+    }
+    println!(
+        "{} {}: replay reproduced {}",
+        sealed.manifest.capsule_id,
+        sealed.manifest.export_disposition.as_str(),
+        sealed.manifest.evaluation_receipt_id
+    );
+    Ok(())
+}
+
+/// Replays a capsule's own strategy and SDK and returns the completion
+/// manifest the replay produced.
+///
+/// The archive is extracted into a fresh temporary directory, which is
+/// removed afterwards. The worker's only import root is the extracted SDK, its
+/// working directory is the temporary directory, and it runs with `-S`, so
+/// neither the caller's environment nor installed packages can stand in for
+/// the capsule's contents.
+fn replay_capsule(
+    contents: &CapsuleContents,
+    bars: &Path,
+    python: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !Path::new(python).is_absolute() {
+        return Err(
+            "--python must be an absolute interpreter path; the worker receives no PATH".into(),
+        );
+    }
+    let workspace = ReplayWorkspace::create()?;
+    let extracted = extract_strategy_bundle(
+        &contents.sources,
+        &contents.lock.entry_point,
+        &workspace.path.join("bundle"),
+    )?;
+    let configuration_path = workspace.path.join("configuration.json");
+    fs::write(&configuration_path, contents.configuration())?;
+    let text = |path: &Path| {
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or("capsule replay path is not UTF-8")
+    };
+    let worker = PythonWorkerArguments {
+        program: python.to_owned(),
+        strategy_file: text(&extracted.strategy_file)?,
+        class_name: contents.lock.entry_point.class_name.clone(),
+        bundle_root: text(&extracted.strategy_root)?,
+        strategy_id: contents.strategy_id.clone(),
+        strategy_version: contents.strategy_version.clone(),
+        bundle_hash: contents.lock.strategy_bundle_hash.clone(),
+        sandbox: Some(StrategyWorkerSandbox {
+            python_path: extracted.sdk_search_path.clone(),
+            working_directory: workspace.path.clone(),
+        }),
+    };
+    let outputs = evaluate_backtest(
+        bars,
+        &configuration_path,
+        None,
+        StrategyMode::Python(Box::new(worker)),
+    )?;
+    Ok(outputs.completion_manifest)
+}
+
+/// A temporary replay directory, removed when dropped.
+struct ReplayWorkspace {
+    path: PathBuf,
+}
+
+impl ReplayWorkspace {
+    fn create() -> Result<Self, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!(
+            "follon-capsule-replay-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ReplayWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Positional arguments, then each flag's value keyed by the flag.
+type FlagValues = (Vec<String>, BTreeMap<String, String>);
+
+/// Splits `--flag value` pairs from positional arguments; every listed flag
+/// is required exactly once and no other flag is accepted.
+fn parse_flag_values(
+    arguments: &[String],
+    flags: &[&str],
+) -> Result<FlagValues, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    let mut values = BTreeMap::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument.starts_with("--") {
+            if !flags.contains(&argument.as_str()) {
+                return Err(format!("unsupported argument: {argument}").into());
+            }
+            let value = required_argument(arguments, index + 1, argument)?.to_owned();
+            if values.insert(argument.clone(), value).is_some() {
+                return Err(format!("{argument} may be specified only once").into());
+            }
+            index += 2;
+        } else {
+            positional.push(argument.clone());
+            index += 1;
+        }
+    }
+    if let Some(missing) = flags.iter().find(|flag| !values.contains_key(**flag)) {
+        return Err(format!("{missing} is required").into());
+    }
+    Ok((positional, values))
 }
 
 #[derive(Deserialize)]
@@ -1485,8 +1804,9 @@ fn parse_arguments(arguments: Vec<String>) -> Result<CommandArguments, Box<dyn s
                         .to_owned(),
                     bundle_hash: required_argument(&arguments, index + 7, "--python-worker")?
                         .to_owned(),
+                    sandbox: None,
                 };
-                strategy_mode = StrategyMode::Python(worker);
+                strategy_mode = StrategyMode::Python(Box::new(worker));
                 index += 7;
             }
             "--experiment" => {

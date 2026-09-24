@@ -2078,6 +2078,80 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** Algo-wheel allocation, passive repricing, smart routing, and the margin/financing
       functions of `core/accounting` still lack property coverage. No external gate moved.
 
+57. The second advanced-evidence category computed from real data: portable strategy capsules (2026-09-24,
+    DUR-07 and ASSET-04; E2.1b).
+    - **What the earlier assessment missed.** Item 52's remainder and item 53's "Also recorded" note put E2.1b
+      down as product work because no portable bundle, lockfile or evaluation receipt existed to hash. Those
+      three were indeed missing, and those statements stand as written. But the assessment left out what
+      already existed: the SDK's deterministic `strategy_bundle_hash`; `follon-backtest --python-worker`, which
+      evaluates a Python strategy, verifies the hash the worker announces, and records it in the artifact's
+      specification; and the completion manifest every run writes. This item builds on all three.
+    - **What is now real.** `follon_strategy_sdk.bundle_lock` writes a canonical dependency lock: the runtime
+      identity, the entry point, and every strategy and SDK source file's size and SHA-256. It comes from the
+      same enumeration as the bundle hash, so the two cannot disagree. `follon-backtest capsule-package`
+      rebuilds the strategy archive from the two trees. That archive is exactly the length-framed byte stream
+      the bundle hash is computed over, so its SHA-256 is the bundle hash. The packager refuses the archive
+      unless it opens exactly as the lock describes (every namespace, path, size and digest in order, the
+      runtime tail, no trailing bytes). It also refuses unless the evaluation's own specification recorded
+      that bundle hash and the configuration's hash, and the completion manifest hash-binds the artifact.
+      Pipeline step 16i evaluates the repository's worker example this way. Its
+      `var/strategy-capsule/capsule-manifest.json` validates against
+      `contracts/json-schema/v1/strategy-capsule-manifest.schema.json` and the desktop's strict
+      `parseStrategyCapsuleManifest`, and the desktop server classifies it as `strategy_capsule_manifest`, so
+      the panel now renders real evidence.
+    - **The disposition is earned, not claimed.** `StrategyCapsuleVerifier::verify_capsule_payload` checked
+      caller-supplied hashes and then returned the caller's own claimed disposition. It is removed.
+      `CapsuleContents::seal` issues `VERIFIED_PORTABLE` only when it is handed replay output identical to
+      the receipt. The packager produces that output by extracting the archive into a fresh temporary
+      directory and replaying it through the real backtest runner in a sandbox. The new
+      `ProcessStrategyWorker::spawn_sandboxed_with_services` makes the extracted SDK the only `PYTHONPATH`
+      and the temporary directory the working directory, and the interpreter runs with `-S`. The caller's
+      `FOLLON_STRATEGY_SDK_PATH`, the caller's directory, and installed site packages are therefore out of
+      reach. A strategy that imports anything it did not vendor fails the replay, with the interpreter naming
+      the missing module. `capsule-verify` re-derives every manifest field from the capsule's five files and
+      replays again; pipeline step 16i(iv) runs it. `to_json` now serializes through `serde_json`, and
+      `parse` refuses any encoding other than that canonical one.
+    - **A cross-runtime contract.** The Rust archive and the Python digest are pinned to the same test
+      vector in `core/control-plane` and `python/strategy-sdk/tests/test_bundle.py`. The vector includes an
+      uppercase file name, which byte order sorts first and NTFS directory order sorts last, so an unsorted
+      enumeration on either side changes the hash.
+    - **Sixteen deliberate defects were injected, and each was observed to fail before restoration:**
+      - replay without `-S`;
+      - the sandbox keeping the caller's working directory;
+      - the sandbox honouring the caller's `FOLLON_STRATEGY_SDK_PATH`;
+      - `seal` ignoring the replay's bytes;
+      - `capsule-verify` skipping the receipt comparison;
+      - `capsule-package` skipping the bundle binding;
+      - the archive reader skipping per-file digests, ignoring trailing bytes, or ignoring the runtime tail;
+      - the lock parser skipping path validation or accepting non-canonical encodings;
+      - the Rust archive dropping its sort;
+      - a sealed capsule claiming any disposition;
+      - a capsule carrying extra members;
+      - a receipt that need not name the configuration;
+      - the Python enumeration dropping its sort.
+
+      On the first pass the path-validation defect was not caught. Every unsafe path in the test sat without
+      a valid entry point, so the entry-point check refused the lock first. The test was fixed so that each
+      unsafe path is the lock's only fault, and it now fails. The two integration refusals that a later
+      replay would also catch assert which check refused them, so the replay cannot mask a removed binding.
+    - **Measured result.** The Rust workspace rose from 395 to 405 passed / 0 failed / 3 ignored, and
+      Python from 43 to 48 passed. The final `python tools/session_status.py` run measured all seven suites
+      green, and the full evidence pipeline exited 0.
+    - **Bounded remainder.**
+      - DUR-07 asks for a *signed* manifest and clean-machine verification. The manifest is unsigned, and no
+        capsule has been replayed anywhere but the machine that sealed it; `VERIFIED_PORTABLE` covers only
+        the recorded runtime target.
+      - Packaging refuses rather than emitting `MISSING_DEPENDENCY_LOCK`, `UNVERIFIED_EVALUATION` or
+        `RESTRICTED_DATASET_RIGHTS`, so those three dispositions are unreachable. A missing dependency is
+        reported only in the interpreter's error text.
+      - Dataset rights are not assessed. No market data is carried, so nothing is redistributed, but nothing
+        certifies the referenced dataset either (see E2.1c).
+      - Only Python-worker evaluations without corporate actions can be packaged.
+      - The standard library is pinned only through the runtime version string.
+      - The evaluated strategy is the fixed-threshold demo and claims no edge.
+
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

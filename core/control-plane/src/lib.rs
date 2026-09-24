@@ -25,7 +25,12 @@ use sha2::{Digest, Sha256};
 pub mod capsule;
 pub mod provenance;
 
-pub use capsule::{CapsuleExportDisposition, StrategyCapsuleManifest, StrategyCapsuleVerifier};
+pub use capsule::{
+    build_strategy_bundle, extract_strategy_bundle, open_strategy_bundle, read_strategy_capsule,
+    BundleEntryPoint, BundleNamespace, BundleSource, CapsuleContents, CapsuleExportDisposition,
+    ExtractedStrategyBundle, LockedFile, SealedStrategyCapsule, StrategyBundleLock,
+    StrategyCapsuleManifest,
+};
 pub use provenance::{
     CausalEdge, CausalNode, DecisionProvenanceGraphBuilder, DecisionReconstruction,
     ProvenanceIntegrityStatus, ProvenanceRecord,
@@ -551,6 +556,16 @@ impl StrategyWorkerIdentity {
     }
 }
 
+/// Process confinement for a worker whose source comes from a sealed capsule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyWorkerSandbox {
+    /// The child's only `PYTHONPATH` entry, replacing `FOLLON_STRATEGY_SDK_PATH`.
+    pub python_path: std::path::PathBuf,
+    /// The child's working directory, keeping the caller's directory off its
+    /// import path (`python -m` puts the working directory first).
+    pub working_directory: std::path::PathBuf,
+}
+
 /// Explicit single-currency starting balance for bounded worker services.
 ///
 /// It is intentionally limited to the deterministic replay account. A worker
@@ -830,7 +845,7 @@ impl ProcessStrategyWorker {
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
     ) -> Result<Self, EngineError> {
-        Self::spawn_inner(program, arguments, identity, None)
+        Self::spawn_inner(program, arguments, identity, None, None)
     }
 
     /// Starts a worker with bounded point-in-time data, portfolio, state, and
@@ -846,6 +861,28 @@ impl ProcessStrategyWorker {
             arguments,
             identity,
             Some(WorkerRuntimeServices::new(services)?),
+            None,
+        )
+    }
+
+    /// Starts a services-enabled worker confined to an explicit import root
+    /// and working directory, as a capsule replay requires.
+    ///
+    /// The caller's `FOLLON_STRATEGY_SDK_PATH` and current directory are never
+    /// visible to the child, so its code can come only from `sandbox`.
+    pub fn spawn_sandboxed_with_services(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+        services: StrategyWorkerServicesConfig,
+        sandbox: &StrategyWorkerSandbox,
+    ) -> Result<Self, EngineError> {
+        Self::spawn_inner(
+            program,
+            arguments,
+            identity,
+            Some(WorkerRuntimeServices::new(services)?),
+            Some(sandbox),
         )
     }
 
@@ -854,6 +891,7 @@ impl ProcessStrategyWorker {
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
         services: Option<WorkerRuntimeServices>,
+        sandbox: Option<&StrategyWorkerSandbox>,
     ) -> Result<Self, EngineError> {
         identity.validate()?;
         let mut command = Command::new(program);
@@ -861,7 +899,11 @@ impl ProcessStrategyWorker {
             .args(arguments)
             .env_clear()
             .env("PYTHONIOENCODING", "utf-8");
-        if let Some(sdk_path) = std::env::var_os("FOLLON_STRATEGY_SDK_PATH") {
+        if let Some(sandbox) = sandbox {
+            command
+                .env("PYTHONPATH", &sandbox.python_path)
+                .current_dir(&sandbox.working_directory);
+        } else if let Some(sdk_path) = std::env::var_os("FOLLON_STRATEGY_SDK_PATH") {
             command.env("PYTHONPATH", sdk_path);
         }
         let mut child = command
