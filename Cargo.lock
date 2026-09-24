@@ -453,6 +453,7 @@ dependencies = [
  "follon-instrument",
  "follon-news",
  "proptest",
+ "ring",
  "serde_json",
  "sha2 0.10.9",
 ]

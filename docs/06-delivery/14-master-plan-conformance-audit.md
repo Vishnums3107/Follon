@@ -2152,6 +2152,45 @@ These are mandatory master-plan acceptance conditions and are currently open:
 
       No external gate moved.
 
+58. Strategy capsules can be signed, and verification can require a trusted signer (2026-09-24, DUR-07;
+    E2.1d). This closes the "signed manifest" half of item 57's first remainder; item 57 was accurate when
+    written.
+    - **What is now real.** `follon-backtest capsule-sign` fully re-reads a sealed capsule, then adds one
+      detached Ed25519 signature over the exact manifest bytes as `capsule-signature.json`. The manifest
+      hash-binds the other four members, so the signature covers the whole capsule. The v1 manifest schema
+      forbids extra fields and is unchanged. Keys are the PKCS#8 and `{key_id, public_key_hex}` files
+      `follon-admin release-keygen` already writes, and the private key's bytes are zeroed after use.
+      `core/control-plane` gains `ring`. The main workspace already locked it through `core/commercial`, so no
+      crate is new there. The separate Tauri host lockfile gains `ring` 0.17.14, `untrusted` 0.9.0 and
+      `windows-sys` 0.52.0, each with the checksum the main workspace already locks. The signed message is prefixed with `follon-strategy-capsule-signature-v1\0`,
+      so a release-manifest signature cannot be replayed as a capsule signature, and the reverse.
+    - **Verification.** Reading a capsule accepts the signature as an optional sixth member and refuses one
+      that names another capsule or manifest hash. `capsule-verify --trusted-key` refuses an unsigned
+      capsule, a different key identity, and different key material under the same identity. Without the
+      flag, a present signature is reported as "not checked" rather than trusted. A capsule is signed at most
+      once. Pipeline step 16i signs the real capsule and re-verifies it under the trusted key.
+    - **Five deliberate defects were injected, and each was observed to fail before restoration:**
+      - verification ignoring the key identity;
+      - signing and verifying without the capsule domain;
+      - verification skipping the cryptographic check;
+      - reading skipping the signature's manifest binding;
+      - `capsule-verify` parsing `--trusted-key` without checking the signature against it.
+
+      A first attempt at the last one used a guarded `match` arm, which made the match non-exhaustive, so it
+      did not compile. It was recognized, not counted, and replaced. The explicit refuse-to-re-sign check was
+      not injected, because `create_new` would refuse the second write independently.
+    - **Measured result.** The Rust workspace rose from 405 to 407 passed / 0 failed / 3 ignored; the final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0.
+    - **Bounded remainder.**
+      - The pipeline's key is generated locally on every run. It demonstrates the mechanism and is not an
+        independent or custodied signer; there is no key-rotation or revocation list.
+      - A signature attests who sealed the capsule, not that its strategy is sound.
+      - Clean-machine verification, the other half of item 57's first remainder, is still open and cannot be
+        closed from this machine.
+
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

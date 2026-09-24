@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T10:26:12Z  
+**Measured at:** 2026-09-24T16:56:49Z  
 **Branch:** `main`  
-**HEAD:** `64bef5c` -- test(execution): property tests for EMS scheduling legality -- E3.2c (2026-09-24T11:41:42+05:30)  
-**Uncommitted paths:** 12
+**HEAD:** `5b98c56` -- feat(evidence): seal portable strategy capsules from a replayed evaluation -- E2.1b (2026-09-24T22:17:28+05:30)  
+**Uncommitted paths:** 11
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 405 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 407 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
@@ -422,7 +422,8 @@ panels correctly render an empty state.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E2.1a | `decision-reconstruction`: `follon-operations decision-reconstruction` walks the latest fill's causal chain in the real step-2 backtest journal, refuses a journal that does not hash to its manifest's `events_sha256`, binds the manifest's `configuration_hash`, and hashes each node's exact persisted line. Pipeline step 16h. | **done** 2026-09-24 |
-| E2.1b | `strategy-capsule-manifest`: the SDK's `bundle_lock` writes a dependency lock from the same enumeration as the bundle hash; `follon-backtest capsule-package` rebuilds the archive (the exact byte stream that hash covers), binds it to a real `--python-worker` evaluation and its configuration, replays the capsule's own copies under `-S` with no inherited import path, and seals `VERIFIED_PORTABLE` only if the replay reproduces the completion manifest byte for byte. `capsule-verify` re-checks and replays. Pipeline step 16i. Not signed and not yet verified on a second machine (audit item 57). | **done** 2026-09-24 |
+| E2.1b | `strategy-capsule-manifest`: the SDK's `bundle_lock` writes a dependency lock from the same enumeration as the bundle hash; `follon-backtest capsule-package` rebuilds the archive (the exact byte stream that hash covers), binds it to a real `--python-worker` evaluation and its configuration, replays the capsule's own copies under `-S` with no inherited import path, and seals `VERIFIED_PORTABLE` only if the replay reproduces the completion manifest byte for byte. `capsule-verify` re-checks and replays. Pipeline step 16i. Not yet verified on a second machine (audit item 57). | **done** 2026-09-24 |
+| E2.1d | Capsule signing: `follon-backtest capsule-sign` adds one detached, domain-separated Ed25519 signature over the manifest bytes (`capsule-signature.json`, keys in the `release-keygen` format); `capsule-verify --trusted-key` requires exactly that signer. The pipeline signs with a locally generated key, which demonstrates the mechanism only. (audit item 58) | **done** 2026-09-24 |
 | E2.1c | `data-rights-and-semantics-receipt` (`core/market-data::rights`). **Not wiring work.** `certify_receipt` takes `semantic_parity_score_bps` as an input, and nothing in the repository measures one. Feeding it a configured number would publish an operator-typed value as measured evidence, which rule 1 forbids. It needs a real parity computation first, which makes it E2.2-class. | blocked on a real measurement |
 | E2.2+ | The remaining 29 categories are separate per-category product work, not wiring. Each needs its own real computation before its panel may show anything. | open, unsequenced |
 
@@ -532,10 +533,18 @@ short — detail belongs in the conformance audit.
 - Rust workspace **395 → 405 passed**, 0 failed, 3 ignored; Python **43 → 48**.
   The final `python tools/session_status.py` measurement recorded all seven
   suites green, and the full evidence pipeline exited 0.
+- Landed **E2.1d**: `capsule-sign` adds a detached, domain-separated Ed25519
+  signature over the manifest, in the `release-keygen` key format, and
+  `capsule-verify --trusted-key` requires exactly that signer. Pipeline step
+  16i signs and re-verifies the real capsule. Five deliberate defects were
+  injected and caught (audit item 58).
+- Rust workspace **405 → 407 passed**, 0 failed, 3 ignored; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full evidence pipeline exited 0.
 - **Next action:** remaining E3.2 candidates or E3.5 market-data gap repair.
-  E2.1b's own remainder is signing the manifest and verifying a capsule on a
-  second, clean machine. The top external priority is unchanged: the 30 clean
-  PAPER sessions.
+  E2.1b's only remainder is verifying a capsule on a second, clean machine,
+  which needs another machine. The top external priority is unchanged: the 30
+  clean PAPER sessions.
 
 ### 2026-09-24 — session 4
 

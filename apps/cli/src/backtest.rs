@@ -18,9 +18,11 @@ use follon_backtest::{
     FileExperimentStore,
 };
 use follon_cli::{sha256_text, write_immutable};
+use follon_commercial::TrustedReleaseKey;
 use follon_control_plane::{
     build_strategy_bundle, extract_strategy_bundle, import_historical_bars, read_strategy_capsule,
-    BuyOnceStrategy, CapsuleContents, DeterministicFillModel, HistoricalBar, MarketPreconditions,
+    sign_strategy_capsule, verify_capsule_signature, write_capsule_signature, BuyOnceStrategy,
+    CapsuleContents, DeterministicFillModel, HistoricalBar, MarketPreconditions,
     ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity, StrategyWorkerSandbox,
     StrategyWorkerServicesConfig,
 };
@@ -336,6 +338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "counterfactual" => return run_counterfactual(&raw_args[1..]),
             "capsule-package" => return run_capsule_package(&raw_args[1..]),
             "capsule-verify" => return run_capsule_verify(&raw_args[1..]),
+            "capsule-sign" => return run_capsule_sign(&raw_args[1..]),
             _ => {}
         }
     }
@@ -593,6 +596,7 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
             "--packaged-at",
             "--output",
         ],
+        &[],
     )?;
     if !positional.is_empty() {
         return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> --python <interpreter> --packaged-at <utc> --output <dir>".into());
@@ -683,14 +687,27 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
 /// capsule's own strategy and SDK are replayed in a sandbox. Success means the
 /// replay reproduced the sealed evaluation receipt byte for byte.
 fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (positional, flags) = parse_flag_values(arguments, &["--bars", "--python"])?;
+    let (positional, flags) =
+        parse_flag_values(arguments, &["--bars", "--python"], &["--trusted-key"])?;
     let [capsule_directory] = positional.as_slice() else {
         return Err(
-            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> --python <interpreter>"
+            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> --python <interpreter> [--trusted-key <key.json>]"
                 .into(),
         );
     };
     let sealed = read_strategy_capsule(Path::new(capsule_directory))?;
+    let signer = match (flags.get("--trusted-key"), &sealed.signature) {
+        (Some(path), _) => {
+            let key = TrustedReleaseKey::parse_canonical(&fs::read_to_string(path)?)?;
+            verify_capsule_signature(&sealed, &key.key_id, &key.public_key_hex)?;
+            format!("signed by trusted key {}", key.key_id)
+        }
+        (None, Some(signature)) => format!(
+            "signature by {} present but not checked: no --trusted-key given",
+            signature.key_id
+        ),
+        (None, None) => "unsigned".to_owned(),
+    };
     let reproduced = replay_capsule(
         &sealed.contents,
         Path::new(&flags["--bars"]),
@@ -700,11 +717,43 @@ fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
         return Err("capsule replay did not reproduce its evaluation receipt".into());
     }
     println!(
-        "{} {}: replay reproduced {}",
+        "{} {}: replay reproduced {}; {signer}",
         sealed.manifest.capsule_id,
         sealed.manifest.export_disposition.as_str(),
         sealed.manifest.evaluation_receipt_id
     );
+    Ok(())
+}
+
+/// `follon-backtest capsule-sign`: adds a detached Ed25519 signature to a
+/// sealed capsule that does not yet carry one.
+///
+/// The capsule is fully re-read first, so only a capsule whose every binding
+/// holds can be signed. The key is the PKCS#8 file `follon-admin
+/// release-keygen` writes; its bytes are zeroed after use. A signature says who
+/// sealed the capsule; `capsule-verify --trusted-key` checks it.
+fn run_capsule_sign(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (positional, flags) = parse_flag_values(
+        arguments,
+        &["--private-key", "--key-id", "--signed-at"],
+        &[],
+    )?;
+    let [capsule_directory] = positional.as_slice() else {
+        return Err("usage: follon-backtest capsule-sign <capsule-dir> --private-key <key.pk8> --key-id <id> --signed-at <utc>".into());
+    };
+    let directory = Path::new(capsule_directory);
+    let sealed = read_strategy_capsule(directory)?;
+    let mut private_key = fs::read(&flags["--private-key"])?;
+    let signed = sign_strategy_capsule(
+        &sealed,
+        &private_key,
+        &flags["--key-id"],
+        &flags["--signed-at"],
+    );
+    private_key.fill(0);
+    let signature = signed?;
+    write_capsule_signature(directory, &signature)?;
+    println!("{}", signature.to_json());
     Ok(())
 }
 
@@ -787,11 +836,13 @@ impl Drop for ReplayWorkspace {
 /// Positional arguments, then each flag's value keyed by the flag.
 type FlagValues = (Vec<String>, BTreeMap<String, String>);
 
-/// Splits `--flag value` pairs from positional arguments; every listed flag
-/// is required exactly once and no other flag is accepted.
+/// Splits `--flag value` pairs from positional arguments. Each `required`
+/// flag must appear exactly once, each `optional` flag at most once, and no
+/// other flag is accepted.
 fn parse_flag_values(
     arguments: &[String],
-    flags: &[&str],
+    required: &[&str],
+    optional: &[&str],
 ) -> Result<FlagValues, Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
     let mut values = BTreeMap::new();
@@ -799,7 +850,7 @@ fn parse_flag_values(
     while index < arguments.len() {
         let argument = &arguments[index];
         if argument.starts_with("--") {
-            if !flags.contains(&argument.as_str()) {
+            if !required.contains(&argument.as_str()) && !optional.contains(&argument.as_str()) {
                 return Err(format!("unsupported argument: {argument}").into());
             }
             let value = required_argument(arguments, index + 1, argument)?.to_owned();
@@ -812,7 +863,7 @@ fn parse_flag_values(
             index += 1;
         }
     }
-    if let Some(missing) = flags.iter().find(|flag| !values.contains_key(**flag)) {
+    if let Some(missing) = required.iter().find(|flag| !values.contains_key(**flag)) {
         return Err(format!("{missing} is required").into());
     }
     Ok((positional, values))

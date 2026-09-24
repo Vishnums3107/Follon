@@ -135,9 +135,26 @@ The capsule directory holds `strategy-bundle.bin` (the exact byte stream the
 bundle hash is computed over), `dependency.lock`, `configuration.json`,
 `evaluation-receipt.json` (the completion manifest), and
 `capsule-manifest.json`. Market data is referenced by content hash and never
-carried. `VERIFIED_PORTABLE` covers only the recorded runtime target. The
-manifest is not signed, and no capsule has yet been verified on a second
-machine.
+carried. `VERIFIED_PORTABLE` covers only the recorded runtime target, and no
+capsule has yet been verified on a second machine.
+
+A sealed capsule can carry one detached Ed25519 signature over its manifest
+bytes. The manifest hash-binds every other member, so the signature covers the
+whole capsule. Keys use the `follon-admin release-keygen` format:
+
+```powershell
+cargo run -p follon-cli --bin follon-admin -- release-keygen --key-id capsule.key.author --private-key capsule-signing.pk8 --trusted-key trusted-capsule-key.json
+cargo run -p follon-cli --bin follon-backtest -- capsule-sign var/strategy-capsule --private-key capsule-signing.pk8 --key-id capsule.key.author --signed-at 2026-09-07T12:05:00Z
+cargo run -p follon-cli --bin follon-backtest -- capsule-verify var/strategy-capsule --bars tests/fixtures/historical-bars/spy-one-minute.csv --python C:\path\to\python.exe --trusted-key trusted-capsule-key.json
+```
+
+The signature is written as `capsule-signature.json` inside the capsule, and a
+capsule can be signed only once. The signed message is domain-separated from
+release signatures, so neither can be replayed as the other. With
+`--trusted-key`, verification fails unless the capsule is signed by exactly that
+key. Without it, a signature's bindings are still checked, and the output says
+the signer was not checked. A signature attests who sealed the capsule, not
+that its strategy is sound.
 
 ## PAPER operations status and kill switch
 

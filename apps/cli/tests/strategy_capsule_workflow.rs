@@ -179,8 +179,15 @@ fn package(
         .expect("capsule-package starts")
 }
 
-fn verify(python: &Path, capsule: &Path, bars: &Path, hostile: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_follon-backtest"))
+fn verify(
+    python: &Path,
+    capsule: &Path,
+    bars: &Path,
+    hostile: &Path,
+    trusted_key: Option<&Path>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_follon-backtest"));
+    command
         .current_dir(hostile)
         .env("FOLLON_STRATEGY_SDK_PATH", hostile)
         .arg("capsule-verify")
@@ -188,9 +195,38 @@ fn verify(python: &Path, capsule: &Path, bars: &Path, hostile: &Path) -> Output 
         .arg("--bars")
         .arg(bars)
         .arg("--python")
-        .arg(python)
+        .arg(python);
+    if let Some(trusted_key) = trusted_key {
+        command.arg("--trusted-key").arg(trusted_key);
+    }
+    command.output().expect("capsule-verify starts")
+}
+
+/// Writes an Ed25519 keypair with `follon-admin release-keygen`.
+fn keygen(directory: &Path, key_id: &str) -> (PathBuf, PathBuf) {
+    fs::create_dir_all(directory).expect("key directory is creatable");
+    let private_key = directory.join("capsule-signing.pk8");
+    let trusted_key = directory.join("trusted-capsule-key.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_follon-admin"))
+        .args(["release-keygen", "--key-id", key_id, "--private-key"])
+        .arg(&private_key)
+        .arg("--trusted-key")
+        .arg(&trusted_key)
         .output()
-        .expect("capsule-verify starts")
+        .expect("release-keygen starts");
+    assert!(succeeded(&result), "keygen failed\n{}", describe(&result));
+    (private_key, trusted_key)
+}
+
+fn sign(capsule: &Path, private_key: &Path, key_id: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_follon-backtest"))
+        .arg("capsule-sign")
+        .arg(capsule)
+        .arg("--private-key")
+        .arg(private_key)
+        .args(["--key-id", key_id, "--signed-at", "2026-09-07T12:05:00Z"])
+        .output()
+        .expect("capsule-sign starts")
 }
 
 #[test]
@@ -244,7 +280,7 @@ fn a_capsule_seals_and_reproduces_its_evaluation_despite_a_hostile_environment()
         fs::read(configuration()).expect("configuration exists"),
     );
 
-    let verified = verify(&python, &capsule, &bars(), &hostile);
+    let verified = verify(&python, &capsule, &bars(), &hostile, None);
     assert!(
         succeeded(&verified),
         "verification failed\n{}",
@@ -265,7 +301,7 @@ fn a_capsule_seals_and_reproduces_its_evaluation_despite_a_hostile_environment()
             ),
     )
     .expect("shifted bars are writable");
-    let diverged = verify(&python, &capsule, &shifted_bars, &hostile);
+    let diverged = verify(&python, &capsule, &shifted_bars, &hostile, None);
     assert!(
         !succeeded(&diverged),
         "a replay over different bars was accepted\n{}",
@@ -361,4 +397,70 @@ fn a_capsule_refuses_a_strategy_that_needs_an_installed_package() {
         describe(&packaged)
     );
     assert!(!capsule.exists());
+}
+
+#[test]
+fn a_signed_capsule_verifies_only_under_its_trusted_key() {
+    let Some(python) = python_executable() else {
+        eprintln!("Python is unavailable; the capsule workflow was skipped");
+        return;
+    };
+    let workspace = Workspace::new("signed");
+    let bundle = workspace.0.join("bundle");
+    let strategy_file = write_bundle(&bundle, "");
+    let lock_path = workspace.0.join("dependency.lock");
+    let hash = lock(&python, &bundle, &strategy_file, &lock_path);
+    let artifact = workspace.0.join("evaluation/python-backtest.json");
+    evaluate(&python, &bundle, &strategy_file, &hash, &artifact);
+    let hostile = hostile_directory(&workspace.0);
+    let capsule = workspace.0.join("capsule");
+    let packaged = package(&python, &bundle, &lock_path, &artifact, &capsule, &hostile);
+    assert!(
+        succeeded(&packaged),
+        "packaging failed\n{}",
+        describe(&packaged)
+    );
+
+    let (private_key, trusted_key) = keygen(&workspace.0.join("key"), "capsule.key.author");
+    // Same identity, different key material: only the cryptography can tell.
+    let (_, impostor_key) = keygen(&workspace.0.join("impostor"), "capsule.key.author");
+
+    let unsigned = verify(&python, &capsule, &bars(), &hostile, Some(&trusted_key));
+    assert!(
+        !succeeded(&unsigned) && String::from_utf8_lossy(&unsigned.stderr).contains("not signed"),
+        "an unsigned capsule passed a trusted-key verification\n{}",
+        describe(&unsigned)
+    );
+
+    let signed = sign(&capsule, &private_key, "capsule.key.author");
+    assert!(succeeded(&signed), "signing failed\n{}", describe(&signed));
+    assert!(capsule.join("capsule-signature.json").is_file());
+    let resigned = sign(&capsule, &private_key, "capsule.key.author");
+    assert!(!succeeded(&resigned), "a capsule was signed twice");
+
+    let trusted = verify(&python, &capsule, &bars(), &hostile, Some(&trusted_key));
+    assert!(
+        succeeded(&trusted),
+        "trusted verification failed\n{}",
+        describe(&trusted)
+    );
+    assert!(String::from_utf8_lossy(&trusted.stdout)
+        .contains("signed by trusted key capsule.key.author"));
+
+    let unchecked = verify(&python, &capsule, &bars(), &hostile, None);
+    assert!(
+        succeeded(&unchecked),
+        "verification failed\n{}",
+        describe(&unchecked)
+    );
+    assert!(String::from_utf8_lossy(&unchecked.stdout).contains("not checked"));
+
+    let impostor = verify(&python, &capsule, &bars(), &hostile, Some(&impostor_key));
+    assert!(
+        !succeeded(&impostor)
+            && String::from_utf8_lossy(&impostor.stderr)
+                .contains("capsule signature verification failed"),
+        "a capsule verified under another key with the same identity\n{}",
+        describe(&impostor)
+    );
 }

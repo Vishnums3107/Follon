@@ -10,6 +10,7 @@
 //! | [`CAPSULE_CONFIGURATION_FILE`] | The exact backtest configuration bytes the evaluation ran with |
 //! | [`CAPSULE_RECEIPT_FILE`] | The evaluation's completion manifest, byte for byte |
 //! | [`CAPSULE_MANIFEST_FILE`] | The `strategy-capsule-manifest` v1 document binding the four above |
+//! | [`CAPSULE_SIGNATURE_FILE`] | Optional: a detached, domain-separated Ed25519 signature over the manifest bytes ([`CapsuleSignature`]) |
 //!
 //! Nothing here takes a caller's word for a hash or a disposition. Every digest
 //! in a manifest is computed from bytes, and [`CapsuleContents::seal`] issues
@@ -31,6 +32,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp};
+use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use sha2::{Digest, Sha256};
 
 use crate::{is_sha256, require_exact_json_fields, EngineError};
@@ -47,10 +49,14 @@ pub const CAPSULE_LOCK_FILE: &str = "dependency.lock";
 pub const CAPSULE_CONFIGURATION_FILE: &str = "configuration.json";
 /// Capsule member holding the evaluation's completion manifest.
 pub const CAPSULE_RECEIPT_FILE: &str = "evaluation-receipt.json";
+/// Optional capsule member holding a detached signature over the manifest.
+pub const CAPSULE_SIGNATURE_FILE: &str = "capsule-signature.json";
 /// Directory name the SDK namespace is extracted under, so it is importable.
 pub const SDK_PACKAGE_DIRECTORY: &str = "follon_strategy_sdk";
 
 const CAPSULE_SCHEMA_VERSION: u64 = 1;
+const CAPSULE_SIGNATURE_SCHEMA_VERSION: u64 = 1;
+const CAPSULE_SIGNATURE_DOMAIN: &[u8] = b"follon-strategy-capsule-signature-v1\0";
 const LOCK_SCHEMA_VERSION: u64 = 1;
 const NAMESPACES: [&str; 2] = ["strategy", "sdk"];
 const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
@@ -806,13 +812,218 @@ pub struct SealedStrategyCapsule {
     pub manifest: StrategyCapsuleManifest,
     /// The cross-checked contents.
     pub contents: CapsuleContents,
+    /// The detached signature, if the capsule carries one. Its bindings to
+    /// this manifest are checked on read; its cryptographic validity needs a
+    /// trusted key and is checked by [`verify_capsule_signature`].
+    pub signature: Option<CapsuleSignature>,
+}
+
+/// Detached Ed25519 signature over a sealed capsule's exact manifest bytes.
+///
+/// The manifest hash-binds the other four members, so this one signature
+/// covers the whole capsule. The signed message is domain-separated, so a
+/// release-manifest signature can never be replayed as a capsule signature
+/// or the reverse. It attests who sealed the capsule, not that its strategy
+/// is sound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapsuleSignature {
+    /// The signed capsule's identity.
+    pub capsule_id: String,
+    /// SHA-256 of the exact manifest bytes.
+    pub manifest_sha256: String,
+    /// Canonical signing-key identity.
+    pub key_id: String,
+    /// Lowercase hex of the 64-byte Ed25519 signature.
+    pub signature_hex: String,
+    /// Explicit UTC signing time.
+    pub signed_at: String,
+}
+
+impl CapsuleSignature {
+    /// Formats the signature as canonical sorted-key JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "capsule_id": self.capsule_id,
+            "capsule_signature_schema_version": CAPSULE_SIGNATURE_SCHEMA_VERSION,
+            "key_id": self.key_id,
+            "manifest_sha256": self.manifest_sha256,
+            "signature_hex": self.signature_hex,
+            "signed_at": self.signed_at,
+        })
+        .to_string()
+    }
+
+    /// Parses a signature, refusing any encoding but [`Self::to_json`]'s.
+    pub fn parse(bytes: &[u8]) -> Result<Self, EngineError> {
+        let value = canonical_json_object(bytes, "capsule signature")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| EngineError("capsule signature is not an object".to_owned()))?;
+        require_exact_json_fields(
+            object,
+            &[
+                "capsule_id",
+                "capsule_signature_schema_version",
+                "key_id",
+                "manifest_sha256",
+                "signature_hex",
+                "signed_at",
+            ],
+            "capsule signature",
+        )?;
+        if object
+            .get("capsule_signature_schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(CAPSULE_SIGNATURE_SCHEMA_VERSION)
+        {
+            return Err(EngineError(
+                "unsupported capsule signature schema version".to_owned(),
+            ));
+        }
+        let text =
+            |field: &str| string_field(object, field, "capsule signature").map(str::to_owned);
+        let signature = Self {
+            capsule_id: text("capsule_id")?,
+            manifest_sha256: text("manifest_sha256")?,
+            key_id: text("key_id")?,
+            signature_hex: text("signature_hex")?,
+            signed_at: text("signed_at")?,
+        };
+        validate_canonical_id("capsule signature key_id", &signature.key_id)?;
+        validate_utc_timestamp("capsule signed_at", &signature.signed_at)?;
+        if !is_sha256(&signature.manifest_sha256) {
+            return Err(EngineError(
+                "capsule signature manifest hash is not a lowercase SHA-256".to_owned(),
+            ));
+        }
+        if decode_hex(&signature.signature_hex)?.len() != 64 {
+            return Err(EngineError(
+                "capsule signature must be a 64-byte Ed25519 signature".to_owned(),
+            ));
+        }
+        Ok(signature)
+    }
+
+    fn check_binding(&self, manifest: &StrategyCapsuleManifest) -> Result<(), EngineError> {
+        if self.capsule_id != manifest.capsule_id
+            || self.manifest_sha256 != sha256_hex(manifest.to_json().as_bytes())
+        {
+            return Err(EngineError(
+                "capsule signature does not bind this capsule's manifest".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Signs a sealed capsule's manifest with an Ed25519 PKCS#8 private key.
+pub fn sign_strategy_capsule(
+    sealed: &SealedStrategyCapsule,
+    private_key_pkcs8: &[u8],
+    key_id: &str,
+    signed_at: &str,
+) -> Result<CapsuleSignature, EngineError> {
+    validate_canonical_id("capsule signing key_id", key_id)?;
+    validate_utc_timestamp("capsule signed_at", signed_at)?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(private_key_pkcs8).map_err(|_| {
+        EngineError("capsule signing key is not a valid Ed25519 PKCS#8 key".to_owned())
+    })?;
+    let manifest = sealed.manifest.to_json();
+    let signature = key_pair.sign(&signed_message(manifest.as_bytes()));
+    Ok(CapsuleSignature {
+        capsule_id: sealed.manifest.capsule_id.clone(),
+        manifest_sha256: sha256_hex(manifest.as_bytes()),
+        key_id: key_id.to_owned(),
+        signature_hex: signature
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        signed_at: signed_at.to_owned(),
+    })
+}
+
+/// Verifies that a capsule is signed by exactly the trusted key given.
+///
+/// `public_key_hex` is the 32-byte Ed25519 public key in the lowercase-hex
+/// form `follon-admin release-keygen` publishes.
+pub fn verify_capsule_signature(
+    sealed: &SealedStrategyCapsule,
+    trusted_key_id: &str,
+    public_key_hex: &str,
+) -> Result<(), EngineError> {
+    let signature = sealed
+        .signature
+        .as_ref()
+        .ok_or_else(|| EngineError("capsule is not signed".to_owned()))?;
+    signature.check_binding(&sealed.manifest)?;
+    if signature.key_id != trusted_key_id {
+        return Err(EngineError(
+            "capsule was signed by a different key than the trusted one".to_owned(),
+        ));
+    }
+    let public_key = decode_hex(public_key_hex)?;
+    if public_key.len() != 32 {
+        return Err(EngineError(
+            "trusted capsule key must be a 32-byte Ed25519 public key".to_owned(),
+        ));
+    }
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(
+            &signed_message(sealed.manifest.to_json().as_bytes()),
+            &decode_hex(&signature.signature_hex)?,
+        )
+        .map_err(|_| EngineError("capsule signature verification failed".to_owned()))
+}
+
+/// Adds a signature to a sealed capsule directory that does not yet carry one.
+pub fn write_capsule_signature(
+    directory: &Path,
+    signature: &CapsuleSignature,
+) -> Result<(), EngineError> {
+    let sealed = read_strategy_capsule(directory)?;
+    if sealed.signature.is_some() {
+        return Err(EngineError("capsule is already signed".to_owned()));
+    }
+    signature.check_binding(&sealed.manifest)?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(CAPSULE_SIGNATURE_FILE))?
+        .write_all(signature.to_json().as_bytes())?;
+    Ok(())
+}
+
+fn signed_message(manifest: &[u8]) -> Vec<u8> {
+    [CAPSULE_SIGNATURE_DOMAIN, manifest].concat()
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, EngineError> {
+    if !value.len().is_multiple_of(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(EngineError(
+            "value must be lowercase hexadecimal".to_owned(),
+        ));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| EngineError("value must be lowercase hexadecimal".to_owned()))
+        })
+        .collect()
 }
 
 /// Reads a capsule directory and checks every static binding.
 ///
-/// The directory must hold exactly the five capsule members as regular files.
-/// Every digest in the manifest is recomputed from those files. This does not
-/// replay the evaluation; `follon-backtest capsule-verify` does both.
+/// The directory must hold exactly the five capsule members as regular files,
+/// plus an optional detached signature. Every digest in the manifest is
+/// recomputed from those files, and a signature must bind this manifest. This
+/// does not replay the evaluation or check the signature cryptographically;
+/// `follon-backtest capsule-verify` does both.
 pub fn read_strategy_capsule(directory: &Path) -> Result<SealedStrategyCapsule, EngineError> {
     if !fs::symlink_metadata(directory)?.is_dir() {
         return Err(EngineError(
@@ -833,6 +1044,8 @@ pub fn read_strategy_capsule(directory: &Path) -> Result<SealedStrategyCapsule, 
         }
         members.push(name);
     }
+    let signed = members.iter().any(|name| name == CAPSULE_SIGNATURE_FILE);
+    members.retain(|name| name != CAPSULE_SIGNATURE_FILE);
     members.sort();
     let mut expected = [
         CAPSULE_BUNDLE_FILE,
@@ -844,7 +1057,7 @@ pub fn read_strategy_capsule(directory: &Path) -> Result<SealedStrategyCapsule, 
     expected.sort_unstable();
     if members != expected {
         return Err(EngineError(
-            "capsule must contain exactly its five members".to_owned(),
+            "capsule must contain exactly its five members and an optional signature".to_owned(),
         ));
     }
     let read = |name: &str, limit: u64| -> Result<Vec<u8>, EngineError> {
@@ -863,7 +1076,19 @@ pub fn read_strategy_capsule(directory: &Path) -> Result<SealedStrategyCapsule, 
         read(CAPSULE_RECEIPT_FILE, MAX_DOCUMENT_BYTES)?,
     )?;
     contents.check_manifest(&manifest)?;
-    Ok(SealedStrategyCapsule { manifest, contents })
+    let signature = if signed {
+        let signature =
+            CapsuleSignature::parse(&read(CAPSULE_SIGNATURE_FILE, MAX_DOCUMENT_BYTES)?)?;
+        signature.check_binding(&manifest)?;
+        Some(signature)
+    } else {
+        None
+    };
+    Ok(SealedStrategyCapsule {
+        manifest,
+        contents,
+        signature,
+    })
 }
 
 fn collect_sources(
@@ -1009,6 +1234,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::KeyPair;
 
     const RUNTIME: &str = "cpython|3.12.10|linux";
     /// `_bundle_digest` of [`write_vector_tree`] under [`RUNTIME`], computed by
@@ -1459,5 +1685,124 @@ mod tests {
                 claim.to_json()
             );
         }
+    }
+
+    fn keypair() -> (Vec<u8>, String) {
+        let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pkcs8 = document.as_ref().to_vec();
+        let public = Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .unwrap()
+            .public_key()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (pkcs8, public)
+    }
+
+    fn sealed_vector_capsule(scratch: &Scratch, name: &str) -> PathBuf {
+        let contents = vector_contents(scratch);
+        let receipt = contents.receipt().to_vec();
+        let manifest = contents
+            .seal("2026-09-07T12:00:00Z", "replay", &receipt)
+            .unwrap();
+        let directory = scratch.0.join(name);
+        contents.write_sealed(&manifest, &directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn a_signature_verifies_only_for_its_manifest_and_trusted_key() {
+        let scratch = Scratch::new("signature");
+        let directory = sealed_vector_capsule(&scratch, "signed");
+        let (private_key, public_key) = keypair();
+        let (_, other_public_key) = keypair();
+
+        let unsigned = read_strategy_capsule(&directory).unwrap();
+        assert!(unsigned.signature.is_none());
+        assert!(
+            verify_capsule_signature(&unsigned, "capsule.key", &public_key).is_err(),
+            "an unsigned capsule passed signature verification"
+        );
+
+        let signature = sign_strategy_capsule(
+            &unsigned,
+            &private_key,
+            "capsule.key",
+            "2026-09-07T12:05:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            CapsuleSignature::parse(signature.to_json().as_bytes()).unwrap(),
+            signature
+        );
+        write_capsule_signature(&directory, &signature).unwrap();
+        assert!(
+            write_capsule_signature(&directory, &signature).is_err(),
+            "a capsule was signed twice"
+        );
+
+        let signed = read_strategy_capsule(&directory).unwrap();
+        assert_eq!(signed.signature.as_ref(), Some(&signature));
+        verify_capsule_signature(&signed, "capsule.key", &public_key).unwrap();
+        assert!(
+            verify_capsule_signature(&signed, "capsule.key", &other_public_key).is_err(),
+            "a signature verified under another public key"
+        );
+        assert!(
+            verify_capsule_signature(&signed, "capsule.other", &public_key).is_err(),
+            "a signature verified under another key identity"
+        );
+
+        let with_signature = |signature_hex: String| SealedStrategyCapsule {
+            signature: Some(CapsuleSignature {
+                signature_hex,
+                ..signature.clone()
+            }),
+            ..signed.clone()
+        };
+        let mut flipped = signature.signature_hex.clone().into_bytes();
+        flipped[0] = if flipped[0] == b'0' { b'1' } else { b'0' };
+        assert!(
+            verify_capsule_signature(
+                &with_signature(String::from_utf8(flipped).unwrap()),
+                "capsule.key",
+                &public_key
+            )
+            .is_err(),
+            "a corrupted signature verified"
+        );
+        // A signature over the bare manifest bytes -- the release-signature
+        // construction -- must not verify as a capsule signature.
+        let undomained: String = Ed25519KeyPair::from_pkcs8(&private_key)
+            .unwrap()
+            .sign(signed.manifest.to_json().as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(
+            verify_capsule_signature(&with_signature(undomained), "capsule.key", &public_key)
+                .is_err(),
+            "a signature without the capsule domain verified"
+        );
+
+        // A well-formed signature bound to another manifest is refused on read.
+        let rebound = scratch.0.join("rebound");
+        fs::create_dir(&rebound).unwrap();
+        for entry in fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), rebound.join(entry.file_name())).unwrap();
+        }
+        fs::write(
+            rebound.join(CAPSULE_SIGNATURE_FILE),
+            CapsuleSignature {
+                manifest_sha256: "0".repeat(64),
+                ..signature.clone()
+            }
+            .to_json(),
+        )
+        .unwrap();
+        assert!(read_strategy_capsule(&rebound).is_err());
     }
 }

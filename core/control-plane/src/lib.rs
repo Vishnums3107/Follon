@@ -27,7 +27,8 @@ pub mod provenance;
 
 pub use capsule::{
     build_strategy_bundle, extract_strategy_bundle, open_strategy_bundle, read_strategy_capsule,
-    BundleEntryPoint, BundleNamespace, BundleSource, CapsuleContents, CapsuleExportDisposition,
+    sign_strategy_capsule, verify_capsule_signature, write_capsule_signature, BundleEntryPoint,
+    BundleNamespace, BundleSource, CapsuleContents, CapsuleExportDisposition, CapsuleSignature,
     ExtractedStrategyBundle, LockedFile, SealedStrategyCapsule, StrategyBundleLock,
     StrategyCapsuleManifest,
 };

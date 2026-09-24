@@ -527,7 +527,8 @@ def main() -> None:
     # site packages or inherited import path, and seals the manifest only if
     # the replay reproduces the completion manifest byte for byte. (iv)
     # `capsule-verify` re-checks the sealed capsule from disk and replays it
-    # again. `--packaged-at` is explicit so a re-run reproduces the manifest.
+    # again. `--packaged-at` is explicit so a re-run reproduces the manifest;
+    # the signature changes each run because the key is regenerated.
     python = str(Path(sys.executable).resolve())
     sdk_source = REPOSITORY_ROOT / "python" / "strategy-sdk" / "src"
     evaluation_dir = VAR_DIR / "strategy-evaluation"
@@ -577,13 +578,41 @@ def main() -> None:
             "--output", str(capsule_dir),
         ],
     )
+    # (iv) A locally generated key signs the sealed manifest. It demonstrates
+    # the mechanism only: this key is not an independent or custodied signer.
+    capsule_private_key = VAR_DIR / "strategy-capsule-signing.pk8"
+    capsule_trusted_key = VAR_DIR / "trusted-capsule-key.json"
     run_step(
-        "Step 16i(iv): Independently re-verifying and replaying the sealed capsule",
+        "Step 16i(iv): Generating the capsule signing keypair",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-admin", "--",
+            "release-keygen",
+            "--key-id", "capsule.key.follon.001",
+            "--private-key", str(capsule_private_key),
+            "--trusted-key", str(capsule_trusted_key),
+        ],
+        targets=[capsule_private_key, capsule_trusted_key],
+    )
+    run_step(
+        "Step 16i(v): Signing the sealed capsule manifest",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "capsule-sign", str(capsule_dir),
+            "--private-key", str(capsule_private_key),
+            "--key-id", "capsule.key.follon.001",
+            "--signed-at", "2026-09-07T12:05:00Z",
+        ],
+    )
+    # (vi) Independent re-verification: every digest, the signature under the
+    # trusted key, and a fresh sandboxed replay.
+    run_step(
+        "Step 16i(vi): Independently re-verifying, signature-checking and replaying the capsule",
         [
             "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
             "capsule-verify", str(capsule_dir),
             "--bars", "tests/fixtures/historical-bars/spy-one-minute.csv",
             "--python", python,
+            "--trusted-key", str(capsule_trusted_key),
         ],
     )
 
