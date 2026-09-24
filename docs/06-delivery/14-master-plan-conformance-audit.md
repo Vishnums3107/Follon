@@ -1811,6 +1811,49 @@ These are mandatory master-plan acceptance conditions and are currently open:
     tool wrote is a measurement. `CLAUDE.md` gives any agent session, in any tool, the same starting point
     and the same non-negotiable rules.
 
+48. Controlled-LIVE atomic combination execution closes row 5.6's last structural core gap
+    (2026-09-24, row 5.6).
+    - **E1.4c landed as a complete core slice.** `core/live` now accepts one broker-native atomic
+      execution group in whole combination units, requires every approved leg at its exact side and
+      ratio-derived quantity, accounts every leg through the shared fixed-point fill path, shrinks the
+      debit reservation with remaining units, and persists group receipts, applied identities, signed
+      positions, and FIFO long/short tax lots across restart. Exact reordered replay is a no-op; changed,
+      overlapping, overfilled, incomplete, loose-leg, and cross-shape receipt evidence is refused without
+      an `unwrap`/`expect` panic or an `f64` value path.
+    - **LIVE failure semantics remain LIVE's.** A failed group application rolls back the OMS, cash,
+      positions, tax lots, attribution, receipts, and execution identities before later drained events are
+      processed. It leaves the combination `UNKNOWN` unless already filled and records the existing durable
+      `COMBINATION_EXECUTION_ANOMALY`; no PAPER `evidence_error` field was invented. Unresolved internal
+      incidents are idempotent by category and subject, and the existing
+      `UNRESOLVED_INCIDENTS_REQUIRE_REVIEW` rule blocks later canary submissions. A complete group that
+      genuinely overdraws cash likewise creates the existing `LIVE_CASH_OVERDRAFT` incident, after all legs
+      have been applied so transient per-leg ordering cannot false-positive.
+    - **Cancellation, monitoring, and reconciliation cover the whole order.** Cancellation is idempotent,
+      preserves partial fills, restores the evidenced working state after broker rejection, becomes
+      `UNKNOWN` on transport ambiguity, and lets a complete fill win either ordering of the terminal race.
+      The LIVE dashboard counts working and `UNKNOWN` combinations once. Reconciliation reads plain and
+      combination order maps together and reports broker identity/version, state, filled-unit, cash, and
+      per-leg position differences as `LiveReconciliationIssue` values.
+    - **The regressions were made to prove their claims.** Sixteen deliberate defects were injected and
+      observed to fail their intended tests before being reverted: full reservation after partial fill;
+      suppressed anomaly classification; accepted overfill; accepted overlapping leg receipt; removed
+      combination cancellation dispatch; incorrect cancel-rejection restore; ignored late fill; leg
+      contracts mistaken for combination units; combinations omitted from reconciliation; dropped durable
+      receipts; dropped durable short lots; cancel transport ambiguity treated as known; duplicate
+      same-subject incidents; omitted group cash-overdraft incident; plain-only dashboard counts; and a plain
+      fill accepting a combination-owned receipt identity. A first ratio mutation changed no behavior and
+      was explicitly discarded rather than counted.
+    - **Measured result.** The clean pre-change baseline was 354 passed / 0 failed / 3 ignored in the Rust
+      workspace. The final `python tools/session_status.py` run measured 366 passed / 0 failed / 3 ignored
+      and all seven repository suites green. Independent review found the incident-deduplication,
+      cash-overdraft, dashboard, and cross-shape identity defects before landing; all four are fixed and
+      regression-covered.
+    - **Scope remains bounded.** Item 46's "three of five slices" statement was true when written; E1.4 was
+      subsequently split into three landable LIVE sub-slices and this entry supersedes its progress count,
+      rather than correcting a false historical claim. E1.5, the gRPC/desktop delivery surface, remains open.
+      The real PAPER/LIVE session, broker acceptance, security, legal, and operational gates below remain
+      open, so this is not a production-readiness claim.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use follon_accounting::{
-    Currency, FxBook, MarginPolicy, MarginPosition, TaxLot, TaxLotBook, TaxLotBookSnapshot,
-    TaxLotSelection,
+    Currency, FxBook, MarginPolicy, MarginPosition, ShortTaxLot, TaxLot, TaxLotBook,
+    TaxLotBookSnapshot, TaxLotSelection,
 };
 use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
@@ -26,8 +26,8 @@ use follon_instrument::{TradingCalendar, TradingSession};
 mod combinations;
 
 pub use combinations::{
-    combo_intent_fingerprint, LiveBrokerComboLeg, LiveBrokerComboRequest, LiveComboMarketData,
-    LiveComboOrder,
+    combo_intent_fingerprint, LiveBrokerComboExecution, LiveBrokerComboExecutionLeg,
+    LiveBrokerComboLeg, LiveBrokerComboRequest, LiveComboMarketData, LiveComboOrder,
 };
 use follon_risk::{CandidateOrder, PortfolioRiskSnapshot, RestingOrder, RiskPosition};
 use follon_secrets::{SecretMaterial, SecretProvider, SecretReference};
@@ -717,6 +717,8 @@ pub enum LiveBrokerSubmitResult {
 /// Normalized asynchronous evidence from an audited live broker adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveBrokerEvent {
+    /// One complete atomic combination execution assembled by the adapter.
+    ComboExecution(LiveBrokerComboExecution),
     /// Broker acknowledgement.
     Acknowledged {
         /// OMS client idempotency key.
@@ -1300,6 +1302,12 @@ struct PersistentTaxLotBook {
     applied_lot_ids: Vec<String>,
     applied_disposal_ids: Vec<String>,
     realized_by_currency: BTreeMap<String, String>,
+    #[serde(default)]
+    short_lots: BTreeMap<String, Vec<PersistentTaxLot>>,
+    #[serde(default)]
+    applied_short_lot_ids: Vec<String>,
+    #[serde(default)]
+    applied_cover_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1338,6 +1346,28 @@ struct PersistentLiveComboOrder {
     #[serde(default)]
     broker_order_versions: Vec<String>,
     filled_quantity: String,
+    #[serde(default)]
+    executions: Vec<PersistentLiveComboExecution>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentLiveComboExecution {
+    execution_id: String,
+    client_order_id: String,
+    broker_order_id: String,
+    units: String,
+    legs: Vec<PersistentLiveComboExecutionLeg>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentLiveComboExecutionLeg {
+    execution_id: String,
+    instrument_id: String,
+    side: String,
+    quantity: String,
+    price: String,
+    fee: String,
+    executed_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2211,6 +2241,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         self.ensure_audit_healthy()?;
         self.require_canary_active(occurred_at)?;
         validate_canonical_id("live cancel actor", actor)?;
+        if self.combo_orders.contains_key(order_id) {
+            return self.cancel_combo_order(order_id, actor, occurred_at);
+        }
         let state = self.order_mut(order_id)?.oms.state;
         if !matches!(
             state,
@@ -2346,6 +2379,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             // application leaves no partial mutation in memory, then keep
             // applying the remaining events in the batch.
             let orders_snapshot = self.orders.clone();
+            let combo_orders_snapshot = self.combo_orders.clone();
+            let incidents_snapshot = self.incidents.clone();
+            let event_order_id = event.client_order_id().to_owned();
+            let combination_evidence = self.combo_orders.contains_key(&event_order_id)
+                || matches!(&event, LiveBrokerEvent::ComboExecution(_));
             let portfolios_snapshot = self.portfolios.clone();
             let tax_lots_snapshot = self.tax_lots.clone();
             let strategy_attribution_snapshot = self.strategy_attribution.clone();
@@ -2353,11 +2391,36 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             let cash_snapshot = self.cash;
             if let Err(error) = self.apply_broker_event(event) {
                 self.orders = orders_snapshot;
+                self.combo_orders = combo_orders_snapshot;
+                self.incidents = incidents_snapshot;
                 self.portfolios = portfolios_snapshot;
                 self.tax_lots = tax_lots_snapshot;
                 self.strategy_attribution = strategy_attribution_snapshot;
                 self.execution_ids = execution_ids_snapshot;
                 self.cash = cash_snapshot;
+                if combination_evidence {
+                    if let Some(order) = self.combo_orders.get_mut(&event_order_id) {
+                        if order.oms.state != OrderState::Unknown
+                            && order.oms.state != OrderState::Filled
+                        {
+                            order.oms.transition(
+                                OrderState::Unknown,
+                                "LIVE_COMBINATION_EXECUTION_ANOMALY",
+                            )?;
+                        }
+                    }
+                    self.record_internal_incident(
+                        "COMBINATION_EXECUTION_ANOMALY",
+                        event_order_id.clone(),
+                        error.0.clone(),
+                    );
+                    self.persist(
+                        "live.combo.execution_anomaly.v1",
+                        actor,
+                        occurred_at,
+                        &event_order_id,
+                    )?;
+                }
                 apply_errors.push(error.0);
                 continue;
             }
@@ -2416,15 +2479,38 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .or_default()
                 .push(broker_order);
         }
-        for (order_id, internal) in &self.orders {
+        let order_views = self
+            .orders
+            .iter()
+            .map(|(order_id, order)| {
+                (
+                    order_id,
+                    order.working(),
+                    &order.broker_order_id,
+                    &order.broker_order_versions,
+                    order.filled_quantity,
+                    order.oms.state,
+                )
+            })
+            .chain(self.combo_orders.iter().map(|(order_id, order)| {
+                (
+                    order_id,
+                    order.working(),
+                    &order.broker_order_id,
+                    &order.broker_order_versions,
+                    order.filled_quantity,
+                    order.oms.state,
+                )
+            }));
+        for (order_id, working, broker_order_id, versions, filled_quantity, state) in order_views {
             match broker_orders.get(order_id.as_str()) {
-                None if internal.working() => raw_issues.push((
+                None if working => raw_issues.push((
                     "MISSING_BROKER_ORDER",
                     order_id.clone(),
                     "internal working order is absent from broker snapshot".to_owned(),
                 )),
                 Some(brokers) => {
-                    let broker = internal.broker_order_id.as_ref().and_then(|current| {
+                    let broker = broker_order_id.as_ref().and_then(|current| {
                         brokers
                             .iter()
                             .copied()
@@ -2436,7 +2522,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             order_id.clone(),
                             format!(
                                 "internal_current={:?},broker_versions={}",
-                                internal.broker_order_id,
+                                broker_order_id,
                                 brokers
                                     .iter()
                                     .map(|candidate| candidate.broker_order_id.as_str())
@@ -2445,11 +2531,10 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             ),
                         ));
                     }
-                    if brokers.iter().any(|candidate| {
-                        !internal
-                            .broker_order_versions
-                            .contains(&candidate.broker_order_id)
-                    }) {
+                    if brokers
+                        .iter()
+                        .any(|candidate| !versions.contains(&candidate.broker_order_id))
+                    {
                         raw_issues.push((
                             "BROKER_ORDER_VERSION_MISMATCH",
                             order_id.clone(),
@@ -2463,24 +2548,21 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                                 .checked_add(candidate.filled_quantity)
                                 .map_err(LiveError::from)
                         })?;
-                    if internal.filled_quantity != broker_filled {
+                    if filled_quantity != broker_filled {
                         raw_issues.push((
                             "FILLED_QUANTITY_MISMATCH",
                             order_id.clone(),
-                            format!(
-                                "internal={},broker={broker_filled}",
-                                internal.filled_quantity,
-                            ),
+                            format!("internal={},broker={broker_filled}", filled_quantity,),
                         ));
                     }
                     if let Some(broker) = broker {
-                        if internal.oms.state != broker.state {
+                        if state != broker.state {
                             raw_issues.push((
                                 "ORDER_STATE_MISMATCH",
                                 order_id.clone(),
                                 format!(
                                     "internal={},broker={}",
-                                    internal.oms.state.as_str(),
+                                    state.as_str(),
                                     broker.state.as_str()
                                 ),
                             ));
@@ -2491,7 +2573,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             }
         }
         for broker in &snapshot.orders {
-            if !self.orders.contains_key(&broker.client_order_id) {
+            if !self.orders.contains_key(&broker.client_order_id)
+                && !self.combo_orders.contains_key(&broker.client_order_id)
+            {
                 raw_issues.push((
                     "UNEXPECTED_BROKER_ORDER",
                     broker.client_order_id.clone(),
@@ -2499,6 +2583,21 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 ));
             }
         }
+        raw_issues.extend(
+            self.incidents
+                .values()
+                .filter(|incident| {
+                    incident.unexplained()
+                        && incident.issue.category == "COMBINATION_EXECUTION_ANOMALY"
+                })
+                .map(|incident| {
+                    (
+                        "COMBINATION_EXECUTION_ANOMALY",
+                        incident.issue.subject.clone(),
+                        incident.issue.detail.clone(),
+                    )
+                }),
+        );
         let broker_positions: BTreeMap<_, _> = snapshot
             .positions
             .iter()
@@ -2722,12 +2821,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             audit_sequence: self.journal.sequence(),
             audit_head_hash: self.journal.head_hash().to_owned(),
             active_kill_switches: self.kill_switches.active_keys(),
-            working_orders: self.orders.values().filter(|order| order.working()).count() as u32,
-            unknown_orders: self
-                .orders
-                .values()
-                .filter(|order| order.oms.state == OrderState::Unknown)
-                .count() as u32,
+            working_orders: self.working_order_count() as u32,
+            unknown_orders: self.unknown_order_count() as u32,
             unresolved_incidents: promotion.unresolved_incidents,
             last_reconciled_at: self.last_reconciled_at.clone(),
             last_reconciliation_clean: self.last_reconciliation_clean,
@@ -3264,7 +3359,15 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
     }
 
     fn apply_broker_event(&mut self, event: LiveBrokerEvent) -> Result<(), LiveError> {
+        if self.combo_orders.contains_key(event.client_order_id()) {
+            return self.apply_combo_event(event);
+        }
         match event {
+            LiveBrokerEvent::ComboExecution(_) => {
+                return Err(LiveError(
+                    "live combo execution does not name a combination".to_owned(),
+                ))
+            }
             LiveBrokerEvent::Acknowledged {
                 client_order_id,
                 broker_order_id,
@@ -3309,6 +3412,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 validate_utc_timestamp("live execution time", &executed_at)?;
                 if quantity <= Decimal::ZERO || price <= Decimal::ZERO || fee < Decimal::ZERO {
                     return Err(LiveError("live execution values are invalid".to_owned()));
+                }
+                if self.combo_execution_owns_id(&execution_id) {
+                    return Err(LiveError(
+                        "live execution identity belongs to combination evidence".to_owned(),
+                    ));
                 }
                 if self.execution_ids.contains(&execution_id) {
                     return Ok(());
@@ -3365,28 +3473,17 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         order.oms.intent.strategy_id.clone(),
                     )
                 };
-                self.execution_ids.insert(execution_id.clone());
                 let fill = Fill {
                     execution_id,
                     order_id,
-                    instrument_id: instrument_id.clone(),
+                    instrument_id,
                     side,
                     quantity,
                     price,
                     fee,
                     executed_at,
                 };
-                let portfolio = self.portfolios.entry(instrument_id).or_insert_with(|| {
-                    Portfolio::new(&self.account.account_id, &fill.instrument_id)
-                });
-                portfolio.apply_fill(&fill)?;
-                self.apply_tax_lot_fill(&fill)?;
-                self.apply_strategy_attribution_fill(&fill, &strategy_id)?;
-                let gross = fill.price.checked_mul(fill.quantity)?;
-                self.cash = match fill.side {
-                    Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
-                    Side::Sell => self.cash.checked_add(gross.checked_sub(fill.fee)?)?,
-                };
+                self.apply_accounted_fill(&fill, &strategy_id)?;
                 if self.cash < Decimal::ZERO {
                     self.record_internal_incident(
                         "LIVE_CASH_OVERDRAFT",
@@ -3553,40 +3650,118 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         Ok(())
     }
 
-    /// Applies one real fill to the independent FIFO tax-lot book. See
-    /// `core/paper`'s identical method for the full rationale: a buy
-    /// acquires a new lot at its exact all-in unit cost (price plus fee); a
-    /// sell disposes existing long lots FIFO, and `Portfolio` already
-    /// refuses a sell exceeding the held long quantity before this is
-    /// reached, so a disposal here can never exceed available lots. Lot
-    /// selection is fixed at FIFO — a bounded simplification, not a
-    /// correctness gap.
+    /// Applies one exact fill through every LIVE accounting projection.
+    ///
+    /// Plain orders and every leg of an atomic combination share this path so
+    /// cash, positions, tax lots, strategy attribution, and receipt identity
+    /// cannot diverge by order shape. Signed positions are reachable only when
+    /// the independently configured LIVE short-exposure permission exists.
+    fn apply_accounted_fill(&mut self, fill: &Fill, strategy_id: &str) -> Result<(), LiveError> {
+        let portfolio = self
+            .portfolios
+            .entry(fill.instrument_id.clone())
+            .or_insert_with(|| Portfolio::new(&self.account.account_id, &fill.instrument_id));
+        if self.policy.short_exposure.is_some() {
+            portfolio.apply_signed_fill(fill)?;
+        } else {
+            portfolio.apply_fill(fill)?;
+        }
+        self.apply_tax_lot_fill(fill)?;
+        self.apply_strategy_attribution_fill(fill, strategy_id)?;
+        let gross = fill.price.checked_mul(fill.quantity)?;
+        self.cash = match fill.side {
+            Side::Buy => self.cash.checked_sub(gross.checked_add(fill.fee)?)?,
+            Side::Sell => self.cash.checked_add(gross.checked_sub(fill.fee)?)?,
+        };
+        self.execution_ids.insert(fill.execution_id.clone());
+        Ok(())
+    }
+
+    /// Updates the independent FIFO long/short tax-lot ledger. A crossing fill
+    /// closes opposite inventory first and splits its fee exactly once.
     fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), LiveError> {
         let currency = Currency::new(self.account.currency.clone())?;
+        let available = match fill.side {
+            Side::Buy => self
+                .tax_lots
+                .short_lots(&fill.instrument_id)
+                .iter()
+                .try_fold(Decimal::ZERO, |total, lot| {
+                    total.checked_add(lot.remaining_quantity)
+                })?,
+            Side::Sell => self
+                .tax_lots
+                .lots(&fill.instrument_id)
+                .iter()
+                .try_fold(Decimal::ZERO, |total, lot| {
+                    total.checked_add(lot.remaining_quantity)
+                })?,
+        };
+        let closing = available.min(fill.quantity);
+        let opening = fill.quantity.checked_sub(closing)?;
+        let close_fee = if closing == fill.quantity {
+            fill.fee
+        } else {
+            fill.fee.checked_mul(closing)?.checked_div(fill.quantity)?
+        };
+        if closing > Decimal::ZERO {
+            match fill.side {
+                Side::Buy => {
+                    self.tax_lots.cover(
+                        &format!("taxcover-{}", fill.execution_id),
+                        &fill.instrument_id,
+                        &currency,
+                        closing,
+                        fill.price,
+                        close_fee,
+                        &fill.executed_at,
+                        TaxLotSelection::Fifo,
+                    )?;
+                }
+                Side::Sell => {
+                    self.tax_lots.dispose(
+                        &format!("taxdisposal-{}", fill.execution_id),
+                        &fill.instrument_id,
+                        &currency,
+                        closing,
+                        fill.price,
+                        close_fee,
+                        &fill.executed_at,
+                        TaxLotSelection::Fifo,
+                    )?;
+                }
+            }
+        }
+        if opening == Decimal::ZERO {
+            return Ok(());
+        }
+        let open_fee = fill.fee.checked_sub(close_fee)?;
         match fill.side {
             Side::Buy => {
-                let gross = fill.price.checked_mul(fill.quantity)?;
-                let unit_cost = gross.checked_add(fill.fee)?.checked_div(fill.quantity)?;
+                let gross = fill.price.checked_mul(opening)?;
+                let unit_cost = gross.checked_add(open_fee)?.checked_div(opening)?;
                 self.tax_lots.acquire(TaxLot {
                     lot_id: format!("taxlot-{}", fill.execution_id),
                     instrument_id: fill.instrument_id.clone(),
                     currency,
                     opened_at: fill.executed_at.clone(),
-                    remaining_quantity: fill.quantity,
+                    remaining_quantity: opening,
                     unit_cost,
                 })?;
             }
             Side::Sell => {
-                self.tax_lots.dispose(
-                    &format!("taxdisposal-{}", fill.execution_id),
-                    &fill.instrument_id,
-                    &currency,
-                    fill.quantity,
-                    fill.price,
-                    fill.fee,
-                    &fill.executed_at,
-                    TaxLotSelection::Fifo,
-                )?;
+                self.tax_lots.open_short(ShortTaxLot {
+                    lot_id: format!("taxshort-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency,
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: opening,
+                    unit_proceeds: fill
+                        .price
+                        .checked_mul(opening)?
+                        .checked_sub(open_fee)?
+                        .checked_div(opening)?,
+                })?;
             }
         }
         Ok(())
@@ -3636,6 +3811,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
     }
 
     fn record_internal_incident(&mut self, category: &str, subject: String, detail: String) {
+        if self.incidents.values().any(|incident| {
+            incident.unexplained()
+                && incident.issue.category == category
+                && incident.issue.subject == subject
+        }) {
+            return;
+        }
         let incident_id = format!("incident-internal-{:03}", self.incidents.len() + 1);
         self.incidents
             .entry(incident_id.clone())
@@ -3797,6 +3979,24 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             (currency.as_str().to_owned(), amount.to_string())
                         })
                         .collect(),
+                    short_lots: snapshot
+                        .short_lots
+                        .into_iter()
+                        .map(|(instrument_id, lots)| {
+                            let persisted = lots
+                                .into_iter()
+                                .map(|lot| PersistentTaxLot {
+                                    lot_id: lot.lot_id,
+                                    opened_at: lot.opened_at,
+                                    remaining_quantity: lot.remaining_quantity.to_string(),
+                                    unit_cost: lot.unit_proceeds.to_string(),
+                                })
+                                .collect();
+                            (instrument_id, persisted)
+                        })
+                        .collect(),
+                    applied_short_lot_ids: snapshot.applied_short_lot_ids.into_iter().collect(),
+                    applied_cover_ids: snapshot.applied_cover_ids.into_iter().collect(),
                 }
             },
             marks: self
@@ -3830,6 +4030,29 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             broker_order_id: order.broker_order_id.clone(),
                             broker_order_versions: order.broker_order_versions.clone(),
                             filled_quantity: order.filled_quantity.to_string(),
+                            executions: order
+                                .executions
+                                .values()
+                                .map(|execution| PersistentLiveComboExecution {
+                                    execution_id: execution.execution_id.clone(),
+                                    client_order_id: execution.client_order_id.clone(),
+                                    broker_order_id: execution.broker_order_id.clone(),
+                                    units: execution.units.to_string(),
+                                    legs: execution
+                                        .legs
+                                        .iter()
+                                        .map(|leg| PersistentLiveComboExecutionLeg {
+                                            execution_id: leg.execution_id.clone(),
+                                            instrument_id: leg.instrument_id.clone(),
+                                            side: leg.side.as_str().to_owned(),
+                                            quantity: leg.quantity.to_string(),
+                                            price: leg.price.to_string(),
+                                            fee: leg.fee.to_string(),
+                                            executed_at: leg.executed_at.clone(),
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
                         },
                     )
                 })
@@ -3976,16 +4199,27 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
         let mut portfolios = BTreeMap::new();
         for (instrument_id, position) in state.positions {
-            portfolios.insert(
-                instrument_id.clone(),
+            let quantity = decimal("persisted live position quantity", &position.quantity)?;
+            let average_cost = decimal("persisted live average cost", &position.average_cost)?;
+            let realized_pnl = decimal("persisted live realized pnl", &position.realized_pnl)?;
+            let portfolio = if self.policy.short_exposure.is_some() {
+                Portfolio::recover_signed(
+                    &self.account.account_id,
+                    instrument_id.clone(),
+                    quantity,
+                    average_cost,
+                    realized_pnl,
+                )?
+            } else {
                 Portfolio::recover(
                     &self.account.account_id,
-                    instrument_id,
-                    decimal("persisted live position quantity", &position.quantity)?,
-                    decimal("persisted live average cost", &position.average_cost)?,
-                    decimal("persisted live realized pnl", &position.realized_pnl)?,
-                )?,
-            );
+                    instrument_id.clone(),
+                    quantity,
+                    average_cost,
+                    realized_pnl,
+                )?
+            };
+            portfolios.insert(instrument_id, portfolio);
         }
         let account_currency = Currency::new(self.account.currency.clone())?;
         let mut lots = BTreeMap::new();
@@ -4013,17 +4247,37 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 decimal("persisted live realized tax pnl", &amount)?,
             );
         }
+        let mut short_lots = BTreeMap::new();
+        for (instrument_id, persisted_lots) in state.tax_lots.short_lots {
+            let instrument_lots = persisted_lots
+                .into_iter()
+                .map(|persisted| {
+                    Ok(ShortTaxLot {
+                        lot_id: persisted.lot_id,
+                        instrument_id: instrument_id.clone(),
+                        currency: account_currency.clone(),
+                        opened_at: persisted.opened_at,
+                        remaining_quantity: decimal(
+                            "persisted live short lot remaining quantity",
+                            &persisted.remaining_quantity,
+                        )?,
+                        unit_proceeds: decimal(
+                            "persisted live short lot unit proceeds",
+                            &persisted.unit_cost,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, LiveError>>()?;
+            short_lots.insert(instrument_id, instrument_lots);
+        }
         let tax_lots = TaxLotBook::recover(TaxLotBookSnapshot {
             lots,
             applied_lot_ids: state.tax_lots.applied_lot_ids.into_iter().collect(),
             applied_disposal_ids: state.tax_lots.applied_disposal_ids.into_iter().collect(),
             realized_by_currency,
-            // `core/live`'s `Portfolio` is long-only, so this journal format
-            // never carries short-lot data; an empty short-side ledger is
-            // correct, not a gap.
-            short_lots: BTreeMap::new(),
-            applied_short_lot_ids: BTreeSet::new(),
-            applied_cover_ids: BTreeSet::new(),
+            short_lots,
+            applied_short_lot_ids: state.tax_lots.applied_short_lot_ids.into_iter().collect(),
+            applied_cover_ids: state.tax_lots.applied_cover_ids.into_iter().collect(),
         })?;
         let mut execution_ids = BTreeSet::new();
         for execution_id in state.execution_ids {
@@ -4168,6 +4422,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             }
         }
         let mut combo_orders = BTreeMap::new();
+        let mut combo_execution_ids = BTreeSet::new();
         for (order_id, persisted) in state.combo_orders {
             let intent = ComboIntent::try_from(persisted.intent)?;
             if intent.account_id != self.account.account_id || intent.environment != "LIVE" {
@@ -4225,11 +4480,91 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     "persisted combination decision does not authorize this order".to_owned(),
                 ));
             }
-            let oms = OmsComboOrder::recover(
-                order_id.clone(),
-                intent,
-                parse_order_state(&persisted.state)?,
-            )?;
+            let state = parse_order_state(&persisted.state)?;
+            let mut executions = BTreeMap::new();
+            let mut receipt_units = Decimal::ZERO;
+            for persisted_execution in persisted.executions {
+                let execution = LiveBrokerComboExecution {
+                    execution_id: persisted_execution.execution_id,
+                    client_order_id: persisted_execution.client_order_id,
+                    broker_order_id: persisted_execution.broker_order_id,
+                    units: decimal(
+                        "persisted live combo execution units",
+                        &persisted_execution.units,
+                    )?,
+                    legs: persisted_execution
+                        .legs
+                        .into_iter()
+                        .map(|leg| {
+                            Ok(LiveBrokerComboExecutionLeg {
+                                execution_id: leg.execution_id,
+                                instrument_id: leg.instrument_id,
+                                side: match leg.side.as_str() {
+                                    "BUY" => Side::Buy,
+                                    "SELL" => Side::Sell,
+                                    _ => {
+                                        return Err(LiveError(
+                                            "invalid persisted live combo side".to_owned(),
+                                        ))
+                                    }
+                                },
+                                quantity: decimal(
+                                    "persisted live combo leg quantity",
+                                    &leg.quantity,
+                                )?,
+                                price: decimal("persisted live combo leg price", &leg.price)?,
+                                fee: decimal("persisted live combo leg fee", &leg.fee)?,
+                                executed_at: leg.executed_at,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, LiveError>>()?,
+                };
+                execution.validate(&intent)?;
+                if execution.client_order_id != order_id
+                    || !broker_order_versions.contains(&execution.broker_order_id)
+                {
+                    return Err(LiveError(
+                        "persisted live combination execution identity is inconsistent".to_owned(),
+                    ));
+                }
+                for execution_id in std::iter::once(&execution.execution_id)
+                    .chain(execution.legs.iter().map(|leg| &leg.execution_id))
+                {
+                    if !execution_ids.contains(execution_id)
+                        || !combo_execution_ids.insert(execution_id.clone())
+                    {
+                        return Err(LiveError(
+                            "persisted live combination execution is missing or duplicated in account receipts"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                receipt_units = receipt_units.checked_add(execution.units)?;
+                if executions
+                    .insert(execution.execution_id.clone(), execution)
+                    .is_some()
+                {
+                    return Err(LiveError(
+                        "persisted live combination execution identity is duplicated".to_owned(),
+                    ));
+                }
+            }
+            if receipt_units != filled_quantity
+                || (state == OrderState::Filled && filled_quantity != intent.combo_quantity)
+                || (state == OrderState::PartiallyFilled
+                    && (filled_quantity == Decimal::ZERO
+                        || filled_quantity == intent.combo_quantity))
+                || (matches!(
+                    state,
+                    OrderState::Cancelled | OrderState::Rejected | OrderState::Expired
+                ) && filled_quantity == intent.combo_quantity)
+            {
+                return Err(LiveError(
+                    "persisted live combination lifecycle disagrees with execution receipts"
+                        .to_owned(),
+                ));
+            }
+            let oms = OmsComboOrder::recover(order_id.clone(), intent, state)?;
             combo_orders.insert(
                 order_id,
                 LiveComboOrder {
@@ -4240,6 +4575,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     broker_order_id: persisted.broker_order_id,
                     broker_order_versions,
                     filled_quantity,
+                    executions,
                 },
             );
         }
@@ -4990,6 +5326,7 @@ mod tests {
     use follon_instrument::StaticTradingCalendar;
 
     use super::*;
+    include!("combo_lifecycle_tests.rs");
 
     static JOURNAL_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
@@ -4997,6 +5334,8 @@ mod tests {
     struct TestBroker {
         connected: bool,
         submitted: u32,
+        cancelled: u32,
+        fail_cancel: bool,
         /// Models an adapter with no native atomic combination support.
         reject_combos: bool,
         events: Vec<LiveBrokerEvent>,
@@ -5008,6 +5347,8 @@ mod tests {
             Self {
                 connected: false,
                 submitted: 0,
+                cancelled: 0,
+                fail_cancel: false,
                 reject_combos: false,
                 events: Vec::new(),
                 snapshot: LiveBrokerAccountSnapshot {
@@ -5016,6 +5357,56 @@ mod tests {
                     cash: amount("1000"),
                 },
             }
+        }
+
+        fn queue_combo_fill(
+            &mut self,
+            execution: LiveBrokerComboExecution,
+        ) -> Result<(), LiveError> {
+            let broker_order = self
+                .snapshot
+                .orders
+                .iter_mut()
+                .find(|order| {
+                    order.client_order_id == execution.client_order_id
+                        && order.broker_order_id == execution.broker_order_id
+                })
+                .ok_or_else(|| LiveError("test broker does not know combination".to_owned()))?;
+            broker_order.filled_quantity =
+                broker_order.filled_quantity.checked_add(execution.units)?;
+            broker_order.state = OrderState::PartiallyFilled;
+            for leg in &execution.legs {
+                let signed = match leg.side {
+                    Side::Buy => leg.quantity,
+                    Side::Sell => Decimal::ZERO.checked_sub(leg.quantity)?,
+                };
+                if let Some(position) = self
+                    .snapshot
+                    .positions
+                    .iter_mut()
+                    .find(|position| position.instrument_id == leg.instrument_id)
+                {
+                    position.quantity = position.quantity.checked_add(signed)?;
+                } else {
+                    self.snapshot.positions.push(LiveBrokerPositionSnapshot {
+                        instrument_id: leg.instrument_id.clone(),
+                        quantity: signed,
+                    });
+                }
+                let gross = leg.price.checked_mul(leg.quantity)?;
+                self.snapshot.cash = match leg.side {
+                    Side::Buy => self
+                        .snapshot
+                        .cash
+                        .checked_sub(gross.checked_add(leg.fee)?)?,
+                    Side::Sell => self
+                        .snapshot
+                        .cash
+                        .checked_add(gross.checked_sub(leg.fee)?)?,
+                };
+            }
+            self.events.push(LiveBrokerEvent::ComboExecution(execution));
+            Ok(())
         }
     }
 
@@ -5069,6 +5460,10 @@ mod tests {
         }
 
         fn cancel(&mut self, _client_order_id: &str) -> Result<(), LiveError> {
+            self.cancelled += 1;
+            if self.fail_cancel {
+                return Err(LiveError("test live cancel transport failed".to_owned()));
+            }
             Ok(())
         }
 

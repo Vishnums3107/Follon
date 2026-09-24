@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-23T06:04:01Z  
+**Measured at:** 2026-09-24T03:42:35Z  
 **Branch:** `main`  
-**HEAD:** `bab0261` -- feat(live): assess a multi-leg combination against the controlled-LIVE risk policy -- E1.4a (2026-09-23T11:23:21+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `d42747c` -- feat(live): submit an atomic multi-leg combination under one consumed approval -- E1.4b (2026-09-23T11:34:19+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 354 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 366 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
@@ -85,16 +85,14 @@ session-sized units; each is independently landable.
 The largest genuinely-bounded engineering gap in the repository, and the one
 the previous session explicitly declined to half-land.
 
-**What exists.** `core/execution::plan_option_combo` is a real, tested
-fixed-point planner. `PaperBrokerAdapter::submit_combo` rejects by default;
-`IbkrControlledLiveAdapter` and the PAPER IBKR bridge override it with a real
-atomic BAG transport. The gRPC service exposes combo *planning*.
+**What exists.** The domain contract, fixed-point planner, full PAPER path, and
+controlled-LIVE risk, approval, submission, fill, cancellation, recovery and
+reconciliation paths are implemented and tested. Both environments keep one
+combination as one OMS order and require native atomic broker evidence.
 
-**What is missing.** `PaperBrokerRegistry::submit_combo` is reached from no
-real order flow — it calls `request.validate()` and forwards straight to the
-adapter, bypassing `evaluate_risk`, kill switches, self-trade and rate limits,
-`OmsOrder` lifecycle, and the journal. A repository-wide search finds no caller
-outside `core/paper` itself. `core/live` has no combo type or method at all.
+**What is missing.** The gRPC/desktop boundary still exposes combination
+planning only. E1.5 must route the risk-gated path through that delivery surface;
+no structural gap remains inside `core/paper` or `core/live`.
 
 | Slice | Scope | State |
 | --- | --- | --- |
@@ -104,7 +102,7 @@ outside `core/paper` itself. `core/live` has no combo type or method at all.
 | E1.3b | Combination **fills, cancellation and reconciliation**: atomic `ComboExecution` evidence in whole units, per-leg accounting through the shared fill path, rollback-and-flag on unacceptable evidence, cancellation with its races, and full reconciliation against the broker snapshot. `UNRECONCILED_COMBINATION` is retired. | **done** 2026-09-23 |
 | E1.4a | `core/live` combination contract and risk gate: `LiveComboMarketData`, `evaluate_combo_risk` (every PAPER rule plus the canary ceilings, the deployed-capital ceiling and the unresolved-incident block), `combo_intent_fingerprint` binding an approval to the exact structure, and its own short-exposure permission. Assessment only. | **done** 2026-09-23 |
 | E1.4b | `core/live` canary **submission** path: `submit_canary_combo_intent`, `LiveComboOrder`, a rejecting `LiveBrokerAdapter::submit_combo` default, approval binding and consumption via `combo_intent_fingerprint`, the canary submission counter, durable audit before the irreversible broker call, restart recovery, and integration into every risk counter | **done** 2026-09-23 |
-| E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | next |
+| E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | **done** 2026-09-24 |
 | E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
 
 **E1.1 design decisions a later slice must not silently reverse.** Each is
@@ -318,6 +316,46 @@ durable-format decision and was out of scope here.
   read both maps. Its legs count individually for self-trade, because a working
   short leg is a real resting sell however the group is labelled.
 
+**E1.4c design decisions a later slice must not silently reverse.**
+
+- **LIVE receives one atomic execution group in whole combination units.** Every
+  approved leg must be present with its exact side and ratio-derived quantity;
+  loose leg evidence is an anomaly, never a partial combination fill.
+- **A failed evidence application rolls back the OMS and every accounting
+  projection, then continues the drained batch.** The combination becomes
+  `UNKNOWN` unless already filled, and a durable unexplained
+  `COMBINATION_EXECUTION_ANOMALY` incident blocks later canaries through the
+  existing `UNRESOLVED_INCIDENTS_REQUIRE_REVIEW` rule. LIVE did not acquire
+  PAPER's `evidence_error` field.
+- **Unresolved internal incidents are idempotent by category and subject.** Two
+  bad receipts for one combination remain one blocking incident; otherwise a
+  reconciliation report could reuse one incident identity twice and persist a
+  journal its own recovery rules reject.
+- **Execution identity is durable.** Exact reordered replay is a no-op; changed
+  evidence under the same group identity and any reused group or leg receipt are
+  refused before accounting, including a plain execution that reuses a
+  combination-owned identity. Receipts, short tax lots, and applied identities
+  survive restart, so replay after reopen cannot double-apply cash or positions.
+- **The single and combination paths share the same fill accounting.** Signed
+  positions and FIFO long/short tax lots are reachable only under LIVE's own
+  explicit short-exposure permission. All value arithmetic remains `Decimal`.
+- **Reserved cash shrinks with remaining units.** Cancellation is idempotent,
+  preserves partial fills, restores the evidenced working state on rejection,
+  becomes `UNKNOWN` on a transport ambiguity, and lets a complete atomic fill
+  win either ordering of the cancellation race.
+- **A complete atomic group receives the same post-fill cash-overdraft guard as
+  a plain fill.** The check runs after every leg is accounted so leg ordering
+  cannot create a false incident; a real overdraft creates the existing
+  unexplained incident that blocks later canaries.
+- **Monitoring counts both order maps.** A working or `UNKNOWN` combination
+  counts once in the LIVE dashboard, matching the risk gate operators must
+  explain.
+- **Reconciliation reads both order maps through one view** and compares broker
+  identity/version, state and filled combination units, plus cash and each leg's
+  position, using `LiveReconciliationIssue` throughout.
+- **No panics.** `core/live` production code contains no `unwrap` or `expect`;
+  malformed or inconsistent execution evidence is refused and incidented.
+
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
@@ -414,6 +452,45 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-24 — session 2
+
+- Re-established the requested baseline before writing code: clean `d42747c`,
+  all seven suites green, Rust workspace 354 passed / 0 failed / 3 ignored.
+- Landed **E1.4c**, closing the last structural `core/live` gap in audit row
+  5.6: whole-unit atomic combination execution evidence, shared per-leg
+  accounting with durable FIFO long/short tax lots, exact replay identity,
+  rollback-and-incident handling, cancellation races, restart recovery, and
+  reconciliation across both order maps. LIVE uses
+  `LiveReconciliationIssue` and the existing unexplained-incident gate; it did
+  not acquire PAPER's `evidence_error` concept.
+- Rust workspace tests rose **354 → 366 passed**, 0 failed, 3 ignored. The final
+  `python tools/session_status.py` measurement recorded all seven suites green;
+  Tauri remained 17 passed and Python 42 passed.
+- Sixteen deliberate defects were injected and each was caught before being
+  reverted: retaining the full debit reservation after a partial fill;
+  suppressing combination anomaly classification; accepting an overfill;
+  accepting a reused leg receipt; removing combination cancellation dispatch;
+  restoring every rejected cancel to `ACKNOWLEDGED`; ignoring a late full fill
+  after a terminal callback; counting largest-leg contracts as filled units;
+  omitting combinations from reconciliation; dropping durable execution
+  receipts; dropping durable short lots; treating cancel transport failure as a
+  known acknowledgement; and allowing repeated same-subject anomalies to create
+  duplicate incident identities; omitting the atomic-group cash-overdraft
+  incident; counting only plain orders in the monitoring dashboard; and
+  accepting a plain execution that reused a combination-owned receipt identity.
+  One earlier ratio injection selected the first
+  canonical leg and did not change behavior, so it was discarded and replaced
+  by the largest-leg defect rather than counted as verification.
+- Independent review found four defects before landing: repeated incidents could
+  make the journal unreopenable; combination overdrafts did not create the
+  canary-blocking incident; the monitoring dashboard omitted combination orders;
+  and plain fills could misclassify a combination-owned receipt as an idempotent
+  replay. Each was fixed, covered by a regression, re-injected, and observed to
+  fail before restoration.
+- **Next action: E1.5 — expose the risk-gated combination path through gRPC and
+  the desktop, replacing the current planning-only surface.** Do not start E2;
+  the 30-session PAPER gate and options acceptance remain external and open.
 
 ### 2026-09-23 — session 1
 

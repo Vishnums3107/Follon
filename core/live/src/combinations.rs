@@ -9,6 +9,144 @@
 //! as a side effect.
 use super::*;
 
+/// One complete native LIVE combination execution, assembled by the adapter.
+///
+/// This is incremental execution evidence, never a cumulative status callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveBrokerComboExecution {
+    /// Stable identity for this complete atomic group.
+    pub execution_id: String,
+    /// Immutable OMS identity.
+    pub client_order_id: String,
+    /// Native identity shared by every leg.
+    pub broker_order_id: String,
+    /// Positive whole combination units executed in this group.
+    pub units: Decimal,
+    /// Exactly one execution for each approved instrument, in any arrival order.
+    pub legs: Vec<LiveBrokerComboExecutionLeg>,
+}
+
+/// Exact leg economics and attribution within one atomic LIVE execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveBrokerComboExecutionLeg {
+    /// Broker execution identity, unique across the account.
+    pub execution_id: String,
+    /// Canonical approved leg identity.
+    pub instrument_id: String,
+    /// Approved side.
+    pub side: Side,
+    /// Exact contracts, equal to group units times the approved ratio.
+    pub quantity: Decimal,
+    /// Positive execution price in the account's normalized value units.
+    pub price: Decimal,
+    /// Non-negative exact commission in account currency.
+    pub fee: Decimal,
+    /// Canonical UTC execution time.
+    pub executed_at: String,
+}
+
+impl LiveBrokerEvent {
+    pub(super) fn client_order_id(&self) -> &str {
+        match self {
+            Self::ComboExecution(execution) => &execution.client_order_id,
+            Self::Acknowledged {
+                client_order_id, ..
+            }
+            | Self::Execution {
+                client_order_id, ..
+            }
+            | Self::Cancelled {
+                client_order_id, ..
+            }
+            | Self::CancelRejected {
+                client_order_id, ..
+            }
+            | Self::Expired {
+                client_order_id, ..
+            }
+            | Self::ReplaceRequested {
+                client_order_id, ..
+            }
+            | Self::Replaced {
+                client_order_id, ..
+            }
+            | Self::ReplaceRejected {
+                client_order_id, ..
+            }
+            | Self::Rejected {
+                client_order_id, ..
+            } => client_order_id,
+        }
+    }
+}
+
+impl LiveBrokerComboExecution {
+    pub(super) fn validate(&self, intent: &ComboIntent) -> Result<(), LiveError> {
+        validate_canonical_id("live combo execution_id", &self.execution_id)?;
+        validate_canonical_id(
+            "live combo execution client_order_id",
+            &self.client_order_id,
+        )?;
+        validate_canonical_id(
+            "live combo execution broker_order_id",
+            &self.broker_order_id,
+        )?;
+        if self.units <= Decimal::ZERO
+            || self.units.scaled() % follon_domain::DECIMAL_SCALE != 0
+            || self.legs.len() != intent.legs.len()
+        {
+            return Err(LiveError(
+                "live combination execution requires whole units and every leg".to_owned(),
+            ));
+        }
+        let mut instruments = BTreeSet::new();
+        let mut identities = BTreeSet::from([self.execution_id.as_str()]);
+        for leg in &self.legs {
+            validate_canonical_id("live combo leg execution_id", &leg.execution_id)?;
+            validate_utc_timestamp("live combo leg execution time", &leg.executed_at)?;
+            let approved = intent
+                .legs
+                .iter()
+                .find(|approved| approved.instrument_id == leg.instrument_id)
+                .ok_or_else(|| {
+                    LiveError("live combination execution has an unapproved instrument".to_owned())
+                })?;
+            if !instruments.insert(&leg.instrument_id)
+                || !identities.insert(&leg.execution_id)
+                || leg.side != approved.side
+                || leg.quantity
+                    != self
+                        .units
+                        .checked_mul(Decimal::from_integer(i64::from(approved.ratio))?)?
+                || leg.price <= Decimal::ZERO
+                || leg.fee < Decimal::ZERO
+            {
+                return Err(LiveError(
+                    "live combination execution has duplicate identities or inconsistent leg economics"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn fills(&self) -> Vec<Fill> {
+        self.legs
+            .iter()
+            .map(|leg| Fill {
+                execution_id: leg.execution_id.clone(),
+                order_id: self.client_order_id.clone(),
+                instrument_id: leg.instrument_id.clone(),
+                side: leg.side,
+                quantity: leg.quantity,
+                price: leg.price,
+                fee: leg.fee,
+                executed_at: leg.executed_at.clone(),
+            })
+            .collect()
+    }
+}
+
 /// One mark per leg of a combination, evaluated as a single observation.
 ///
 /// Kept as a collection of [`LiveMarketData`] rather than a new shape so a
@@ -546,10 +684,12 @@ pub struct LiveComboOrder {
     pub broker_order_versions: Vec<String>,
     /// Exact filled combination units, in whole units.
     pub filled_quantity: Decimal,
+    /// Applied atomic execution receipts keyed by group identity.
+    pub(super) executions: BTreeMap<String, LiveBrokerComboExecution>,
 }
 
 impl LiveComboOrder {
-    fn working(&self) -> bool {
+    pub(super) fn working(&self) -> bool {
         !matches!(
             self.oms.state,
             OrderState::RiskRejected
@@ -558,6 +698,58 @@ impl LiveComboOrder {
                 | OrderState::Rejected
                 | OrderState::Expired
         )
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.oms.state,
+            OrderState::Filled
+                | OrderState::Cancelled
+                | OrderState::Rejected
+                | OrderState::Expired
+                | OrderState::RiskRejected
+        )
+    }
+
+    fn working_state(&self) -> OrderState {
+        if self.filled_quantity == Decimal::ZERO {
+            OrderState::Acknowledged
+        } else {
+            OrderState::PartiallyFilled
+        }
+    }
+
+    fn acknowledge(&mut self, broker_order_id: &str) -> Result<(), LiveError> {
+        validate_canonical_id("live combo broker_order_id", broker_order_id)?;
+        if self
+            .broker_order_id
+            .as_deref()
+            .is_some_and(|existing| existing != broker_order_id)
+        {
+            return Err(LiveError(
+                "live combination evidence has an unrecognized broker order ID".to_owned(),
+            ));
+        }
+        self.broker_order_id = Some(broker_order_id.to_owned());
+        if !self
+            .broker_order_versions
+            .iter()
+            .any(|existing| existing == broker_order_id)
+        {
+            self.broker_order_versions.push(broker_order_id.to_owned());
+        }
+        if self.is_terminal() {
+            return Ok(());
+        }
+        if self.oms.state == OrderState::PendingSubmit {
+            self.oms
+                .transition(OrderState::Submitted, "LIVE_COMBO_BROKER_EVIDENCE_RECEIVED")?;
+        }
+        if matches!(self.oms.state, OrderState::Submitted | OrderState::Unknown) {
+            self.oms
+                .transition(self.working_state(), "LIVE_COMBO_BROKER_ACKNOWLEDGED")?;
+        }
+        Ok(())
     }
 
     /// Cash a working combination still has committed.
@@ -698,6 +890,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 broker_order_id: None,
                 broker_order_versions: Vec::new(),
                 filled_quantity: Decimal::ZERO,
+                executions: BTreeMap::new(),
             },
         );
         self.approvals
@@ -806,6 +999,190 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             .ok_or_else(|| LiveError("unknown live OMS combination order".to_owned()))
     }
 
+    pub(super) fn cancel_combo_order(
+        &mut self,
+        order_id: &str,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<(), LiveError> {
+        if !self.broker_connected {
+            return Err(LiveError(
+                "reconnect and reconcile before live combination cancellation".to_owned(),
+            ));
+        }
+        let order = self.combo_order_mut(order_id)?;
+        if matches!(
+            order.oms.state,
+            OrderState::PendingCancel | OrderState::Cancelled
+        ) {
+            return Ok(());
+        }
+        if !matches!(
+            order.oms.state,
+            OrderState::Acknowledged | OrderState::PartiallyFilled
+        ) {
+            return Err(LiveError(
+                "only acknowledged or partially filled live combinations may cancel".to_owned(),
+            ));
+        }
+        order
+            .oms
+            .transition(OrderState::PendingCancel, "LIVE_COMBO_CANCEL_REQUESTED")?;
+        // The intent is durable before the external command, including a
+        // crash or disconnect between these two operations.
+        self.persist("live.combo.pending_cancel.v1", actor, occurred_at, order_id)?;
+        if let Err(error) = self.broker.cancel(order_id) {
+            self.combo_order_mut(order_id)?
+                .oms
+                .transition(OrderState::Unknown, "LIVE_COMBO_CANCEL_OUTCOME_UNKNOWN")?;
+            self.broker_connected = false;
+            self.persist("live.combo.cancel_unknown.v1", actor, occurred_at, order_id)?;
+            return Err(error);
+        }
+        self.persist("live.combo.cancel_sent.v1", actor, occurred_at, order_id)
+    }
+
+    pub(super) fn apply_combo_event(&mut self, event: LiveBrokerEvent) -> Result<(), LiveError> {
+        let order_id = event.client_order_id().to_owned();
+        validate_canonical_id("live combo event client_order_id", &order_id)?;
+        match event {
+            LiveBrokerEvent::ComboExecution(mut execution) => {
+                // Canonicalize leg ordering, so a reordered exact replay is an
+                // idempotent no-op rather than changed evidence.
+                execution
+                    .legs
+                    .sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
+                let order = self.combo_orders.get(&order_id).ok_or_else(|| {
+                    LiveError("live OMS does not know combination".to_owned())
+                })?;
+                execution.validate(&order.oms.intent)?;
+                if let Some(previous) = order.executions.get(&execution.execution_id) {
+                    return if previous == &execution {
+                        Ok(())
+                    } else {
+                        Err(LiveError(
+                            "live combination execution identity reused with changed evidence"
+                                .to_owned(),
+                        ))
+                    };
+                }
+                if self.execution_ids.contains(&execution.execution_id)
+                    || execution
+                        .legs
+                        .iter()
+                        .any(|leg| self.execution_ids.contains(&leg.execution_id))
+                {
+                    return Err(LiveError(
+                        "live combination execution overlaps previously applied evidence"
+                            .to_owned(),
+                    ));
+                }
+                let total = order.filled_quantity.checked_add(execution.units)?;
+                if total > order.oms.intent.combo_quantity {
+                    return Err(LiveError(
+                        "live combination execution exceeds approved units".to_owned(),
+                    ));
+                }
+                let strategy_id = order.oms.intent.strategy_id.clone();
+                let order = self.combo_order_mut(&order_id)?;
+                if matches!(
+                    order.oms.state,
+                    OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+                ) {
+                    order.oms.transition(
+                        OrderState::Unknown,
+                        "LATE_LIVE_COMBO_EXECUTION_AFTER_TERMINAL",
+                    )?;
+                }
+                order.acknowledge(&execution.broker_order_id)?;
+                // `synchronize` snapshots every accounting projection and the
+                // OMS before dispatch, so any leg failure rolls back the group.
+                for fill in execution.fills() {
+                    self.apply_accounted_fill(&fill, &strategy_id)?;
+                }
+                // Evaluate the complete atomic group, not an intermediate leg:
+                // a credit leg may legitimately repair the temporary cash
+                // position created by an earlier debit leg.
+                if self.cash < Decimal::ZERO {
+                    self.record_internal_incident(
+                        "LIVE_CASH_OVERDRAFT",
+                        self.account.account_id.clone(),
+                        "a broker combination execution exceeded independently available cash"
+                            .to_owned(),
+                    );
+                }
+                self.execution_ids.insert(execution.execution_id.clone());
+                let order = self.combo_order_mut(&order_id)?;
+                order.filled_quantity = total;
+                if total == order.oms.intent.combo_quantity {
+                    if order.oms.state != OrderState::Filled {
+                        order
+                            .oms
+                            .transition(OrderState::Filled, "LIVE_BROKER_COMBO_FULL_FILL")?;
+                    }
+                } else if order.oms.state == OrderState::Acknowledged {
+                    order.oms.transition(
+                        OrderState::PartiallyFilled,
+                        "LIVE_BROKER_COMBO_PARTIAL_FILL",
+                    )?;
+                }
+                order
+                    .executions
+                    .insert(execution.execution_id.clone(), execution);
+            }
+            LiveBrokerEvent::Acknowledged {
+                broker_order_id, ..
+            } => self
+                .combo_order_mut(&order_id)?
+                .acknowledge(&broker_order_id)?,
+            LiveBrokerEvent::CancelRejected { reason, .. } => {
+                validate_reason("live combo cancellation rejection", &reason)?;
+                let order = self.combo_order_mut(&order_id)?;
+                if matches!(order.oms.state, OrderState::PendingCancel | OrderState::Unknown) {
+                    order
+                        .oms
+                        .transition(order.working_state(), "LIVE_COMBO_CANCEL_REJECTED")?;
+                }
+            }
+            LiveBrokerEvent::Cancelled { reason, .. } => {
+                self.finish_combo_as(&order_id, &reason, OrderState::Cancelled)?
+            }
+            LiveBrokerEvent::Expired { reason, .. } => {
+                self.finish_combo_as(&order_id, &reason, OrderState::Expired)?
+            }
+            LiveBrokerEvent::Rejected { reason, .. } => {
+                self.finish_combo_as(&order_id, &reason, OrderState::Rejected)?
+            }
+            _ => {
+                return Err(LiveError(
+                    "live combination requires complete atomic execution evidence; replacement is unsupported"
+                        .to_owned(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_combo_as(
+        &mut self,
+        order_id: &str,
+        reason: &str,
+        state: OrderState,
+    ) -> Result<(), LiveError> {
+        validate_reason("live combo terminal reason", reason)?;
+        let order = self.combo_order_mut(order_id)?;
+        if order.is_terminal() {
+            return Ok(());
+        }
+        if order.oms.state == OrderState::PendingSubmit {
+            order
+                .oms
+                .transition(OrderState::Submitted, "LIVE_COMBO_BROKER_EVIDENCE_RECEIVED")?;
+        }
+        order.oms.transition(state, reason)?;
+        Ok(())
+    }
+
     /// Non-terminal orders of both kinds. A combination counts once.
     pub(super) fn working_order_count(&self) -> usize {
         self.orders.values().filter(|order| order.working()).count()
@@ -830,13 +1207,33 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
 
     /// Whether any order of either kind is in the `UNKNOWN` safety state.
     pub(super) fn has_unknown_order(&self) -> bool {
+        self.unknown_order_count() > 0
+    }
+
+    /// Ambiguous orders of both kinds. A combination counts once.
+    pub(super) fn unknown_order_count(&self) -> usize {
         self.orders
             .values()
-            .any(|order| order.oms.state == OrderState::Unknown)
-            || self
+            .filter(|order| order.oms.state == OrderState::Unknown)
+            .count()
+            + self
                 .combo_orders
                 .values()
-                .any(|order| order.oms.state == OrderState::Unknown)
+                .filter(|order| order.oms.state == OrderState::Unknown)
+                .count()
+    }
+
+    /// Whether a durable atomic receipt owns this group or leg identity.
+    pub(super) fn combo_execution_owns_id(&self, execution_id: &str) -> bool {
+        self.combo_orders.values().any(|order| {
+            order.executions.values().any(|execution| {
+                execution.execution_id == execution_id
+                    || execution
+                        .legs
+                        .iter()
+                        .any(|leg| leg.execution_id == execution_id)
+            })
+        })
     }
 
     /// Whether a working order of either kind would trade against `side` on
