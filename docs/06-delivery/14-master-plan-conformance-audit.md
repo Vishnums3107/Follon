@@ -1978,6 +1978,34 @@ These are mandatory master-plan acceptance conditions and are currently open:
       does not recognize `portfolio.position_updated.v1`; the default fill target is unaffected. No external
       gate moved.
 
+53. A fourth property/model-test slice: the PAPER atomic-combination lifecycle (2026-09-24, Reliability and
+    quality conformance; E3.2a). Advances the "combination legality" example items 42-44 named in their
+    remainders.
+    - **What is now real.** `core/paper/tests/combo_lifecycle_proptest.rs` adds `proptest` as a dev-dependency
+      to `core/paper` and generates arbitrary 2-4 leg combinations -- any sides, ratios 1-3, debit or credit
+      protection, per-leg fees -- then drives each through a random sequence of whole-unit atomic fills,
+      broker re-deliveries of already-applied executions, and an optional cancellation. After every step it
+      checks an independently written model: filled units, the lifecycle state implied by filled units and
+      cancellation, every leg's signed position (`side * ratio * units`), exact cash including fees, a
+      working combination counting once on the dashboard, replay leaving every observable byte unchanged,
+      and a clean reconciliation against the broker model's own snapshot. It uses only the public API; a
+      small test adapter wraps the real `IbkrPaperAdapter` to re-deliver evidence the way a reconnecting
+      broker may.
+    - **Verified against injected defects.** Seven defects were injected into production code and each failed
+      the property: a replayed execution applied twice; a sell-leg fee not charged; a partial fill never
+      leaving `ACKNOWLEDGED`; cancellation discarding filled units; working combinations omitted from the
+      dashboard count; the broker model omitting a fee (caught only by reconciliation); and the broker
+      snapshot reporting leg contracts instead of combination units. The first double-apply injection
+      disabled one guard but left the group-identity check live through operator precedence, so it tested a
+      refusal rather than a double-apply; it was recognized, not counted, and redone with both guards off.
+    - **Also recorded.** E2.1b (`strategy-capsule-manifest`) was assessed as product work rather than wiring:
+      no portable strategy bundle, lockfile, or evaluation receipt exists in the repository to hash or cite,
+      and the verifier returns the caller's claimed disposition. It was not wired.
+    - **Measured result.** The Rust workspace rose from 383 to 384 passed / 0 failed / 3 ignored; the final
+      `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** The controlled-LIVE combination lifecycle and EMS scheduling still lack an
+      equivalent model test. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T05:00:39Z  
+**Measured at:** 2026-09-24T05:18:53Z  
 **Branch:** `main`  
-**HEAD:** `937673a` -- feat(desktop): submit a risk-gated atomic PAPER combination -- E1.5b (2026-09-24T10:12:05+05:30)  
-**Uncommitted paths:** 10
+**HEAD:** `ddaf9ef` -- feat(evidence): compute decision reconstruction from the real journal -- E2.1a (2026-09-24T10:31:20+05:30)  
+**Uncommitted paths:** 5
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 383 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 384 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
@@ -422,7 +422,7 @@ state.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E2.1a | `decision-reconstruction`: `follon-operations decision-reconstruction` walks the latest fill's causal chain in the real step-2 backtest journal, refuses a journal that does not hash to its manifest's `events_sha256`, binds the manifest's `configuration_hash`, and hashes each node's exact persisted line. Pipeline step 16h. | **done** 2026-09-24 |
-| E2.1b | `strategy-capsule-manifest` (`core/control-plane::capsule`). The verifier checks supplied hashes but builds no manifest; wiring it honestly needs a real bundle, configuration, lockfile and evaluation receipt to hash and cite, and `to_json` still builds JSON by hand without escaping (fix it the way E2.1a fixed `provenance`). | open |
+| E2.1b | `strategy-capsule-manifest` (`core/control-plane::capsule`). **Product work, not wiring** (assessed 2026-09-24). The verifier only checks hashes a caller supplies and then returns the caller's own claimed disposition; it builds no manifest. The pipeline's only evaluated strategy is compiled into the Rust backtest binary, and no portable strategy bundle, dependency lockfile or evaluation receipt exists anywhere to hash or cite. It needs a capsule-packaging step first. `to_json` also still builds JSON by hand without escaping. | open, E2.2-class |
 | E2.1c | `data-rights-and-semantics-receipt` (`core/market-data::rights`). **Not wiring work.** `certify_receipt` takes `semantic_parity_score_bps` as an input, and nothing in the repository measures one. Feeding it a configured number would publish an operator-typed value as measured evidence, which rule 1 forbids. It needs a real parity computation first, which makes it E2.2-class. | blocked on a real measurement |
 | E2.2+ | The remaining 29 categories are separate per-category product work, not wiring. Each needs its own real computation before its panel may show anything. | open, unsequenced |
 
@@ -443,7 +443,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | ID | Gap | Conformance row |
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
-| E3.2 | Property/model/fault coverage beyond the three landed slices (OMS lifecycle, option settlement, portfolio aggregation) | Reliability |
+| E3.2 | Property/model/fault coverage beyond the four landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER atomic-combination lifecycle). Next candidates: the LIVE combination lifecycle, EMS scheduling legality | Reliability |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
 | E3.5 | Market-data gap-repair operation | 5.2 |
@@ -562,8 +562,21 @@ short — detail belongs in the conformance audit.
 - Assessed the rest of E2.1: **E2.1b** (capsule manifest) needs real inputs to
   hash; **E2.1c** (data-rights receipt) is blocked, because its parity score
   would have to be typed in, not measured.
-- **Next action: E2.1b** if a real strategy bundle, lockfile and evaluation
-  receipt can be cited; otherwise E3. The top external priority is unchanged:
+- Assessed **E2.1b** as product work: there is no portable strategy bundle,
+  lockfile or evaluation receipt to hash, so a capsule could only be built
+  from invented inputs.
+- Landed **E3.2a**: `core/paper/tests/combo_lifecycle_proptest.rs`, a
+  model-based property test (128 cases) driving arbitrary 2–4 leg debit and
+  credit combinations through random whole-unit fills, broker replays and
+  cancellation, checked after every step against an independent model and a
+  clean reconciliation. Public API only. Seven deliberate defects were
+  injected and each was caught; one first attempt at a double-apply defect left
+  a guard live, was recognized as not modelling the intended defect, and was
+  redone.
+- Rust workspace **383 → 384 passed**, 0 failed, 3 ignored; the final
+  `python tools/session_status.py` measurement recorded all seven suites green.
+- **Next action: E3.2b** — the same model test for the controlled-LIVE
+  combination lifecycle. The top external priority is unchanged:
   the 30 clean PAPER sessions, which need a configured IBKR paper account, not
   code. Run `python tools/generate_pipeline_evidence.py` at least once per
   session that touches a persisted format.
