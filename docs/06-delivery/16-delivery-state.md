@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T17:04:43Z  
+**Measured at:** 2026-09-24T17:14:42Z  
 **Branch:** `main`  
-**HEAD:** `d050774` -- feat(evidence): sign strategy capsules and verify against a trusted key -- E2.1d (2026-09-24T22:27:29+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `b6cfcd0` -- test(execution): property tests for algo-wheel allocation -- E3.2d (2026-09-24T22:35:03+05:30)  
+**Uncommitted paths:** 5
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 411 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 415 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
@@ -444,7 +444,8 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | ID | Gap | Conformance row |
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
-| E3.2 | Property/model/fault coverage beyond the seven landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, and algo-wheel allocation). Remaining candidates: passive repricing, smart routing, margin/financing functions | Reliability |
+| E3.2 | Property/model/fault coverage beyond the eight landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, and passive repricing). Remaining candidates: smart routing, margin/financing functions | Reliability |
+| E3.6 | No pre-trade check validates an order's limit price against the instrument's `tick_size`, so an off-grid limit passes PAPER and controlled-LIVE risk and reaches the broker, to be rejected there. Found while landing E3.2e (audit item 60). | 5.5 / 5.7 |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
 | E3.5 | Market-data gap-repair operation | 5.2 |
@@ -554,10 +555,24 @@ short — detail belongs in the conformance audit.
 - Rust workspace **407 → 411 passed**, 0 failed, 3 ignored; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
-- **Next action:** remaining E3.2 candidates (passive repricing, smart
-  routing, margin/financing) or E3.5 market-data gap repair. E2.1b's only
-  remainder is verifying a capsule on a second, clean machine. The top
-  external priority is unchanged: the 30 clean PAPER sessions.
+- Landed **E3.2e**: `core/execution/tests/passive_repricing_proptest.rs`
+  found a real defect. A replacement clamped to an off-grid hard limit was
+  emitted off the tick grid; because it follows a confirmed cancel, the order
+  would have been left with no working child. The clamp now takes the most
+  aggressive on-grid price inside the limit. A deterministic regression and
+  the shrunk seed both fail without the fix. Ten further injected defects were
+  each caught, and the suite was stress-run 20 × 1,024 cases without failure
+  (audit item 60).
+- Recorded **E3.6**: no pre-trade check validates any order's limit price
+  against the instrument tick size.
+- Rust workspace **411 → 415 passed**, 0 failed, 3 ignored; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
+- **Next action:** E3.6, the pre-trade tick check, because it is a live-order
+  correctness gap. After that, the remaining E3.2 candidates (smart routing,
+  margin/financing) or E3.5 market-data gap repair. E2.1b's only remainder is
+  verifying a capsule on a second, clean machine. The top external priority is
+  unchanged: the 30 clean PAPER sessions.
 
 ### 2026-09-24 — session 4
 

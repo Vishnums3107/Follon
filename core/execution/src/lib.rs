@@ -1340,9 +1340,21 @@ pub fn plan_passive_repricing(
             Side::Sell => observation.best_ask,
         };
         if let Some(hard_limit) = parent.limit_price {
+            // Clamp to the most aggressive price on the tick grid that still
+            // respects the hard limit. An operator-typed limit need not be on
+            // the grid, and a venue rejects an off-grid replacement after the
+            // working child's cancel has already been confirmed.
+            let tick = policy.tick_size.scaled();
+            let below = hard_limit.scaled() - hard_limit.scaled().rem_euclid(tick);
             candidate = match parent.side {
-                Side::Buy => candidate.min(hard_limit),
-                Side::Sell => candidate.max(hard_limit),
+                Side::Buy => candidate.min(Decimal::from_scaled(below)),
+                Side::Sell => {
+                    candidate.max(Decimal::from_scaled(if below == hard_limit.scaled() {
+                        below
+                    } else {
+                        below + tick
+                    }))
+                }
             };
         }
         let more_aggressive = match parent.side {
@@ -2391,6 +2403,57 @@ mod tests {
             plan.initial.child_order_id
         );
         assert_eq!(plan.replacements[0].replacement.quantity, parent.quantity);
+    }
+
+    #[test]
+    fn passive_replacement_clamped_to_an_off_grid_hard_limit_stays_on_the_tick_grid() {
+        // Shrunk by `passive_repricing_proptest`: a sell collared at 3.86999999
+        // on a 0.01 grid used to be replaced at exactly 3.86999999, which a
+        // venue rejects after the working child's cancel is confirmed.
+        let observations = [PassiveMarketObservation {
+            observed_after_seconds: 5,
+            best_bid: amount("3.73"),
+            best_ask: amount("3.78"),
+        }];
+        let policy = PassiveRepricePolicy {
+            initial_limit_price: amount("3.87"),
+            tick_size: amount("0.01"),
+            maximum_chase_bps: 100,
+            maximum_replacements: 1,
+            minimum_replace_interval_seconds: 1,
+        };
+        let mut sell = parent("1");
+        sell.side = Side::Sell;
+        sell.limit_price = Some(amount("3.86999999"));
+        let plan = plan_passive_repricing(&sell, &policy, &observations).expect("sell plan");
+        // The nearest on-grid price at or above the collar is 3.87, the initial
+        // price itself, so there is nothing to improve on and no replacement.
+        assert!(plan.replacements.is_empty());
+
+        sell.limit_price = Some(amount("3.85999999"));
+        let plan = plan_passive_repricing(&sell, &policy, &observations).expect("sell plan");
+        assert_eq!(
+            plan.replacements[0].replacement.limit_price,
+            Some(amount("3.86"))
+        );
+
+        let mut buy = parent("1");
+        buy.limit_price = Some(amount("3.75000001"));
+        let buy_policy = PassiveRepricePolicy {
+            initial_limit_price: amount("3.70"),
+            maximum_chase_bps: 500,
+            ..policy
+        };
+        let buy_observations = [PassiveMarketObservation {
+            observed_after_seconds: 5,
+            best_bid: amount("3.77"),
+            best_ask: amount("3.80"),
+        }];
+        let plan = plan_passive_repricing(&buy, &buy_policy, &buy_observations).expect("buy plan");
+        assert_eq!(
+            plan.replacements[0].replacement.limit_price,
+            Some(amount("3.75"))
+        );
     }
 
     #[test]

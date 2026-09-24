@@ -2228,6 +2228,58 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** Passive repricing, smart routing, and the margin/financing functions of
       `core/accounting` still lack property coverage. No external gate moved.
 
+60. An eighth property-test slice, passive cancel-and-replace repricing, found a real defect (2026-09-24,
+    Reliability and quality conformance; E3.2e). This closes the "passive repricing" candidate named in item
+    59's remainder.
+    - **The defect.** `plan_passive_repricing` clamps each candidate price to the parent's hard limit. When
+      that limit was off the venue tick grid, the clamp emitted the off-grid limit itself as a replacement
+      price. The shrunk case was a sell on a 0.01 grid collared at 3.86999999, replaced at exactly 3.86999999.
+      A replacement is transmitted only after the working child's cancel is confirmed. A venue rejects an
+      off-grid price, so the order would have been left with no working child at all. The initial price and
+      every quote were already tick-checked; only the clamped price escaped. The clamp now takes the most
+      aggressive on-grid price that still respects the limit: the tick floor for a buy, the tick ceiling for a
+      sell. The collar is therefore never crossed. The deterministic regression
+      `passive_replacement_clamped_to_an_off_grid_hard_limit_stays_on_the_tick_grid` and the committed shrunk
+      seed both fail without the fix.
+    - **What is now real.** `core/execution/tests/passive_repricing_proptest.rs` has three properties over
+      random buy and sell quote paths. In 512 cases, 438 produce replacements (1,101 in total) and 22 exercise
+      the off-grid clamp.
+      - Every replacement obeys every rule: post-only against the quote it was planned from; strictly
+        monotonic toward the market; within the hard limit; within `maximum_chase_bps`, computed exactly as
+        `price_deviation_bps` truncates; within the replacement budget and the replace interval; scheduled at
+        an observation; cancelling exactly the previous child; restating the full quantity as a limit order;
+        and on the tick grid.
+      - No eligible reprice is skipped: the plan equals a greedy oracle written in integer arithmetic.
+      - Malformed inputs are refused: an off-grid or already-marketable initial price, non-increasing
+        observation times, a locked quote, an initial price beyond the hard limit, and a zero interval.
+    - **Verified against injected defects.** Reverting the fix failed both the unit regression and the
+      property. Ten further injected defects each failed a property:
+      - pricing from the far side of the book;
+      - moving away from the market;
+      - chasing twice the configured bound;
+      - ignoring the replace interval;
+      - allowing one replacement over budget;
+      - cancelling the initial child every time;
+      - a buy ignoring the hard limit;
+      - an extra second of cooldown that silently skips eligible reprices, which only the completeness oracle
+        sees;
+      - accepting non-increasing observation times.
+
+      A first attempt at the cancel-chain defect did not compile, so it was not counted and was replaced.
+      Seeds that only injected runs recorded were removed; the committed regression file holds only the real
+      defect's seed. The suite was stress-run 20 times at 1,024 cases on fresh seeds without failure.
+    - **Measured result.** The Rust workspace rose from 411 to 415 passed / 0 failed / 3 ignored; the
+      final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.**
+      - **A wider gap, not closed here.** No code path in the repository checks an order's limit price against
+        the instrument's `tick_size`, which is only validated as positive. A plain PAPER or controlled-LIVE
+        order with an off-grid limit therefore passes risk and would be rejected by the broker. Closing this
+        means a pre-trade check in both risk gates, so it is recorded as its own slice (E3.6) rather than
+        folded in here.
+      - Smart routing and the margin/financing functions of `core/accounting` still lack property coverage.
+
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

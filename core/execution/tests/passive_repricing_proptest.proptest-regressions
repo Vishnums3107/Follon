@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9252478636bcd4acf57cf0fa7e0795393af702f285b09a5e7d1fb0b48322bd09 # shrinks to scenario = Scenario { side: Sell, tick: 1000000, quantity: 1, initial: 387000000, hard_limit: Some(386999999), chase_bps: 1, maximum_replacements: 1, interval: 1, quotes: [(5, 373000000, 378000000), (30, 373000000, 374000000), (34, 373000000, 374000000), (48, 370000000, 371000000)] }
