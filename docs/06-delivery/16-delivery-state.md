@@ -56,17 +56,17 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T04:06:52Z  
+**Measured at:** 2026-09-24T04:41:53Z  
 **Branch:** `main`  
-**HEAD:** `70bfc40` -- feat(live): fill, cancel and reconcile an atomic combination -- E1.4c (2026-09-24T09:14:27+05:30)  
-**Uncommitted paths:** 11
+**HEAD:** `bb43803` -- feat(api): submit a risk-gated atomic PAPER combination -- E1.5a (2026-09-24T09:39:32+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
 | Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 371 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
-| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
+| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 28 | 0 | 0 |
 | Python suite (`pytest`) | **PASS** | 0 | 43 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
@@ -89,13 +89,15 @@ the previous session explicitly declined to half-land.
 controlled-LIVE risk, approval, submission, fill, cancellation, recovery and
 reconciliation paths are implemented and tested. Both environments keep one
 combination as one OMS order and require native atomic broker evidence. The
-versioned gRPC boundary now has a configured PAPER command that reaches this
-real risk/OMS path rather than returning another plan.
+versioned gRPC boundary and the Tauri desktop host both have a PAPER command
+that reaches this real risk/OMS path rather than returning another plan, and
+the desktop has an operator combination ticket.
 
-**What is missing.** The desktop boundary still exposes only the single-order
-PAPER command path. E1.5b must add a validated combination IPC contract, native
-gateway dispatch/cancellation visibility, and an operator ticket. No structural
-gap remains inside `core/paper`, `core/live`, or the gRPC boundary.
+**What is missing.** Nothing structural inside the repository: every E1 slice
+has landed. What remains for row 5.6 is external — broker-backed PAPER
+acceptance of a real combination against IBKR, and the options-acceptance gate
+below. The desktop still has no live market-data feed, so every leg's
+observation is operator-attested, exactly as for the single-order ticket.
 
 | Slice | Scope | State |
 | --- | --- | --- |
@@ -107,7 +109,7 @@ gap remains inside `core/paper`, `core/live`, or the gRPC boundary.
 | E1.4b | `core/live` canary **submission** path: `submit_canary_combo_intent`, `LiveComboOrder`, a rejecting `LiveBrokerAdapter::submit_combo` default, approval binding and consumption via `combo_intent_fingerprint`, the canary submission counter, durable audit before the irreversible broker call, restart recovery, and integration into every risk counter | **done** 2026-09-23 |
 | E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | **done** 2026-09-24 |
 | E1.5a | Versioned gRPC `SubmitPaperCombo` command backed by a configured durable `PaperTradingService`, exact per-leg observations, explicit short permission, and a loopback-or-mTLS write boundary | **done** 2026-09-24 |
-| E1.5b | Desktop combination IPC, native PAPER gateway dispatch/cancellation visibility, and operator ticket | open |
+| E1.5b | Desktop `submit_combo_order` IPC contract, native PAPER gateway dispatch through `submit_combo_intent` with atomic reference-priced fills, combination-aware cancellation receipts, an optional config-file short-exposure bound, and an operator combination ticket | **done** 2026-09-24 |
 
 **E1.1 design decisions a later slice must not silently reverse.** Each is
 covered by a test named after it.
@@ -378,6 +380,36 @@ durable-format decision and was out of scope here.
   identity and a client CA. This is still not the authenticated privileged
   control plane recorded as E3.3 and makes no production-readiness claim.
 
+**E1.5b design decisions a later slice must not silently reverse.**
+
+- **A leg's observation lives on the leg.** `ComboLegIntent` carries its own
+  `referencePrice` and `referenceObservedAt`, and the gateway builds each mark
+  only from them, so a request with an unpriced leg is not expressible and no
+  leg can be priced from its limit. Building marks from limit prices was
+  injected as a deliberate defect and the per-leg collar test caught it.
+- **The desktop submits one command, never legs.** `submit_combo_order`
+  becomes one `ComboIntent` and one OMS order. The ticket's regression asserts
+  it never invokes `submit_order`.
+- **Whole units only, refused at the boundary.** A combination fills in whole
+  units, so a fractional request could never complete; the IPC contract and
+  the ticket both refuse it rather than leave it resting forever.
+- **The model fills atomically or not at all, and respects the sign.** The
+  in-process `ManualFillAdapter` fills the whole group at the per-leg
+  observations only when `ComboPriceLimit::check_net_price` accepts the net
+  at those observations; a debit-protected structure observed at a credit
+  rests. Dropping the sign guard was injected and caught. An armed reference
+  is cleared after every submission, so a risk-rejected one can never price
+  a later request.
+- **Cancellation receipts read both order maps.** Reading only the plain map
+  reported every cancelled combination as `UNKNOWN`; that injection was caught.
+- **An approved retry reuses the durable decision time.** A fresh clock
+  reading would make `core/paper` refuse the retry as a changed request; a
+  previously rejected intent created no order and is simply evaluated again.
+- **Short exposure is granted only in the operator's config file.** The
+  optional `short_exposure.max_short_quantity` mirrors the version-1
+  `paper-command-route` shape; absent, every net short — and so nearly every
+  spread — is refused exactly as before. The UI has no control for it.
+
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
@@ -474,6 +506,38 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-24 — session 4
+
+- Baseline at `bb43803`: all seven suites green; the only uncommitted change was
+  the previous session's regenerated status block.
+- Landed **E1.5b**, the last E1 slice. The Tauri host gained a validated
+  `submit_combo_order` IPC command whose legs each carry their own attested
+  observation; the native PAPER gateway routes it through
+  `PaperTradingService::submit_combo_intent`, the in-process model fills the
+  whole group atomically only when the observed net satisfies the approved
+  protection, and `cancel_order` receipts now report a combination's real
+  state. A new combination ticket in the execution workspace submits exactly
+  one command. The desktop config gained an optional short-exposure bound in
+  the E1.5a route shape; absent, nothing changes.
+- Nine deliberate defects were injected and each was caught before being
+  reverted: cancellation receipt reading only the plain-order map; fill
+  marketability ignoring the protection's sign; fractional units accepted;
+  configured short permission ignored; armed reference not cleared after a
+  risk rejection; leg marks taken from limit prices; duplicate instruments
+  accepted; and, in the ticket's TypeScript, an unobserved leg priced from its
+  limit and fractional units accepted.
+- Tauri host tests rose **17 → 28 passed**; the desktop evidence suite gained
+  `combo-ticket-regression.mjs`. Rust workspace unchanged at 371 passed / 0
+  failed / 3 ignored, Python 43. The final `python tools/session_status.py`
+  measurement recorded all seven suites green.
+- Corrected in place a pre-existing false README sentence claiming the desktop
+  exposed no cancellation or position close; the ticket has had both.
+- **Next action: E2.1** — wire the three categories that already have real
+  Rust modules (`strategy-capsule-manifest`, `decision-reconstruction`,
+  `data-rights-and-semantics-receipt`) into the evidence pipeline. The top
+  external priority is unchanged: the 30 clean PAPER sessions, which need a
+  configured IBKR paper account, not code.
 
 ### 2026-09-24 — session 3
 

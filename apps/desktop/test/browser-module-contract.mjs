@@ -40,8 +40,10 @@ async function verifyModule(relativePath) {
 
 await verifyModule("main.js");
 assert.deepEqual([...visited].sort(), [
+  "ComboTicket.js",
   "OrderTicket.js",
   "catalog.js",
+  "combo-intent.js",
   "command-palette.js",
   "evidence.js",
   "main.js",

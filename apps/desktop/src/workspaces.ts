@@ -57,6 +57,7 @@ import { FeatureDefinition, SystemStatus } from "./catalog.js";
 import { createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { OrderTicket } from "./OrderTicket.js";
+import { ComboTicket } from "./ComboTicket.js";
 
 export type EvidenceArtifact = Readonly<{
   name: string;
@@ -186,6 +187,7 @@ export type WorkspaceContext = Readonly<{
 type Metric = readonly [label: string, value: string, detail: string, state?: "good" | "warn" | "bad", isSignature?: boolean];
 
 let mountedTicket: ReturnType<typeof createRoot> | undefined;
+let mountedComboTicket: ReturnType<typeof createRoot> | undefined;
 const tableFilterValues = new Map<string, string>();
 
 const OMS_LIFECYCLE_COVERAGE: ReadonlyArray<readonly [string, string, string]> = [
@@ -249,6 +251,8 @@ export function renderWorkspace(
 ): void {
   mountedTicket?.unmount();
   mountedTicket = undefined;
+  mountedComboTicket?.unmount();
+  mountedComboTicket = undefined;
   summaryRoot.replaceChildren();
   canvasRoot.replaceChildren();
   switch (workspaceId) {
@@ -1298,6 +1302,22 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
     mountedTicket.render(createElement(OrderTicket, {
       defaultAccountId: paper?.account_id ?? "",
       defaultEnvironment: "PAPER",
+    }));
+  } catch {
+    // Non-browser or mock DOM testing environment
+  }
+
+  const comboTicket = createPanel(
+    "Combination ticket",
+    "Submit one atomic multi-leg PAPER combination to the configured Risk/OMS route as a single order. Controlled-LIVE is not exposed by this ticket.",
+  );
+  const comboTicketRoot = document.createElement("div");
+  comboTicket.append(comboTicketRoot);
+  root.append(comboTicket);
+  try {
+    mountedComboTicket = createRoot(comboTicketRoot);
+    mountedComboTicket.render(createElement(ComboTicket, {
+      defaultAccountId: paper?.account_id ?? "",
     }));
   } catch {
     // Non-browser or mock DOM testing environment

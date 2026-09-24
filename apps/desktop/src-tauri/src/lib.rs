@@ -15,6 +15,7 @@ pub fn run() {
         .manage(trading_state)
         .invoke_handler(tauri::generate_handler![
             trading::submit_order,
+            trading::submit_combo_order,
             trading::cancel_order,
             trading::close_position,
             trading::trading_command_status

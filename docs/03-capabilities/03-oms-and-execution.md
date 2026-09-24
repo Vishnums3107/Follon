@@ -62,6 +62,17 @@ server TLS identity and client CA, so the write method is not exposed on an
 unauthenticated remote socket. This is local PAPER engineering evidence, not
 external-broker or production acceptance.
 
+The Tauri desktop host has the equivalent `submit_combo_order` IPC command. Its
+`ComboOrderIntent` places each leg's operator-attested observation on the leg
+itself, so no leg can reach risk unpriced or priced from its limit. The native
+PAPER gateway converts it into one `ComboIntent` and calls the same
+`submit_combo_intent`; the in-process paper model fills the whole group
+atomically only when the net price at those observations satisfies the
+approved protection, sign included, and otherwise leaves it resting. Existing
+`cancel_order` reaches combinations and its receipt reads both order maps. The
+desktop's optional `short_exposure` bound lives only in the operator-authored
+configuration file, never in the UI.
+
 ## Safety requirements
 
 - An accepted intent has a terminal state or an explicitly unresolved `UNKNOWN` state.

@@ -30,20 +30,22 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use follon_domain::{
-    Decimal, OrderIntent as DomainOrderIntent, OrderState, OrderType as DomainOrderType,
-    Side as DomainSide, TimeInForce as DomainTimeInForce,
+    ComboIntent, ComboIntentLeg, ComboPriceLimit, Decimal, OrderIntent as DomainOrderIntent,
+    OrderState, OrderType as DomainOrderType, Side as DomainSide, TimeInForce as DomainTimeInForce,
 };
 use follon_paper::{
-    BrokerCancelRequest, BrokerOrderRequest, BrokerSubmitResult, IbkrPaperAdapter,
-    KillSwitchRegistry, PaperAccount, PaperBrokerAdapter, PaperError, PaperMarketData,
-    PaperRiskPolicy, PaperTradingService,
+    BrokerCancelRequest, BrokerComboExecution, BrokerComboExecutionLeg, BrokerComboRequest,
+    BrokerOrderRequest, BrokerSubmitResult, IbkrPaperAdapter, KillSwitchRegistry, PaperAccount,
+    PaperBrokerAdapter, PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy,
+    PaperTradingService, ShortExposurePolicy,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::trading::{
-    CancelOrderIntent, ClosePositionIntent, CommandReceipt, CommandStatus, OrderIntent, OrderSide,
-    OrderType, RiskOmsGateway, TimeInForce, TradingCommandError, TradingCommandKind,
+    CancelOrderIntent, ClosePositionIntent, ComboOrderIntent, ComboPriceLimitKind, CommandReceipt,
+    CommandStatus, OrderIntent, OrderSide, OrderType, RiskOmsGateway, TimeInForce,
+    TradingCommandError, TradingCommandKind,
 };
 
 /// Wraps the in-process simulated IBKR paper adapter so a successfully
@@ -54,9 +56,53 @@ use crate::trading::{
 /// full at the reference price; a non-marketable limit order is left
 /// resting (`Acknowledged`), exactly like a real limit order untouched until
 /// the price moves, and remains cancellable.
+///
+/// A combination is evaluated the same way, as one unit: its net price at the
+/// per-leg reference observations must satisfy the approved net-price
+/// protection, sign included, or the whole group rests. When it is marketable
+/// it fills as one complete atomic execution at those observations; no leg
+/// ever fills on its own.
 struct ManualFillAdapter {
     inner: IbkrPaperAdapter,
     next_reference: Option<(Decimal, String)>,
+    next_combo_reference: Option<ArmedComboReference>,
+}
+
+/// The per-leg observations and protection the next `submit_combo()` call
+/// evaluates fillability against.
+struct ArmedComboReference {
+    price_limit: ComboPriceLimit,
+    combo_quantity: Decimal,
+    marks: Vec<(String, Decimal)>,
+    executed_at: String,
+}
+
+impl ArmedComboReference {
+    fn mark_for(&self, instrument_id: &str) -> Option<Decimal> {
+        self.marks
+            .iter()
+            .find(|(observed, _)| observed == instrument_id)
+            .map(|(_, mark)| *mark)
+    }
+
+    /// The signed net price of one unit at the reference observations:
+    /// positive is a debit, negative a credit, matching
+    /// `ComboIntent::protected_net_price`. `None` if any leg is unobserved --
+    /// an unobserved leg is never priced from anything else.
+    fn net_price(&self, request: &BrokerComboRequest) -> Result<Option<Decimal>, PaperError> {
+        let mut net = Decimal::ZERO;
+        for leg in &request.legs {
+            let Some(mark) = self.mark_for(&leg.instrument_id) else {
+                return Ok(None);
+            };
+            let leg_net = mark.checked_mul(Decimal::from_integer(i64::from(leg.ratio))?)?;
+            net = match leg.side {
+                DomainSide::Buy => net.checked_add(leg_net)?,
+                DomainSide::Sell => net.checked_sub(leg_net)?,
+            };
+        }
+        Ok(Some(net))
+    }
 }
 
 impl ManualFillAdapter {
@@ -64,6 +110,7 @@ impl ManualFillAdapter {
         Ok(Self {
             inner: IbkrPaperAdapter::new(account)?,
             next_reference: None,
+            next_combo_reference: None,
         })
     }
 
@@ -71,6 +118,18 @@ impl ManualFillAdapter {
     /// fillability against.
     fn arm_next_reference(&mut self, reference_price: Decimal, executed_at: String) {
         self.next_reference = Some((reference_price, executed_at));
+    }
+
+    /// Arms the per-leg observations the next `submit_combo()` call will
+    /// evaluate fillability against.
+    fn arm_next_combo_reference(&mut self, reference: ArmedComboReference) {
+        self.next_combo_reference = Some(reference);
+    }
+
+    /// Drops an armed combination reference no broker call consumed, e.g.
+    /// after a risk rejection, so it can never price a later request.
+    fn disarm_combo_reference(&mut self) {
+        self.next_combo_reference = None;
     }
 }
 
@@ -101,6 +160,50 @@ impl PaperBrokerAdapter for ManualFillAdapter {
                 )?;
             }
         }
+        Ok(result)
+    }
+
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        let result = self.inner.submit_combo(request)?;
+        let (BrokerSubmitResult::Acknowledged { broker_order_id }, Some(reference)) =
+            (&result, self.next_combo_reference.take())
+        else {
+            return Ok(result);
+        };
+        let Some(net_price) = reference.net_price(request)? else {
+            return Ok(result);
+        };
+        // Marketable only if the net at the observations satisfies the
+        // approved protection *including its sign*: a debit-protected
+        // combination observed at a credit is a different trade and rests.
+        if reference.price_limit.check_net_price(net_price).is_err() {
+            return Ok(result);
+        }
+        let mut legs = Vec::with_capacity(request.legs.len());
+        for (index, leg) in request.legs.iter().enumerate() {
+            let Some(price) = reference.mark_for(&leg.instrument_id) else {
+                return Ok(result);
+            };
+            legs.push(BrokerComboExecutionLeg {
+                execution_id: format!("{}.fill.leg-{index}", request.client_order_id),
+                instrument_id: leg.instrument_id.clone(),
+                side: leg.side,
+                quantity: leg.quantity,
+                price,
+                fee: Decimal::ZERO,
+                executed_at: reference.executed_at.clone(),
+            });
+        }
+        self.inner.queue_combo_fill(BrokerComboExecution {
+            execution_id: format!("{}.fill", request.client_order_id),
+            client_order_id: request.client_order_id.clone(),
+            broker_order_id: broker_order_id.clone(),
+            units: reference.combo_quantity,
+            legs,
+        })?;
         Ok(result)
     }
 
@@ -188,6 +291,78 @@ impl PaperOmsGateway {
             ));
         }
         Ok(())
+    }
+
+    /// The authoritative OMS state of an order in either map.
+    ///
+    /// Cancellation is one command for both kinds of order, so its receipt
+    /// must read both: reading only the plain-order map would report every
+    /// combination as `UNKNOWN` however cleanly it had been cancelled.
+    fn any_order_state<B: PaperBrokerAdapter>(
+        service: &PaperTradingService<B>,
+        order_id: &str,
+    ) -> Option<OrderState> {
+        service
+            .order(order_id)
+            .map(|order| order.oms.state)
+            .or_else(|| service.combo_order(order_id).map(|order| order.oms.state))
+    }
+
+    fn domain_combo_intent(intent: &ComboOrderIntent) -> Result<ComboIntent, TradingCommandError> {
+        let amount = Self::parse_decimal("price_limit", &intent.price_limit)?;
+        let legs = intent
+            .legs
+            .iter()
+            .map(|leg| {
+                Ok(ComboIntentLeg {
+                    instrument_id: leg.instrument_id.clone(),
+                    side: Self::domain_side(&leg.side),
+                    ratio: leg.ratio,
+                    limit_price: Self::parse_decimal("leg limit_price", &leg.limit_price)?,
+                })
+            })
+            .collect::<Result<Vec<_>, TradingCommandError>>()?;
+        Ok(ComboIntent {
+            intent_id: intent.intent_id.clone(),
+            account_id: intent.account_id.clone(),
+            strategy_id: intent.strategy_id.clone(),
+            correlation_id: intent.correlation_id.clone(),
+            legs,
+            combo_quantity: Self::parse_decimal("combo_quantity", &intent.combo_quantity)?,
+            price_limit: match intent.price_limit_kind {
+                ComboPriceLimitKind::MaximumDebit => ComboPriceLimit::MaximumDebit(amount),
+                ComboPriceLimitKind::MinimumCredit => ComboPriceLimit::MinimumCredit(amount),
+            },
+            time_in_force: Self::domain_time_in_force(&intent.time_in_force),
+            rationale: intent.rationale.clone(),
+            created_at: intent.created_at.clone(),
+            strategy_version: intent.strategy_version.clone(),
+            configuration_version: intent.configuration_version.clone(),
+            environment: "PAPER".to_owned(),
+        })
+    }
+
+    /// One observation per leg, taken only from that leg's own attested
+    /// reference. Nothing here can fill a gap from a limit price.
+    fn combo_market(
+        intent: &ComboOrderIntent,
+    ) -> Result<PaperComboMarketData, TradingCommandError> {
+        Ok(PaperComboMarketData {
+            marks: intent
+                .legs
+                .iter()
+                .map(|leg| {
+                    Ok(PaperMarketData {
+                        instrument_id: leg.instrument_id.clone(),
+                        mark_price: Self::parse_decimal(
+                            "leg reference_price",
+                            &leg.reference_price,
+                        )?,
+                        observed_at: leg.reference_observed_at.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, TradingCommandError>>()?,
+        })
     }
 
     fn command_status(state: OrderState) -> CommandStatus {
@@ -290,6 +465,80 @@ impl RiskOmsGateway for PaperOmsGateway {
         })
     }
 
+    fn submit_combo(
+        &self,
+        intent: ComboOrderIntent,
+    ) -> Result<CommandReceipt, TradingCommandError> {
+        let domain_intent = Self::domain_combo_intent(&intent)?;
+        let market = Self::combo_market(&intent)?;
+        let reference = ArmedComboReference {
+            price_limit: domain_intent.price_limit,
+            combo_quantity: domain_intent.combo_quantity,
+            marks: market
+                .marks
+                .iter()
+                .map(|mark| (mark.instrument_id.clone(), mark.mark_price))
+                .collect(),
+            executed_at: Self::now_canonical(),
+        };
+
+        let mut service = self
+            .service
+            .lock()
+            .expect("paper OMS mutex is not poisoned");
+        // An idempotent retry of an approved combination must present the
+        // original decision time, which only the durable risk evidence knows;
+        // a fresh clock reading would make core/paper refuse the retry as a
+        // changed request. A previously *rejected* intent created no order,
+        // so it is simply evaluated again at the current time.
+        let decided_at = service
+            .combo_risk_evidence(&format!("paper-combo-risk-{}", intent.intent_id))
+            .filter(|evidence| evidence.decision.approved)
+            .map_or_else(
+                || reference.executed_at.clone(),
+                |evidence| evidence.decision.decided_at.clone(),
+            );
+        service.broker_mut().arm_next_combo_reference(reference);
+        let submitted = service.submit_combo_intent(domain_intent, market, &decided_at);
+        service.broker_mut().disarm_combo_reference();
+        let outcome = submitted.map_err(|error| Self::map_error("submit_combo", error))?;
+        if !outcome.decision.approved {
+            return Ok(CommandReceipt {
+                command: TradingCommandKind::SubmitCombo,
+                request_id: intent.intent_id,
+                status: CommandStatus::RiskRejected,
+                order_id: None,
+                message: format!(
+                    "risk rejected: {}",
+                    outcome.decision.reason_codes.join(", ")
+                ),
+            });
+        }
+        // Drains the atomic execution `ManualFillAdapter::submit_combo` may
+        // have queued, so the receipt reports the combination's real state.
+        service
+            .synchronize()
+            .map_err(|error| Self::map_error("submit_combo", error))?;
+        let state = outcome
+            .order_id
+            .as_deref()
+            .and_then(|id| service.combo_order(id))
+            .map(|order| order.oms.state)
+            .or(outcome.state);
+        Ok(CommandReceipt {
+            command: TradingCommandKind::SubmitCombo,
+            request_id: intent.intent_id,
+            status: state
+                .map(Self::command_status)
+                .unwrap_or(CommandStatus::Unknown),
+            order_id: outcome.order_id,
+            message: format!(
+                "accepted as one atomic order: combination is now {}",
+                state.map_or_else(|| "UNKNOWN".to_owned(), |state| format!("{state:?}"))
+            ),
+        })
+    }
+
     fn cancel_order(
         &self,
         intent: CancelOrderIntent,
@@ -308,7 +557,7 @@ impl RiskOmsGateway for PaperOmsGateway {
         service
             .synchronize()
             .map_err(|error| Self::map_error("cancel_order", error))?;
-        let state = service.order(&intent.order_id).map(|order| order.oms.state);
+        let state = Self::any_order_state(&*service, &intent.order_id);
         let status = state
             .map(Self::command_status)
             .unwrap_or(CommandStatus::Unknown);
@@ -448,8 +697,20 @@ struct DesktopPaperConfiguration {
     max_market_data_age_seconds: u64,
     max_order_rate: u32,
     order_rate_window_seconds: u64,
+    /// Optional, explicitly bounded net-short permission, in the same shape
+    /// as the version-1 `paper-command-route` document. Absent means every
+    /// net short position -- and so almost every spread with a short leg --
+    /// is refused, exactly as before this field existed.
+    #[serde(default)]
+    short_exposure: Option<DesktopShortExposure>,
     kill_switch_version: String,
     journal_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopShortExposure {
+    max_short_quantity: String,
 }
 
 fn decimal(name: &str, value: &str) -> Result<Decimal, String> {
@@ -514,10 +775,22 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
         // operator adopts the CLI/journal configuration path (see
         // `follon_paper::PortfolioRiskComposition`).
         portfolio_risk: None,
-        // Net short exposure stays refused from the desktop. Permitting it is a
-        // deliberate operator decision with a stated bound, and this host has
-        // no operator-authenticated surface on which to take one.
-        short_exposure: None,
+        // Net short exposure is refused unless the operator-authored
+        // configuration file states a bound. The desktop UI never grants it:
+        // it has no operator-authenticated surface on which to take that
+        // decision, so the permission lives only in the file the operator
+        // controls, alongside every other risk limit.
+        short_exposure: document
+            .short_exposure
+            .map(|permission| {
+                Ok::<_, String>(ShortExposurePolicy {
+                    max_short_quantity: decimal(
+                        "short_exposure.max_short_quantity",
+                        &permission.max_short_quantity,
+                    )?,
+                })
+            })
+            .transpose()?,
     };
     let kill_switches = KillSwitchRegistry::new(document.kill_switch_version)
         .map_err(|error| format!("kill switch registry: {error}"))?;
@@ -539,10 +812,18 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trading::{ExecutionEnvironment, OrderIntent, OrderSide, OrderType, TimeInForce};
+    use crate::trading::{
+        ComboLegIntent, ExecutionEnvironment, OrderIntent, OrderSide, OrderType, TimeInForce,
+    };
     use follon_domain::OrderState;
 
     fn test_gateway(name: &str) -> (PaperOmsGateway, PathBuf, PathBuf) {
+        test_gateway_with(name, "")
+    }
+
+    /// `extra` is spliced verbatim into the configuration document, e.g. an
+    /// optional `"short_exposure": {...},` entry.
+    fn test_gateway_with(name: &str, extra: &str) -> (PaperOmsGateway, PathBuf, PathBuf) {
         let scratch = std::env::temp_dir().join(format!(
             "follon-desktop-paper-gateway-{}-{name}",
             std::process::id()
@@ -569,6 +850,7 @@ mod tests {
                     "max_market_data_age_seconds": 300,
                     "max_order_rate": 20,
                     "order_rate_window_seconds": 60,
+                    {extra}
                     "kill_switch_version": "kill.desktop.test.v1",
                     "journal_path": {:?}
                 }}"#,
@@ -827,6 +1109,230 @@ mod tests {
             OrderState::Acknowledged
         );
         drop(service);
+        cleanup(scratch);
+    }
+
+    const SHORT_PERMISSION: &str = r#""short_exposure": { "max_short_quantity": "10" },"#;
+    const LONG_LEG: &str = "inst.opt.spy.c500";
+    const SHORT_LEG: &str = "inst.opt.spy.c505";
+
+    /// A two-leg vertical: buy `LONG_LEG`, sell `SHORT_LEG`, two units.
+    /// Each tuple is (limit price, attested reference price).
+    fn vertical(
+        intent_id: &str,
+        long: (&str, &str),
+        short: (&str, &str),
+        maximum_debit: &str,
+    ) -> ComboOrderIntent {
+        let leg = |instrument_id: &str, side, (limit, reference): (&str, &str)| ComboLegIntent {
+            instrument_id: instrument_id.to_owned(),
+            side,
+            ratio: 1,
+            limit_price: limit.to_owned(),
+            reference_price: reference.to_owned(),
+            reference_observed_at: PaperOmsGateway::now_canonical(),
+        };
+        ComboOrderIntent {
+            intent_id: intent_id.to_owned(),
+            account_id: "acct.desktop.paper.test".to_owned(),
+            strategy_id: "desktop.manual".to_owned(),
+            correlation_id: format!("corr-{intent_id}"),
+            legs: vec![
+                leg(LONG_LEG, OrderSide::Buy, long),
+                leg(SHORT_LEG, OrderSide::Sell, short),
+            ],
+            combo_quantity: "2".to_owned(),
+            price_limit_kind: ComboPriceLimitKind::MaximumDebit,
+            price_limit: maximum_debit.to_owned(),
+            time_in_force: TimeInForce::Day,
+            rationale: "gateway combination test".to_owned(),
+            created_at: PaperOmsGateway::now_canonical(),
+            strategy_version: "desktop.v1".to_owned(),
+            configuration_version: "desktop.v1".to_owned(),
+            environment: ExecutionEnvironment::Paper,
+        }
+    }
+
+    /// Net 2.00 debit at the references, protected at 2.60: marketable.
+    fn marketable_vertical(intent_id: &str) -> ComboOrderIntent {
+        vertical(intent_id, ("50.5", "50"), ("47.9", "48"), "2.6")
+    }
+
+    /// Net 2.00 debit at the references, protected at 1.50: not marketable.
+    fn resting_vertical(intent_id: &str) -> ComboOrderIntent {
+        vertical(intent_id, ("49", "50"), ("47.5", "48"), "1.5")
+    }
+
+    fn position(gateway: &PaperOmsGateway, instrument_id: &str) -> Option<String> {
+        let service = gateway.service.lock().unwrap();
+        service
+            .dashboard()
+            .positions
+            .into_iter()
+            .find(|position| position.instrument_id == instrument_id)
+            .map(|position| position.quantity)
+    }
+
+    #[test]
+    fn submit_combo_fills_atomically_through_real_risk_and_oms() {
+        let (gateway, scratch, _journal) = test_gateway_with("combo-fill", SHORT_PERMISSION);
+        let intent = marketable_vertical("intent.desktop.combo.001");
+
+        let receipt = gateway
+            .submit_combo(intent.clone())
+            .expect("a marketable combination should be accepted");
+
+        assert_eq!(receipt.command, TradingCommandKind::SubmitCombo);
+        assert_eq!(receipt.status, CommandStatus::Filled);
+        let order_id = receipt.order_id.clone().expect("one OMS order exists");
+        {
+            let service = gateway.service.lock().unwrap();
+            let order = service.combo_order(&order_id).expect("combination exists");
+            assert_eq!(order.oms.state, OrderState::Filled);
+            assert_eq!(order.filled_quantity, "2".parse::<Decimal>().unwrap());
+            // One combination is one order: no plain order was created for a leg.
+            assert!(service.order(&order_id).is_none());
+            assert_eq!(service.dashboard().working_orders, 0);
+        }
+        assert_eq!(position(&gateway, LONG_LEG).as_deref(), Some("2.00000000"));
+        assert_eq!(
+            position(&gateway, SHORT_LEG).as_deref(),
+            Some("-2.00000000")
+        );
+
+        // An identical retry is answered from durable evidence, not re-executed.
+        let retry = gateway
+            .submit_combo(intent)
+            .expect("an identical retry must be idempotent");
+        assert_eq!(retry.order_id, receipt.order_id);
+        assert_eq!(retry.status, CommandStatus::Filled);
+        assert_eq!(position(&gateway, LONG_LEG).as_deref(), Some("2.00000000"));
+        assert_eq!(
+            position(&gateway, SHORT_LEG).as_deref(),
+            Some("-2.00000000")
+        );
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn submit_combo_with_a_short_leg_is_refused_without_configured_permission() {
+        let (gateway, scratch, _journal) = test_gateway("combo-no-short");
+
+        let receipt = gateway
+            .submit_combo(marketable_vertical("intent.desktop.combo.002"))
+            .expect("a risk rejection is a normal, successful outcome");
+
+        assert_eq!(receipt.status, CommandStatus::RiskRejected);
+        assert!(receipt.order_id.is_none());
+        assert!(receipt
+            .message
+            .contains("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED"));
+        assert!(position(&gateway, LONG_LEG).is_none());
+        assert!(position(&gateway, SHORT_LEG).is_none());
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn non_marketable_combo_rests_and_its_cancellation_is_visible() {
+        let (gateway, scratch, _journal) = test_gateway_with("combo-cancel", SHORT_PERMISSION);
+        let receipt = gateway
+            .submit_combo(resting_vertical("intent.desktop.combo.003"))
+            .expect("a resting combination should be accepted");
+        assert_eq!(receipt.status, CommandStatus::Acknowledged);
+        let order_id = receipt.order_id.expect("combination was created");
+        assert!(position(&gateway, LONG_LEG).is_none());
+
+        let cancel = CancelOrderIntent {
+            request_id: "request.cancel.combo.003".to_owned(),
+            account_id: "acct.desktop.paper.test".to_owned(),
+            order_id: order_id.clone(),
+            correlation_id: "corr-cancel-combo-003".to_owned(),
+            environment: ExecutionEnvironment::Paper,
+        };
+        let cancelled = gateway
+            .cancel_order(cancel.clone())
+            .expect("the combination should be cancellable");
+        assert_eq!(cancelled.status, CommandStatus::Cancelled);
+        assert!(cancelled.message.contains("Cancelled"));
+        assert_eq!(
+            gateway
+                .service
+                .lock()
+                .unwrap()
+                .combo_order(&order_id)
+                .expect("combination remains")
+                .oms
+                .state,
+            OrderState::Cancelled
+        );
+
+        let retry = gateway
+            .cancel_order(cancel)
+            .expect("an identical cancellation retry must be idempotent");
+        assert_eq!(retry.status, CommandStatus::Cancelled);
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn debit_protected_combo_observed_at_a_credit_rests_rather_than_fills() {
+        let (gateway, scratch, _journal) = test_gateway_with("combo-sign", SHORT_PERMISSION);
+        // Protected net 0.50 debit; the references price the structure at a
+        // 2.00 *credit*. That is not the trade the operator approved.
+        let receipt = gateway
+            .submit_combo(vertical(
+                "intent.desktop.combo.004",
+                ("49", "48"),
+                ("48.5", "50"),
+                "0.5",
+            ))
+            .expect("the combination should be accepted by risk");
+        assert_eq!(receipt.status, CommandStatus::Acknowledged);
+        let order_id = receipt.order_id.expect("combination was created");
+        assert_eq!(
+            gateway
+                .service
+                .lock()
+                .unwrap()
+                .combo_order(&order_id)
+                .expect("combination exists")
+                .filled_quantity,
+            Decimal::ZERO
+        );
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn each_leg_is_collared_against_its_own_attested_reference() {
+        let (gateway, scratch, _journal) = test_gateway_with("combo-collar", SHORT_PERMISSION);
+        // The long leg's limit (60) is 2000 bps from its reference (50). A
+        // gateway that priced a leg from anything but its own attested
+        // observation -- its limit, say -- would let this through.
+        let receipt = gateway
+            .submit_combo(vertical(
+                "intent.desktop.combo.006",
+                ("60", "50"),
+                ("47.9", "48"),
+                "12.1",
+            ))
+            .expect("a risk rejection is a normal outcome");
+        assert_eq!(receipt.status, CommandStatus::RiskRejected);
+        assert!(receipt.message.contains("PRICE_COLLAR_EXCEEDED"));
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn a_risk_rejected_combo_leaves_no_armed_reference_behind() {
+        let (gateway, scratch, _journal) = test_gateway("combo-disarm");
+        gateway
+            .submit_combo(marketable_vertical("intent.desktop.combo.005"))
+            .expect("a risk rejection is a normal outcome");
+        assert!(gateway
+            .service
+            .lock()
+            .unwrap()
+            .broker_mut()
+            .next_combo_reference
+            .is_none());
         cleanup(scratch);
     }
 

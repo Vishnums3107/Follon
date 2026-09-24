@@ -11,9 +11,10 @@ The operations view exposes risk limits, attribution, alerts, schedules, replay 
 configuration identities, the journal-bound projection fingerprint, and the
 verified journal cursor alongside PAPER
 kill switches, `UNKNOWN` orders, reconciliation incidents, positions, and
-promotion evidence. The desktop exposes only PAPER intent submission.
-Cancellation, position-close, and controlled-LIVE actions remain outside the
-checked-in workstation flow.
+promotion evidence. The desktop exposes PAPER order submission, cancellation,
+and position close, plus a combination ticket that submits one atomic
+multi-leg PAPER combination as a single Risk/OMS order. Controlled-LIVE actions
+remain outside the checked-in workstation flow.
 
 React owns the application shell, Vite emits the deployable web bundle, and the
 Tauri v2 host provides a separate native desktop command boundary. Its
@@ -22,6 +23,21 @@ configured Risk/OMS route; the web bundle does not receive broker credentials
 or adapter access.
 The checked-in host returns an explicit route-unavailable response until that
 gateway is configured, rather than reporting a fictitious trade.
+
+The `submit_combo_order` command accepts 2–16 distinct legs, a whole number of
+units, and a maximum-debit or minimum-credit net protection. Each leg carries
+its own operator-attested observed price and time, because no market-data feed
+is wired into the host; a leg without one cannot be expressed. The gateway
+routes the combination through `PaperTradingService::submit_combo_intent`, and
+`cancel_order` reports a combination's real OMS state. Net short exposure — and
+so almost any spread with a short leg — is refused unless the operator-authored
+`FOLLON_DESKTOP_PAPER_CONFIG` file states an explicit bound:
+
+```json
+"short_exposure": { "max_short_quantity": "10" }
+```
+
+The UI never grants that permission itself.
 
 The packaged client reads its versioned evidence API from the loopback service
 at `http://127.0.0.1:8080`. The service grants cross-origin access only to the
