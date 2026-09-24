@@ -56,18 +56,18 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T03:42:35Z  
+**Measured at:** 2026-09-24T04:06:52Z  
 **Branch:** `main`  
-**HEAD:** `d42747c` -- feat(live): submit an atomic multi-leg combination under one consumed approval -- E1.4b (2026-09-23T11:34:19+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `70bfc40` -- feat(live): fill, cancel and reconcile an atomic combination -- E1.4c (2026-09-24T09:14:27+05:30)  
+**Uncommitted paths:** 11
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 366 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 371 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 17 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 42 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 43 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -88,11 +88,14 @@ the previous session explicitly declined to half-land.
 **What exists.** The domain contract, fixed-point planner, full PAPER path, and
 controlled-LIVE risk, approval, submission, fill, cancellation, recovery and
 reconciliation paths are implemented and tested. Both environments keep one
-combination as one OMS order and require native atomic broker evidence.
+combination as one OMS order and require native atomic broker evidence. The
+versioned gRPC boundary now has a configured PAPER command that reaches this
+real risk/OMS path rather than returning another plan.
 
-**What is missing.** The gRPC/desktop boundary still exposes combination
-planning only. E1.5 must route the risk-gated path through that delivery surface;
-no structural gap remains inside `core/paper` or `core/live`.
+**What is missing.** The desktop boundary still exposes only the single-order
+PAPER command path. E1.5b must add a validated combination IPC contract, native
+gateway dispatch/cancellation visibility, and an operator ticket. No structural
+gap remains inside `core/paper`, `core/live`, or the gRPC boundary.
 
 | Slice | Scope | State |
 | --- | --- | --- |
@@ -103,7 +106,8 @@ no structural gap remains inside `core/paper` or `core/live`.
 | E1.4a | `core/live` combination contract and risk gate: `LiveComboMarketData`, `evaluate_combo_risk` (every PAPER rule plus the canary ceilings, the deployed-capital ceiling and the unresolved-incident block), `combo_intent_fingerprint` binding an approval to the exact structure, and its own short-exposure permission. Assessment only. | **done** 2026-09-23 |
 | E1.4b | `core/live` canary **submission** path: `submit_canary_combo_intent`, `LiveComboOrder`, a rejecting `LiveBrokerAdapter::submit_combo` default, approval binding and consumption via `combo_intent_fingerprint`, the canary submission counter, durable audit before the irreversible broker call, restart recovery, and integration into every risk counter | **done** 2026-09-23 |
 | E1.4c | `core/live` combination fills, cancellation and reconciliation — the E1.3b equivalent | **done** 2026-09-24 |
-| E1.5 | Desktop/gRPC surface for the risk-gated path, replacing planning-only exposure | open |
+| E1.5a | Versioned gRPC `SubmitPaperCombo` command backed by a configured durable `PaperTradingService`, exact per-leg observations, explicit short permission, and a loopback-or-mTLS write boundary | **done** 2026-09-24 |
+| E1.5b | Desktop combination IPC, native PAPER gateway dispatch/cancellation visibility, and operator ticket | open |
 
 **E1.1 design decisions a later slice must not silently reverse.** Each is
 covered by a test named after it.
@@ -356,6 +360,24 @@ durable-format decision and was out of scope here.
 - **No panics.** `core/live` production code contains no `unwrap` or `expect`;
   malformed or inconsistent execution evidence is refused and incidented.
 
+**E1.5a design decisions a later slice must not silently reverse.**
+
+- **Planning and submission are separate RPCs.** `PlanOptionCombo` remains a
+  deterministic calculation. `SubmitPaperCombo` converts the request into the
+  canonical domain contract and calls `PaperTradingService::submit_combo_intent`;
+  it cannot report an assessment-only result as an order outcome.
+- **The write route is explicit and durable.** No `FOLLON_TRADING_API_PAPER_CONFIG`
+  means `FAILED_PRECONDITION` and no action. A configured route uses the
+  version-1 `paper-command-route` contract, one journal, one exact risk policy,
+  kill switches, idempotency, and an explicitly bounded short permission.
+- **Every leg carries independent operator-supplied market evidence.** The
+  delivery boundary never fills a missing observation from a limit price or
+  any other plausible-looking value.
+- **A remote write socket requires mutual TLS.** Loopback may remain local and
+  plaintext; a non-loopback PAPER command route requires both the server TLS
+  identity and a client CA. This is still not the authenticated privileged
+  control plane recorded as E3.3 and makes no production-readiness claim.
+
 ### E2 — Advanced-evidence categories with no computation behind them (item 45)
 
 `tools/build_advanced_evidence_fixtures.py` holds 32 hand-typed JSON documents.
@@ -452,6 +474,35 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-24 — session 3
+
+- Re-established a clean baseline at `70bfc40`: all seven suites green, Rust
+  workspace 366 passed / 0 failed / 3 ignored and Python 42 passed.
+- E1.5 was larger than one landable slice, so it was split. Landed **E1.5a**:
+  the versioned gRPC boundary now exposes `SubmitPaperCombo`, which requires a
+  configured version-1 PAPER command route and calls the real durable
+  `PaperTradingService::submit_combo_intent` path. It returns the exact risk
+  decision and authoritative OMS state, preserves idempotency/restart recovery,
+  requires one fixed-point observation per leg, and supports only an explicit
+  configured short-exposure bound.
+- The route fails closed when absent. It may bind plaintext on loopback; a
+  non-loopback write route requires a server TLS identity and client CA. This
+  is local PAPER engineering, not an authenticated production control plane or
+  external broker acceptance.
+- Six deliberate defects were injected and each was caught before being
+  reverted: replacing OMS submission with assessment-only risk evaluation;
+  dropping the configured short permission; fabricating a missing leg mark
+  from its limit price; returning a plausible response from an unconfigured
+  route; flipping a risk rejection to `approved`; and accepting server-only TLS
+  without a client CA for a remote write socket.
+- Rust workspace tests rose **366 → 371 passed**, 0 failed, 3 ignored; Python
+  rose **42 → 43 passed** for the versioned route-schema fixture. The final
+  `python tools/session_status.py` measurement recorded all seven suites green.
+- **Next action: E1.5b — add the desktop combination IPC contract, native PAPER
+  gateway dispatch/cancellation visibility, and operator ticket.** Do not start
+  E2; the external PAPER, options-acceptance, security, legal, and operations
+  gates remain open.
 
 ### 2026-09-24 — session 2
 

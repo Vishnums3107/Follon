@@ -1,5 +1,6 @@
 //! Deployed gRPC topology for broker-neutral execution planning, portfolio
-//! risk, and multi-currency margin valuation.
+//! risk, multi-currency margin valuation, and configured risk-gated PAPER
+//! combination submission.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -11,17 +12,24 @@ use std::sync::{Arc, Mutex};
 use follon_accounting::{
     value_margin_account, Currency, FxBook, FxQuote, MarginPolicy, MarginPosition, MarginRate,
 };
-use follon_domain::{validate_canonical_id, Decimal, Side};
+use follon_domain::{
+    validate_canonical_id, ComboIntent, ComboIntentLeg, Decimal, OrderState, Side, TimeInForce,
+};
 use follon_execution::{
     plan_execution, plan_option_combo, plan_passive_repricing, ChildInstruction as CoreChild,
     ChildOrderKind as CoreChildOrderKind, ComboPriceLimit, ExecutionAlgorithm, OptionComboLeg,
     ParentOrder, PassiveMarketObservation, PassiveRepricePolicy,
+};
+use follon_paper::{
+    IbkrPaperAdapter, KillSwitchRegistry, PaperAccount, PaperComboMarketData, PaperMarketData,
+    PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
 };
 use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
     evaluate_portfolio_risk, CandidateOrder as CoreCandidateOrder, PortfolioRiskPolicy,
     PortfolioRiskSnapshot, RestingOrder as CoreRestingOrder, RiskPosition,
 };
+use serde::Deserialize;
 use tokio::signal;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
@@ -37,13 +45,18 @@ use api::{
     BucketLimit, CancelReplaceInstruction, ChildInstruction, ChildOrderKind, ComboLegInstruction,
     ComboPriceLimitKind, CurrencyAmount, ExecutionAlgorithmKind, ExecutionPlanRequest,
     ExecutionPlanResponse, ExecutionSide, HealthRequest, HealthResponse, MarginAccountRequest,
-    MarginAccountResponse, OptionComboRequest, OptionComboResponse, PassiveRepricingRequest,
+    MarginAccountResponse, OmsOrderState, OptionComboRequest, OptionComboResponse,
+    OrderTimeInForceKind, PaperComboMarketObservation, PassiveRepricingRequest,
     PassiveRepricingResponse, PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics,
+    SubmitPaperComboRequest, SubmitPaperComboResponse,
 };
+
+type PaperComboRoute = Arc<Mutex<PaperTradingService<IbkrPaperAdapter>>>;
 
 #[derive(Clone)]
 struct OperatingSystemService {
     database: Option<Arc<Mutex<PostgresStore>>>,
+    paper_combo_route: Option<PaperComboRoute>,
     transport_tls: bool,
 }
 
@@ -240,6 +253,38 @@ impl TradingOperatingSystem for OperatingSystemService {
         }))
     }
 
+    async fn submit_paper_combo(
+        &self,
+        request: Request<SubmitPaperComboRequest>,
+    ) -> Result<Response<SubmitPaperComboResponse>, Status> {
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let intent = paper_combo_intent(&request)?;
+        let market = paper_combo_market(&request.observations)?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER combination Risk/OMS route is not configured; no order was sent",
+            )
+        })?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER combination route lock poisoned"))?;
+        let outcome = service
+            .submit_combo_intent(intent, market, &request.decided_at)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(SubmitPaperComboResponse {
+            decision_id: outcome.decision.decision_id,
+            approved: outcome.decision.approved,
+            reason_codes: outcome.decision.reason_codes,
+            policy_version: outcome.decision.policy_version,
+            order_id: outcome.order_id,
+            state: outcome
+                .state
+                .map(oms_order_state)
+                .unwrap_or(OmsOrderState::Unspecified) as i32,
+        }))
+    }
+
     async fn evaluate_portfolio_risk(
         &self,
         request: Request<PortfolioRiskRequest>,
@@ -399,6 +444,97 @@ impl TradingOperatingSystem for OperatingSystemService {
     }
 }
 
+fn paper_combo_intent(request: &SubmitPaperComboRequest) -> Result<ComboIntent, Status> {
+    if request.environment != "PAPER" {
+        return Err(Status::invalid_argument(
+            "SubmitPaperCombo accepts the PAPER environment only",
+        ));
+    }
+    let price = decimal("price_limit", &request.price_limit)?;
+    let price_limit = match ComboPriceLimitKind::try_from(request.price_limit_kind) {
+        Ok(ComboPriceLimitKind::MaximumDebit) => ComboPriceLimit::MaximumDebit(price),
+        Ok(ComboPriceLimitKind::MinimumCredit) => ComboPriceLimit::MinimumCredit(price),
+        _ => {
+            return Err(Status::invalid_argument(
+                "combo price limit kind is required",
+            ))
+        }
+    };
+    let time_in_force = match OrderTimeInForceKind::try_from(request.time_in_force) {
+        Ok(OrderTimeInForceKind::Day) => TimeInForce::Day,
+        Ok(OrderTimeInForceKind::GoodTilCancelled) => TimeInForce::GoodTilCancelled,
+        _ => return Err(Status::invalid_argument("time in force is required")),
+    };
+    let legs = request
+        .legs
+        .iter()
+        .map(|leg| {
+            Ok(ComboIntentLeg {
+                instrument_id: leg.instrument_id.clone(),
+                side: side(leg.side)?,
+                ratio: leg.ratio,
+                limit_price: decimal("leg.limit_price", &leg.limit_price)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    let intent = ComboIntent {
+        intent_id: request.intent_id.clone(),
+        account_id: request.account_id.clone(),
+        strategy_id: request.strategy_id.clone(),
+        correlation_id: request.correlation_id.clone(),
+        legs,
+        combo_quantity: decimal("combo_quantity", &request.combo_quantity)?,
+        price_limit,
+        time_in_force,
+        rationale: request.rationale.clone(),
+        created_at: request.created_at.clone(),
+        strategy_version: request.strategy_version.clone(),
+        configuration_version: request.configuration_version.clone(),
+        environment: request.environment.clone(),
+    };
+    intent
+        .validate()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(intent)
+}
+
+fn paper_combo_market(
+    observations: &[PaperComboMarketObservation],
+) -> Result<PaperComboMarketData, Status> {
+    Ok(PaperComboMarketData {
+        marks: observations
+            .iter()
+            .map(|observation| {
+                Ok(PaperMarketData {
+                    instrument_id: observation.instrument_id.clone(),
+                    mark_price: decimal("observation.mark_price", &observation.mark_price)?,
+                    observed_at: observation.observed_at.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?,
+    })
+}
+
+fn oms_order_state(state: OrderState) -> OmsOrderState {
+    match state {
+        OrderState::Created => OmsOrderState::Created,
+        OrderState::PendingRisk => OmsOrderState::PendingRisk,
+        OrderState::RiskRejected => OmsOrderState::RiskRejected,
+        OrderState::Approved => OmsOrderState::Approved,
+        OrderState::PendingSubmit => OmsOrderState::PendingSubmit,
+        OrderState::Submitted => OmsOrderState::Submitted,
+        OrderState::Acknowledged => OmsOrderState::Acknowledged,
+        OrderState::PartiallyFilled => OmsOrderState::PartiallyFilled,
+        OrderState::Filled => OmsOrderState::Filled,
+        OrderState::PendingCancel => OmsOrderState::PendingCancel,
+        OrderState::PendingReplace => OmsOrderState::PendingReplace,
+        OrderState::Cancelled => OmsOrderState::Cancelled,
+        OrderState::Rejected => OmsOrderState::Rejected,
+        OrderState::Expired => OmsOrderState::Expired,
+        OrderState::Unknown => OmsOrderState::Unknown,
+    }
+}
+
 fn risk_policy(policy: &api::PortfolioRiskPolicy) -> Result<PortfolioRiskPolicy, Status> {
     Ok(PortfolioRiskPolicy {
         version: policy.version.clone(),
@@ -508,11 +644,43 @@ fn validate_id(name: &str, value: &str) -> Result<(), Status> {
     validate_canonical_id(name, value).map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaperCommandRouteDocument {
+    schema_version: u32,
+    account_id: String,
+    currency: String,
+    initial_cash: String,
+    risk_policy_version: String,
+    trading_calendar_id: String,
+    max_order_quantity: String,
+    max_order_notional: String,
+    max_price_deviation_bps: String,
+    max_open_orders: usize,
+    max_position_quantity: String,
+    max_realized_loss: String,
+    max_market_data_age_seconds: u64,
+    max_order_rate: u32,
+    order_rate_window_seconds: u64,
+    #[serde(default)]
+    short_exposure: Option<PaperCommandShortExposureDocument>,
+    kill_switch_version: String,
+    adapter_kind: String,
+    journal_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaperCommandShortExposureDocument {
+    max_short_quantity: String,
+}
+
 struct RuntimeConfig {
     bind: SocketAddr,
     production: bool,
     database_url: Option<String>,
     database_ca: Option<PathBuf>,
+    paper_command_route: Option<PathBuf>,
     tls_certificate: Option<PathBuf>,
     tls_private_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
@@ -531,6 +699,7 @@ impl RuntimeConfig {
             production,
             database_url: database_url(production)?,
             database_ca: env_path("FOLLON_DATABASE_CA"),
+            paper_command_route: env_path("FOLLON_TRADING_API_PAPER_CONFIG"),
             tls_certificate: env_path("FOLLON_GRPC_TLS_CERTIFICATE"),
             tls_private_key: env_path("FOLLON_GRPC_TLS_PRIVATE_KEY"),
             tls_client_ca: env_path("FOLLON_GRPC_TLS_CLIENT_CA"),
@@ -553,8 +722,87 @@ impl RuntimeConfig {
         {
             return Err("production PostgreSQL URL must require TLS".to_owned());
         }
+        config.validate_paper_command_route_transport()?;
         Ok(config)
     }
+
+    fn validate_paper_command_route_transport(&self) -> Result<(), String> {
+        if self.paper_command_route.is_some()
+            && !self.bind.ip().is_loopback()
+            && (tls_identity_paths(self).is_none() || self.tls_client_ca.is_none())
+        {
+            return Err(
+                "a remote PAPER command route requires server TLS and a client CA".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read PAPER command-route config: {error}"))?;
+    let document: PaperCommandRouteDocument = serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid PAPER command-route config: {error}"))?;
+    if document.schema_version != 1 {
+        return Err("unsupported PAPER command-route schema version".to_owned());
+    }
+    if document.adapter_kind != "IBKR_PAPER_MODEL" {
+        return Err("unsupported PAPER command-route adapter kind".to_owned());
+    }
+    let account = PaperAccount {
+        account_id: document.account_id,
+        currency: document.currency,
+        initial_cash: route_decimal("initial_cash", &document.initial_cash)?,
+        environment: "PAPER".to_owned(),
+    };
+    let policy = PaperRiskPolicy {
+        version: document.risk_policy_version,
+        trading_calendar_id: document.trading_calendar_id,
+        max_order_quantity: route_decimal("max_order_quantity", &document.max_order_quantity)?,
+        max_order_notional: route_decimal("max_order_notional", &document.max_order_notional)?,
+        max_price_deviation_bps: route_decimal(
+            "max_price_deviation_bps",
+            &document.max_price_deviation_bps,
+        )?,
+        max_open_orders: document.max_open_orders,
+        max_position_quantity: route_decimal(
+            "max_position_quantity",
+            &document.max_position_quantity,
+        )?,
+        max_realized_loss: route_decimal("max_realized_loss", &document.max_realized_loss)?,
+        max_market_data_age_seconds: document.max_market_data_age_seconds,
+        max_order_rate: document.max_order_rate,
+        order_rate_window_seconds: document.order_rate_window_seconds,
+        portfolio_risk: None,
+        short_exposure: document
+            .short_exposure
+            .map(|permission| -> Result<ShortExposurePolicy, String> {
+                Ok(ShortExposurePolicy {
+                    max_short_quantity: route_decimal(
+                        "short_exposure.max_short_quantity",
+                        &permission.max_short_quantity,
+                    )?,
+                })
+            })
+            .transpose()?,
+    };
+    let broker = IbkrPaperAdapter::new(&account)
+        .map_err(|error| format!("PAPER command-route adapter: {error}"))?;
+    let service = PaperTradingService::open_durable(
+        account,
+        policy,
+        KillSwitchRegistry::new(document.kill_switch_version)
+            .map_err(|error| format!("PAPER command-route kill switches: {error}"))?,
+        broker,
+        &document.journal_path,
+    )
+    .map_err(|error| format!("PAPER command-route service: {error}"))?;
+    Ok(Arc::new(Mutex::new(service)))
+}
+
+fn route_decimal(name: &str, value: &str) -> Result<Decimal, String> {
+    Decimal::from_str(value).map_err(|error| format!("invalid {name}: {error}"))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -650,9 +898,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let paper_combo_route = config
+        .paper_command_route
+        .as_deref()
+        .map(paper_combo_route_from_path)
+        .transpose()
+        .map_err(std::io::Error::other)?;
     let transport_tls = tls_identity_paths(&config).is_some();
     let service = OperatingSystemService {
         database,
+        paper_combo_route: paper_combo_route.clone(),
         transport_tls,
     };
     let mut server = Server::builder();
@@ -671,8 +926,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.tls_config(tls)?;
     }
     eprintln!(
-        "follon-trading-api listening on {} (tls={}, production={})",
-        config.bind, transport_tls, config.production
+        "follon-trading-api listening on {} (tls={}, production={}, paper_combo_route={})",
+        config.bind,
+        transport_tls,
+        config.production,
+        paper_combo_route.is_some()
     );
     server
         .add_service(TradingOperatingSystemServer::new(service))
@@ -686,11 +944,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PAPER_ROUTE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
     fn service() -> OperatingSystemService {
         OperatingSystemService {
             database: None,
+            paper_combo_route: None,
             transport_tls: false,
+        }
+    }
+
+    fn configured_paper_service(name: &str) -> (OperatingSystemService, PaperComboRoute, PathBuf) {
+        let sequence = PAPER_ROUTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let scratch = std::env::temp_dir().join(format!(
+            "follon-trading-api-paper-combo-{}-{sequence}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("create route scratch");
+        let journal = scratch.join("journal.ndjson");
+        let config = scratch.join("route.json");
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "account_id": "acct.grpc.paper.test",
+            "currency": "USD",
+            "initial_cash": "100000",
+            "risk_policy_version": "risk.grpc.paper.v1",
+            "trading_calendar_id": "cal.us.options.test",
+            "max_order_quantity": "100",
+            "max_order_notional": "50000",
+            "max_price_deviation_bps": "100",
+            "max_open_orders": 10,
+            "max_position_quantity": "1000",
+            "max_realized_loss": "10000",
+            "max_market_data_age_seconds": 5,
+            "max_order_rate": 20,
+            "order_rate_window_seconds": 60,
+            "short_exposure": { "max_short_quantity": "1000" },
+            "kill_switch_version": "kills.grpc.paper.v1",
+            "adapter_kind": "IBKR_PAPER_MODEL",
+            "journal_path": journal.to_string_lossy(),
+        });
+        std::fs::write(
+            &config,
+            serde_json::to_vec_pretty(&document).expect("serialize route config"),
+        )
+        .expect("write route config");
+        let route = paper_combo_route_from_path(&config).expect("configured PAPER combo route");
+        (
+            OperatingSystemService {
+                database: None,
+                paper_combo_route: Some(route.clone()),
+                transport_tls: false,
+            },
+            route,
+            scratch,
+        )
+    }
+
+    fn paper_combo_request(intent_id: &str) -> SubmitPaperComboRequest {
+        SubmitPaperComboRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            intent_id: intent_id.to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            strategy_id: "strategy.grpc.test".to_owned(),
+            correlation_id: format!("corr-{intent_id}"),
+            combo_quantity: "2".to_owned(),
+            price_limit_kind: ComboPriceLimitKind::MaximumDebit as i32,
+            price_limit: "2".to_owned(),
+            legs: vec![
+                api::OptionComboLeg {
+                    instrument_id: "inst.us_option.spy.500c".to_owned(),
+                    side: ExecutionSide::Buy as i32,
+                    ratio: 1,
+                    limit_price: "3".to_owned(),
+                },
+                api::OptionComboLeg {
+                    instrument_id: "inst.us_option.spy.505c".to_owned(),
+                    side: ExecutionSide::Sell as i32,
+                    ratio: 1,
+                    limit_price: "1".to_owned(),
+                },
+            ],
+            time_in_force: OrderTimeInForceKind::Day as i32,
+            rationale: "gRPC risk-gated combination test".to_owned(),
+            created_at: "2026-01-02T14:30:00Z".to_owned(),
+            strategy_version: "strategy.grpc.v1".to_owned(),
+            configuration_version: "config.grpc.v1".to_owned(),
+            environment: "PAPER".to_owned(),
+            decided_at: "2026-01-02T14:30:02Z".to_owned(),
+            observations: vec![
+                PaperComboMarketObservation {
+                    instrument_id: "inst.us_option.spy.500c".to_owned(),
+                    mark_price: "3".to_owned(),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                PaperComboMarketObservation {
+                    instrument_id: "inst.us_option.spy.505c".to_owned(),
+                    mark_price: "1".to_owned(),
+                    observed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+            ],
         }
     }
 
@@ -706,6 +1062,7 @@ mod tests {
             production: false,
             database_url: None,
             database_ca: None,
+            paper_command_route: None,
             tls_certificate: None,
             tls_private_key: None,
             tls_client_ca: None,
@@ -722,6 +1079,23 @@ mod tests {
         assert!(tls_identity_paths(&config).is_some());
     }
 
+    #[test]
+    fn paper_command_route_requires_loopback_or_mutual_tls() {
+        let mut config = base_config();
+        config.paper_command_route = Some(PathBuf::from("paper-route.json"));
+        assert!(config.validate_paper_command_route_transport().is_ok());
+
+        config.bind = "0.0.0.0:50051".parse().expect("remote bind");
+        assert!(config.validate_paper_command_route_transport().is_err());
+
+        config.tls_certificate = Some(PathBuf::from("server.pem"));
+        config.tls_private_key = Some(PathBuf::from("server-key.pem"));
+        assert!(config.validate_paper_command_route_transport().is_err());
+
+        config.tls_client_ca = Some(PathBuf::from("clients.pem"));
+        assert!(config.validate_paper_command_route_transport().is_ok());
+    }
+
     #[tokio::test]
     async fn health_check_never_claims_tls_when_only_certificate_is_configured() {
         let config = {
@@ -732,6 +1106,7 @@ mod tests {
         let transport_tls = tls_identity_paths(&config).is_some();
         let service = OperatingSystemService {
             database: None,
+            paper_combo_route: None,
             transport_tls,
         };
         let response = service
@@ -847,5 +1222,99 @@ mod tests {
         assert_eq!(response.legs.len(), 2);
         assert_eq!(response.legs[0].quantity, "2.00000000");
         assert_eq!(response.legs[1].side, ExecutionSide::Sell as i32);
+    }
+
+    #[tokio::test]
+    async fn paper_combo_rpc_persists_one_risk_gated_atomic_order() {
+        let (service, route, scratch) = configured_paper_service("submit");
+        let request = paper_combo_request("intent.grpc.paper.combo.1");
+        let response = service
+            .submit_paper_combo(Request::new(request.clone()))
+            .await
+            .expect("risk-gated submission")
+            .into_inner();
+
+        assert!(response.approved);
+        assert_eq!(response.reason_codes, ["APPROVED"]);
+        assert_eq!(response.policy_version, "risk.grpc.paper.v1");
+        assert_eq!(response.state, OmsOrderState::Acknowledged as i32);
+        let order_id = response.order_id.expect("approved order identity");
+        {
+            let paper = route.lock().expect("PAPER route");
+            let order = paper.combo_order(&order_id).expect("durable combo order");
+            assert_eq!(order.oms.intent.intent_id, request.intent_id);
+            assert_eq!(order.oms.intent.legs.len(), 2);
+            assert_eq!(order.oms.state, OrderState::Acknowledged);
+        }
+
+        let repeated = service
+            .submit_paper_combo(Request::new(request))
+            .await
+            .expect("idempotent submission")
+            .into_inner();
+        assert_eq!(repeated.order_id.as_deref(), Some(order_id.as_str()));
+        assert_eq!(repeated.decision_id, response.decision_id);
+        drop(service);
+        drop(route);
+        let reopened = paper_combo_route_from_path(&scratch.join("route.json"))
+            .expect("reopen durable PAPER combo route");
+        let paper = reopened.lock().expect("reopened PAPER route");
+        let order = paper
+            .combo_order(&order_id)
+            .expect("combination survives route restart");
+        assert_eq!(order.oms.state, OrderState::Acknowledged);
+        drop(paper);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_combo_rpc_returns_risk_rejection_without_an_order() {
+        let (service, _route, scratch) = configured_paper_service("risk-rejection");
+        let mut request = paper_combo_request("intent.grpc.paper.combo.rejected");
+        request.combo_quantity = "101".to_owned();
+        let response = service
+            .submit_paper_combo(Request::new(request))
+            .await
+            .expect("risk decision")
+            .into_inner();
+
+        assert!(!response.approved);
+        assert!(response
+            .reason_codes
+            .contains(&"MAX_ORDER_QUANTITY_EXCEEDED".to_owned()));
+        assert!(response.order_id.is_none());
+        assert_eq!(response.state, OmsOrderState::Unspecified as i32);
+        drop(service);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_combo_rpc_refuses_incomplete_per_leg_market_evidence() {
+        let (service, _route, scratch) = configured_paper_service("missing-mark");
+        let mut request = paper_combo_request("intent.grpc.paper.combo.missing.mark");
+        request.observations.pop();
+        let error = service
+            .submit_paper_combo(Request::new(request))
+            .await
+            .expect_err("every leg requires independent market evidence");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("one mark per leg"));
+        drop(service);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_combo_rpc_fails_closed_without_a_configured_route() {
+        let error = service()
+            .submit_paper_combo(Request::new(paper_combo_request(
+                "intent.grpc.paper.combo.unconfigured",
+            )))
+            .await
+            .expect_err("unconfigured route must not act like planning success");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("not configured"));
     }
 }

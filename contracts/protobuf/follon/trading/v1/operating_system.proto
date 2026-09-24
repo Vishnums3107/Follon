@@ -2,13 +2,14 @@ syntax = "proto3";
 
 package follon.trading.v1;
 
-// Deployed read/plan boundary. Capital-bearing submission remains behind the
-// separately reviewed broker adapter and controlled-LIVE activation gate.
+// Deployed planning, risk, and configured PAPER command boundary. Capital-bearing
+// submission remains behind the separately reviewed controlled-LIVE activation gate.
 service TradingOperatingSystem {
   rpc CheckHealth(HealthRequest) returns (HealthResponse);
   rpc PlanExecution(ExecutionPlanRequest) returns (ExecutionPlanResponse);
   rpc PlanPassiveRepricing(PassiveRepricingRequest) returns (PassiveRepricingResponse);
   rpc PlanOptionCombo(OptionComboRequest) returns (OptionComboResponse);
+  rpc SubmitPaperCombo(SubmitPaperComboRequest) returns (SubmitPaperComboResponse);
   rpc EvaluatePortfolioRisk(PortfolioRiskRequest) returns (PortfolioRiskResponse);
   rpc ValueMarginAccount(MarginAccountRequest) returns (MarginAccountResponse);
 }
@@ -149,6 +150,68 @@ message OptionComboResponse {
   string combo_quantity = 2;
   string protected_net_price = 3;
   repeated ComboLegInstruction legs = 4;
+}
+
+enum OrderTimeInForceKind {
+  ORDER_TIME_IN_FORCE_KIND_UNSPECIFIED = 0;
+  ORDER_TIME_IN_FORCE_KIND_DAY = 1;
+  ORDER_TIME_IN_FORCE_KIND_GOOD_TIL_CANCELLED = 2;
+}
+
+enum OmsOrderState {
+  OMS_ORDER_STATE_UNSPECIFIED = 0;
+  OMS_ORDER_STATE_CREATED = 1;
+  OMS_ORDER_STATE_PENDING_RISK = 2;
+  OMS_ORDER_STATE_RISK_REJECTED = 3;
+  OMS_ORDER_STATE_APPROVED = 4;
+  OMS_ORDER_STATE_PENDING_SUBMIT = 5;
+  OMS_ORDER_STATE_SUBMITTED = 6;
+  OMS_ORDER_STATE_ACKNOWLEDGED = 7;
+  OMS_ORDER_STATE_PARTIALLY_FILLED = 8;
+  OMS_ORDER_STATE_FILLED = 9;
+  OMS_ORDER_STATE_PENDING_CANCEL = 10;
+  OMS_ORDER_STATE_PENDING_REPLACE = 11;
+  OMS_ORDER_STATE_CANCELLED = 12;
+  OMS_ORDER_STATE_REJECTED = 13;
+  OMS_ORDER_STATE_EXPIRED = 14;
+  OMS_ORDER_STATE_UNKNOWN = 15;
+}
+
+message PaperComboMarketObservation {
+  string instrument_id = 1;
+  string mark_price = 2;
+  string observed_at = 3;
+}
+
+// A declarative PAPER request. The service must route this through the
+// configured PaperTradingService risk/OMS boundary; it is not a planning RPC.
+message SubmitPaperComboRequest {
+  string tenant_id = 1;
+  string intent_id = 2;
+  string account_id = 3;
+  string strategy_id = 4;
+  string correlation_id = 5;
+  string combo_quantity = 6;
+  ComboPriceLimitKind price_limit_kind = 7;
+  string price_limit = 8;
+  repeated OptionComboLeg legs = 9;
+  OrderTimeInForceKind time_in_force = 10;
+  string rationale = 11;
+  string created_at = 12;
+  string strategy_version = 13;
+  string configuration_version = 14;
+  string environment = 15;
+  string decided_at = 16;
+  repeated PaperComboMarketObservation observations = 17;
+}
+
+message SubmitPaperComboResponse {
+  string decision_id = 1;
+  bool approved = 2;
+  repeated string reason_codes = 3;
+  string policy_version = 4;
+  optional string order_id = 5;
+  OmsOrderState state = 6;
 }
 
 message BucketLimit {

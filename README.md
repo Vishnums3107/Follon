@@ -63,7 +63,9 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   content-addressed execution-plan evidence (`ExecutionPlanEvidence`),
   portfolio-wide risk, and balanced multi-currency/margin accounting. Scheduled,
   passive, combination, risk, and
-  margin planning are exposed through the versioned gRPC API.
+  margin planning are exposed through the versioned gRPC API. A separately
+  configured PAPER command route also exposes atomic combination submission
+  through the real PAPER risk/OMS/journal path; it fails closed when absent.
 - Customer IAM primitives with Argon2id, TOTP MFA, lockout, short opaque
   sessions, revocation, tenant isolation, and explicit RBAC permissions.
 - Transactional PostgreSQL migrations and adapter behavior for tenant-isolated

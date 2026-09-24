@@ -43,11 +43,24 @@ The order-management system owns client IDs, broker IDs, the lifecycle state mac
   must support a native atomic combination or reject before transmitting any
   leg; the planner never authorizes legging risk.
 
-These are deterministic planning contracts, not broker acceptance evidence.
-The versioned gRPC API exposes scheduled execution algorithms through arrival
-price, the full cancel-before-replace passive sequence, and synchronized
-net-price-protected option-combination plans. An adapter must still map a combo
-to a native atomic broker order or reject it before transmitting any leg.
+The planning methods are deterministic contracts, not broker acceptance
+evidence. The versioned gRPC API exposes scheduled execution algorithms through
+arrival price, the full cancel-before-replace passive sequence, and synchronized
+net-price-protected option-combination plans.
+
+The same API also has a distinct `SubmitPaperCombo` command. It exists only
+when `FOLLON_TRADING_API_PAPER_CONFIG` names a valid version-1 PAPER command
+route. That route converts the protobuf request into the canonical
+`ComboIntent`, requires one independently supplied observation per leg, and
+calls `PaperTradingService::submit_combo_intent`; it cannot fall back to the
+planning method. The configured service owns the durable journal, exact risk
+policy, kill switches, adapter model, idempotency record, and optional explicit
+short-exposure bound. With no configured route the RPC fails closed and no
+planning response is presented as an order outcome. A configured command route
+may bind to loopback without TLS; a non-loopback bind additionally requires a
+server TLS identity and client CA, so the write method is not exposed on an
+unauthenticated remote socket. This is local PAPER engineering evidence, not
+external-broker or production acceptance.
 
 ## Safety requirements
 
