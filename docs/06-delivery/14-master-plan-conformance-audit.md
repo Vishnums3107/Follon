@@ -2006,6 +2006,29 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** The controlled-LIVE combination lifecycle and EMS scheduling still lack an
       equivalent model test. No external gate moved.
 
+54. A fifth property/model-test slice: the controlled-LIVE atomic-combination lifecycle (2026-09-24,
+    Reliability and quality conformance; E3.2b).
+    - **What is now real.** `core/live/tests/combo_lifecycle_proptest.rs` adds `proptest` as a dev-dependency
+      to `core/live` and runs item 53's model against the capital path: every case opens a durable journal,
+      activates CANARY through `LiveActivation::for_configuration`, registers a four-eyes approval bound by
+      `combo_intent_fingerprint`, connects through a `SecretProvider`, and submits through
+      `submit_canary_combo_intent`. Random whole-unit fills, re-deliveries and cancellation follow. After every
+      step it checks filled units, lifecycle state, signed leg positions, exact cash including fees, the
+      working count, that no incident was raised, replay leaving the monitoring view unchanged (audit
+      sequence excluded, since every call is audited), and a clean reconciliation. The broker is a model
+      written in the test file, not a repository adapter, so reconciliation compares the service with
+      independent arithmetic.
+    - **Verified against injected defects.** Seven defects were injected into production code and each failed
+      the property: a replayed execution applied twice (both overlap guards disabled); a sell-leg fee and
+      separately a buy-leg fee not charged; a partial fill never leaving `ACKNOWLEDGED`; cancellation
+      discarding filled units; working combinations omitted from the count; and filled units not recorded.
+      The first clean run failed on a defect in the test's own broker model, which never advanced its order
+      state on a fill; that was corrected in the model and is not counted as a finding.
+    - **Measured result.** The Rust workspace rose from 384 to 385 passed / 0 failed / 3 ignored; the final
+      `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** EMS scheduling legality in `core/execution` still lacks a property test. No
+      external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
