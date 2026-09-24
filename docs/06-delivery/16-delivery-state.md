@@ -443,7 +443,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | ID | Gap | Conformance row |
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
-| E3.2 | Property/model/fault coverage beyond the five landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles). Next candidate: EMS scheduling legality | Reliability |
+| E3.2 | Property/model/fault coverage beyond the six landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles and EMS scheduling legality). Remaining candidates: algo-wheel allocation, passive repricing, smart routing, margin/financing functions | Reliability |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
 | E3.5 | Market-data gap-repair operation | 5.2 |
@@ -600,7 +600,20 @@ short — detail belongs in the conformance audit.
   `core/accounting` fail without the fix, and the shrunk seed is committed.
   The three property suites were then stress-run on fresh seeds (25 × PAPER,
   25 × scheduling, 8 × LIVE) with no failure.
-- **Next action: E3.2c** — EMS scheduling legality in `core/execution`. The top external priority is unchanged:
+- Landed **E3.2c**: `core/execution/tests/scheduling_legality_proptest.rs`,
+  six properties checking what each planner's own `validate_against` cannot:
+  TWAP slices within one unit and larger-first, VWAP children exactly the floor
+  of their proportional share (and refusal only when a window truly rounds to
+  zero), participation exactly `min(cap, remaining)`, arrival price
+  front-loaded and flat at zero urgency, iceberg display-size children, and
+  exact offsets, unique identities and inherited limits everywhere. Seven
+  conservation-preserving defects were injected; each was caught, and none
+  tripped `validate_against`, so none would have been caught before.
+- Rust workspace **385 → 395 passed**, 0 failed, 3 ignored (six scheduling
+  properties and four fix regressions); the final
+  `python tools/session_status.py` measurement recorded all seven suites green.
+- **Next action:** remaining E3.2 candidates (algo-wheel allocation, passive
+  repricing, smart routing), or E3.5 market-data gap repair. The top external priority is unchanged:
   the 30 clean PAPER sessions, which need a configured IBKR paper account, not
   code. Run `python tools/generate_pipeline_evidence.py` at least once per
   session that touches a persisted format.

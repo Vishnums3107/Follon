@@ -469,6 +469,7 @@ name = "follon-execution"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

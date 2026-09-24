@@ -2054,6 +2054,30 @@ These are mandatory master-plan acceptance conditions and are currently open:
       were stress-run on fresh seeds -- 25 runs of the PAPER model, 25 of the scheduling properties, 8 of the
       LIVE model -- with no failure.
 
+56. A sixth property-test slice: EMS scheduling legality (2026-09-24, Reliability and quality conformance;
+    E3.2c). Closes the "EMS scheduling" example items 42-44 and 53-54 named in their remainders.
+    - **What is now real.** `core/execution/tests/scheduling_legality_proptest.rs` adds `proptest` as a
+      dev-dependency to `core/execution`. Every planner already calls `ExecutionPlan::validate_against`, which
+      proves conservation and ordered offsets, so these six properties check what that self-check cannot,
+      against integer oracles in 1e-8 units: TWAP children number `min(slices, units)`, differ by at most one
+      unit and put larger slices first; VWAP children are exactly the floor of their proportional share with the
+      last absorbing the remainder, and a schedule is refused if and only if a window would round to zero;
+      participation children are exactly `min(volume * rate, remaining)` window by window with only truly
+      unavailable liquidity unallocated; arrival price is non-increasing and flat at zero urgency; iceberg
+      children are the display size except a final smaller remainder, identically through `plan_execution` and
+      `plan_iceberg_execution`; and every algorithm has offsets exactly `index * interval`, unique child
+      identities, and the parent's limit and child kind.
+    - **Verified against injected defects that preserve conservation.** Seven were injected and each failed its
+      property: TWAP remainder units given to the last slices; the whole TWAP remainder on the first slice; VWAP
+      rounding shares up; a doubled participation cap; back-loaded arrival price; an iceberg slice one unit over
+      the display size; and offsets shifted by one interval. None of the seven tripped `validate_against`, so
+      none was detectable before this slice.
+    - **Measured result.** Together with item 55, the Rust workspace rose from 385 to 395 passed / 0 failed / 3
+      ignored; the final `python tools/session_status.py` run measured all seven suites green, and the three
+      property suites were stress-run on fresh seeds without failure.
+    - **Bounded remainder.** Algo-wheel allocation, passive repricing, smart routing, and the margin/financing
+      functions of `core/accounting` still lack property coverage. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
