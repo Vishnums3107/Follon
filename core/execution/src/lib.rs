@@ -1476,9 +1476,13 @@ fn compare_quotes(side: Side, left: &VenueQuote, right: &VenueQuote) -> Ordering
         (Ok(left_price), Ok(right_price), Side::Sell) => right_price.cmp(&left_price),
         _ => Ordering::Equal,
     };
+    // Larger size first as the last tie-break: several quotes from one venue
+    // (depth) that otherwise tie must route the same whatever order they
+    // arrive in. Quotes still tied after this are identical.
     price_order
         .then_with(|| left.latency_rank.cmp(&right.latency_rank))
         .then_with(|| left.venue.cmp(&right.venue))
+        .then_with(|| right.available_quantity.cmp(&left.available_quantity))
 }
 
 /// Versioned trading capabilities declared for a specific venue.
@@ -1578,12 +1582,12 @@ pub fn smart_route_with_capabilities(
         }
     }
 
-    // 2. Validate quotes: every quoted venue MUST have an authoritative capability record
-    let required_kind = if parent.limit_price.is_some() {
-        ChildOrderKind::Limit
-    } else {
-        ChildOrderKind::Market
-    };
+    // 2. Validate quotes: every quoted venue MUST have an authoritative capability record.
+    // Every routed child is a marketable limit at its venue's quote price,
+    // exactly as `smart_route` emits, so slippage is capped at the quoted
+    // level even for a market parent. A venue must therefore accept limit
+    // orders whatever the parent's kind.
+    let required_kind = ChildOrderKind::Limit;
 
     for quote in quotes {
         validate_canonical_id("venue", &quote.venue)?;
@@ -2454,6 +2458,63 @@ mod tests {
             plan.replacements[0].replacement.limit_price,
             Some(amount("3.75"))
         );
+    }
+
+    #[test]
+    fn tied_depth_from_one_venue_routes_the_same_in_any_order() {
+        // Two levels from one venue tie on all-in price, rank and venue; the
+        // larger routes first, whatever order the book lists them in.
+        let level = |size: &str| VenueQuote {
+            venue: "venue.a".to_owned(),
+            available_quantity: amount(size),
+            price: amount("99"),
+            fee_per_unit: Decimal::ZERO,
+            latency_rank: 0,
+        };
+        let parent = parent("5");
+        let forward = smart_route(&parent, &[level("3"), level("4")]).expect("route");
+        let reverse = smart_route(&parent, &[level("4"), level("3")]).expect("route");
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.children[0].quantity, amount("4"));
+        assert_eq!(forward.children[1].quantity, amount("1"));
+    }
+
+    #[test]
+    fn a_market_parent_routes_as_marketable_limits_through_both_routers() {
+        let mut market_parent = parent("5");
+        market_parent.limit_price = None;
+        let quotes = [VenueQuote {
+            venue: "venue.a".to_owned(),
+            available_quantity: amount("9"),
+            price: amount("99.5"),
+            fee_per_unit: Decimal::ZERO,
+            latency_rank: 0,
+        }];
+        let capability = |kinds: &[ChildOrderKind]| VenueCapability {
+            venue: "venue.a".to_owned(),
+            capability_version: "cap.a.v1".to_owned(),
+            supported_order_kinds: kinds.iter().copied().collect(),
+            supports_iceberg: false,
+            min_quantity: None,
+            max_quantity: None,
+        };
+        let plain = smart_route(&market_parent, &quotes).expect("plain route");
+        let (gated, _) = smart_route_with_capabilities(
+            &market_parent,
+            &quotes,
+            &[capability(&[ChildOrderKind::Limit])],
+        )
+        .expect("gated route");
+        assert_eq!(gated, plain);
+        assert_eq!(gated.children[0].kind, ChildOrderKind::Limit);
+        assert_eq!(gated.children[0].limit_price, Some(amount("99.5")));
+        // A venue that cannot take a limit order cannot receive a routed child.
+        assert!(smart_route_with_capabilities(
+            &market_parent,
+            &quotes,
+            &[capability(&[ChildOrderKind::Market])],
+        )
+        .is_err());
     }
 
     #[test]

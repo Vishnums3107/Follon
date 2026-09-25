@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-25T03:36:28Z  
+**Measured at:** 2026-09-25T03:42:18Z  
 **Branch:** `main`  
-**HEAD:** `3376fa2` -- feat(risk): refuse orders off the instrument tick grid in PAPER and LIVE -- E3.6 (2026-09-24T23:05:23+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `e642194` -- test(execution): property tests for smart routing -- E3.2f (2026-09-25T09:06:47+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 427 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 430 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
@@ -444,7 +444,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | ID | Gap | Conformance row |
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
-| E3.2 | Property/model/fault coverage beyond the nine landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, and smart routing). Remaining candidate: margin/financing functions. Two smart-routing contract ambiguities need a decision (audit item 62): order-dependent splits between tied quotes from one venue, and the gated router's `Market` child carrying a limit price | Reliability |
+| E3.2 | Property/model/fault coverage beyond the nine landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, and smart routing). Remaining candidate: margin/financing functions. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
@@ -530,10 +530,19 @@ short — detail belongs in the conformance audit.
 - Rust workspace **422 → 427 passed**, 0 failed, 3 ignored; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
+- Landed **E3.2g**, both operator decisions on item 62's ambiguities. Tied
+  depth from one venue breaks ties by larger size, so routing no longer
+  depends on quote order. Every routed child is now a marketable limit at its
+  quote price in both routers, so the gated router requires `Limit` support
+  even for a market parent. Reverting either change fails the property tests;
+  the ten item-62 defects were re-injected and each still failed (audit item
+  63).
+- Rust workspace **427 → 430 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
 - **Next action:** E3.2's last candidate (margin/financing functions) or E3.5
-  market-data gap repair. The smart-routing ambiguities of item 62 need an
-  operator decision. The top external priority is unchanged: the 30 clean
-  PAPER sessions.
+  market-data gap repair. The top external priority is unchanged: the 30
+  clean PAPER sessions.
 
 ### 2026-09-24 — session 5
 

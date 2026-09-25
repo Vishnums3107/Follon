@@ -9,13 +9,18 @@
 //!   the quote's size (or the venue's `max_quantity`), and respects the
 //!   parent's limit on the quote price;
 //! - children never get worse in all-in price (price plus fee for a buy, minus
-//!   fee for a sell), ties broken by latency rank and then venue;
+//!   fee for a sell), ties broken by latency rank, then venue, then larger
+//!   size first;
+//! - every child is a marketable limit at its quote price, whether or not the
+//!   parent has a limit (the operator-decided contract of audit item 63);
 //! - nothing is left unallocated while a quote inside the limit still has
 //!   size;
 //! - each plan equals an exact greedy oracle, including the capability
 //!   router's `min_quantity` and `max_quantity` rules;
-//! - quote order does not matter;
-//! - with permissive capabilities the gated router equals the plain one;
+//! - quote order does not matter, including for several tied quotes from one
+//!   venue;
+//! - with permissive capabilities the gated router equals the plain one, for
+//!   market and limit parents alike;
 //! - every route decision mirrors its child, and malformed inputs are refused.
 
 use std::cmp::Reverse;
@@ -124,6 +129,7 @@ impl Book {
                 },
                 quote.latency,
                 quote.venue.clone(),
+                Reverse(quote.available),
             )
         });
         ranked
@@ -201,13 +207,38 @@ fn book() -> impl Strategy<Value = Book> {
         })
 }
 
-/// Books whose parent always has a limit, generated directly rather than
-/// filtered, so a large case count cannot exhaust proptest's reject budget.
-fn limit_book() -> impl Strategy<Value = Book> {
-    (book(), 90i128..=110).prop_map(|(mut book, cents)| {
-        book.limit.get_or_insert(cents * CENT);
+/// Books in which quotes share a few venues, as multi-level depth does, and
+/// often tie on price, fee and rank.
+fn depth_book() -> impl Strategy<Value = Book> {
+    (book(), prop::collection::vec(0usize..3, 12)).prop_map(|(mut book, venues)| {
+        for (quote, venue) in book.quotes.iter_mut().zip(venues) {
+            quote.venue = format!("venue.d{venue}");
+            quote.price = 100 * CENT;
+            quote.fee = 0;
+            quote.latency = 0;
+        }
         book
     })
+}
+
+/// One permissive capability per distinct venue.
+fn unique_capabilities(book: &Book) -> Vec<VenueCapability> {
+    let venues: BTreeSet<&str> = book
+        .quotes
+        .iter()
+        .map(|quote| quote.venue.as_str())
+        .collect();
+    venues
+        .into_iter()
+        .map(|venue| VenueCapability {
+            venue: venue.to_owned(),
+            capability_version: "venue.cap.v1".to_owned(),
+            supported_order_kinds: BTreeSet::from([ChildOrderKind::Limit]),
+            supports_iceberg: false,
+            min_quantity: None,
+            max_quantity: None,
+        })
+        .collect()
 }
 
 fn children(plan: &ExecutionPlan) -> Vec<(String, i128, i128)> {
@@ -234,6 +265,11 @@ fn assert_routing_invariants(book: &Book, plan: &ExecutionPlan) -> Result<(), Te
             &format!("parent.route.route.{:04}", index + 1)
         );
         prop_assert_eq!(child.scheduled_after_seconds, 0);
+        prop_assert_eq!(
+            child.kind,
+            ChildOrderKind::Limit,
+            "a routed child must be a marketable limit"
+        );
         let venue = child.venue.as_deref().expect("venue");
         let quote = book
             .quotes
@@ -351,7 +387,21 @@ proptest! {
     }
 
     #[test]
-    fn permissive_gated_routing_equals_plain_routing_for_limit_parents(book in limit_book()) {
+    fn tied_depth_from_one_venue_routes_the_same_in_any_order(book in depth_book()) {
+        let mut reversed = book.clone();
+        reversed.quotes.reverse();
+        let plan = smart_route(&book.parent(), &book.quotes()).unwrap();
+        prop_assert_eq!(&plan, &smart_route(&reversed.parent(), &reversed.quotes()).unwrap());
+        let (gated, _) = smart_route_with_capabilities(&book.parent(), &book.quotes(), &unique_capabilities(&book)).unwrap();
+        let (gated_reversed, _) = smart_route_with_capabilities(&reversed.parent(), &reversed.quotes(), &unique_capabilities(&reversed)).unwrap();
+        prop_assert_eq!(gated, gated_reversed);
+        let (expected, unallocated) = book.expected(false);
+        prop_assert_eq!(children(&plan), expected);
+        prop_assert_eq!(plan.unallocated_quantity.scaled(), unallocated);
+    }
+
+    #[test]
+    fn permissive_gated_routing_equals_plain_routing(book in book()) {
         let plain = smart_route(&book.parent(), &book.quotes()).unwrap();
         let (gated, _) = smart_route_with_capabilities(&book.parent(), &book.quotes(), &book.capabilities(false)).unwrap();
         prop_assert_eq!(gated, plain);
@@ -374,10 +424,10 @@ proptest! {
                 smart_route_with_capabilities(&parent, &quotes, &capabilities).is_err()
             }
             // A venue that cannot take the parent's order kind.
+            // A venue that cannot take the limit order every routed child is,
+            // whatever the parent's kind.
             2 => {
-                let kind = if parent.limit_price.is_some() { ChildOrderKind::Limit } else { ChildOrderKind::Market };
-                capabilities[0].supported_order_kinds.remove(&kind);
-                prop_assume!(!capabilities[0].supported_order_kinds.is_empty());
+                capabilities[0].supported_order_kinds.remove(&ChildOrderKind::Limit);
                 smart_route_with_capabilities(&parent, &quotes, &capabilities).is_err()
             }
             // A quote with no size, to either router.

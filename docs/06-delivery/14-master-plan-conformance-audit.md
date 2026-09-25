@@ -2382,6 +2382,31 @@ These are mandatory master-plan acceptance conditions and are currently open:
 
       No external gate moved.
 
+63. The two smart-routing ambiguities of item 62, resolved as the operator decided (2026-09-25, row 5.6;
+    E3.2g).
+    - **Tied depth from one venue now routes the same whatever order it arrives in.** `compare_quotes` gains a
+      final tie-break, larger available quantity first, shared by both routers. Several levels from one venue
+      remain legal, and only quotes identical in every field remain tied, where order cannot matter.
+      Previously the same five units split 3 + 2 or 4 + 1 depending on input order.
+    - **Every routed child is a marketable limit at its quote price.** `smart_route_with_capabilities`
+      previously emitted a `Market` child carrying a limit price for a parent with no limit. It now emits a
+      `Limit` child at the quote price, exactly as `smart_route` always has. Slippage is therefore capped at
+      the quoted level, and a venue must support `Limit` whatever the parent's kind. A venue that declares
+      only `Market` is refused, where it was previously accepted for a market parent.
+    - **Tests.** Two deterministic regressions: `tied_depth_from_one_venue_routes_the_same_in_any_order`, and
+      `a_market_parent_routes_as_marketable_limits_through_both_routers`. The item-62 properties were updated
+      to the new contract: every child is a `Limit`; the oracle ranks by size last; the gated router equals
+      the plain one for market and limit parents alike; and a venue without `Limit` is refused. A new
+      property routes depth books, in which quotes share three venues and tie on price, fee and rank, in
+      both orders through both routers and against the oracle. Reverting either change fails the property
+      tests alone, as well as its unit regression. The ten defects of item 62 were re-injected against the
+      final files and each still failed, and the suite was stress-run 20 times at 1,024 cases without
+      failure.
+    - **Measured result.** The Rust workspace rose from 427 to 430 passed / 0 failed / 3 ignored; the
+      final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** Neither router has a consumer outside `core/execution` yet, so no OMS or broker
+      path exercises this contract. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
