@@ -2331,6 +2331,57 @@ These are mandatory master-plan acceptance conditions and are currently open:
 
       No external gate moved.
 
+62. A ninth property-test slice: smart routing (2026-09-25, Reliability and quality conformance; E3.2f).
+    This closes the "smart routing" candidate named in item 60's remainder.
+    - **What is now real.** `core/execution/tests/smart_routing_proptest.rs` checks `smart_route` and
+      `smart_route_with_capabilities` over random buy and sell books of 1 to 12 venues, against arithmetic in
+      1e-8 units. In 512 cases, 339 leave quantity unallocated, 117 rank a quote over the limit ahead of an
+      eligible one, and in 285 the venue bounds change the plan.
+      - Every child names a quoted venue at that quote's price, within its displayed size and the venue's
+        `max_quantity`, and inside the parent's limit.
+      - Children never get worse in all-in price, with ties broken by latency and then venue.
+      - Nothing is left unallocated while a quote inside the limit still has size.
+      - Each plan equals an exact greedy oracle, which for the gated router includes `min_quantity` and
+        `max_quantity`.
+      - Quote order does not change either plan.
+      - With permissive capabilities, the gated router equals the plain one for limit parents.
+      - Every route decision mirrors its child, with its all-in price, fee, rank and identity.
+      - Missing, duplicate or unsupported capabilities, empty books and zero-size quotes are refused.
+    - **Verified against injected defects, and two weak tests found and fixed.** Ten defects were injected,
+      and all ten failed on the final test file:
+      - ignoring the latency tie-break;
+      - inverting the sell ranking;
+      - ranking buys without fees;
+      - the plain router stopping at the first quote over the limit;
+      - the gated router ignoring the buy limit;
+      - the plain router ignoring displayed size;
+      - the gated router ignoring a venue maximum, or skipping the post-cap minimum;
+      - a sell decision adding the fee;
+      - decision ids numbered from zero.
+
+      On the first pass the early-stop defect was **not** caught. The generator's fees were at most one
+      cent while prices differed by whole cents, so fees could never reorder quotes. A quote over the limit
+      therefore always ranked after every eligible one, and stopping early changed nothing. Fees now range
+      up to $3.00, and the defect fails. A first attempt at the gated-limit defect did not compile, so it was
+      not counted and was replaced. A first stress run then failed 11 of 20 times with no routing defect: the
+      differential property discarded every book without a limit and exhausted proptest's reject budget at
+      1,024 cases. It now generates limit parents directly, and the suite was stress-run 20 times at 1,024
+      cases without failure. Seeds that only injected runs recorded were removed.
+    - **Measured result.** The Rust workspace rose from 422 to 427 passed / 0 failed / 3 ignored; the
+      final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder: two contract ambiguities, recorded rather than changed.** Neither router has a
+      consumer outside `core/execution` yet.
+      - Both routers accept several quotes from one venue. When such quotes tie on all-in price, latency and
+        venue, the allocation depends on input order: for one book the same five units split 3 + 2 or 4 + 1.
+        Refusing duplicates would forbid legitimate multi-level depth from one venue, so the right rule
+        needs a decision.
+      - For a parent with no limit, `smart_route` emits a marketable `Limit` child at the quote price, while
+        `smart_route_with_capabilities` emits a `Market` child that still carries that limit price, which is
+        self-contradictory.
+      - The margin and financing functions of `core/accounting` still lack property coverage.
+
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

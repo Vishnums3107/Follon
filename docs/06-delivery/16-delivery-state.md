@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-24T17:34:58Z  
+**Measured at:** 2026-09-25T03:36:28Z  
 **Branch:** `main`  
-**HEAD:** `7afbf98` -- fix(execution): keep passive replacements clamped to a hard limit on the tick grid -- E3.2e (2026-09-24T22:45:03+05:30)  
-**Uncommitted paths:** 23
+**HEAD:** `3376fa2` -- feat(risk): refuse orders off the instrument tick grid in PAPER and LIVE -- E3.6 (2026-09-24T23:05:23+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 422 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 427 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
@@ -444,7 +444,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | ID | Gap | Conformance row |
 | --- | --- | --- |
 | E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
-| E3.2 | Property/model/fault coverage beyond the eight landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, and passive repricing). Remaining candidates: smart routing, margin/financing functions | Reliability |
+| E3.2 | Property/model/fault coverage beyond the nine landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, and smart routing). Remaining candidate: margin/financing functions. Two smart-routing contract ambiguities need a decision (audit item 62): order-dependent splits between tied quotes from one venue, and the gated router's `Market` child carrying a limit price | Reliability |
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
@@ -512,6 +512,28 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-25 — session 6
+
+- Baseline at `3376fa2`: clean tree, all seven suites green at the end of
+  session 5.
+- Landed **E3.2f**: `core/execution/tests/smart_routing_proptest.rs` checks
+  both routers against an exact greedy oracle, including the gated router's
+  venue bounds. It also checks per-child invariants, all-in ordering, that no
+  eligible size is left behind, independence from quote order, agreement
+  between the two routers, and route decisions. Ten deliberate defects were
+  injected and caught on the final file. The pass also found two weak tests:
+  fees too small to reorder quotes, which hid an early-stop defect, and a
+  filtered property that exhausted proptest's reject budget. Both were fixed,
+  and the suite was stress-run 20 × 1,024 cases without failure. Two contract
+  ambiguities are recorded for a decision rather than changed (audit item 62).
+- Rust workspace **422 → 427 passed**, 0 failed, 3 ignored; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
+- **Next action:** E3.2's last candidate (margin/financing functions) or E3.5
+  market-data gap repair. The smart-routing ambiguities of item 62 need an
+  operator decision. The top external priority is unchanged: the 30 clean
+  PAPER sessions.
 
 ### 2026-09-24 — session 5
 
