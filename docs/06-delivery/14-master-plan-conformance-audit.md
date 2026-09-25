@@ -2407,6 +2407,58 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** Neither router has a consumer outside `core/execution` yet, so no OMS or broker
       path exercises this contract. No external gate moved.
 
+64. A tenth property-test slice: margin valuation and financing accrual (2026-09-25, Reliability and quality
+    conformance; E3.2h).
+    - **Pure functions.** `core/accounting/tests/margin_financing_proptest.rs` holds `value_margin_account`
+      and `accrue_financing` to an independent integer oracle in 1e-8 units. Generated books use whole
+      quantities and multipliers with full-precision marks, so the only rounding is at the documented
+      points: an FX conversion, a basis-point requirement, and a day-count accrual, each truncated toward
+      zero. EUR->USD rates are drawn from rates whose inverse is also exact. Thirteen properties:
+      - every snapshot field matches the oracle, `maintenance <= initial`, and `margin_call` holds exactly
+        when equity is below maintenance;
+      - a direct quote and the equivalent inverse quote value a book identically;
+      - negating every position negates its value and leaves both requirements unchanged;
+      - position order does not matter, and requirements are additive over any split of the positions;
+      - raising an initial rate never lowers the requirement;
+      - valuation succeeds exactly when every needed conversion is fresh;
+      - every invalid margin input is refused;
+      - every charge matches `principal x rate x days / (basis x 10,000)`, and the currency totals sum the
+        charges;
+      - balance order does not matter;
+      - splitting an interval never charges more, and loses at most one 1e-8 unit per balance;
+      - more days, a higher rate, a larger principal, or a 360-day basis never charges less;
+      - every invalid financing input is refused.
+    - **Account wrapper.** `core/backtest/tests/financing_accrual_proptest.rs` covers
+      `AdvancedBacktestAccount::accrue_financing`. Only negative cash accrues debit financing, and only a
+      short accrues borrow, on `|quantity| x mark x multiplier`. Exactly the returned charge is debited per
+      currency. The report's cumulative financing is the sum of every accrual. An accrual identity applies
+      once. A refusal for a missing debit rate, a missing mark, or a non-positive mark leaves the account
+      unchanged and does not consume the identity. `core/backtest` gains `proptest` as a dev-dependency.
+      The workspace lock already carried proptest, so no new crate enters it.
+    - **Defect injection (rule 5).**
+      - Pure functions: 21 of 21 deliberate defects were caught, in three repeated runs. They included
+        margin on the signed or unconverted value, an inverse quote that multiplies, an off-by-one or
+        future-dated staleness check, a margin call on the initial requirement, exposure that drops cash,
+        a fixed 365-day basis, dividing before multiplying, an overwritten currency total, and each dropped
+        validation.
+      - Wrapper: 12 of 12 were caught, in two runs. They included positive cash or long positions
+        accruing, borrow ignoring the multiplier, a credited charge, an identity not recorded or consumed
+        on refusal, a missing rate or mark silently skipped, cumulative financing overwritten, and a debit
+        applied to the wrong currency.
+      - The first pass missed one defect, an initial-rate cap raised from 10,000 to 20,000 bps, because
+        generated invalid rates were spread far past the limit. Every invalid-input case now sits exactly
+        on its boundary half the time. One candidate defect was not counted: dropping the wrapper's own
+        non-positive-mark check is an equivalent mutant, because `accrue_financing` refuses a zero or
+        negative principal anyway.
+      - Both suites were stress-run 20 times without failure.
+    - **No defect found.** Both functions met every property. Recorded as the pinned contract rather than
+      changed: margin requirements and financing charges truncate toward zero. A requirement can therefore
+      under-state by at most 1e-8 per position, and an accrual under-charge by at most 1e-8 per balance.
+    - **Measured result.** The Rust workspace rose from 430 to 446 passed / 0 failed / 3
+      ignored; the final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** With this slice, every candidate E3.2 named has property coverage. Further
+      property coverage is open-ended and no longer a named gap. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

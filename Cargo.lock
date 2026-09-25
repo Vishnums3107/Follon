@@ -402,6 +402,7 @@ dependencies = [
  "follon-domain",
  "follon-instrument",
  "follon-market-data",
+ "proptest",
  "serde_json",
  "sha2 0.10.9",
 ]
