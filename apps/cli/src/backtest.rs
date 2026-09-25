@@ -358,12 +358,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_immutable(&arguments.artifact_path, &outputs.artifact_json)?;
     write_immutable(&event_path, &outputs.event_stream)?;
     write_immutable(&report_path, &outputs.report)?;
-    let advanced_artifact_path = arguments
-        .artifact_path
-        .with_extension("advanced-account.json");
-    let advanced_report_path = arguments.artifact_path.with_extension("advanced-report.md");
-    write_immutable(&advanced_artifact_path, &outputs.advanced_artifact)?;
-    write_immutable(&advanced_report_path, &outputs.advanced_report)?;
     write_immutable(&manifest_path, &outputs.completion_manifest)?;
     if let Some(experiment) = arguments.experiment {
         let record = ExperimentRecord::from_artifact(
@@ -379,14 +373,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("event stream: {}", event_path.display());
     eprintln!("report: {}", report_path.display());
     eprintln!("completion manifest: {}", manifest_path.display());
-    eprintln!(
-        "advanced account artifact: {}",
-        advanced_artifact_path.display()
-    );
-    eprintln!(
-        "advanced account report: {}",
-        advanced_report_path.display()
-    );
     eprintln!(
         "artifact fingerprint: {}",
         outputs.completed.artifact.fingerprint()
@@ -405,8 +391,6 @@ struct EvaluationOutputs {
     artifact_json: String,
     event_stream: String,
     report: String,
-    advanced_artifact: String,
-    advanced_report: String,
     completion_manifest: String,
 }
 
@@ -489,7 +473,7 @@ fn evaluate_backtest(
         bars,
         corporate_actions,
     };
-    let completed = match strategy_mode {
+    let mut completed = match strategy_mode {
         StrategyMode::Builtin => {
             let mut strategy = BuyOnceStrategy::new(
                 &document.account.account_id,
@@ -536,19 +520,14 @@ fn evaluate_backtest(
         &input.corporate_actions,
         &configuration.advanced_account,
     )?;
+    // The advanced economics travel inside the artifact itself (schema 3),
+    // so its hash and fingerprint bind them; there is no sidecar to read.
+    completed.artifact = completed.artifact.with_advanced_account(advanced_report);
     let artifact_json = completed.artifact.canonical_json();
     let event_stream = completed.canonical_events.join("\n") + "\n";
     let report = completed.artifact.markdown_report();
-    let advanced_artifact = advanced_report.canonical_json();
-    let advanced_report_text = advanced_report.markdown_report();
-    let advanced_manifest = format!(
-        "{{\"artifact_sha256\":\"{}\",\"report_sha256\":\"{}\"}}",
-        sha256_text(&advanced_artifact),
-        sha256_text(&advanced_report_text),
-    );
     let completion_manifest = format!(
-        "{{\"advanced_account\":{},\"artifact_fingerprint\":\"{}\",\"artifact_sha256\":\"{}\",\"configuration_hash\":\"{}\",\"event_output_hash\":\"{}\",\"events_sha256\":\"{}\",\"manifest_schema_version\":2,\"report_sha256\":\"{}\",\"specification_fingerprint\":\"{}\"}}",
-        advanced_manifest,
+        "{{\"artifact_fingerprint\":\"{}\",\"artifact_sha256\":\"{}\",\"configuration_hash\":\"{}\",\"event_output_hash\":\"{}\",\"events_sha256\":\"{}\",\"manifest_schema_version\":3,\"report_sha256\":\"{}\",\"specification_fingerprint\":\"{}\"}}",
         completed.artifact.fingerprint(),
         sha256_text(&artifact_json),
         configuration.content_hash,
@@ -563,8 +542,6 @@ fn evaluate_backtest(
         artifact_json,
         event_stream,
         report,
-        advanced_artifact,
-        advanced_report: advanced_report_text,
         completion_manifest,
     })
 }

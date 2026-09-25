@@ -136,6 +136,8 @@ type BacktestSummary = Readonly<{
   report: Readonly<Record<string, unknown>>;
   specification: Readonly<Record<string, unknown>>;
   specification_fingerprint: unknown;
+  /** Complete advanced-account economics carried by a schema-3 artifact. */
+  advanced_account?: Readonly<Record<string, unknown>> | null;
 }>;
 
 type SnapshotDashboard = Readonly<{
@@ -1129,6 +1131,23 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
       field(run.performance, "return_bps"), field(run.performance, "max_drawdown_bps"), shortHash(text(run.artifact_fingerprint))];
   }), "No backtest result artifacts are available.", (index) => context.onOpenArtifact(snapshot.backtests[index]?.artifact ?? ""));
   root.append(runs);
+
+  // Schema-3 artifacts carry the complete economics; older runs are not
+  // back-filled, so they are simply absent from this table.
+  const advancedRuns = snapshot.backtests.filter((run) => isRecord(run.advanced_account));
+  const economics = createPanel(
+    "Advanced-account economics",
+    "Multi-currency cash, long and short positions, margin, financing, and attributed charges, carried inside each schema-3 artifact. These supersede the single-currency run comparison figures.",
+  );
+  economics.id = "advanced-account-economics";
+  appendTableOrEmpty(economics, ["Artifact", "Base currency", "Net liquidation", "Initial margin", "Maintenance margin", "Excess liquidity", "Margin call", "Realized P&L", "Unrealized P&L", "Execution charges", "Financing charges"], advancedRuns.map((run) => {
+    const advanced = record(run.advanced_account);
+    const margin = record(advanced.margin);
+    return [run.artifact, field(margin, "base_currency"), field(margin, "net_liquidation_value"), field(margin, "initial_margin"),
+      field(margin, "maintenance_margin"), field(margin, "excess_liquidity"), field(margin, "margin_call"), field(advanced, "realized_pnl"),
+      field(advanced, "unrealized_pnl"), field(advanced, "execution_charges"), field(advanced, "financing_charges")];
+  }), "No indexed run carries advanced-account economics; they appear in artifact schema 3.", (index) => context.onOpenArtifact(advancedRuns[index]?.artifact ?? ""));
+  root.append(economics);
 
   const trades = createPanel("Trade evidence", "Inspect each canonical simulated execution rather than relying only on aggregate trade counts.");
   appendTableOrEmpty(trades, ["Time", "Execution", "Order", "Instrument", "Side", "Quantity", "Price", "Fee", "Source"], fills.map((item) => {
@@ -3118,7 +3137,8 @@ function isBacktestSummary(value: unknown): value is BacktestSummary {
   return isRecord(value) && typeof value.artifact === "string" && typeof value.modified_at === "string" &&
     typeof value.artifact_fingerprint === "string" && typeof value.event_output_hash === "string" &&
     typeof value.specification_fingerprint === "string" && isRecord(value.performance) &&
-    isRecord(value.report) && isRecord(value.specification);
+    isRecord(value.report) && isRecord(value.specification) &&
+    (value.advanced_account === undefined || value.advanced_account === null || isRecord(value.advanced_account));
 }
 
 function isEvidenceArtifact(value: unknown): value is EvidenceArtifact {

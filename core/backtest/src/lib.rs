@@ -1451,7 +1451,15 @@ impl AdvancedBacktestReport {
     /// Renders the advanced-account margin and economics evidence for review.
     pub fn markdown_report(&self) -> String {
         format!(
-            "# Follon Advanced Backtest Report\n\n| Metric | Exact value |\n| --- | ---: |\n| Base currency | {} |\n| Net liquidation value | {} |\n| Initial margin | {} |\n| Maintenance margin | {} |\n| Excess liquidity | {} |\n| Margin call | {} |\n| Realized P&L | {} |\n| Unrealized P&L | {} |\n| Execution charges | {} |\n| Financing charges | {} |\n\n",
+            "# Follon Advanced Backtest Report\n\n{}",
+            self.markdown_table()
+        )
+    }
+
+    /// The metric table shared by the standalone and embedded reports.
+    fn markdown_table(&self) -> String {
+        format!(
+            "| Metric | Exact value |\n| --- | ---: |\n| Base currency | {} |\n| Net liquidation value | {} |\n| Initial margin | {} |\n| Maintenance margin | {} |\n| Excess liquidity | {} |\n| Margin call | {} |\n| Realized P&L | {} |\n| Unrealized P&L | {} |\n| Execution charges | {} |\n| Financing charges | {} |\n\n",
             self.margin.base_currency.as_str(),
             self.margin.net_liquidation_value,
             self.margin.initial_margin,
@@ -1591,6 +1599,10 @@ pub struct BacktestArtifact {
     pub accounting_entries: Vec<AccountingEntry>,
     /// Exact performance summary and equity curve.
     pub performance: PerformanceReport,
+    /// Complete advanced-account economics for the same event stream, when
+    /// attached. These are the authoritative economics: `report` comes from
+    /// the single-currency, long-only ledger that builds the events.
+    pub advanced_account: Option<AdvancedBacktestReport>,
 }
 
 impl BacktestArtifact {
@@ -1626,26 +1638,58 @@ impl BacktestArtifact {
             report,
             accounting_entries,
             performance,
+            advanced_account: None,
         })
     }
 
-    /// Stable digest of the complete portable result, including its report.
+    /// Attaches the advanced-account economics derived from this artifact's
+    /// own event stream, which makes it an artifact schema version 3.
+    pub fn with_advanced_account(mut self, advanced_account: AdvancedBacktestReport) -> Self {
+        self.advanced_account = Some(advanced_account);
+        self
+    }
+
+    /// Artifact schema version: 3 when advanced economics are attached.
+    pub fn schema_version(&self) -> u32 {
+        if self.advanced_account.is_some() {
+            3
+        } else {
+            2
+        }
+    }
+
+    /// Stable digest of the complete portable result, including its report
+    /// and, when attached, the advanced-account economics.
     pub fn fingerprint(&self) -> String {
-        sha256(&format!(
+        let mut preimage = format!(
             "specification={}\nevents={}\nreport={}\nperformance={}\nentries={}\n",
             self.specification_fingerprint,
             self.event_output_hash,
             self.report.canonical_json(),
             self.performance.canonical_json(),
             accounting_entries_json(&self.accounting_entries),
-        ))
+        );
+        if let Some(advanced_account) = &self.advanced_account {
+            preimage.push_str(&format!(
+                "advanced_account={}\n",
+                advanced_account.canonical_json()
+            ));
+        }
+        sha256(&preimage)
     }
 
     /// Portable canonical JSON suitable for an immutable result artifact.
     pub fn canonical_json(&self) -> String {
+        let advanced_account = self
+            .advanced_account
+            .as_ref()
+            .map(|report| format!("\"advanced_account\":{},", report.canonical_json()))
+            .unwrap_or_default();
         format!(
-            "{{\"accounting_entries\":{},\"artifact_schema_version\":2,\"artifact_fingerprint\":\"{}\",\"event_output_hash\":\"{}\",\"performance\":{},\"report\":{},\"specification\":{},\"specification_fingerprint\":\"{}\"}}",
+            "{{\"accounting_entries\":{},{}\"artifact_schema_version\":{},\"artifact_fingerprint\":\"{}\",\"event_output_hash\":\"{}\",\"performance\":{},\"report\":{},\"specification\":{},\"specification_fingerprint\":\"{}\"}}",
             accounting_entries_json(&self.accounting_entries),
+            advanced_account,
+            self.schema_version(),
             self.fingerprint(),
             self.event_output_hash,
             self.performance.canonical_json(),
@@ -1726,6 +1770,17 @@ impl BacktestArtifact {
                 entry.cash_delta,
             )
             .expect("writing to a string cannot fail");
+        }
+        if let Some(advanced_account) = &self.advanced_account {
+            report.push_str(
+                "\n## Advanced account\n\n\
+                 These are the complete economics of this run: multi-currency cash, \
+                 long and short positions, margin, financing, and attributed charges, \
+                 derived from the same canonical event stream. The Performance, \
+                 Positions, and Accounting entries sections above come from the \
+                 single-currency, long-only ledger used to build the events.\n\n",
+            );
+            report.push_str(&advanced_account.markdown_table());
         }
         report
     }
@@ -2792,6 +2847,66 @@ mod tests {
             "b".repeat(64)
         );
         assert_eq!(artifact_json["performance"]["trade_count"], 1);
+        assert!(artifact_json.get("advanced_account").is_none());
+    }
+
+    #[test]
+    fn attached_advanced_economics_make_a_schema_3_artifact_bound_by_its_fingerprint() {
+        let input = runner_input();
+        let spec = runner_spec(&input);
+        let (instruments, calendar) = market_dependencies();
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let plain = BacktestRunner::new(spec, runner_engine())
+            .unwrap()
+            .run(&mut runner_strategy(), &input, &market)
+            .unwrap()
+            .artifact;
+        let usd = Currency::new("USD").unwrap();
+        let policy = MarginPolicy {
+            base_currency: usd.clone(),
+            maximum_fx_age_seconds: 0,
+            rates: BTreeMap::from([(
+                "equity".to_owned(),
+                follon_accounting::MarginRate {
+                    initial_bps: 10_000,
+                    maintenance_bps: 10_000,
+                },
+            )]),
+        };
+        let economics = |cash: &str| {
+            AdvancedBacktestAccount::new(BTreeMap::from([(usd.clone(), amount(cash))]))
+                .unwrap()
+                .report(&BTreeMap::new(), &FxBook::default(), &policy, 0)
+                .unwrap()
+        };
+
+        let attached = plain.clone().with_advanced_account(economics("1000"));
+        assert_eq!(attached.schema_version(), 3);
+        let json: serde_json::Value = serde_json::from_str(&attached.canonical_json()).unwrap();
+        assert_eq!(json["artifact_schema_version"], 3);
+        assert_eq!(
+            json["advanced_account"]["margin"]["net_liquidation_value"],
+            "1000.00000000"
+        );
+        assert_eq!(json["artifact_fingerprint"], attached.fingerprint());
+        assert!(attached.markdown_report().contains("## Advanced account"));
+        assert!(attached
+            .markdown_report()
+            .contains("| Net liquidation value | 1000.00000000 |"));
+        // The fingerprint covers the economics, and a plain artifact is unchanged.
+        assert_ne!(attached.fingerprint(), plain.fingerprint());
+        assert_ne!(
+            attached.fingerprint(),
+            plain
+                .clone()
+                .with_advanced_account(economics("999"))
+                .fingerprint()
+        );
+        assert_eq!(plain.schema_version(), 2);
+        assert!(!plain.markdown_report().contains("## Advanced account"));
     }
 
     #[test]

@@ -902,7 +902,7 @@ def workspace_snapshot(as_of: str | None = None) -> dict[str, object]:
                 execution_evidence.append(
                     {"artifact": name, "modified_at": metadata["modified_at"], "data": payload}
                 )
-            elif payload.get("artifact_schema_version") in {1, 2} and isinstance(payload.get("report"), dict):
+            elif payload.get("artifact_schema_version") in {1, 2, 3} and isinstance(payload.get("report"), dict):
                 backtests.append(
                     {
                         "artifact": name,
@@ -913,6 +913,12 @@ def workspace_snapshot(as_of: str | None = None) -> dict[str, object]:
                         "report": payload.get("report", {}),
                         "specification": payload.get("specification", {}),
                         "specification_fingerprint": payload.get("specification_fingerprint"),
+                        # Schema 3 carries the complete advanced-account economics.
+                        "advanced_account": (
+                            payload.get("advanced_account")
+                            if isinstance(payload.get("advanced_account"), dict)
+                            else None
+                        ),
                     }
                 )
             elif "manifest_schema_version" in payload:

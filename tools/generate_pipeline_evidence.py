@@ -89,9 +89,11 @@ def main() -> None:
         VAR_DIR / "follon-backtest-artifact.events.ndjson",
         VAR_DIR / "follon-backtest-artifact.report.md",
         VAR_DIR / "follon-backtest-artifact.manifest.json",
-        VAR_DIR / "follon-backtest-artifact.advanced-account.json",
-        VAR_DIR / "follon-backtest-artifact.advanced-report.md",
     ]
+    # Schema-3 artifacts carry the advanced-account economics themselves, so
+    # remove the sidecars earlier runs published rather than leave them orphaned.
+    for retired in ("advanced-account.json", "advanced-report.md"):
+        (VAR_DIR / f"follon-backtest-artifact.{retired}").unlink(missing_ok=True)
     run_step(
         "Step 2: Executing deterministic replay backtest & advanced margin projection",
         [

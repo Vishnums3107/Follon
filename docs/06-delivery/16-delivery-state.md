@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-25T07:52:26Z  
+**Measured at:** 2026-09-25T08:38:28Z  
 **Branch:** `main`  
-**HEAD:** `75bf094` -- test(accounting): property tests for margin valuation and financing accrual -- E3.2h (2026-09-25T11:40:36+05:30)  
-**Uncommitted paths:** 13
+**HEAD:** `330309f` -- feat(market-data): repair quote-stream sequence gaps from a supplied recovery batch -- E3.5 (2026-09-25T13:22:46+05:30)  
+**Uncommitted paths:** 11
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 463 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 464 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
@@ -443,7 +443,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 
 | ID | Gap | Conformance row |
 | --- | --- | --- |
-| E3.1 | Multi-account allocation in the backtester; `BacktestRunner`'s in-run ledger still requires the operator to read the advanced-account sidecar for advanced economics | 5.4 |
+| E3.1 | **E3.1a done 2026-09-25 (audit item 66):** the main artifact (schema 3) and report carry the advanced-account economics, and the sidecar is gone. **Multi-account allocation is frozen** by `03-roadmap-and-gates.md` until the preceding gates are independently evidenced; the operator chose not to override the gate. | 5.4 |
 | E3.2 | Property/model/fault coverage beyond the ten landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, smart routing, and — since 2026-09-25 — margin valuation and financing accrual, item 64). No named candidate remains; further property coverage is open-ended. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
@@ -565,11 +565,19 @@ short — detail belongs in the conformance audit.
 - Rust workspace **446 → 463 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
-- **Next action:** no named repository item remains in E3.2 or E3.5. The
-  remaining E3 partials are E3.1 (multi-account backtest allocation), E3.3
-  (authenticated write control plane), and E3.4 (DAST, which needs a running
-  deployment). E2.1b's clean-machine capsule check is external. The top
-  external priority is unchanged: the 30 clean PAPER sessions.
+- Landed **E3.1a**, the unfrozen half of E3.1, as the operator decided.
+  Multi-account allocation stays frozen by the roadmap gate. The main backtest
+  artifact now carries the advanced-account economics (schema 3, bound by its
+  fingerprint and hash), and the report gains a clearly labelled section. The
+  sidecar files and the manifest's `advanced_account` hashes are retired. The
+  dashboard and Backtest Explorer show the economics. 4/4 injected defects
+  were caught, one per layer (audit item 66; row 5.4 corrected in place).
+- Rust workspace **463 → 464 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
+- **Next action:** E3.3a (authenticated gRPC write path), then E3.4 (a
+  repository-authored dynamic scan of a local deployment), as the operator
+  decided.
 
 ### 2026-09-24 — session 5
 

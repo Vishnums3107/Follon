@@ -281,6 +281,32 @@ class DashboardServerContract(unittest.TestCase):
         self.assertIn("payment=()", captured["Permissions-Policy"])
         self.assertIn("form-action 'none'", captured["Content-Security-Policy"])
 
+    def test_workspace_projection_carries_schema_3_advanced_economics(self) -> None:
+        advanced = {"advanced_report_schema_version": 1, "margin": {"net_liquidation_value": "10.00000000"}}
+        for name, schema, economics in (
+            ("backtest-v3.json", 3, advanced),
+            ("backtest-v3-malformed.json", 3, "not-an-object"),
+            ("backtest-v2.json", 2, None),
+        ):
+            payload = {
+                "artifact_schema_version": schema,
+                "artifact_fingerprint": "a" * 64,
+                "event_output_hash": "b" * 64,
+                "performance": {},
+                "report": {},
+                "specification": {},
+                "specification_fingerprint": "d" * 64,
+            }
+            if economics is not None:
+                payload["advanced_account"] = economics
+            (EVIDENCE_ROOT / name).write_text(json.dumps(payload), encoding="utf-8")
+        snapshot = server.workspace_snapshot()
+        projected = {item["artifact"]: item["advanced_account"] for item in snapshot["backtests"]}
+        self.assertEqual(projected["backtest-v3.json"], advanced)
+        # A malformed section is dropped rather than passed through.
+        self.assertIsNone(projected["backtest-v3-malformed.json"])
+        self.assertIsNone(projected["backtest-v2.json"])
+
     def test_workspace_projection_integrates_typed_feature_evidence(self) -> None:
         (EVIDENCE_ROOT / "market-bars.csv").write_text(
             "event_time,instrument_id,close\n2026-01-01T00:00:00Z,inst.spy,100.0\n",
