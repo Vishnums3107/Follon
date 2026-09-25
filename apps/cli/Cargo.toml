@@ -41,6 +41,10 @@ name = "follon-build-bars"
 path = "src/build_bars.rs"
 
 [[bin]]
+name = "follon-repair-quotes"
+path = "src/repair_quotes.rs"
+
+[[bin]]
 name = "follon-paper-status"
 path = "src/paper.rs"
 

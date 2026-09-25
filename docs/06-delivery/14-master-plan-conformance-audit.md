@@ -371,7 +371,7 @@ kept current, which is itself corrected here rather than left stale):
 | Master-plan capability | Status | Implemented and frontend-integrated evidence | Exact remainder |
 | --- | --- | --- | --- |
 | 5.1 Canonical instruments | Implemented for broker-neutral reference scope | `core/instrument` has permanent IDs, effective-dated versions, symbols, venue, asset class, currency, broker IDs, tick/lot sizes, multiplier, calendars, cash-security settlement lag, option underlying/expiry/strike/right/style/settlement, future root/last-trade/expiry/settlement/margin class, and FX spot/forward/swap base/quote/value-date terms. `follon-fx` CLI and Portfolio workspace provide deterministic pricing and evaluation. Current dataset/reference identity is projected into Research Lab and Strategy Studio. | Production vendor symbol-master ingestion, licensed data operations, and live broker acceptance remain external; reference completeness is not permission to trade every declared class. |
-| 5.2 Market data | Partial | Strict historical trade/bar import, deterministic OHLCV construction, normalized source/receive-time quotes, spread/size validation, duplicate/out-of-order/sequence-gap/delay/staleness classification, exchange sessions and halts, corporate-action inputs, Parquet publication, DuckDB verification, immutable S3-compatible publication, and dataset views are implemented. `core/fx` adds value-dated fixed-point spot/forward/swap snapshots with source/receive-time, sequence, staleness, and replay-order refusal, consumed by `follon-fx` and Portfolio workspace. | No production licensed live quote/trade vendor connection, gap-repair operation, stale-feed operating history, broad vendor symbol-master ingestion, or corporate-action operations service exists. |
+| 5.2 Market data | Partial | Strict historical trade/bar import, deterministic OHLCV construction, normalized source/receive-time quotes, spread/size validation, duplicate/out-of-order/sequence-gap/delay/staleness classification, exchange sessions and halts, corporate-action inputs, Parquet publication, DuckDB verification, immutable S3-compatible publication, and dataset views are implemented. `core/fx` adds value-dated fixed-point spot/forward/swap snapshots with source/receive-time, sequence, staleness, and replay-order refusal, consumed by `follon-fx` and Portfolio workspace. | No production licensed live quote/trade vendor connection, vendor reconnect/re-request of a gap window, stale-feed operating history, broad vendor symbol-master ingestion, or corporate-action operations service exists. **Corrected in place 2026-09-25 (item 65).** This column also listed "gap-repair operation". That was accurate when written and became false when E3.5 landed a deterministic repair from a supplied recovery batch. Requesting that batch from a vendor remains open. |
 | 5.3 Python strategy SDK | Implemented local replay boundary | Isolated worker handshake, strategy/version identity, bundle hashing, deterministic bar-to-intent contract, point-in-time historical queries, deterministic SMA/EMA helpers, immutable portfolio snapshots, bounded saved state with fingerprints, bounded custom metrics, example strategy, schemas, and Strategy Studio projection are implemented. The Rust replay host sends the strict history/portfolio/cash/state frame to Python workers, applies replayed fills to the host-owned portfolio view, and rejects tampered fingerprints, look-ahead metrics, malformed metrics, or protocol drift. Strategy code cannot access broker adapters or credentials. | Direct Python fill/risk callbacks, a deployed gRPC strategy-worker host, and production worker deployment remain external integration work. |
 | 5.4 Professional backtester | Implemented CLI projection; runner-internal accounting remains bounded | Event-driven replay, exact decimal accounting, spread, adverse slippage, attributed commission/exchange/regulatory charges, latency, per-bar partial-fill caps, persistent working orders, post-cost limit protection, sessions/halts, dividends/splits, point-in-time universe membership, long/short accounting, borrow availability/recall calculation, exact borrow/cash-debit financing, multi-currency FX, initial-margin capital checks, delisting settlement, immutable reports/manifests, experiment records, and Backtest Explorer capability evidence are implemented and tested. Every CLI backtest derives a hashed advanced-account result from the same canonical event stream and refuses publication when its capital or lifecycle checks fail. Explicit economics use `advanced_account`; older configurations use a deterministic fully-paid profile derived from immutable reference data. | Multi-account allocation and proof against production-size performance targets remain. The in-run `BacktestRunner` ledger is retained for backward-compatible event construction, so an operator must consume the advanced-account sidecar for advanced economics. |
 | 5.5 OMS | Implemented for current market/limit scope | Stable client identities, idempotency, legal state transitions, cancel/replace, out-of-order evidence, UNKNOWN handling, restart recovery, reconciliation, and causal audit events exist in simulation/PAPER/controlled-LIVE. Execution Blotter renders the lifecycle. `core/paper::evaluate_risk` and `core/live::evaluate_risk` (the exact functions every PAPER/controlled-LIVE order intent passes through before an `OmsOrder` is created) now reject a same-instrument opposite-side order against an existing working order (`SELF_TRADE_RISK`) and reject submissions beyond a configured rolling-window rate (`MAX_ORDER_RATE_EXCEEDED`), closing a prior gap where those two pre-trade-risk-doc checks existed only in the disconnected `core/risk` evidence engine and never actually gated a real order. The desktop order ticket's submit/cancel/close-position commands are no longer permanently wired to an inert `TradingCommandState::unavailable()` stub: `apps/desktop/src-tauri/src/paper_gateway.rs` is a real `RiskOmsGateway` backed by an in-process `follon_paper::PaperTradingService`, so when an operator points `FOLLON_DESKTOP_PAPER_CONFIG` at a valid PAPER configuration file the desktop actually submits, cancels, and closes real PAPER orders through the genuine risk/kill-switch/audit-journal path (see the UX row below and the dated entry in "Locally closed gaps"). | It is not a claim of complete OMS coverage for every future order type, asset class, or live broker. Without `FOLLON_DESKTOP_PAPER_CONFIG` configured, the desktop command surface remains unavailable exactly as before. |
@@ -2458,6 +2458,57 @@ These are mandatory master-plan acceptance conditions and are currently open:
       ignored; the final `python tools/session_status.py` run measured all seven suites green.
     - **Bounded remainder.** With this slice, every candidate E3.2 named has property coverage. Further
       property coverage is open-ended and no longer a named gap. No external gate moved.
+
+65. Deterministic quote-stream gap repair from a supplied recovery batch (2026-09-25, row 5.2; E3.5).
+    - **Scope, as the operator decided.** No repository component records a live quote stream, and none
+      re-requests missing data from a vendor. The IBKR adapter has no market-data subscription. The
+      normalized `Quote` and `FeedQualityMonitor` had no producer or consumer outside their own tests.
+      E3.5 therefore lands the repair core and a file CLI, which complete the monitor's gap reports. It
+      does not claim a live operation.
+    - **What is now real.** `core/market-data/src/gap_repair.rs` provides `detect_quote_gaps`,
+      `repair_quote_gaps`, and a v1 quote CSV contract (`import_quotes`, `quotes_to_csv`).
+      - A gap is a missing sequence strictly between two recorded sequences of one instrument. Nothing
+        before the first or after the last recorded sequence is knowable, so repair refuses to extend a
+        stream.
+      - Repair fills a gap only with a record from the recovery batch. It never interpolates, and it
+        never changes or drops a recorded quote. Identical re-deliveries collapse and are counted. A
+        batch record identical to a recorded quote corroborates it.
+      - The whole repair is refused when either input holds two different quotes for one sequence, or
+        one identity for two sequences. It is also refused when a batch record conflicts with the
+        recording, reuses a recorded identity, lies outside every gap, or contradicts its merged
+        neighbours' event-time order.
+      - Every unfilled sequence stays declared as residual.
+    - **CLI.** `follon-repair-quotes --recorded --recovery --output-dir [--require-complete]` writes an
+      immutable `repaired-quotes.csv` and `gap-repair.json`. The JSON holds the input and output SHA-256
+      hashes, the gaps, the recovered runs, the residual gaps, and the counts. A refusal writes nothing.
+      `--require-complete` fails on a residual gap after the evidence is written. The inputs are
+      `tests/fixtures/market-data/quotes-{recorded,recovery}-v1.csv`, and no pipeline step publishes the
+      result to `var/`, because the input is a fixture, not a recording.
+    - **Tests.**
+      - Six unit tests in the module.
+      - `core/market-data/tests/gap_repair_proptest.rs` has seven properties over generated true streams,
+        of which only part is recorded. Gaps, recovered runs, residual gaps, and the repaired stream
+        match an exact oracle, and every repaired quote is a true record. Input order and re-deliveries
+        do not matter. A second repair recovers nothing new. A full batch restores the interior. Six
+        kinds of hostile batch record, and a self-contradicting recording, are refused. Detection agrees
+        with the sequence gaps `FeedQualityMonitor` reports under out-of-order arrival.
+      - `apps/cli/tests/quote_gap_repair_workflow.rs` has three workflow tests: the record and
+        idempotent re-run, the completeness gate, and a conflicting batch that writes nothing.
+    - **Defect injection (rule 5).**
+      - Repair module: 16 of 16 caught on the final files. The first pass caught 15. The survivor let a
+        repair extend a stream before its first recorded sequence, because hostile cases probed only the
+        tail. A head case was added.
+      - Before injection, three further gaps were closed: a recovered quote later than its upper
+        neighbour, a self-contradicting recording, and sequence ranges that seldom overlapped across
+        instruments.
+      - CLI: 3 of 3 caught (completeness gate ignored, residual reported as gaps, output created before
+        the repair).
+      - The property suite was stress-run 20 times without failure.
+    - **Measured result.** The Rust workspace rose from 446 to 463 passed / 0 failed / 3
+      ignored; the final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** A live quote recorder, vendor reconnect and re-request of a gap window, and
+      a consumer that refuses to trade on an incomplete stream do not exist. These now belong to the
+      vendor gate of row 5.2. No external gate moved.
 
 ## Business-readiness decision
 

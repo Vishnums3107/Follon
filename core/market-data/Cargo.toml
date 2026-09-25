@@ -12,6 +12,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
 time = { version = "0.3.44", features = ["formatting", "parsing"] }
 
+[dev-dependencies]
+proptest = "1.11.0"
+
 [lib]
 path = "src/lib.rs"
 

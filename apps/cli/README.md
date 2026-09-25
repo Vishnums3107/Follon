@@ -81,6 +81,37 @@ Trade IDs and per-instrument source sequences must be unique. The builder sorts
 by source time/sequence, emits canonical `(event_time, instrument_id)` order,
 uses exact decimals, and atomically publishes an immutable output file.
 
+## Quote-stream gap repair
+
+`follon-repair-quotes` fills sequence gaps in a recorded v1 quote stream, using
+only a recovery batch you supply, such as a vendor replay of the gap window:
+
+```powershell
+cargo run -p follon-cli --bin follon-repair-quotes -- --recorded tests/fixtures/market-data/quotes-recorded-v1.csv --recovery tests/fixtures/market-data/quotes-recovery-v1.csv --output-dir var/quote-repair
+```
+
+A gap is a missing sequence strictly between two recorded sequences of one
+instrument. The command never interpolates, and it never changes or drops a
+recorded quote. A recovery record identical to a recorded quote corroborates
+it. The whole repair is refused, and nothing is written, when a recovery
+record:
+
+- differs from the recorded quote at its sequence;
+- reuses a recorded quote identity;
+- lies outside every gap;
+- contradicts its neighbours' event-time order.
+
+On success the command writes two immutable files:
+
+- `repaired-quotes.csv`, in instrument-then-sequence order;
+- `gap-repair.json`, which holds the input and output SHA-256 hashes, the
+  gaps, the recovered runs, and the residual gaps.
+
+A gap the batch does not fill stays declared in `residual`.
+`--require-complete` makes a residual gap a failing exit, after both files are
+written. The command repairs files; nothing in the repository records a live
+quote stream or requests a replay from a vendor.
+
 ## Python strategy worker
 
 Install `python/strategy-sdk` into a dedicated virtual environment first, or

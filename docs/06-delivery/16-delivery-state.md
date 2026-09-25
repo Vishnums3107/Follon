@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-25T06:10:04Z  
+**Measured at:** 2026-09-25T07:52:26Z  
 **Branch:** `main`  
-**HEAD:** `e111c93` -- fix(execution): make smart routing order-independent and route every child as a marketable limit -- E3.2g (2026-09-25T09:13:13+05:30)  
-**Uncommitted paths:** 6
+**HEAD:** `75bf094` -- test(accounting): property tests for margin valuation and financing accrual -- E3.2h (2026-09-25T11:40:36+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 446 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 463 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
@@ -448,7 +448,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
 | E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
-| E3.5 | Market-data gap-repair operation | 5.2 |
+| E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 
 ## The backlog that code cannot close
 
@@ -552,8 +552,24 @@ short — detail belongs in the conformance audit.
 - Rust workspace **430 → 446 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
-- **Next action:** E3.5 market-data gap repair. The top external priority is
-  unchanged: the 30 clean PAPER sessions.
+- Landed **E3.5**, scoped as the operator decided, because nothing records or
+  re-requests real quotes. `core/market-data` gains `detect_quote_gaps`,
+  `repair_quote_gaps`, and a v1 quote CSV contract. `follon-repair-quotes`
+  writes an immutable repaired stream and a hash-bound repair record. Repair
+  fills only from the supplied batch, never interpolates, refuses a
+  contradicting batch or recording, and declares every residual gap. The
+  suite has seven properties against a true-stream oracle, including
+  agreement with `FeedQualityMonitor`. 16/16 module defects were caught, after
+  a missed head-extension case was added, and 3/3 CLI defects (audit item 65;
+  row 5.2 corrected in place).
+- Rust workspace **446 → 463 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
+- **Next action:** no named repository item remains in E3.2 or E3.5. The
+  remaining E3 partials are E3.1 (multi-account backtest allocation), E3.3
+  (authenticated write control plane), and E3.4 (DAST, which needs a running
+  deployment). E2.1b's clean-machine capsule check is external. The top
+  external priority is unchanged: the 30 clean PAPER sessions.
 
 ### 2026-09-24 — session 5
 
