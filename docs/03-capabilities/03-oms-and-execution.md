@@ -59,8 +59,22 @@ short-exposure bound. With no configured route the RPC fails closed and no
 planning response is presented as an order outcome. A configured command route
 may bind to loopback without TLS; a non-loopback bind additionally requires a
 server TLS identity and client CA, so the write method is not exposed on an
-unauthenticated remote socket. This is local PAPER engineering evidence, not
-external-broker or production acceptance.
+unauthenticated remote socket.
+
+Every call also needs an authenticated operator. A configured route requires
+the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
+`BeginOperatorLogin` and `CompleteOperatorLogin` check a password and then a
+mandatory TOTP code, and return a bearer session. `SubmitPaperCombo` refuses
+three kinds of caller before it reads the intent:
+
+- a caller with no session, or a malformed one (`UNAUTHENTICATED`);
+- a session whose role does not grant PAPER trading (`PERMISSION_DENIED`);
+- a session presented for another tenant (`PERMISSION_DENIED`).
+
+The directory serves one tenant. The PAPER journal records the operator as the
+combination's `submitted_by`, and an idempotent retry must come from the same
+operator. This is local PAPER engineering evidence, not external-broker or
+production acceptance.
 
 The Tauri desktop host has the equivalent `submit_combo_order` IPC command. Its
 `ComboOrderIntent` places each leg's operator-attested observation on the leg

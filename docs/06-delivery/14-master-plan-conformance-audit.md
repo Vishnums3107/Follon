@@ -392,7 +392,7 @@ kept current, which is itself corrected here rather than left stale):
 | Parquet + DuckDB research store | Implemented locally | Deterministic Parquet, hash/row revalidation, catalogue registration, receipts, recovery verification, and dashboard indexing exist. |
 | Object storage | Implemented locally; production gate | Versioned immutable S3-compatible publication and recovery exist against local MinIO. KMS, retention/object lock, replication, monitoring, and drilled production recovery remain external. |
 | Protobuf/gRPC contracts | Implemented topology; local runtime verified 2026-09-15; production evidence open | `follon-trading-api` serves health, scheduled/passive/options-combination EMS, portfolio-risk, and margin APIs; validates tenant/account/strategy scope; migrates/health-checks PostgreSQL; requires database TLS plus server certificate/key/client CA in production; and is packaged in development and production Compose. A 2026-09-15 session with a reachable Docker engine found the checked-in image and Compose topology could not actually build or run at all (see item 29): a missing workspace-member copy, a stale MSRV-pinned base image, a 2.2 GB build-context defect, a nested-Tokio-runtime panic on its first real database connection, and a dashboard container crash were all found and fixed, then proven fixed by actually running `docker compose -f infra/compose.dev.yml up` end to end -- PostgreSQL, MinIO, the gRPC service, and the dashboard all reported healthy, and the dashboard's live status endpoint confirmed it. This is still a single operator's local Windows Docker Desktop engine, not production container acceptance; TLS, production secrets, and a deployed environment remain external. |
-| REST/WebSocket UI boundary | Partial | A bounded read-only REST API serves all ten workspaces; the earlier local evidence client supports projection-only WebSocket evidence. There is no authenticated privileged write control plane. |
+| REST/WebSocket UI boundary | Partial | A bounded read-only REST API serves all ten workspaces; the earlier local evidence client supports projection-only WebSocket evidence. **Corrected in place 2026-09-25 (item 67).** This row said "There is no authenticated privileged write control plane". That was accurate when written and is now false for the gRPC write path. `SubmitPaperCombo` requires an operator session: password plus mandatory TOTP, a role granting PAPER trading, and one tenant. The REST boundary stays read-only. The desktop's Tauri IPC writes do not authenticate the operator. Centralized approval policy and the separate deployment review remain. |
 | Modular monolith first | Implemented | Crate/package boundaries and the ADR preserve the plan's initial modular-monolith posture. |
 | Live market/broker integration | Implemented inert capital boundary; external review gate | PAPER retains its fixed official-API bridge. `IbkrControlledLiveAdapter` requires signed artifact verification, exact two-reviewer binding, loopback LIVE port, managed secret material, initial broker snapshot, price-protected allow-listed canary limits, and irreversible instance emergency stop. No real LIVE vendor transport, credential, review record, or capital session is configured. |
 
@@ -2551,6 +2551,60 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** Multi-account allocation is gated. The in-run ledger still builds the events,
       and its long-only single-currency figures remain in the artifact, clearly labelled. Proof against
       production-size performance targets remains. No external gate moved.
+
+67. The gRPC write path authenticates and authorizes its operator (2026-09-25, Architecture and Security
+    rows; E3.3a).
+    - **Scope, as the operator decided.** E3.3 is an epic: the documented requirement is "authenticated
+      identities, roles, MFA, CSRF protection, idempotency, approval policy, centralized tamper-evident
+      audit, and separate deployment review". The first whole slice wires the existing, previously
+      unused `core/identity` kernel into `follon-trading-api`'s one write RPC. The REST dashboard stays
+      read-only.
+    - **What is now real.**
+      - `core/identity` gains `import_user` (an Argon2id PHC hash only), role names, a public
+        `hash_new_password` and `totp_code`, and `OperatorDirectory`, a one-tenant document. The
+        directory is refused for a hash that is not Argon2id, a missing or short TOTP secret, an
+        unknown or duplicate role, a duplicate user or email, or an unknown field. Its JSON Schema is
+        `contracts/json-schema/v1/operator-directory.schema.json`, and a test fails if the schema and
+        the struct drift apart.
+      - `follon-admin operator-add` reads the password from a file, stores only its hash, prints a fresh
+        TOTP secret once as an `otpauth://` URI, refuses a tenant mismatch, and replaces the directory
+        atomically.
+      - `follon-trading-api` gains `BeginOperatorLogin`, `CompleteOperatorLogin` (the TOTP step, with
+        replay protection) and `RevokeOperatorSession`. `SubmitPaperCombo` requires
+        `authorization: Bearer <session>` and `Permission::PaperTrade` for the request's tenant. It does
+        so before it reads the intent, the route, or the market data. It is `UNAUTHENTICATED` without a
+        well-formed session and `PERMISSION_DENIED` for a wrong role, tenant, or revoked session.
+      - Startup refuses a PAPER route without an operator directory. It also refuses operator login on a
+        plaintext non-loopback bind. The directory file is read only when it is a regular, bounded
+        file.
+      - One directory serves one tenant, so a route is reachable only by that tenant's operators.
+    - **Attribution.** `PaperComboRiskEvidence` gains `submitted_by`, journaled as a skipped-when-absent
+      extension, so an unattributed journal is byte-identical to before. It survives restart and is
+      returned in the response. An idempotent retry from another operator, or from an unattributed
+      caller, is refused.
+    - **Tests.**
+      - Identity: six new tests, covering the RFC 4648 and RFC 6238 vectors, login, every unsafe record,
+        schema drift, and the enrolment URI.
+      - PAPER: journaling, retry ownership, recovery, and the absent key.
+      - trading-api: four new tests covering every unauthorized caller (none reaches the route), login
+        (wrong password, wrong tenant, wrong code, replayed code), the startup rules, and the file
+        loader. The three existing route tests now log in as a real operator.
+      - CLI: `operator_directory_workflow` provisions two operators, refuses five unsafe additions
+        without touching the file, and logs in with the printed second factor.
+      - Rule 5: 12 of 12 injected defects were caught on the final files. The first pass caught 11. The
+        survivor ignored an unknown role beside a valid one, and a case for it was added.
+    - **Measured result.** The Rust workspace rose from 464 to 476 passed / 0 failed / 3
+      ignored; the final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** Several things remain.
+      - Sessions live only in the server's memory. There is no persisted session store, no CSRF-bearing
+        browser write surface (by design, since REST stays read-only), and no approval policy or
+        four-eyes step on PAPER writes.
+      - The directory's TOTP secrets sit in a file rather than a managed secret store.
+      - The read RPCs remain unauthenticated.
+      - The desktop's Tauri IPC writes do not authenticate the operator.
+      - Kill-switch and LIVE writes have no RPC.
+      - The separate deployment review is external.
+    - This is not a production-readiness claim. No external gate moved.
 
 ## Business-readiness decision
 

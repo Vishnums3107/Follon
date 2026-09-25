@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-25T08:38:28Z  
+**Measured at:** 2026-09-25T09:02:36Z  
 **Branch:** `main`  
-**HEAD:** `330309f` -- feat(market-data): repair quote-stream sequence gaps from a supplied recovery batch -- E3.5 (2026-09-25T13:22:46+05:30)  
-**Uncommitted paths:** 11
+**HEAD:** `251f231` -- feat(backtest): carry advanced-account economics in the main artifact -- E3.1a (2026-09-25T14:09:33+05:30)  
+**Uncommitted paths:** 17
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 464 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 476 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
@@ -446,7 +446,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.1 | **E3.1a done 2026-09-25 (audit item 66):** the main artifact (schema 3) and report carry the advanced-account economics, and the sidecar is gone. **Multi-account allocation is frozen** by `03-roadmap-and-gates.md` until the preceding gates are independently evidenced; the operator chose not to override the gate. | 5.4 |
 | E3.2 | Property/model/fault coverage beyond the ten landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, smart routing, and — since 2026-09-25 — margin valuation and financing accrual, item 64). No named candidate remains; further property coverage is open-ended. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
-| E3.3 | No authenticated privileged *write* control plane; the REST boundary is read-only | Architecture |
+| E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes, kill-switch and LIVE write RPCs, a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
 | E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 
@@ -575,9 +575,20 @@ short — detail belongs in the conformance audit.
 - Rust workspace **463 → 464 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
-- **Next action:** E3.3a (authenticated gRPC write path), then E3.4 (a
-  repository-authored dynamic scan of a local deployment), as the operator
-  decided.
+- Landed **E3.3a**, as the operator decided. `follon-trading-api`'s one write
+  RPC now requires an operator session: an Argon2id password plus a mandatory
+  TOTP from a one-tenant directory, which `follon-admin operator-add`
+  provisions. The session's role must grant PAPER trading in the request's
+  tenant, and it is checked before anything else is read. The PAPER journal
+  records `submitted_by`, and a retry must come from the same operator. A route
+  refuses to start without a directory, and remote plaintext login is refused.
+  12/12 injected defects were caught, after an unknown-role case was added
+  (audit item 67; Architecture row corrected in place).
+- Rust workspace **464 → 476 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green.
+- **Next action:** E3.4, a repository-authored dynamic scan of a local
+  deployment that also exercises the new operator authentication.
 
 ### 2026-09-24 — session 5
 

@@ -15,6 +15,13 @@ use rand_core::{OsRng, RngCore};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+pub mod directory;
+
+pub use directory::{
+    decode_base32, encode_base32, totp_provisioning_uri, OperatorDirectory, OperatorRecord,
+    OPERATOR_DIRECTORY_SCHEMA_VERSION,
+};
+
 const LOGIN_FAILURE_LIMIT: u8 = 5;
 const LOCKOUT_SECONDS: i64 = 15 * 60;
 const MFA_CHALLENGE_SECONDS: i64 = 5 * 60;
@@ -111,6 +118,30 @@ impl Role {
                 Permission::PortfolioRead | Permission::AuditRead
             ),
         }
+    }
+
+    /// Stable lowercase name used in provisioned operator directories.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OrganizationAdmin => "organization_admin",
+            Self::RiskManager => "risk_manager",
+            Self::Trader => "trader",
+            Self::ReadOnly => "read_only",
+            Self::Auditor => "auditor",
+        }
+    }
+
+    /// Parses a stable role name; an unknown name is refused, never defaulted.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::OrganizationAdmin,
+            Self::RiskManager,
+            Self::Trader,
+            Self::ReadOnly,
+            Self::Auditor,
+        ]
+        .into_iter()
+        .find(|role| role.name() == name)
     }
 }
 
@@ -297,6 +328,60 @@ impl IdentityService {
                 tenant_id,
                 password_hash,
                 mfa_secret: None,
+                recovery_code_hashes: BTreeSet::new(),
+                last_accepted_totp_step: None,
+                roles,
+                enabled: true,
+                security_version: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Loads one provisioned user whose password was already hashed offline.
+    ///
+    /// The hash must be an Argon2id PHC string, so a server never holds a
+    /// plaintext password and never accepts a weaker scheme. The same
+    /// identity, email, and role rules as [`Self::create_user`] apply.
+    pub fn import_user(
+        &mut self,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        email: impl Into<String>,
+        password_hash: &str,
+        mfa_secret: Option<Vec<u8>>,
+        roles: BTreeSet<Role>,
+    ) -> Result<(), IdentityError> {
+        let user_id = user_id.into();
+        let tenant_id = tenant_id.into();
+        validate_canonical_id("user_id", &user_id).map_err(|error| IdentityError(error.0))?;
+        validate_canonical_id("tenant_id", &tenant_id).map_err(|error| IdentityError(error.0))?;
+        let normalized_email = normalize_email(&email.into())?;
+        validate_argon2id_hash(password_hash)?;
+        if mfa_secret.as_ref().is_some_and(|secret| secret.len() < 20) {
+            return Err(IdentityError(
+                "TOTP secret must contain at least 160 bits".to_owned(),
+            ));
+        }
+        if roles.is_empty() {
+            return Err(IdentityError("user must have at least one role".to_owned()));
+        }
+        if self.users.contains_key(&user_id)
+            || self
+                .email_index
+                .contains_key(&(tenant_id.clone(), normalized_email.clone()))
+        {
+            return Err(IdentityError("user already exists".to_owned()));
+        }
+        self.email_index
+            .insert((tenant_id.clone(), normalized_email), user_id.clone());
+        self.users.insert(
+            user_id.clone(),
+            UserRecord {
+                user_id,
+                tenant_id,
+                password_hash: password_hash.to_owned(),
+                mfa_secret,
                 recovery_code_hashes: BTreeSet::new(),
                 last_accepted_totp_step: None,
                 roles,
@@ -765,6 +850,22 @@ fn validate_password(password: &str) -> Result<(), IdentityError> {
     Ok(())
 }
 
+/// Validates a new password against the policy and returns its Argon2id PHC
+/// hash, for provisioning a user offline.
+pub fn hash_new_password(password: &str) -> Result<String, IdentityError> {
+    validate_password(password)?;
+    hash_password(password)
+}
+
+fn validate_argon2id_hash(encoded: &str) -> Result<(), IdentityError> {
+    match PasswordHash::new(encoded) {
+        Ok(hash) if hash.algorithm.as_str() == "argon2id" && hash.hash.is_some() => Ok(()),
+        _ => Err(IdentityError(
+            "password hash must be an Argon2id PHC string".to_owned(),
+        )),
+    }
+}
+
 fn hash_password(password: &str) -> Result<String, IdentityError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -805,7 +906,9 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-fn totp_code(secret: &[u8], epoch_seconds: i64) -> Result<String, IdentityError> {
+/// Returns the RFC 6238 six-digit TOTP code (HMAC-SHA1, 30-second step) for
+/// one secret at one instant, as an authenticator app computes it.
+pub fn totp_code(secret: &[u8], epoch_seconds: i64) -> Result<String, IdentityError> {
     if epoch_seconds < 0 || secret.len() < 20 {
         return Err(authentication_failed());
     }

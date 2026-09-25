@@ -9,7 +9,14 @@ service TradingOperatingSystem {
   rpc PlanExecution(ExecutionPlanRequest) returns (ExecutionPlanResponse);
   rpc PlanPassiveRepricing(PassiveRepricingRequest) returns (PassiveRepricingResponse);
   rpc PlanOptionCombo(OptionComboRequest) returns (OptionComboResponse);
+  // Requires `authorization: Bearer <session>` from CompleteOperatorLogin, for
+  // an operator whose role grants PAPER trading in the request's tenant.
   rpc SubmitPaperCombo(SubmitPaperComboRequest) returns (SubmitPaperComboResponse);
+  // Operator login: password first, then a mandatory TOTP second factor.
+  rpc BeginOperatorLogin(BeginOperatorLoginRequest) returns (BeginOperatorLoginResponse);
+  rpc CompleteOperatorLogin(CompleteOperatorLoginRequest) returns (OperatorSession);
+  // Revokes the bearer session presented in the `authorization` header.
+  rpc RevokeOperatorSession(RevokeOperatorSessionRequest) returns (RevokeOperatorSessionResponse);
   rpc EvaluatePortfolioRisk(PortfolioRiskRequest) returns (PortfolioRiskResponse);
   rpc ValueMarginAccount(MarginAccountRequest) returns (MarginAccountResponse);
 }
@@ -212,6 +219,35 @@ message SubmitPaperComboResponse {
   string policy_version = 4;
   optional string order_id = 5;
   OmsOrderState state = 6;
+  // The authenticated operator the PAPER journal records as the submitter.
+  string submitted_by = 7;
+}
+
+message BeginOperatorLoginRequest {
+  string tenant_id = 1;
+  string email = 2;
+  string password = 3;
+}
+
+message BeginOperatorLoginResponse {
+  string challenge_token = 1;
+  int64 expires_at_epoch_seconds = 2;
+}
+
+message CompleteOperatorLoginRequest {
+  string challenge_token = 1;
+  string totp_code = 2;
+}
+
+message OperatorSession {
+  string session_token = 1;
+  int64 expires_at_epoch_seconds = 2;
+}
+
+message RevokeOperatorSessionRequest {}
+
+message RevokeOperatorSessionResponse {
+  bool revoked = 1;
 }
 
 message BucketLimit {

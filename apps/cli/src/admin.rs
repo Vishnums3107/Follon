@@ -19,6 +19,7 @@ use follon_commercial::{
     PrivacyRequestKind, ReleaseSignature, SelfHostConfig, SubscriptionObservation,
     TenantProvisioning, TrustedReleaseKey,
 };
+use follon_identity::{totp_provisioning_uri, OperatorDirectory, Role};
 use serde::Deserialize;
 
 const COMMERCIAL_INPUT_SCHEMA_VERSION: u32 = 1;
@@ -44,10 +45,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "release-verify" => release_verify(&arguments[1..]),
         "self-host-validate" => self_host_validate(&arguments[1..]),
         "self-host-readiness" => self_host_readiness(&arguments[1..]),
+        "operator-add" => operator_add(&arguments[1..]),
         command => {
             Err(format!("unsupported follon-admin command: {command}\n\n{}", usage()).into())
         }
     }
+}
+
+/// Adds one operator to a tenant's operator directory, which the trading API
+/// loads to authorize write RPCs.
+///
+/// The password is read from a file, never from the command line, and only
+/// its Argon2id hash is stored. A fresh TOTP secret is printed once for
+/// enrolment in an authenticator; it cannot be shown again. The directory is
+/// replaced atomically, so a failed run leaves the previous one intact.
+fn operator_add(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let directory_path = PathBuf::from(required_option(arguments, "--directory")?);
+    let tenant_id = required_option(arguments, "--tenant-id")?;
+    let user_id = required_option(arguments, "--user-id")?;
+    let email = required_option(arguments, "--email")?;
+    let role_names = required_option(arguments, "--roles")?;
+    let password_path = PathBuf::from(required_option(arguments, "--password-file")?);
+    reject_unexpected(
+        arguments,
+        &[],
+        &[
+            "--directory",
+            "--tenant-id",
+            "--user-id",
+            "--email",
+            "--roles",
+            "--password-file",
+        ],
+    )?;
+    let roles = role_names
+        .split(',')
+        .map(|name| Role::from_name(name).ok_or_else(|| format!("unknown role: {name}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let password = fs::read_to_string(&password_path)
+        .map_err(|error| format!("cannot read --password-file: {error}"))?;
+    let password = password.trim_end_matches(['\r', '\n']);
+    let mut directory = if directory_path.exists() {
+        let directory = OperatorDirectory::parse(&fs::read_to_string(&directory_path)?)?;
+        if directory.tenant_id != tenant_id {
+            return Err(format!(
+                "the directory serves tenant {}, not {tenant_id}",
+                directory.tenant_id
+            )
+            .into());
+        }
+        directory
+    } else {
+        OperatorDirectory::new(tenant_id)?
+    };
+    let secret = directory.add_operator(user_id, email, password, &roles)?;
+    ensure_parent(&directory_path)?;
+    let staging = directory_path.with_extension(format!("{}.tmp", std::process::id()));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(directory.to_json()?.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&staging, &directory_path).inspect_err(|_| {
+        let _ = fs::remove_file(&staging);
+    })?;
+    println!("operator={user_id}");
+    println!("tenant={}", directory.tenant_id);
+    println!(
+        "totp_uri={}",
+        totp_provisioning_uri(
+            "Follon",
+            &format!("{}/{user_id}", directory.tenant_id),
+            &secret
+        )
+    );
+    eprintln!("enrol the TOTP URI in an authenticator now; this command does not print it again, and the directory file is secret material");
+    Ok(())
 }
 
 fn provision(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -618,7 +694,7 @@ fn reject_option_only_arguments(
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  follon-admin provision <provisioning.json> --ledger <ledger.ndjson> --event-id <id> --actor <id>\n  follon-admin subscription <subscription.json> --ledger <ledger.ndjson> --event-id <id> --actor <id> --observed-at <UTC>\n  follon-admin entitlement <tenant-id> --ledger <ledger.ndjson> --as-of <UTC>\n  follon-admin retention-plan <inventory.json> --data-root <directory> --tenant-id <id> --as-of <UTC> --output <plan.json>\n  follon-admin privacy-plan <inventory.json> <privacy-request.json> --data-root <directory> --as-of <UTC> --output <plan.json>\n  follon-admin retention-execute <plan.json> --data-root <directory> --asset-id <id> --confirm-plan-hash <sha256> --executed-at <UTC> --actor <id> --receipt <receipt.json>\n  follon-admin release-manifest --release-id <id> --version <version> --created-at <UTC> --source-revision <git-sha> --sbom-sha256 <sha256> --artifacts-root <directory> --artifact <artifact_id=relative_path> [--artifact <artifact_id=relative_path>] --output <manifest.json>\n  follon-admin release-keygen --key-id <id> --private-key <new.pk8> --trusted-key <trusted-key.json>\n  follon-admin release-sign <manifest.json> --private-key <key.pk8> --key-id <id> --signed-at <UTC> --output <signature.json>\n  follon-admin release-verify <manifest.json> <signature.json> <trusted-key.json> --artifacts-root <directory>\n  follon-admin self-host-validate <self-host.json>\n  follon-admin self-host-readiness <self-host.json> <manifest.json> <signature.json> <trusted-key.json> --artifacts-root <directory> --ledger <ledger.ndjson> --as-of <UTC> --output <readiness.json>"
+    "Usage:\n  follon-admin provision <provisioning.json> --ledger <ledger.ndjson> --event-id <id> --actor <id>\n  follon-admin subscription <subscription.json> --ledger <ledger.ndjson> --event-id <id> --actor <id> --observed-at <UTC>\n  follon-admin entitlement <tenant-id> --ledger <ledger.ndjson> --as-of <UTC>\n  follon-admin retention-plan <inventory.json> --data-root <directory> --tenant-id <id> --as-of <UTC> --output <plan.json>\n  follon-admin privacy-plan <inventory.json> <privacy-request.json> --data-root <directory> --as-of <UTC> --output <plan.json>\n  follon-admin retention-execute <plan.json> --data-root <directory> --asset-id <id> --confirm-plan-hash <sha256> --executed-at <UTC> --actor <id> --receipt <receipt.json>\n  follon-admin release-manifest --release-id <id> --version <version> --created-at <UTC> --source-revision <git-sha> --sbom-sha256 <sha256> --artifacts-root <directory> --artifact <artifact_id=relative_path> [--artifact <artifact_id=relative_path>] --output <manifest.json>\n  follon-admin release-keygen --key-id <id> --private-key <new.pk8> --trusted-key <trusted-key.json>\n  follon-admin release-sign <manifest.json> --private-key <key.pk8> --key-id <id> --signed-at <UTC> --output <signature.json>\n  follon-admin release-verify <manifest.json> <signature.json> <trusted-key.json> --artifacts-root <directory>\n  follon-admin self-host-validate <self-host.json>\n  follon-admin operator-add --directory <operators.json> --tenant-id <id> --user-id <id> --email <address> --roles <role[,role]> --password-file <file>\n  follon-admin self-host-readiness <self-host.json> <manifest.json> <signature.json> <trusted-key.json> --artifacts-root <directory> --ledger <ledger.ndjson> --as-of <UTC> --output <readiness.json>"
 }
 
 fn print_usage() {

@@ -10,6 +10,7 @@ authors.workspace = true
 follon-accounting = { path = "../../core/accounting" }
 follon-domain = { path = "../../core/domain" }
 follon-execution = { path = "../../core/execution" }
+follon-identity = { path = "../../core/identity" }
 follon-paper = { path = "../../core/paper" }
 follon-postgres = { path = "../../adapters/persistence/postgres" }
 follon-risk = { path = "../../core/risk" }

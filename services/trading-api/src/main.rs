@@ -1,6 +1,12 @@
 //! Deployed gRPC topology for broker-neutral execution planning, portfolio
 //! risk, multi-currency margin valuation, and configured risk-gated PAPER
 //! combination submission.
+//!
+//! The one write RPC, `SubmitPaperCombo`, requires a bearer session from an
+//! operator in the configured operator directory: password plus a mandatory
+//! TOTP second factor, and a role that grants PAPER trading in the request's
+//! tenant. The directory serves one tenant, so a route is reachable only by
+//! that tenant's operators, and the PAPER journal records who submitted.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -20,6 +26,7 @@ use follon_execution::{
     ChildOrderKind as CoreChildOrderKind, ComboPriceLimit, ExecutionAlgorithm, OptionComboLeg,
     ParentOrder, PassiveMarketObservation, PassiveRepricePolicy,
 };
+use follon_identity::{IdentityService, LoginOutcome, OperatorDirectory, Permission};
 use follon_paper::{
     IbkrPaperAdapter, KillSwitchRegistry, PaperAccount, PaperComboMarketData, PaperMarketData,
     PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
@@ -42,6 +49,10 @@ pub mod api {
 
 use api::trading_operating_system_server::{TradingOperatingSystem, TradingOperatingSystemServer};
 use api::{
+    BeginOperatorLoginRequest, BeginOperatorLoginResponse, CompleteOperatorLoginRequest,
+    OperatorSession, RevokeOperatorSessionRequest, RevokeOperatorSessionResponse,
+};
+use api::{
     BucketLimit, CancelReplaceInstruction, ChildInstruction, ChildOrderKind, ComboLegInstruction,
     ComboPriceLimitKind, CurrencyAmount, ExecutionAlgorithmKind, ExecutionPlanRequest,
     ExecutionPlanResponse, ExecutionSide, HealthRequest, HealthResponse, MarginAccountRequest,
@@ -52,12 +63,58 @@ use api::{
 };
 
 type PaperComboRoute = Arc<Mutex<PaperTradingService<IbkrPaperAdapter>>>;
+type OperatorIdentity = Arc<Mutex<IdentityService>>;
 
 #[derive(Clone)]
 struct OperatingSystemService {
     database: Option<Arc<Mutex<PostgresStore>>>,
     paper_combo_route: Option<PaperComboRoute>,
+    /// Operators allowed to call write RPCs; `None` refuses every write.
+    identity: Option<OperatorIdentity>,
     transport_tls: bool,
+}
+
+impl OperatingSystemService {
+    fn identity(&self) -> Result<std::sync::MutexGuard<'_, IdentityService>, Status> {
+        self.identity
+            .as_ref()
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "operator identity is not configured; no write is accepted",
+                )
+            })?
+            .lock()
+            .map_err(|_| Status::internal("operator identity lock poisoned"))
+    }
+}
+
+/// The opaque session token from `authorization: Bearer <token>`. Anything
+/// else is refused before the request body is even read.
+fn bearer_token<T>(request: &Request<T>) -> Result<String, Status> {
+    let malformed = || Status::unauthenticated("a bearer operator session is required");
+    let header = request
+        .metadata()
+        .get("authorization")
+        .ok_or_else(malformed)?
+        .to_str()
+        .map_err(|_| malformed())?;
+    let token = header.strip_prefix("Bearer ").ok_or_else(malformed)?;
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(malformed());
+    }
+    Ok(token.to_owned())
+}
+
+fn now_epoch_seconds() -> Result<i64, Status> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .ok_or_else(|| Status::internal("system clock is before the Unix epoch"))
 }
 
 #[tonic::async_trait]
@@ -257,8 +314,20 @@ impl TradingOperatingSystem for OperatingSystemService {
         &self,
         request: Request<SubmitPaperComboRequest>,
     ) -> Result<Response<SubmitPaperComboResponse>, Status> {
+        let token = bearer_token(&request)?;
         let request = request.into_inner();
         validate_tenant(&request.tenant_id)?;
+        // Authorization precedes every other check, so an unauthorized caller
+        // learns nothing about the route, the intent, or the market data.
+        let operator = self
+            .identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::PaperTrade,
+                now_epoch_seconds()?,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
         let intent = paper_combo_intent(&request)?;
         let market = paper_combo_market(&request.observations)?;
         let route = self.paper_combo_route.as_ref().ok_or_else(|| {
@@ -270,7 +339,7 @@ impl TradingOperatingSystem for OperatingSystemService {
             .lock()
             .map_err(|_| Status::internal("PAPER combination route lock poisoned"))?;
         let outcome = service
-            .submit_combo_intent(intent, market, &request.decided_at)
+            .submit_combo_intent_as(intent, market, &request.decided_at, Some(&operator.user_id))
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         Ok(Response::new(SubmitPaperComboResponse {
             decision_id: outcome.decision.decision_id,
@@ -282,7 +351,70 @@ impl TradingOperatingSystem for OperatingSystemService {
                 .state
                 .map(oms_order_state)
                 .unwrap_or(OmsOrderState::Unspecified) as i32,
+            submitted_by: operator.user_id,
         }))
+    }
+
+    async fn begin_operator_login(
+        &self,
+        request: Request<BeginOperatorLoginRequest>,
+    ) -> Result<Response<BeginOperatorLoginResponse>, Status> {
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let mut identity = self.identity()?;
+        let outcome = identity
+            .begin_login(
+                &request.tenant_id,
+                &request.email,
+                &request.password,
+                now_epoch_seconds()?,
+            )
+            .map_err(|_| Status::unauthenticated("authentication failed"))?;
+        match outcome {
+            LoginOutcome::MfaRequired {
+                challenge_token,
+                expires_at_epoch_seconds,
+            } => Ok(Response::new(BeginOperatorLoginResponse {
+                challenge_token,
+                expires_at_epoch_seconds,
+            })),
+            // The directory refuses an operator without TOTP, so this cannot
+            // happen; if it ever does, the session is revoked, never issued.
+            LoginOutcome::Authenticated(session) => {
+                identity.revoke_session(&session.token);
+                Err(Status::failed_precondition(
+                    "operator login requires a second factor",
+                ))
+            }
+        }
+    }
+
+    async fn complete_operator_login(
+        &self,
+        request: Request<CompleteOperatorLoginRequest>,
+    ) -> Result<Response<OperatorSession>, Status> {
+        let request = request.into_inner();
+        let session = self
+            .identity()?
+            .complete_totp(
+                &request.challenge_token,
+                &request.totp_code,
+                now_epoch_seconds()?,
+            )
+            .map_err(|_| Status::unauthenticated("authentication failed"))?;
+        Ok(Response::new(OperatorSession {
+            session_token: session.token,
+            expires_at_epoch_seconds: session.expires_at_epoch_seconds,
+        }))
+    }
+
+    async fn revoke_operator_session(
+        &self,
+        request: Request<RevokeOperatorSessionRequest>,
+    ) -> Result<Response<RevokeOperatorSessionResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let revoked = self.identity()?.revoke_session(&token);
+        Ok(Response::new(RevokeOperatorSessionResponse { revoked }))
     }
 
     async fn evaluate_portfolio_risk(
@@ -683,6 +815,7 @@ struct RuntimeConfig {
     database_url: Option<String>,
     database_ca: Option<PathBuf>,
     paper_command_route: Option<PathBuf>,
+    operator_directory: Option<PathBuf>,
     tls_certificate: Option<PathBuf>,
     tls_private_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
@@ -702,6 +835,7 @@ impl RuntimeConfig {
             database_url: database_url(production)?,
             database_ca: env_path("FOLLON_DATABASE_CA"),
             paper_command_route: env_path("FOLLON_TRADING_API_PAPER_CONFIG"),
+            operator_directory: env_path("FOLLON_TRADING_API_OPERATOR_DIRECTORY"),
             tls_certificate: env_path("FOLLON_GRPC_TLS_CERTIFICATE"),
             tls_private_key: env_path("FOLLON_GRPC_TLS_PRIVATE_KEY"),
             tls_client_ca: env_path("FOLLON_GRPC_TLS_CLIENT_CA"),
@@ -725,7 +859,25 @@ impl RuntimeConfig {
             return Err("production PostgreSQL URL must require TLS".to_owned());
         }
         config.validate_paper_command_route_transport()?;
+        config.validate_operator_authentication()?;
         Ok(config)
+    }
+
+    /// A PAPER route accepts writes only from authenticated operators, and
+    /// operator passwords never cross a plaintext non-loopback transport.
+    fn validate_operator_authentication(&self) -> Result<(), String> {
+        if self.paper_command_route.is_some() && self.operator_directory.is_none() {
+            return Err(
+                "a PAPER command route requires FOLLON_TRADING_API_OPERATOR_DIRECTORY".to_owned(),
+            );
+        }
+        if self.operator_directory.is_some()
+            && !self.bind.ip().is_loopback()
+            && tls_identity_paths(self).is_none()
+        {
+            return Err("operator login off loopback requires server TLS".to_owned());
+        }
+        Ok(())
     }
 
     fn validate_paper_command_route_transport(&self) -> Result<(), String> {
@@ -810,6 +962,26 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
         &document.journal_path,
     )
     .map_err(|error| format!("PAPER command-route service: {error}"))?;
+    Ok(Arc::new(Mutex::new(service)))
+}
+
+/// Loads the operator directory from a regular, bounded file. It holds TOTP
+/// secrets, so it is read like the PostgreSQL URL file: never through a
+/// symbolic link and never beyond a fixed size.
+fn operator_identity_from_path(path: &Path) -> Result<OperatorIdentity, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect operator directory: {error}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1_048_576
+    {
+        return Err("operator directory file is unsafe or oversized".to_owned());
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read operator directory: {error}"))?;
+    let service = OperatorDirectory::parse(&contents)
+        .and_then(|directory| directory.identity_service())
+        .map_err(|error| format!("invalid operator directory: {error}"))?;
     Ok(Arc::new(Mutex::new(service)))
 }
 
@@ -916,10 +1088,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(paper_combo_route_from_path)
         .transpose()
         .map_err(std::io::Error::other)?;
+    let identity = config
+        .operator_directory
+        .as_deref()
+        .map(operator_identity_from_path)
+        .transpose()
+        .map_err(std::io::Error::other)?;
     let transport_tls = tls_identity_paths(&config).is_some();
     let service = OperatingSystemService {
         database,
         paper_combo_route: paper_combo_route.clone(),
+        identity: identity.clone(),
         transport_tls,
     };
     let mut server = Server::builder();
@@ -938,11 +1117,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.tls_config(tls)?;
     }
     eprintln!(
-        "follon-trading-api listening on {} (tls={}, production={}, paper_combo_route={})",
+        "follon-trading-api listening on {} (tls={}, production={}, paper_combo_route={}, operator_identity={})",
         config.bind,
         transport_tls,
         config.production,
-        paper_combo_route.is_some()
+        paper_combo_route.is_some(),
+        identity.is_some()
     );
     server
         .add_service(TradingOperatingSystemServer::new(service))
@@ -956,16 +1136,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use follon_identity::{totp_code, Role};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
 
     static PAPER_ROUTE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+    const OPERATOR_PASSWORD: &str = "Correct-Horse-9-Battery";
+
+    struct TestDirectory {
+        json: String,
+        trader_secret: Vec<u8>,
+        viewer_secret: Vec<u8>,
+    }
+
+    /// One trader and one read-only operator, hashed once per test binary
+    /// because Argon2id is deliberately slow.
+    fn test_directory() -> &'static TestDirectory {
+        static DIRECTORY: OnceLock<TestDirectory> = OnceLock::new();
+        DIRECTORY.get_or_init(|| {
+            let mut directory = OperatorDirectory::new("tenant.alpha").unwrap();
+            let trader_secret = directory
+                .add_operator(
+                    "user.trader",
+                    "trader@example.com",
+                    OPERATOR_PASSWORD,
+                    &[Role::Trader],
+                )
+                .unwrap();
+            let viewer_secret = directory
+                .add_operator(
+                    "user.viewer",
+                    "viewer@example.com",
+                    OPERATOR_PASSWORD,
+                    &[Role::ReadOnly],
+                )
+                .unwrap();
+            TestDirectory {
+                json: directory.to_json().unwrap(),
+                trader_secret,
+                viewer_secret,
+            }
+        })
+    }
+
+    fn operator_identity() -> OperatorIdentity {
+        Arc::new(Mutex::new(
+            OperatorDirectory::parse(&test_directory().json)
+                .unwrap()
+                .identity_service()
+                .unwrap(),
+        ))
+    }
 
     fn service() -> OperatingSystemService {
         OperatingSystemService {
             database: None,
             paper_combo_route: None,
+            identity: None,
             transport_tls: false,
         }
+    }
+
+    fn authorized<T>(message: T, token: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        request
+    }
+
+    async fn login(service: &OperatingSystemService, email: &str, secret: &[u8]) -> String {
+        let challenge = service
+            .begin_operator_login(Request::new(BeginOperatorLoginRequest {
+                tenant_id: "tenant.alpha".to_owned(),
+                email: email.to_owned(),
+                password: OPERATOR_PASSWORD.to_owned(),
+            }))
+            .await
+            .expect("password step")
+            .into_inner();
+        service
+            .complete_operator_login(Request::new(CompleteOperatorLoginRequest {
+                challenge_token: challenge.challenge_token,
+                totp_code: totp_code(secret, now_epoch_seconds().unwrap()).unwrap(),
+            }))
+            .await
+            .expect("second factor")
+            .into_inner()
+            .session_token
+    }
+
+    async fn trader_token(service: &OperatingSystemService) -> String {
+        login(
+            service,
+            "trader@example.com",
+            &test_directory().trader_secret,
+        )
+        .await
     }
 
     fn configured_paper_service(name: &str) -> (OperatingSystemService, PaperComboRoute, PathBuf) {
@@ -1010,6 +1278,7 @@ mod tests {
             OperatingSystemService {
                 database: None,
                 paper_combo_route: Some(route.clone()),
+                identity: Some(operator_identity()),
                 transport_tls: false,
             },
             route,
@@ -1076,6 +1345,7 @@ mod tests {
             database_url: None,
             database_ca: None,
             paper_command_route: None,
+            operator_directory: None,
             tls_certificate: None,
             tls_private_key: None,
             tls_client_ca: None,
@@ -1120,6 +1390,7 @@ mod tests {
         let service = OperatingSystemService {
             database: None,
             paper_combo_route: None,
+            identity: None,
             transport_tls,
         };
         let response = service
@@ -1240,14 +1511,16 @@ mod tests {
     #[tokio::test]
     async fn paper_combo_rpc_persists_one_risk_gated_atomic_order() {
         let (service, route, scratch) = configured_paper_service("submit");
+        let token = trader_token(&service).await;
         let request = paper_combo_request("intent.grpc.paper.combo.1");
         let response = service
-            .submit_paper_combo(Request::new(request.clone()))
+            .submit_paper_combo(authorized(request.clone(), &token))
             .await
             .expect("risk-gated submission")
             .into_inner();
 
         assert!(response.approved);
+        assert_eq!(response.submitted_by, "user.trader");
         assert_eq!(response.reason_codes, ["APPROVED"]);
         assert_eq!(response.policy_version, "risk.grpc.paper.v1");
         assert_eq!(response.state, OmsOrderState::Acknowledged as i32);
@@ -1258,10 +1531,14 @@ mod tests {
             assert_eq!(order.oms.intent.intent_id, request.intent_id);
             assert_eq!(order.oms.intent.legs.len(), 2);
             assert_eq!(order.oms.state, OrderState::Acknowledged);
+            let evidence = paper
+                .combo_risk_evidence(&response.decision_id)
+                .expect("journaled risk evidence");
+            assert_eq!(evidence.submitted_by.as_deref(), Some("user.trader"));
         }
 
         let repeated = service
-            .submit_paper_combo(Request::new(request))
+            .submit_paper_combo(authorized(request, &token))
             .await
             .expect("idempotent submission")
             .into_inner();
@@ -1284,10 +1561,11 @@ mod tests {
     #[tokio::test]
     async fn paper_combo_rpc_returns_risk_rejection_without_an_order() {
         let (service, _route, scratch) = configured_paper_service("risk-rejection");
+        let token = trader_token(&service).await;
         let mut request = paper_combo_request("intent.grpc.paper.combo.rejected");
         request.combo_quantity = "101".to_owned();
         let response = service
-            .submit_paper_combo(Request::new(request))
+            .submit_paper_combo(authorized(request, &token))
             .await
             .expect("risk decision")
             .into_inner();
@@ -1305,10 +1583,11 @@ mod tests {
     #[tokio::test]
     async fn paper_combo_rpc_refuses_incomplete_per_leg_market_evidence() {
         let (service, _route, scratch) = configured_paper_service("missing-mark");
+        let token = trader_token(&service).await;
         let mut request = paper_combo_request("intent.grpc.paper.combo.missing.mark");
         request.observations.pop();
         let error = service
-            .submit_paper_combo(Request::new(request))
+            .submit_paper_combo(authorized(request, &token))
             .await
             .expect_err("every leg requires independent market evidence");
 
@@ -1320,14 +1599,235 @@ mod tests {
 
     #[tokio::test]
     async fn paper_combo_rpc_fails_closed_without_a_configured_route() {
-        let error = service()
-            .submit_paper_combo(Request::new(paper_combo_request(
-                "intent.grpc.paper.combo.unconfigured",
-            )))
+        let mut service = service();
+        service.identity = Some(operator_identity());
+        let token = trader_token(&service).await;
+        let error = service
+            .submit_paper_combo(authorized(
+                paper_combo_request("intent.grpc.paper.combo.unconfigured"),
+                &token,
+            ))
             .await
             .expect_err("unconfigured route must not act like planning success");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn paper_combo_rpc_refuses_every_unauthenticated_or_unauthorized_caller() {
+        let (service, route, scratch) = configured_paper_service("unauthorized");
+        let intent_id = "intent.grpc.paper.combo.unauthorized";
+        let request = || paper_combo_request(intent_id);
+        let code = |result: Result<Response<SubmitPaperComboResponse>, Status>| {
+            result.expect_err("the write must be refused").code()
+        };
+
+        // No session, a non-bearer scheme, and a malformed token never reach
+        // the identity service.
+        assert_eq!(
+            code(service.submit_paper_combo(Request::new(request())).await),
+            tonic::Code::Unauthenticated
+        );
+        for header in ["Basic dXNlcjpwYXNz", "Bearer not-a-token", "bearer 00"] {
+            let mut unauthenticated = Request::new(request());
+            unauthenticated
+                .metadata_mut()
+                .insert("authorization", header.parse().unwrap());
+            assert_eq!(
+                code(service.submit_paper_combo(unauthenticated).await),
+                tonic::Code::Unauthenticated,
+                "{header}"
+            );
+        }
+        // A well-formed token nobody issued.
+        assert_eq!(
+            code(
+                service
+                    .submit_paper_combo(authorized(request(), &"ab".repeat(32)))
+                    .await
+            ),
+            tonic::Code::PermissionDenied
+        );
+        // A real session whose role cannot trade.
+        let viewer = login(
+            &service,
+            "viewer@example.com",
+            &test_directory().viewer_secret,
+        )
+        .await;
+        assert_eq!(
+            code(
+                service
+                    .submit_paper_combo(authorized(request(), &viewer))
+                    .await
+            ),
+            tonic::Code::PermissionDenied
+        );
+        // A trader's session presented for another tenant.
+        let trader = trader_token(&service).await;
+        let mut other_tenant = request();
+        other_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            code(
+                service
+                    .submit_paper_combo(authorized(other_tenant, &trader))
+                    .await
+            ),
+            tonic::Code::PermissionDenied
+        );
+        // A revoked session.
+        let revoked = service
+            .revoke_operator_session(authorized(RevokeOperatorSessionRequest {}, &trader))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(revoked.revoked);
+        assert_eq!(
+            code(
+                service
+                    .submit_paper_combo(authorized(request(), &trader))
+                    .await
+            ),
+            tonic::Code::PermissionDenied
+        );
+        // None of these reached the PAPER route.
+        let paper = route.lock().unwrap();
+        assert!(paper
+            .combo_order(&format!("combo-order-{intent_id}"))
+            .is_none());
+        assert!(paper
+            .combo_risk_evidence(&format!("paper-combo-risk-{intent_id}"))
+            .is_none());
+        drop(paper);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn operator_login_requires_the_password_and_a_fresh_second_factor() {
+        let mut service = service();
+        assert_eq!(
+            service
+                .begin_operator_login(Request::new(BeginOperatorLoginRequest {
+                    tenant_id: "tenant.alpha".to_owned(),
+                    email: "trader@example.com".to_owned(),
+                    password: OPERATOR_PASSWORD.to_owned(),
+                }))
+                .await
+                .expect_err("no directory, no login")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        service.identity = Some(operator_identity());
+        let begin = |password: &str, tenant: &str| BeginOperatorLoginRequest {
+            tenant_id: tenant.to_owned(),
+            email: "trader@example.com".to_owned(),
+            password: password.to_owned(),
+        };
+        for (password, tenant) in [
+            ("Wrong-Horse-9-Battery", "tenant.alpha"),
+            (OPERATOR_PASSWORD, "tenant.beta"),
+        ] {
+            assert_eq!(
+                service
+                    .begin_operator_login(Request::new(begin(password, tenant)))
+                    .await
+                    .expect_err("password step must fail")
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+        }
+        let challenge = |service: &OperatingSystemService| {
+            let service = service.clone();
+            async move {
+                service
+                    .begin_operator_login(Request::new(begin(OPERATOR_PASSWORD, "tenant.alpha")))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .challenge_token
+            }
+        };
+        let complete = |token: String, code: String| CompleteOperatorLoginRequest {
+            challenge_token: token,
+            totp_code: code,
+        };
+        let now = now_epoch_seconds().unwrap();
+        let good = totp_code(&test_directory().trader_secret, now).unwrap();
+        let wrong = format!("{:06}", (good.parse::<u32>().unwrap() + 1) % 1_000_000);
+        assert_eq!(
+            service
+                .complete_operator_login(Request::new(complete(challenge(&service).await, wrong)))
+                .await
+                .expect_err("a wrong code must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let session = service
+            .complete_operator_login(Request::new(complete(
+                challenge(&service).await,
+                good.clone(),
+            )))
+            .await
+            .expect("the right code logs in")
+            .into_inner();
+        assert_eq!(session.session_token.len(), 64);
+        // The same code cannot mint a second session.
+        assert_eq!(
+            service
+                .complete_operator_login(Request::new(complete(challenge(&service).await, good)))
+                .await
+                .expect_err("a replayed code must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn a_paper_route_requires_an_operator_directory_and_remote_login_requires_tls() {
+        let mut config = base_config();
+        config.paper_command_route = Some(PathBuf::from("paper-route.json"));
+        assert!(config.validate_operator_authentication().is_err());
+        config.operator_directory = Some(PathBuf::from("operators.json"));
+        assert!(config.validate_operator_authentication().is_ok());
+
+        config.paper_command_route = None;
+        config.bind = "0.0.0.0:50051".parse().expect("remote bind");
+        assert!(config.validate_operator_authentication().is_err());
+        config.tls_certificate = Some(PathBuf::from("server.pem"));
+        config.tls_private_key = Some(PathBuf::from("server-key.pem"));
+        assert!(config.validate_operator_authentication().is_ok());
+    }
+
+    #[test]
+    fn the_operator_directory_file_loads_only_when_safe_and_valid() {
+        let sequence = PAPER_ROUTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let scratch = std::env::temp_dir().join(format!(
+            "follon-trading-api-operators-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let valid = scratch.join("operators.json");
+        std::fs::write(&valid, &test_directory().json).unwrap();
+        assert!(operator_identity_from_path(&valid).is_ok());
+
+        let tampered = scratch.join("tampered.json");
+        let mut directory = OperatorDirectory::parse(&test_directory().json).unwrap();
+        directory.operators[0].totp_secret_base32 = "MZXW6YTBOI".to_owned();
+        std::fs::write(&tampered, serde_json::to_string(&directory).unwrap()).unwrap();
+        assert!(operator_identity_from_path(&tampered).is_err());
+
+        let garbage = scratch.join("garbage.json");
+        std::fs::write(&garbage, "{").unwrap();
+        assert!(operator_identity_from_path(&garbage).is_err());
+        assert!(
+            operator_identity_from_path(&scratch).is_err(),
+            "a directory is not a file"
+        );
+        assert!(operator_identity_from_path(&scratch.join("missing.json")).is_err());
+        let _ = std::fs::remove_dir_all(scratch);
     }
 }

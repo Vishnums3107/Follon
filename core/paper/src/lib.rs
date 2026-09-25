@@ -1781,6 +1781,9 @@ pub struct PaperComboRiskEvidence {
     pub decision: RiskDecision,
     /// The exact validated per-leg observation evaluated by risk.
     pub market: PaperComboMarketData,
+    /// The authenticated operator who submitted the combination, when it
+    /// arrived through an authenticated route; `None` for a direct caller.
+    pub submitted_by: Option<String>,
 }
 
 /// Immutable record of the decision and exact market observation that produced it.
@@ -2126,6 +2129,9 @@ struct PersistentComboRiskEvidence {
     actor: String,
     evaluated_limits: String,
     market: Vec<PersistentMarketData>,
+    /// Versioned extension; absence retains the exact pre-E3.3a serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submitted_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2766,7 +2772,24 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         market: PaperComboMarketData,
         decided_at: &str,
     ) -> Result<PaperSubmitOutcome, PaperError> {
+        self.submit_combo_intent_as(intent, market, decided_at, None)
+    }
+
+    /// Submits a combination on behalf of an authenticated operator, whose
+    /// identity is journaled with the risk evidence. An idempotent retry must
+    /// come from the same submitter, so one operator cannot claim, or replay
+    /// as their own, another operator's order.
+    pub fn submit_combo_intent_as(
+        &mut self,
+        intent: ComboIntent,
+        market: PaperComboMarketData,
+        decided_at: &str,
+        submitted_by: Option<&str>,
+    ) -> Result<PaperSubmitOutcome, PaperError> {
         self.ensure_persistence_healthy()?;
+        if let Some(operator) = submitted_by {
+            validate_canonical_id("paper combo submitted_by", operator)?;
+        }
         intent.validate()?;
         validate_utc_timestamp("paper combo risk decision time", decided_at)?;
         market.validate_for(&intent)?;
@@ -2809,6 +2832,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                         .to_owned(),
                 ));
             }
+            if evidence.submitted_by.as_deref() != submitted_by {
+                return Err(PaperError(
+                    "paper combination retry must come from the original submitter".to_owned(),
+                ));
+            }
             return Ok(PaperSubmitOutcome {
                 decision: evidence.decision.clone(),
                 order_id: Some(order_id),
@@ -2824,6 +2852,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             intent: intent.clone(),
             decision: decision.clone(),
             market: market.clone(),
+            submitted_by: submitted_by.map(str::to_owned),
         };
         if !decision.approved {
             self.combo_risk_evidence
@@ -6081,6 +6110,7 @@ impl From<&PaperComboRiskEvidence> for PersistentComboRiskEvidence {
                 .iter()
                 .map(PersistentMarketData::from)
                 .collect(),
+            submitted_by: evidence.submitted_by.clone(),
         }
     }
 }
@@ -6091,6 +6121,9 @@ impl TryFrom<PersistentComboRiskEvidence> for PaperComboRiskEvidence {
     fn try_from(evidence: PersistentComboRiskEvidence) -> Result<Self, Self::Error> {
         let intent = ComboIntent::try_from(evidence.intent)?;
         let market = combo_market_from_persisted(evidence.market)?;
+        if let Some(operator) = &evidence.submitted_by {
+            validate_canonical_id("persisted paper combo submitted_by", operator)?;
+        }
         Ok(Self {
             decision: RiskDecision {
                 decision_id: format!("paper-combo-risk-{}", intent.intent_id),
@@ -6105,6 +6138,7 @@ impl TryFrom<PersistentComboRiskEvidence> for PaperComboRiskEvidence {
             },
             intent,
             market,
+            submitted_by: evidence.submitted_by,
         })
     }
 }
@@ -6872,6 +6906,110 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.category == "MISSING_BROKER_ORDER"));
+    }
+
+    #[test]
+    fn an_authenticated_submitter_is_journaled_and_owns_the_retry() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-{}.ndjson",
+            std::process::id(),
+            "combo-submitted-by"
+        ));
+        let _ = fs::remove_file(&journal_path);
+        let account = account();
+        let open = || {
+            PaperTradingService::open_durable(
+                account.clone(),
+                policy_permitting_shorts(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account).unwrap(),
+                &journal_path,
+            )
+            .unwrap()
+        };
+        let mut service = open();
+        let intent = combo_intent("combo-000027", "2026-01-02T14:30:00Z");
+        let market = combo_market("2026-01-02T14:30:00Z");
+        let decided_at = "2026-01-02T14:30:02Z";
+        let outcome = service
+            .submit_combo_intent_as(
+                intent.clone(),
+                market.clone(),
+                decided_at,
+                Some("user.trader"),
+            )
+            .unwrap();
+        assert!(outcome.decision.approved);
+        let decision_id = outcome.decision.decision_id.clone();
+        assert_eq!(
+            service
+                .combo_risk_evidence(&decision_id)
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        // Neither another operator nor an unattributed caller may claim it.
+        for other in [Some("user.other"), None] {
+            assert!(service
+                .submit_combo_intent_as(intent.clone(), market.clone(), decided_at, other)
+                .is_err());
+        }
+        assert!(service
+            .submit_combo_intent_as(
+                combo_intent("combo-000028", "2026-01-02T14:30:00Z"),
+                market.clone(),
+                decided_at,
+                Some("User Trader"),
+            )
+            .is_err());
+        // The original submitter's retry is the idempotent original.
+        let retry = service
+            .submit_combo_intent_as(intent, market.clone(), decided_at, Some("user.trader"))
+            .unwrap();
+        assert_eq!(retry.order_id, outcome.order_id);
+        // A direct, unattributed submission journals no `submitted_by` key at
+        // all, keeping the earlier serialization byte for byte.
+        service
+            .submit_combo_intent(
+                combo_intent("combo-000029", "2026-01-02T14:30:00Z"),
+                market,
+                decided_at,
+            )
+            .unwrap();
+        drop(service);
+
+        // The attribution survives a restart.
+        let reopened = open();
+        assert_eq!(
+            reopened
+                .combo_risk_evidence(&decision_id)
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        drop(reopened);
+        let journal = fs::read_to_string(&journal_path).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        fn find<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+            match value {
+                serde_json::Value::Object(map) => map
+                    .get(key)
+                    .or_else(|| map.values().find_map(|child| find(child, key))),
+                serde_json::Value::Array(items) => items.iter().find_map(|child| find(child, key)),
+                _ => None,
+            }
+        }
+        let attributed = find(&last, "paper-combo-risk-combo-000027").unwrap();
+        assert_eq!(attributed["submitted_by"], "user.trader");
+        let unattributed = find(&last, "paper-combo-risk-combo-000029").unwrap();
+        assert!(
+            unattributed.get("submitted_by").is_none(),
+            "an unattributed decision must not carry submitted_by"
+        );
+        let _ = fs::remove_file(&journal_path);
     }
 
     #[test]

@@ -293,3 +293,32 @@ boundary and must never be placed in this repository, a container image, or a
 self-host deployment. The [commercial/self-hosting runbook](../../docs/operations/04-commercial-self-hosting-runbook.md)
 and [privacy/retention runbook](../../docs/operations/05-privacy-retention-runbook.md)
 contain the required operating procedure and boundaries.
+
+## Trading API operators
+
+`follon-trading-api` accepts its one write RPC, `SubmitPaperCombo`, only from
+an operator in the directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
+A configured PAPER route refuses to start without one. `follon-admin
+operator-add` provisions each operator:
+
+```powershell
+cargo run -p follon-cli --bin follon-admin -- operator-add --directory operators.json --tenant-id tenant.alpha --user-id user.trader --email trader@example.com --roles trader --password-file password.txt
+```
+
+- The password is read from a file, never the command line, and only its
+  Argon2id hash is stored.
+- A fresh TOTP secret is generated and printed once as an `otpauth://` URI, for
+  enrolment in an authenticator. Every operator must pass this second factor.
+- One directory serves one tenant. Roles are `organization_admin`,
+  `risk_manager`, `trader`, `read_only` and `auditor`; only `trader` grants
+  PAPER trading.
+- A refused addition leaves the directory unchanged, and a successful one
+  replaces it atomically.
+- The directory holds TOTP secrets, so it is secret material: keep it readable
+  only by the service account, as with the PostgreSQL URL file.
+
+A client logs in with `BeginOperatorLogin` (password) and then
+`CompleteOperatorLogin` (TOTP). It sends the returned session as
+`authorization: Bearer <token>`. The PAPER journal records the operator as the
+combination's `submitted_by`. Sessions last 15 minutes, live only in the
+server's memory, and end on restart.
