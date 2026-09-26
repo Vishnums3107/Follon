@@ -16,7 +16,7 @@ use follon_domain::{
     NewsHeadline, OrderIntent, OrderState, OrderStateChange, OrderType, PnlSnapshot,
     PositionSnapshot, RiskDecision, SentimentVector, Side, TimeInForce,
 };
-use follon_instrument::{InstrumentRegistry, TradingCalendar};
+use follon_instrument::{Instrument, InstrumentRegistry, TradingCalendar};
 use follon_news::{
     replay_availability_time_from_unix_ns, replay_time_from_unix_ns, NlpSentimentEngine,
 };
@@ -194,8 +194,9 @@ pub struct MarketPreconditions<'a> {
     pub calendar: &'a dyn TradingCalendar,
 }
 
-impl MarketPreconditions<'_> {
-    fn validate(&self, bar: &Bar, event_time: &str) -> Result<(), EngineError> {
+impl<'a> MarketPreconditions<'a> {
+    /// Returns the bar's effective reference data once its session resolves.
+    fn validate(&self, bar: &Bar, event_time: &str) -> Result<&'a Instrument, EngineError> {
         let version = self
             .instruments
             .resolve(&bar.instrument_id, event_time)
@@ -216,7 +217,7 @@ impl MarketPreconditions<'_> {
                     .to_owned(),
             ));
         }
-        Ok(())
+        Ok(&version.instrument)
     }
 }
 
@@ -1570,16 +1571,68 @@ impl RiskPolicy {
         })
     }
 
-    /// Applies the ordinary pre-trade policy plus explicit news shock collars.
+    /// Applies [`Self::evaluate`] plus the rules PAPER and controlled LIVE
+    /// apply to the instrument's own trading increments (E3.6d), so a replay
+    /// cannot approve an order either environment would refuse. A limit price
+    /// must sit on the tick grid (`LIMIT_PRICE_OFF_TICK_GRID`) and the quantity
+    /// must be a whole number of lots (`ORDER_QUANTITY_OFF_LOT_SIZE`).
+    ///
+    /// `reference` is the instrument's effective-dated reference data at the
+    /// replay time, where PAPER reads an operator-configured table. A replay
+    /// already carries versioned reference data, bound into its dataset
+    /// manifest, so it has no second table to drift out of step with.
+    pub fn evaluate_with_reference(
+        &self,
+        intent: &OrderIntent,
+        bar: &Bar,
+        reference: &Instrument,
+        replay_time: &str,
+    ) -> Result<RiskDecision, EngineError> {
+        let mut decision = self.evaluate(intent, bar, replay_time)?;
+        if reference.instrument_id != intent.instrument_id {
+            return Err(EngineError(
+                "risk reference data instrument does not match the intent".to_owned(),
+            ));
+        }
+        if reference.tick_size <= Decimal::ZERO || reference.lot_size <= Decimal::ZERO {
+            return Err(EngineError(
+                "instrument reference data has a non-positive tick or lot size".to_owned(),
+            ));
+        }
+        let mut reasons = std::mem::take(&mut decision.reason_codes);
+        reasons.retain(|reason| reason != "APPROVED");
+        if intent
+            .limit_price
+            .is_some_and(|price| !is_whole_multiple(price, reference.tick_size))
+        {
+            reasons.push("LIMIT_PRICE_OFF_TICK_GRID".to_owned());
+        }
+        if !is_whole_multiple(intent.quantity, reference.lot_size) {
+            reasons.push("ORDER_QUANTITY_OFF_LOT_SIZE".to_owned());
+        }
+        decision.approved = reasons.is_empty();
+        if decision.approved {
+            reasons.push("APPROVED".to_owned());
+        }
+        decision.reason_codes = reasons;
+        decision.evaluated_limits.push_str(&format!(
+            ",instrument_tick_size={},instrument_lot_size={}",
+            reference.tick_size, reference.lot_size,
+        ));
+        Ok(decision)
+    }
+
+    /// Applies [`Self::evaluate_with_reference`] plus explicit news shock collars.
     pub fn evaluate_news(
         &self,
         intent: &OrderIntent,
         bar: &Bar,
+        reference: &Instrument,
         replay_time: &str,
         shock: &NewsShockContext,
     ) -> Result<RiskDecision, EngineError> {
         shock.validate()?;
-        let mut decision = self.evaluate(intent, bar, replay_time)?;
+        let mut decision = self.evaluate_with_reference(intent, bar, reference, replay_time)?;
         let requested_price = intent.limit_price.unwrap_or(bar.close);
         let news_slippage_bps =
             price_deviation_bps(shock.pre_headline_reference_price, requested_price)?;
@@ -1623,6 +1676,14 @@ impl RiskPolicy {
         ));
         Ok(decision)
     }
+}
+
+/// Whether `value` is an exact whole multiple of a positive `increment`.
+///
+/// Both are fixed-point with the same scale, so their scaled integers divide
+/// exactly when the decimals do. A non-positive increment has no multiples.
+fn is_whole_multiple(value: Decimal, increment: Decimal) -> bool {
+    increment > Decimal::ZERO && value.scaled() % increment.scaled() == 0
 }
 
 /// OMS order whose legal transitions are enforced independently of a broker.
@@ -2312,14 +2373,35 @@ impl ReplayEngine {
         })
     }
 
-    /// Processes one historical bar through strategy, risk, OMS, simulation, and portfolio.
-    pub fn process_bar(
+    /// Replays a bar with no reference data or calendar, for this crate's
+    /// unit tests of the engine itself.
+    ///
+    /// It applies no session, halt, tick or lot rule, so it is not public:
+    /// every other replay goes through
+    /// [`Self::process_bar_with_market_preconditions`] (E3.6d).
+    #[cfg(test)]
+    fn process_bar(
         &mut self,
         sink: &mut impl EventSink,
         strategy: &mut impl Strategy,
         account_id: &str,
         event_time: &str,
         bar: Bar,
+    ) -> Result<ReplayResult, EngineError> {
+        self.replay_bar(sink, strategy, account_id, event_time, bar, None)
+    }
+
+    /// Processes one historical bar through strategy, risk, OMS, simulation,
+    /// and portfolio. `reference` is the bar's effective reference data; it is
+    /// absent only for [`Self::process_bar`]'s unit tests.
+    fn replay_bar(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        account_id: &str,
+        event_time: &str,
+        bar: Bar,
+        reference: Option<&Instrument>,
     ) -> Result<ReplayResult, EngineError> {
         bar.validate()?;
         self.clock.advance_to(event_time)?;
@@ -2401,6 +2483,9 @@ impl ReplayEngine {
                     .to_owned(),
             ));
         }
+        if let Some(reference) = reference {
+            self.require_whole_lot_fill_cap(reference)?;
+        }
         if self
             .working_orders
             .contains_key(&format!("order-{}", intent.intent_id))
@@ -2426,7 +2511,13 @@ impl ReplayEngine {
         let intent_event_id = intent_event.event_id.clone();
         events.push(intent_event);
 
-        let decision = self.policy.evaluate(&intent, &bar, self.clock.now())?;
+        let decision = match reference {
+            Some(reference) => {
+                self.policy
+                    .evaluate_with_reference(&intent, &bar, reference, self.clock.now())?
+            }
+            None => self.policy.evaluate(&intent, &bar, self.clock.now())?,
+        };
         let current_time = self.clock.now().to_owned();
         let decision_event = self.emit(
             sink,
@@ -2606,6 +2697,11 @@ impl ReplayEngine {
 
     /// Replays one causally linked sentiment vector through strategy, risk,
     /// OMS, deterministic simulation, portfolio, and audit evidence.
+    ///
+    /// `instruments` supplies the market snapshot's effective reference data,
+    /// so a news-driven order meets the same tick and lot rules as a bar-driven
+    /// one (E3.6d). No calendar is consulted here.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_news_sentiment(
         &mut self,
         sink: &mut impl EventSink,
@@ -2614,6 +2710,7 @@ impl ReplayEngine {
         sentiment: SentimentVector,
         market: Bar,
         shock: NewsShockContext,
+        instruments: &InstrumentRegistry,
     ) -> Result<ReplayResult, EngineError> {
         sentiment.validate()?;
         market.validate()?;
@@ -2652,6 +2749,16 @@ impl ReplayEngine {
                     error.0
                 ))
             })?;
+        // Resolved at the decision time, and before anything is recorded.
+        let reference = &instruments
+            .resolve(&market.instrument_id, &availability_time)
+            .ok_or_else(|| {
+                EngineError(
+                    "no effective instrument reference data for the news market snapshot"
+                        .to_owned(),
+                )
+            })?
+            .instrument;
         self.clock.advance_to(&availability_time)?;
         let correlation_id = format!("corr-news-{}", sentiment.causation_news_id);
         let sentiment_event = self.emit(
@@ -2684,6 +2791,7 @@ impl ReplayEngine {
             strategy,
             account_id,
             &market,
+            reference,
             &shock,
             &sentiment_event_id,
             intent,
@@ -2705,6 +2813,7 @@ impl ReplayEngine {
         strategy: &mut impl Strategy,
         account_id: &str,
         market: &Bar,
+        reference: &Instrument,
         shock: &NewsShockContext,
         causation_id: &str,
         intent: OrderIntent,
@@ -2726,6 +2835,7 @@ impl ReplayEngine {
                 "news intent instrument does not match its market snapshot".to_owned(),
             ));
         }
+        self.require_whole_lot_fill_cap(reference)?;
         if self
             .working_orders
             .contains_key(&format!("order-{}", intent.intent_id))
@@ -2749,9 +2859,9 @@ impl ReplayEngine {
         )?;
         let intent_event_id = intent_event.event_id.clone();
         events.push(intent_event);
-        let decision = self
-            .policy
-            .evaluate_news(&intent, market, self.clock.now(), shock)?;
+        let decision =
+            self.policy
+                .evaluate_news(&intent, market, reference, self.clock.now(), shock)?;
         let current_time = self.clock.now().to_owned();
         let decision_event = self.emit(
             sink,
@@ -2844,6 +2954,24 @@ impl ReplayEngine {
         if working.remaining_quantity > Decimal::ZERO {
             self.working_orders
                 .insert(working.order.order_id.clone(), working);
+        }
+        Ok(())
+    }
+
+    /// A per-bar fill cap must be a whole number of the traded instrument's
+    /// lots. Risk makes the order whole lots, so every partial fill and every
+    /// remainder is then whole lots too. It is a configuration fault, not a
+    /// decision, so it is an error raised before the intent is recorded.
+    fn require_whole_lot_fill_cap(&self, reference: &Instrument) -> Result<(), EngineError> {
+        if self
+            .fill_model
+            .max_fill_quantity
+            .is_some_and(|cap| !is_whole_multiple(cap, reference.lot_size))
+        {
+            return Err(EngineError(format!(
+                "simulated fill cap is not a whole number of {}'s lots",
+                reference.instrument_id
+            )));
         }
         Ok(())
     }
@@ -2996,7 +3124,9 @@ impl ReplayEngine {
         Ok(Some((position, pnl)))
     }
 
-    /// Processes a bar only after its reference data and trading session resolve.
+    /// Processes a bar only after its reference data and trading session
+    /// resolve. That reference data then prices the decision's tick and lot
+    /// rules and bounds the fill cap (E3.6d).
     pub fn process_bar_with_market_preconditions(
         &mut self,
         sink: &mut impl EventSink,
@@ -3006,8 +3136,8 @@ impl ReplayEngine {
         bar: Bar,
         market: &MarketPreconditions<'_>,
     ) -> Result<ReplayResult, EngineError> {
-        market.validate(&bar, event_time)?;
-        self.process_bar(sink, strategy, account_id, event_time, bar)
+        let reference = market.validate(&bar, event_time)?;
+        self.replay_bar(sink, strategy, account_id, event_time, bar, Some(reference))
     }
 
     fn emit_order_change(
@@ -3188,6 +3318,14 @@ mod tests {
     }
 
     fn market_dependencies() -> (InstrumentRegistry, StaticTradingCalendar) {
+        market_dependencies_with("0.01", 1)
+    }
+
+    /// SPY's session and reference data at an explicit tick and lot size.
+    fn market_dependencies_with(
+        tick_size: &str,
+        lot_size: i64,
+    ) -> (InstrumentRegistry, StaticTradingCalendar) {
         let calendar = StaticTradingCalendar::new(
             "cal.us_equities.nyse",
             vec![TradingSession {
@@ -3208,8 +3346,8 @@ mod tests {
                     venue: "venue.nyse_arca".to_owned(),
                     currency: "USD".to_owned(),
                     broker_ids: BTreeMap::new(),
-                    tick_size: Decimal::from_str("0.01").unwrap(),
-                    lot_size: Decimal::from_integer(1).unwrap(),
+                    tick_size: Decimal::from_str(tick_size).unwrap(),
+                    lot_size: Decimal::from_integer(lot_size).unwrap(),
                     multiplier: Decimal::from_integer(1).unwrap(),
                     trading_calendar_id: "cal.us_equities.nyse".to_owned(),
                 },
@@ -3587,6 +3725,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .unwrap_err();
         assert_eq!(
@@ -3597,6 +3736,373 @@ mod tests {
         assert_eq!(
             error.0,
             "news intent instrument does not match its market snapshot"
+        );
+    }
+
+    /// Submits one order on the first bar or sentiment it sees, on that
+    /// observation's own instrument.
+    struct SubmitsOnce {
+        quantity: Decimal,
+        limit_price: Option<Decimal>,
+        submitted: bool,
+    }
+
+    impl SubmitsOnce {
+        fn new(quantity: i64, limit_price: Option<&str>) -> Self {
+            Self {
+                quantity: Decimal::from_integer(quantity).unwrap(),
+                limit_price: limit_price.map(|price| Decimal::from_str(price).unwrap()),
+                submitted: false,
+            }
+        }
+
+        fn submit(
+            &mut self,
+            instrument_id: &str,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            if self.submitted {
+                return Ok(None);
+            }
+            self.submitted = true;
+            Ok(Some(OrderIntent {
+                intent_id: "intent-increments-001".to_owned(),
+                account_id: "acct-paper-001".to_owned(),
+                strategy_id: "strategy-increments-001".to_owned(),
+                instrument_id: instrument_id.to_owned(),
+                correlation_id: "corr-increments-001".to_owned(),
+                side: Side::Buy,
+                quantity: self.quantity,
+                order_type: if self.limit_price.is_some() {
+                    OrderType::Limit
+                } else {
+                    OrderType::Market
+                },
+                limit_price: self.limit_price,
+                time_in_force: TimeInForce::Day,
+                rationale: "reference-data increment regression".to_owned(),
+                created_at: replay_time.to_owned(),
+                strategy_version: "strategy-increments-v1".to_owned(),
+                configuration_version: "cfg-example-1".to_owned(),
+                environment: "SIMULATION".to_owned(),
+            }))
+        }
+    }
+
+    impl Strategy for SubmitsOnce {
+        fn on_bar(
+            &mut self,
+            bar: &Bar,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            self.submit(&bar.instrument_id, replay_time)
+        }
+
+        fn on_news_sentiment(
+            &mut self,
+            sentiment: &SentimentVector,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            self.submit(&sentiment.instrument_id, replay_time)
+        }
+    }
+
+    fn only_decision(events: &[EventEnvelope]) -> RiskDecision {
+        let decisions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::RiskDecision(decision) => Some(decision.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        decisions.into_iter().next().unwrap()
+    }
+
+    fn fill_quantities(events: &[EventEnvelope]) -> Vec<Decimal> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::Fill(fill) => Some(fill.quantity),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reference_data_tick_and_lot_rules_match_paper() {
+        // SPY trading at a nickel tick in five-share lots. The engine policy
+        // allows ten shares and a 500 bps collar around the 100 close.
+        let (instruments, _) = market_dependencies_with("0.05", 5);
+        let reference = &instruments
+            .resolve("inst.us_equity.spy", "2026-01-02T14:31:00Z")
+            .unwrap()
+            .instrument;
+        let policy = engine().policy;
+        let decide = |quantity: i64, limit: Option<&str>| {
+            let intent = SubmitsOnce::new(quantity, limit)
+                .submit("inst.us_equity.spy", "2026-01-02T14:31:00Z")
+                .unwrap()
+                .unwrap();
+            policy
+                .evaluate_with_reference(&intent, &bar(), reference, "2026-01-02T14:31:00Z")
+                .unwrap()
+        };
+
+        let on_grid = decide(10, Some("100.05"));
+        assert_eq!(on_grid.reason_codes, vec!["APPROVED".to_owned()]);
+        assert!(on_grid
+            .evaluated_limits
+            .ends_with(",instrument_tick_size=0.05000000,instrument_lot_size=5.00000000"));
+        // Three shares is a whole number of ticks, but not of lots.
+        assert_eq!(
+            decide(3, None).reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert_eq!(
+            decide(5, Some("100.02")).reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        assert_eq!(
+            decide(3, Some("100.02")).reason_codes,
+            vec![
+                "LIMIT_PRICE_OFF_TICK_GRID".to_owned(),
+                "ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()
+            ]
+        );
+        // A market order has no price to put on the grid.
+        assert!(decide(5, None).approved);
+        // The ordinary limits still apply alongside the increments.
+        assert_eq!(
+            decide(13, None).reason_codes,
+            vec![
+                "MAX_QUANTITY_EXCEEDED".to_owned(),
+                "ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()
+            ]
+        );
+
+        let mut other = reference.clone();
+        other.instrument_id = "inst.us_equity.qqq".to_owned();
+        let intent = SubmitsOnce::new(5, None)
+            .submit("inst.us_equity.spy", "2026-01-02T14:31:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy
+                .evaluate_with_reference(&intent, &bar(), &other, "2026-01-02T14:31:00Z")
+                .unwrap_err()
+                .0,
+            "risk reference data instrument does not match the intent"
+        );
+
+        // Unvalidated reference data with no lot is an error, not a "no".
+        let mut no_lot = reference.clone();
+        no_lot.lot_size = Decimal::ZERO;
+        assert_eq!(
+            policy
+                .evaluate_with_reference(&intent, &bar(), &no_lot, "2026-01-02T14:31:00Z")
+                .unwrap_err()
+                .0,
+            "instrument reference data has a non-positive tick or lot size"
+        );
+    }
+
+    #[test]
+    fn replay_applies_reference_data_increments_before_an_order_exists() {
+        let (instruments, calendar) = market_dependencies_with("0.05", 5);
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let replay_once = |strategy: &mut SubmitsOnce| {
+            let mut replay = engine();
+            let mut store = InMemoryEventStore::default();
+            let mut events = Vec::new();
+            for event_time in ["2026-01-02T14:31:00Z", "2026-01-02T14:32:00Z"] {
+                events.extend(
+                    replay
+                        .process_bar_with_market_preconditions(
+                            &mut store,
+                            strategy,
+                            "acct-paper-001",
+                            event_time,
+                            bar(),
+                            &market,
+                        )
+                        .unwrap()
+                        .events,
+                );
+            }
+            events
+        };
+
+        // Three shares of a five-share lot is refused, and no order exists.
+        let refused = replay_once(&mut SubmitsOnce::new(3, None));
+        let decision = only_decision(&refused);
+        assert_eq!(
+            decision.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(decision
+            .evaluated_limits
+            .contains("instrument_lot_size=5.00000000"));
+        assert!(!refused
+            .iter()
+            .any(|event| event.event_type == "order.state_changed.v1"));
+        assert!(fill_quantities(&refused).is_empty());
+
+        // An off-grid limit is refused the same way.
+        let off_grid = replay_once(&mut SubmitsOnce::new(5, Some("100.02")));
+        assert_eq!(
+            only_decision(&off_grid).reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        assert!(fill_quantities(&off_grid).is_empty());
+
+        // Two whole lots are approved and fill on the next bar.
+        let approved = replay_once(&mut SubmitsOnce::new(10, None));
+        assert!(only_decision(&approved).approved);
+        assert_eq!(
+            fill_quantities(&approved),
+            vec![Decimal::from_integer(10).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_fill_cap_must_be_a_whole_number_of_lots() {
+        let (instruments, calendar) = market_dependencies_with("0.01", 5);
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+
+        // A three-share cap would split a ten-share order into partials of
+        // three, which no five-share-lot venue executes.
+        let mut replay = engine();
+        replay.fill_model.max_fill_quantity = Some(Decimal::from_integer(3).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let error = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut SubmitsOnce::new(10, None),
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap_err();
+        assert_eq!(event_types(&store), vec!["market.bar.v1"]);
+        assert_eq!(
+            error.0,
+            "simulated fill cap is not a whole number of inst.us_equity.spy's lots"
+        );
+
+        // A one-lot cap fills the same order in two whole lots.
+        let mut replay = engine();
+        replay.fill_model.max_fill_quantity = Some(Decimal::from_integer(5).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = SubmitsOnce::new(10, None);
+        let mut fills = Vec::new();
+        for event_time in [
+            "2026-01-02T14:31:00Z",
+            "2026-01-02T14:32:00Z",
+            "2026-01-02T14:33:00Z",
+        ] {
+            fills.extend(fill_quantities(
+                &replay
+                    .process_bar_with_market_preconditions(
+                        &mut store,
+                        &mut strategy,
+                        "acct-paper-001",
+                        event_time,
+                        bar(),
+                        &market,
+                    )
+                    .unwrap()
+                    .events,
+            ));
+        }
+        let lot = Decimal::from_integer(5).unwrap();
+        assert_eq!(fills, vec![lot, lot]);
+        assert!(replay.working_orders.is_empty());
+    }
+
+    fn replay_news_order(
+        strategy: &mut SubmitsOnce,
+        fill_cap: Option<i64>,
+        instruments: &InstrumentRegistry,
+    ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
+        let mut replay = news_engine();
+        replay.fill_model.max_fill_quantity =
+            fill_cap.map(|cap| Decimal::from_integer(cap).unwrap());
+        let mut store = InMemoryEventStore::default();
+        replay
+            .process_news_headline(&mut store, strategy, news_headline())
+            .unwrap();
+        let result = replay.process_news_sentiment(
+            &mut store,
+            strategy,
+            "acct-paper-001",
+            news_sentiment(),
+            bar(),
+            NewsShockContext {
+                pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+                current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+            },
+            instruments,
+        );
+        let recorded = event_types(&store).into_iter().map(str::to_owned).collect();
+        (result, recorded)
+    }
+
+    #[test]
+    fn news_orders_meet_the_same_reference_data_increments() {
+        let (round_lots, _) = market_dependencies_with("0.01", 5);
+
+        let (result, _) = replay_news_order(&mut SubmitsOnce::new(3, None), None, &round_lots);
+        let events = result.unwrap().events;
+        assert_eq!(
+            only_decision(&events).reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(fill_quantities(&events).is_empty());
+
+        // The same order at a one-share lot is approved and fills, and its
+        // evidence names the increments it was judged against.
+        let (result, _) =
+            replay_news_order(&mut SubmitsOnce::new(3, None), None, &news_reference_data());
+        let events = result.unwrap().events;
+        let decision = only_decision(&events);
+        assert!(decision.approved);
+        assert!(decision
+            .evaluated_limits
+            .contains(",instrument_tick_size=0.01000000,instrument_lot_size=1.00000000,"));
+        assert_eq!(
+            fill_quantities(&events),
+            vec![Decimal::from_integer(3).unwrap()]
+        );
+
+        // An off-lot fill cap is refused before the news intent is recorded.
+        let (result, recorded) =
+            replay_news_order(&mut SubmitsOnce::new(10, None), Some(3), &round_lots);
+        assert_eq!(recorded, vec!["news.headline.v1", "news.sentiment.v1"]);
+        assert_eq!(
+            result.unwrap_err().0,
+            "simulated fill cap is not a whole number of inst.us_equity.spy's lots"
+        );
+    }
+
+    #[test]
+    fn news_without_reference_data_is_refused_before_recording_it() {
+        let mut strategy = SubmitsOnce::new(1, None);
+        let (result, recorded) =
+            replay_news_order(&mut strategy, None, &InstrumentRegistry::default());
+        assert_eq!(recorded, vec!["news.headline.v1"]);
+        assert!(!strategy.submitted);
+        assert_eq!(
+            result.unwrap_err().0,
+            "no effective instrument reference data for the news market snapshot"
         );
     }
 
@@ -4239,6 +4745,11 @@ mod tests {
         }
     }
 
+    /// The news fixtures' reference data: SPY at a 0.01 tick and a 1-share lot.
+    fn news_reference_data() -> InstrumentRegistry {
+        market_dependencies().0
+    }
+
     fn news_engine() -> ReplayEngine {
         ReplayEngine::new(
             "2026-09-01T10:59:59Z",
@@ -4283,6 +4794,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .unwrap();
         headline
@@ -4356,6 +4868,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .expect("causally linked sentiment should be accepted");
         let sentiment_event = &sentiment.events[0];
@@ -4400,6 +4913,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .is_err());
         assert_eq!(store.events().len(), event_count_before);
@@ -4449,6 +4963,7 @@ mod tests {
                 news_sentiment(),
                 bar(),
                 shock.clone(),
+                &news_reference_data(),
             )
             .unwrap();
         let counts_before = [
@@ -4478,6 +4993,7 @@ mod tests {
             news_sentiment(),
             bar(),
             shock,
+            &news_reference_data(),
         );
         assert!(duplicate.is_err());
         assert_eq!(store.events().len(), event_count_before);

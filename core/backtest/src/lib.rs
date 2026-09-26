@@ -2646,6 +2646,16 @@ mod tests {
         follon_instrument::InstrumentRegistry,
         follon_instrument::StaticTradingCalendar,
     ) {
+        market_dependencies_with_lot(1)
+    }
+
+    /// SPY's session and reference data at an explicit lot size.
+    fn market_dependencies_with_lot(
+        lot_size: i64,
+    ) -> (
+        follon_instrument::InstrumentRegistry,
+        follon_instrument::StaticTradingCalendar,
+    ) {
         use follon_instrument::{
             AssetClass, Instrument, InstrumentVersion, StaticTradingCalendar, TradingSession,
         };
@@ -2671,7 +2681,7 @@ mod tests {
                     currency: "USD".to_owned(),
                     broker_ids: BTreeMap::new(),
                     tick_size: Decimal::from_str("0.01").unwrap(),
-                    lot_size: Decimal::from_integer(1).unwrap(),
+                    lot_size: Decimal::from_integer(lot_size).unwrap(),
                     multiplier: Decimal::from_integer(1).unwrap(),
                     trading_calendar_id: "cal.us_equities.nyse".to_owned(),
                 },
@@ -2848,6 +2858,43 @@ mod tests {
         );
         assert_eq!(artifact_json["performance"]["trade_count"], 1);
         assert!(artifact_json.get("advanced_account").is_none());
+    }
+
+    #[test]
+    fn a_backtest_refuses_an_order_its_reference_data_does_not_permit() {
+        // `BuyOnceStrategy` buys one share. PAPER and controlled LIVE refuse
+        // that against a five-share lot, so the backtest must as well (E3.6d).
+        let input = runner_input();
+        let spec = runner_spec(&input);
+        let (instruments, calendar) = market_dependencies_with_lot(5);
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let completed = BacktestRunner::new(spec, runner_engine())
+            .unwrap()
+            .run(&mut runner_strategy(), &input, &market)
+            .unwrap();
+
+        assert_eq!(completed.artifact.performance.trade_count, 0);
+        assert!(completed.artifact.report.positions.is_empty());
+        let decisions: Vec<serde_json::Value> = completed
+            .canonical_events
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event_type"] == "risk.decision.v1")
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0]["payload"];
+        assert_eq!(decision["approved"], false);
+        assert_eq!(
+            decision["reason_codes"],
+            serde_json::json!(["ORDER_QUANTITY_OFF_LOT_SIZE"])
+        );
+        assert!(decision["evaluated_limits"]
+            .as_str()
+            .unwrap()
+            .ends_with(",instrument_tick_size=0.01000000,instrument_lot_size=5.00000000"));
     }
 
     #[test]

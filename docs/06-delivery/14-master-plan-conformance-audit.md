@@ -2831,6 +2831,73 @@ These are mandatory master-plan acceptance conditions and are currently open:
       cannot hedge one instrument on another's bar. That needs a point-in-time multi-instrument mark
       model, which does not exist. No external gate moved.
 
+73. Replay meets the tick and lot rules PAPER and controlled LIVE meet (2026-09-26, rows 5.4, 5.5 and 5.7,
+    research-to-live parity; E3.6d). This closes the parity gap item 70 recorded.
+    - **The gap.** Items 61, 69 and 70 made PAPER and controlled-LIVE risk refuse an off-grid limit and a
+      quantity that is not a whole number of lots. The replay engine behind every backtest checked
+      neither. It resolved each bar's reference data only to check the session, and never passed it to
+      risk. A backtest could therefore approve and fill an order that both environments refuse. Its
+      per-bar fill cap could also split a whole-lot order into partials of any size.
+    - **The rule.**
+      - `RiskPolicy::evaluate_with_reference` applies `evaluate`, then PAPER's two codes,
+        `LIMIT_PRICE_OFF_TICK_GRID` and `ORDER_QUANTITY_OFF_LOT_SIZE`. The evidence gains PAPER's field
+        names, `instrument_tick_size=` and `instrument_lot_size=`. `evaluate_news` builds on it.
+      - The source differs from PAPER's by design. PAPER reads an operator-configured table. A replay
+        already carries effective-dated reference data, versioned by the dataset manifest's
+        `reference_data_version` and content-addressed in the backtest configuration, so there is no
+        second table to drift. An unlisted instrument cannot reach this rule, because a bar without
+        reference data is already an error. The `..._UNCONFIGURED` codes therefore have no replay
+        counterpart.
+      - A configured `max_fill_quantity` must be a whole number of the traded instrument's lots. Risk
+        makes the order whole lots, so every partial fill and every remainder is then whole lots too. It
+        is a configuration fault rather than a decision, so it is an error, raised before the intent is
+        recorded.
+      - The news path now takes the instrument registry. It resolves the snapshot's reference data at the
+        decision time, before anything is recorded. Missing reference data is an error.
+      - `process_bar`, which replays with no reference data or calendar, is now test-only. Every replay
+        outside the crate's own unit tests goes through `process_bar_with_market_preconditions`. No caller
+        can therefore skip the session, halt, tick or lot rule. The code that earlier items name as
+        `ReplayEngine::process_bar` now lives in the private `replay_bar`.
+    - **Evidence effect.** Every checked-in backtest configuration trades one share of a one-share-lot
+      instrument at market, so no outcome changed. Every decision's evidence string gained the two fields.
+      That changes the canonical event stream and every hash built on it. No checked-in fixture pins those
+      bytes, and the pipeline regenerates `var/`.
+    - **Tests.**
+      - The rule itself: an on-grid order approved, with its evidence; an off-lot quantity that is a
+        whole number of ticks; an off-grid limit; both at once; a market order, which has no price to put
+        on the grid; an ordinary rejection kept alongside the increments; reference data for another
+        instrument; and reference data with no lot.
+      - The checked replay path refuses an off-lot and an off-grid order before any order exists, and
+        fills two whole lots.
+      - A three-share cap against a five-share lot is refused before the intent is recorded, and a
+        five-share cap fills ten shares as two whole lots.
+      - The news path refuses an off-lot order, approves the same order at a one-share lot with its
+        evidence, refuses an off-lot cap before recording the intent, and refuses missing reference data
+        before recording the sentiment.
+      - `BacktestRunner` end to end: `BuyOnceStrategy`'s one share against a five-share lot is refused,
+        and nothing trades.
+    - **Rule 5.** 14 of 14 injected defects were caught, each on a test assertion:
+      - the rule: the lot rule dropped, the tick rule dropped, the quantity checked against the tick,
+        another instrument's reference accepted, the increments left out of the evidence, the ordinary
+        rejection reasons discarded, and the non-positive-increment guard dropped;
+      - the paths: the checked replay path passing no reference (caught separately by the engine test and
+        by the `BacktestRunner` test), the news decision ignoring the reference, the bar-path and
+        news-path fill caps unchecked, the cap checked against the tick, and the news reference resolved
+        after the sentiment is recorded.
+    - **Measured result.** The Rust workspace rose from 495 to 501 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (76 probes, 0 failed). The pipeline's built-in and Python-worker
+      backtests both record `instrument_tick_size=0.01000000,instrument_lot_size=1.00000000` on their
+      decisions.
+    - **Bounded remainder.**
+      - The fill model applies spread and slippage in basis points and does not round to the tick grid.
+        A simulated fill can therefore print off the grid, which no venue fill would. Rounding would change
+        existing backtest economics, so it is recorded here rather than changed.
+      - The fill cap is checked when an intent arrives. An effective-dated lot change while an order is
+        still working is not re-checked.
+      - Reference data is enforced as configured, exactly as PAPER's table is, and a venue's own odd-lot
+        handling is not modelled. The news path consults no calendar, as before. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
