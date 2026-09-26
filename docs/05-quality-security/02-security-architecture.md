@@ -35,10 +35,12 @@ the SBOM as a release artifact. `core/identity` additionally enforces Argon2id
 password hashing/policy/rotation, bounded TOTP challenges, hashed one-time
 recovery codes, lockout, opaque hashed 15-minute sessions, immediate
 security-version revocation, tenant authorization, and five server-side RBAC
-roles. Since E3.3a, `follon-trading-api` enforces it on its write RPC. It loads
+roles. Since E3.3a, `follon-trading-api` enforces it on its write RPCs. It loads
 a one-tenant operator directory (Argon2id hashes and mandatory TOTP), provisioned
-by `follon-admin operator-add`, and requires a bearer session whose role grants
-PAPER trading. PostgreSQL identity rows are protected by forced tenant RLS. Production
+by `follon-admin operator-add`, and requires a bearer session. `SubmitPaperCombo`
+needs a role that grants PAPER trading. Since E3.3b, `ActivatePaperKillSwitch` and
+`ReleasePaperKillSwitch` need one that grants kill-switch operation, and the PAPER
+journal records the operator of every change. PostgreSQL identity rows are protected by forced tenant RLS. Production
 Compose requires database TLS, gRPC mutual TLS, and client-certificate TLS at
 the dashboard proxy.
 

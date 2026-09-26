@@ -2,11 +2,14 @@
 //! risk, multi-currency margin valuation, and configured risk-gated PAPER
 //! combination submission.
 //!
-//! The one write RPC, `SubmitPaperCombo`, requires a bearer session from an
-//! operator in the configured operator directory: password plus a mandatory
-//! TOTP second factor, and a role that grants PAPER trading in the request's
-//! tenant. The directory serves one tenant, so a route is reachable only by
-//! that tenant's operators, and the PAPER journal records who submitted.
+//! Every write RPC requires a bearer session from an operator in the
+//! configured operator directory: password plus a mandatory TOTP second
+//! factor. `SubmitPaperCombo` needs a role that grants PAPER trading, and
+//! `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` need one that grants
+//! kill-switch operation (risk_manager), each in the request's tenant. The
+//! directory serves one tenant, so a route is reachable only by that tenant's
+//! operators, and the PAPER journal records who submitted and who moved a
+//! switch.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -28,8 +31,8 @@ use follon_execution::{
 };
 use follon_identity::{IdentityService, LoginOutcome, OperatorDirectory, Permission};
 use follon_paper::{
-    IbkrPaperAdapter, KillSwitchRegistry, PaperAccount, PaperComboMarketData, PaperMarketData,
-    PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
+    IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperComboMarketData,
+    PaperMarketData, PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
 };
 use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
@@ -50,7 +53,8 @@ pub mod api {
 use api::trading_operating_system_server::{TradingOperatingSystem, TradingOperatingSystemServer};
 use api::{
     BeginOperatorLoginRequest, BeginOperatorLoginResponse, CompleteOperatorLoginRequest,
-    OperatorSession, RevokeOperatorSessionRequest, RevokeOperatorSessionResponse,
+    OperatorSession, PaperKillSwitchRequest, PaperKillSwitchResponse, RevokeOperatorSessionRequest,
+    RevokeOperatorSessionResponse,
 };
 use api::{
     BucketLimit, CancelReplaceInstruction, ChildInstruction, ChildOrderKind, ComboLegInstruction,
@@ -86,6 +90,53 @@ impl OperatingSystemService {
             .lock()
             .map_err(|_| Status::internal("operator identity lock poisoned"))
     }
+
+    /// Activates or releases one PAPER kill switch for an operator whose role
+    /// grants kill-switch operation. Authorization precedes every other check,
+    /// and the change is journaled with the operator and the server's time.
+    fn operate_paper_kill_switch(
+        &self,
+        request: Request<PaperKillSwitchRequest>,
+        activate: bool,
+    ) -> Result<Response<PaperKillSwitchResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        let operator = self
+            .identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::KillSwitchOperate,
+                now,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        let scope = KillSwitchScope::from_key(&request.scope)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER Risk/OMS route is not configured; no kill switch was changed",
+            )
+        })?;
+        let operated_at = utc_timestamp(now)?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        let changed = if activate {
+            service.activate_kill_switch_as(scope.clone(), &operator.user_id, &operated_at)
+        } else {
+            service.release_kill_switch_as(scope.clone(), &operator.user_id, &operated_at)
+        }
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(PaperKillSwitchResponse {
+            scope: scope.as_key(),
+            changed,
+            active_kill_switches: service.kill_switches().active_keys(),
+            operated_by: operator.user_id,
+            operated_at,
+        }))
+    }
 }
 
 /// The opaque session token from `authorization: Bearer <token>`. Anything
@@ -115,6 +166,22 @@ fn now_epoch_seconds() -> Result<i64, Status> {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
         .ok_or_else(|| Status::internal("system clock is before the Unix epoch"))
+}
+
+/// The canonical second-precision UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) the
+/// PAPER journal requires, for one epoch second.
+fn utc_timestamp(epoch_seconds: i64) -> Result<String, Status> {
+    let at = time::OffsetDateTime::from_unix_timestamp(epoch_seconds)
+        .map_err(|_| Status::internal("system clock is out of range"))?;
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    ))
 }
 
 #[tonic::async_trait]
@@ -415,6 +482,20 @@ impl TradingOperatingSystem for OperatingSystemService {
         let token = bearer_token(&request)?;
         let revoked = self.identity()?.revoke_session(&token);
         Ok(Response::new(RevokeOperatorSessionResponse { revoked }))
+    }
+
+    async fn activate_paper_kill_switch(
+        &self,
+        request: Request<PaperKillSwitchRequest>,
+    ) -> Result<Response<PaperKillSwitchResponse>, Status> {
+        self.operate_paper_kill_switch(request, true)
+    }
+
+    async fn release_paper_kill_switch(
+        &self,
+        request: Request<PaperKillSwitchRequest>,
+    ) -> Result<Response<PaperKillSwitchResponse>, Status> {
+        self.operate_paper_kill_switch(request, false)
     }
 
     async fn evaluate_portfolio_risk(
@@ -1159,10 +1240,11 @@ mod tests {
         json: String,
         trader_secret: Vec<u8>,
         viewer_secret: Vec<u8>,
+        risk_secret: Vec<u8>,
     }
 
-    /// One trader and one read-only operator, hashed once per test binary
-    /// because Argon2id is deliberately slow.
+    /// A trader, a read-only operator and a risk manager, hashed once per
+    /// test binary because Argon2id is deliberately slow.
     fn test_directory() -> &'static TestDirectory {
         static DIRECTORY: OnceLock<TestDirectory> = OnceLock::new();
         DIRECTORY.get_or_init(|| {
@@ -1183,10 +1265,19 @@ mod tests {
                     &[Role::ReadOnly],
                 )
                 .unwrap();
+            let risk_secret = directory
+                .add_operator(
+                    "user.risk",
+                    "risk@example.com",
+                    OPERATOR_PASSWORD,
+                    &[Role::RiskManager],
+                )
+                .unwrap();
             TestDirectory {
                 json: directory.to_json().unwrap(),
                 trader_secret,
                 viewer_secret,
+                risk_secret,
             }
         })
     }
@@ -1246,6 +1337,17 @@ mod tests {
             &test_directory().trader_secret,
         )
         .await
+    }
+
+    async fn risk_token(service: &OperatingSystemService) -> String {
+        login(service, "risk@example.com", &test_directory().risk_secret).await
+    }
+
+    fn kill_switch_request(scope: &str) -> PaperKillSwitchRequest {
+        PaperKillSwitchRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            scope: scope.to_owned(),
+        }
     }
 
     fn configured_paper_service(name: &str) -> (OperatingSystemService, PaperComboRoute, PathBuf) {
@@ -1751,6 +1853,136 @@ mod tests {
         drop(service);
         drop(route);
         let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_kill_switch_rpcs_require_kill_switch_operation_and_journal_the_operator() {
+        let (service, route, scratch) = configured_paper_service("kill-switch");
+        let leg = "instrument:inst.us_option.spy.500c";
+        let code = |result: Result<Response<PaperKillSwitchResponse>, Status>| {
+            result.expect_err("the change must be refused").code()
+        };
+
+        // No session, then a trader: trading does not grant kill-switch operation.
+        assert_eq!(
+            code(
+                service
+                    .activate_paper_kill_switch(Request::new(kill_switch_request(leg)))
+                    .await
+            ),
+            tonic::Code::Unauthenticated
+        );
+        let trader = trader_token(&service).await;
+        for activate in [true, false] {
+            let request = authorized(kill_switch_request(leg), &trader);
+            let result = if activate {
+                service.activate_paper_kill_switch(request).await
+            } else {
+                service.release_paper_kill_switch(request).await
+            };
+            assert_eq!(code(result), tonic::Code::PermissionDenied);
+        }
+        assert!(route
+            .lock()
+            .unwrap()
+            .kill_switches()
+            .active_keys()
+            .is_empty());
+
+        // The risk manager activates it, and is recorded as the operator.
+        let risk = risk_token(&service).await;
+        let activated = service
+            .activate_paper_kill_switch(authorized(kill_switch_request(leg), &risk))
+            .await
+            .expect("a risk manager operates kill switches")
+            .into_inner();
+        assert!(activated.changed);
+        assert_eq!(activated.scope, leg);
+        assert_eq!(activated.operated_by, "user.risk");
+        assert_eq!(activated.active_kill_switches, vec![leg.to_owned()]);
+        let repeat = service
+            .activate_paper_kill_switch(authorized(kill_switch_request(leg), &risk))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!repeat.changed, "a repeat changes nothing");
+
+        // While it is active, a trader's combination on that leg is refused.
+        let refused = service
+            .submit_paper_combo(authorized(
+                paper_combo_request("intent.grpc.paper.combo.halted"),
+                &trader,
+            ))
+            .await
+            .expect("risk decision")
+            .into_inner();
+        assert!(!refused.approved);
+        assert!(refused
+            .reason_codes
+            .contains(&"KILL_SWITCH_INSTRUMENT_INST.US_OPTION.SPY.500C".to_owned()));
+
+        // A malformed scope and another tenant are refused before the route.
+        assert_eq!(
+            code(
+                service
+                    .activate_paper_kill_switch(authorized(
+                        kill_switch_request("instrument:Not Canonical"),
+                        &risk
+                    ))
+                    .await
+            ),
+            tonic::Code::InvalidArgument
+        );
+        let mut other_tenant = kill_switch_request(leg);
+        other_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            code(
+                service
+                    .release_paper_kill_switch(authorized(other_tenant, &risk))
+                    .await
+            ),
+            tonic::Code::PermissionDenied
+        );
+
+        let released = service
+            .release_paper_kill_switch(authorized(kill_switch_request(leg), &risk))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(released.changed);
+        assert!(released.active_kill_switches.is_empty());
+        let paper = route.lock().unwrap();
+        let operations = paper.kill_switch_operations();
+        assert_eq!(operations.len(), 2, "exactly the two changes are journaled");
+        assert!(operations
+            .iter()
+            .all(|operation| operation.operator == "user.risk" && operation.scope == leg));
+        assert_eq!(operations[0].operated_at, activated.operated_at);
+        drop(paper);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_kill_switch_rpcs_fail_closed_without_a_configured_route() {
+        let mut service = service();
+        service.identity = Some(operator_identity());
+        let risk = risk_token(&service).await;
+        let status = service
+            .activate_paper_kill_switch(authorized(kill_switch_request("global"), &risk))
+            .await
+            .expect_err("no route, no change");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn server_time_renders_as_the_canonical_utc_timestamp() {
+        assert_eq!(utc_timestamp(0).unwrap(), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            utc_timestamp(1_700_000_000).unwrap(),
+            "2023-11-14T22:13:20Z"
+        );
     }
 
     #[tokio::test]

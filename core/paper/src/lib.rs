@@ -1253,6 +1253,63 @@ impl KillSwitchScope {
             }
         }
     }
+
+    /// Parses a scope from its stable key, the inverse of [`Self::as_key`]:
+    /// `global`, `account:<id>`, `strategy:<id>` or `instrument:<id>`, with a
+    /// canonical identity.
+    pub fn from_key(value: &str) -> Result<Self, PaperError> {
+        if value == "global" {
+            return Ok(Self::Global);
+        }
+        for (prefix, builder) in [
+            ("account:", Self::Account as fn(String) -> Self),
+            ("strategy:", Self::Strategy as fn(String) -> Self),
+            ("instrument:", Self::Instrument as fn(String) -> Self),
+        ] {
+            if let Some(target) = value.strip_prefix(prefix) {
+                let scope = builder(target.to_owned());
+                scope.validate()?;
+                return Ok(scope);
+            }
+        }
+        Err(PaperError(
+            "kill-switch scope must be global, account:<id>, strategy:<id> or instrument:<id>"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Which way an operator moved a kill switch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KillSwitchAction {
+    /// The switch was activated.
+    Activate,
+    /// The switch was released.
+    Release,
+}
+
+impl KillSwitchAction {
+    /// Stable journal identity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Activate => "ACTIVATE",
+            Self::Release => "RELEASE",
+        }
+    }
+}
+
+/// One operator-attributed kill-switch change, as the PAPER journal records
+/// it (E3.3b).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KillSwitchOperation {
+    /// The scope's stable key ([`KillSwitchScope::as_key`]).
+    pub scope: String,
+    /// Whether the switch was activated or released.
+    pub action: KillSwitchAction,
+    /// The authenticated operator who made the change.
+    pub operator: String,
+    /// Canonical UTC time the change was applied.
+    pub operated_at: String,
 }
 
 /// Versioned independently-operable paper kill-switch registry.
@@ -2107,6 +2164,18 @@ struct PersistentPaperState {
     /// journal for the same reason.
     #[serde(default)]
     combo_risk_evidence: BTreeMap<String, PersistentComboRiskEvidence>,
+    /// Operator-attributed kill-switch changes (E3.3b). Never written while
+    /// empty, so a journal without one re-serializes byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kill_switch_operations: Vec<PersistentKillSwitchOperation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentKillSwitchOperation {
+    scope: String,
+    action: String,
+    operator: String,
+    operated_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -2466,6 +2535,9 @@ pub struct PaperTradingService<B> {
     account: PaperAccount,
     risk_policy: PaperRiskPolicy,
     kill_switches: KillSwitchRegistry,
+    /// Operator-attributed kill-switch changes, oldest first (E3.3b). A local
+    /// change through [`Self::activate_kill_switch`] adds none, as before.
+    kill_switch_operations: Vec<KillSwitchOperation>,
     broker: B,
     broker_route_fingerprint: String,
     broker_connected: bool,
@@ -2547,6 +2619,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             account,
             risk_policy,
             kill_switches,
+            kill_switch_operations: Vec::new(),
             broker,
             broker_route_fingerprint,
             broker_connected: true,
@@ -2642,6 +2715,61 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.ensure_persistence_healthy()?;
         let changed = self.kill_switches.deactivate(scope);
         if changed {
+            self.persist()?;
+        }
+        Ok(changed)
+    }
+
+    /// Activates a kill switch for an authenticated operator (E3.3b). The
+    /// change is journaled with the operator and time. Activating a switch
+    /// that is already active changes nothing and journals nothing.
+    pub fn activate_kill_switch_as(
+        &mut self,
+        scope: KillSwitchScope,
+        operator: &str,
+        operated_at: &str,
+    ) -> Result<bool, PaperError> {
+        self.operate_kill_switch_as(scope, KillSwitchAction::Activate, operator, operated_at)
+    }
+
+    /// Releases a kill switch for an authenticated operator, journaled exactly
+    /// as [`Self::activate_kill_switch_as`] journals an activation.
+    pub fn release_kill_switch_as(
+        &mut self,
+        scope: KillSwitchScope,
+        operator: &str,
+        operated_at: &str,
+    ) -> Result<bool, PaperError> {
+        self.operate_kill_switch_as(scope, KillSwitchAction::Release, operator, operated_at)
+    }
+
+    /// Operator-attributed kill-switch changes, oldest first.
+    pub fn kill_switch_operations(&self) -> &[KillSwitchOperation] {
+        &self.kill_switch_operations
+    }
+
+    fn operate_kill_switch_as(
+        &mut self,
+        scope: KillSwitchScope,
+        action: KillSwitchAction,
+        operator: &str,
+        operated_at: &str,
+    ) -> Result<bool, PaperError> {
+        self.ensure_persistence_healthy()?;
+        scope.validate()?;
+        validate_canonical_id("kill-switch operator", operator)?;
+        validate_utc_timestamp("kill-switch operation time", operated_at)?;
+        let changed = match action {
+            KillSwitchAction::Activate => self.kill_switches.activate(scope.clone())?,
+            KillSwitchAction::Release => self.kill_switches.deactivate(&scope),
+        };
+        if changed {
+            self.kill_switch_operations.push(KillSwitchOperation {
+                scope: scope.as_key(),
+                action,
+                operator: operator.to_owned(),
+                operated_at: operated_at.to_owned(),
+            });
             self.persist()?;
         }
         Ok(changed)
@@ -5157,6 +5285,16 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     )
                 })
                 .collect(),
+            kill_switch_operations: self
+                .kill_switch_operations
+                .iter()
+                .map(|operation| PersistentKillSwitchOperation {
+                    scope: operation.scope.clone(),
+                    action: operation.action.as_str().to_owned(),
+                    operator: operation.operator.clone(),
+                    operated_at: operation.operated_at.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -5519,6 +5657,30 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         for scope in state.active_kill_switches {
             restored_switches.activate(parse_kill_switch_scope(&scope)?)?;
         }
+        let mut kill_switch_operations = Vec::with_capacity(state.kill_switch_operations.len());
+        for persisted in state.kill_switch_operations {
+            let scope = parse_kill_switch_scope(&persisted.scope)?;
+            let action = match persisted.action.as_str() {
+                "ACTIVATE" => KillSwitchAction::Activate,
+                "RELEASE" => KillSwitchAction::Release,
+                _ => {
+                    return Err(PaperError(
+                        "persisted kill-switch action is invalid".to_owned(),
+                    ))
+                }
+            };
+            validate_canonical_id("persisted kill-switch operator", &persisted.operator)?;
+            validate_utc_timestamp(
+                "persisted kill-switch operation time",
+                &persisted.operated_at,
+            )?;
+            kill_switch_operations.push(KillSwitchOperation {
+                scope: scope.as_key(),
+                action,
+                operator: persisted.operator,
+                operated_at: persisted.operated_at,
+            });
+        }
         let mut incidents = BTreeMap::new();
         for (incident_id, persisted) in state.incidents {
             validate_canonical_id("persisted incident_id", &incident_id)?;
@@ -5617,6 +5779,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.strategy_attribution = strategy_attribution;
         self.execution_ids = execution_ids;
         self.kill_switches = restored_switches;
+        self.kill_switch_operations = kill_switch_operations;
         self.incidents = incidents;
         self.last_reconciled_at = state.last_reconciled_at;
         self.last_reconciliation_clean = state.last_reconciliation_clean;
@@ -6333,32 +6496,8 @@ fn parse_order_state(value: &str) -> Result<OrderState, PaperError> {
 }
 
 fn parse_kill_switch_scope(value: &str) -> Result<KillSwitchScope, PaperError> {
-    if value == "global" {
-        return Ok(KillSwitchScope::Global);
-    }
-    for (prefix, builder) in [
-        (
-            "account:",
-            KillSwitchScope::Account as fn(String) -> KillSwitchScope,
-        ),
-        (
-            "strategy:",
-            KillSwitchScope::Strategy as fn(String) -> KillSwitchScope,
-        ),
-        (
-            "instrument:",
-            KillSwitchScope::Instrument as fn(String) -> KillSwitchScope,
-        ),
-    ] {
-        if let Some(target) = value.strip_prefix(prefix) {
-            let scope = builder(target.to_owned());
-            scope.validate()?;
-            return Ok(scope);
-        }
-    }
-    Err(PaperError(
-        "persisted kill-switch scope is invalid".to_owned(),
-    ))
+    KillSwitchScope::from_key(value)
+        .map_err(|_| PaperError("persisted kill-switch scope is invalid".to_owned()))
 }
 
 #[cfg(test)]
@@ -7380,6 +7519,158 @@ mod tests {
             "an unattributed decision must not carry submitted_by"
         );
         let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn an_operator_kill_switch_change_is_journaled_and_survives_reopen() {
+        let journal = |label: &str| {
+            let path = std::env::temp_dir().join(format!(
+                "follon-paper-journal-{}-{label}.ndjson",
+                std::process::id()
+            ));
+            let _ = fs::remove_file(&path);
+            path
+        };
+        let account = account();
+        let open = |path: &Path| {
+            PaperTradingService::open_durable(
+                account.clone(),
+                policy(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account).unwrap(),
+                path,
+            )
+            .unwrap()
+        };
+        // The journal is exclusively locked while its service is open, so it
+        // is read only after the service is dropped.
+        let last_state = |path: &Path| {
+            let journal = fs::read_to_string(path).unwrap();
+            let record: serde_json::Value =
+                serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+            record["state"].clone()
+        };
+
+        // A local, unattributed change journals no operator record at all,
+        // keeping the earlier serialization byte for byte.
+        let local_path = journal("kill-switch-local");
+        let mut local = open(&local_path);
+        assert!(local.activate_kill_switch(KillSwitchScope::Global).unwrap());
+        drop(local);
+        assert!(last_state(&local_path)
+            .get("kill_switch_operations")
+            .is_none());
+        let _ = fs::remove_file(&local_path);
+
+        let journal_path = journal("kill-switch-operator");
+        let mut service = open(&journal_path);
+        let spy = KillSwitchScope::Instrument("inst.us_equity.spy".to_owned());
+        assert!(service
+            .activate_kill_switch_as(spy.clone(), "user.risk", "2026-01-02T14:29:00Z")
+            .unwrap());
+        // A repeat changes nothing and journals nothing.
+        assert!(!service
+            .activate_kill_switch_as(spy.clone(), "user.risk", "2026-01-02T14:29:30Z")
+            .unwrap());
+        // The switch binds: an order on that instrument is refused.
+        let refused = service
+            .submit_intent(
+                intent("intent-kill-operator-001", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:01Z",
+            )
+            .unwrap();
+        assert_eq!(
+            refused.decision.reason_codes,
+            vec!["KILL_SWITCH_INSTRUMENT_INST.US_EQUITY.SPY".to_owned()]
+        );
+        // A malformed operator or time changes nothing.
+        assert!(service
+            .release_kill_switch_as(spy.clone(), "User Risk", "2026-01-02T14:31:00Z")
+            .is_err());
+        assert!(service
+            .release_kill_switch_as(spy.clone(), "user.risk", "yesterday")
+            .is_err());
+        assert_eq!(
+            service.kill_switches().active_keys(),
+            vec!["instrument:inst.us_equity.spy".to_owned()]
+        );
+        assert!(service
+            .release_kill_switch_as(spy, "user.risk.second", "2026-01-02T14:31:00Z")
+            .unwrap());
+        let expected = vec![
+            KillSwitchOperation {
+                scope: "instrument:inst.us_equity.spy".to_owned(),
+                action: KillSwitchAction::Activate,
+                operator: "user.risk".to_owned(),
+                operated_at: "2026-01-02T14:29:00Z".to_owned(),
+            },
+            KillSwitchOperation {
+                scope: "instrument:inst.us_equity.spy".to_owned(),
+                action: KillSwitchAction::Release,
+                operator: "user.risk.second".to_owned(),
+                operated_at: "2026-01-02T14:31:00Z".to_owned(),
+            },
+        ];
+        assert_eq!(service.kill_switch_operations(), expected.as_slice());
+        drop(service);
+
+        // The journal names each operator, and a reopen restores the record.
+        let state = last_state(&journal_path);
+        assert_eq!(state["kill_switch_operations"][0]["operator"], "user.risk");
+        assert_eq!(state["kill_switch_operations"][1]["action"], "RELEASE");
+        let reopened = open(&journal_path);
+        assert_eq!(reopened.kill_switch_operations(), expected.as_slice());
+        assert!(reopened.kill_switches().active_keys().is_empty());
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn a_persisted_kill_switch_operation_must_be_well_formed() {
+        let mut attributed = service();
+        attributed
+            .activate_kill_switch_as(KillSwitchScope::Global, "user.risk", "2026-01-02T14:29:00Z")
+            .unwrap();
+        let valid = attributed.persistent_state();
+        let mut restored = service();
+        restored.restore(valid.clone()).unwrap();
+        assert_eq!(restored.kill_switch_operations().len(), 1);
+        let corruptions: [fn(&mut PersistentKillSwitchOperation); 4] = [
+            |operation| operation.scope = "everything".to_owned(),
+            |operation| operation.action = "TOGGLE".to_owned(),
+            |operation| operation.operator = "User Risk".to_owned(),
+            |operation| operation.operated_at = "yesterday".to_owned(),
+        ];
+        for corrupt in corruptions {
+            let mut state = valid.clone();
+            corrupt(&mut state.kill_switch_operations[0]);
+            assert!(service().restore(state).is_err());
+        }
+    }
+
+    #[test]
+    fn a_kill_switch_scope_parses_from_its_stable_key() {
+        for scope in [
+            KillSwitchScope::Global,
+            KillSwitchScope::Account("acct.paper.001".to_owned()),
+            KillSwitchScope::Strategy("strategy.paper.001".to_owned()),
+            KillSwitchScope::Instrument("inst.us_equity.spy".to_owned()),
+        ] {
+            assert_eq!(KillSwitchScope::from_key(&scope.as_key()).unwrap(), scope);
+        }
+        for malformed in [
+            "",
+            "GLOBAL",
+            "everything",
+            "instrument:",
+            "account:Not Canonical",
+        ] {
+            assert!(
+                KillSwitchScope::from_key(malformed).is_err(),
+                "accepted {malformed:?}"
+            );
+        }
     }
 
     #[test]

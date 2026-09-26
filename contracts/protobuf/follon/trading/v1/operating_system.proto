@@ -17,6 +17,11 @@ service TradingOperatingSystem {
   rpc CompleteOperatorLogin(CompleteOperatorLoginRequest) returns (OperatorSession);
   // Revokes the bearer session presented in the `authorization` header.
   rpc RevokeOperatorSession(RevokeOperatorSessionRequest) returns (RevokeOperatorSessionResponse);
+  // Require `authorization: Bearer <session>` for an operator whose role grants
+  // kill-switch operation (risk_manager) in the request's tenant. The PAPER
+  // journal records the operator and server time of every change.
+  rpc ActivatePaperKillSwitch(PaperKillSwitchRequest) returns (PaperKillSwitchResponse);
+  rpc ReleasePaperKillSwitch(PaperKillSwitchRequest) returns (PaperKillSwitchResponse);
   rpc EvaluatePortfolioRisk(PortfolioRiskRequest) returns (PortfolioRiskResponse);
   rpc ValueMarginAccount(MarginAccountRequest) returns (MarginAccountResponse);
 }
@@ -248,6 +253,25 @@ message RevokeOperatorSessionRequest {}
 
 message RevokeOperatorSessionResponse {
   bool revoked = 1;
+}
+
+// Names one PAPER kill switch by its stable key: `global`, `account:<id>`,
+// `strategy:<id>` or `instrument:<id>`.
+message PaperKillSwitchRequest {
+  string tenant_id = 1;
+  string scope = 2;
+}
+
+message PaperKillSwitchResponse {
+  string scope = 1;
+  // Whether this request changed the switch; repeating it changes nothing.
+  bool changed = 2;
+  // Every active PAPER kill switch after the request.
+  repeated string active_kill_switches = 3;
+  // The authenticated operator the PAPER journal records with a change.
+  string operated_by = 4;
+  // The server's UTC time for the request.
+  string operated_at = 5;
 }
 
 message BucketLimit {

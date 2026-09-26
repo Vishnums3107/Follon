@@ -10,7 +10,10 @@ authentication) on loopback, then probes both over the network:
   oversized requests, and leaked tracebacks;
 - the gRPC API for unauthenticated, malformed, forged, wrong-role, wrong-tenant
   and revoked sessions, password lockout, the TOTP second factor and its
-  replay, malformed and oversized messages, and unknown methods;
+  replay, malformed and oversized messages, unknown methods, and the
+  kill-switch RPCs' separation of the risk-manager role from trading;
+- the stopped API's PAPER journal, for the operator of every kill-switch
+  change;
 - both binaries' startup refusals for unsafe configurations.
 
 This is a scan the repository wrote about itself. It is not an independent
@@ -45,6 +48,7 @@ import grpc
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 SERVICE = "/follon.trading.v1.TradingOperatingSystem/"
 TENANT = "tenant.alpha"
+KILL_SCOPE = "instrument:inst.us_option.spy.500c"
 EXE = ".exe" if os.name == "nt" else ""
 
 
@@ -244,6 +248,10 @@ def combo_request(intent_id: str, tenant: str = TENANT) -> bytes:
     for instrument, _, price in legs:
         body += pb_message(17, pb_string(1, instrument) + pb_string(2, price) + pb_string(3, "2026-01-02T14:30:00Z"))
     return body
+
+
+def kill_switch_request(scope: str = KILL_SCOPE, tenant: str = TENANT) -> bytes:
+    return pb_string(1, tenant) + pb_string(2, scope)
 
 
 # --- the dashboard ------------------------------------------------------------
@@ -526,9 +534,58 @@ def scan_api(scan: Scan, api: Api, operators: dict[str, tuple[str, bytes]], pass
     code, _ = api.call("GrantAdministrator", b"")
     scan.record("G23", target, "unknown method", "an undeclared method is not served",
                 "UNIMPLEMENTED", code.name, code == grpc.StatusCode.UNIMPLEMENTED)
+
+    # Kill switches: only a role that grants kill-switch operation moves one.
+    code, _ = api.call("ActivatePaperKillSwitch", kill_switch_request())
+    scan.record("G24", target, "authentication", "a kill-switch change with no session is refused",
+                "UNAUTHENTICATED", code.name, code == grpc.StatusCode.UNAUTHENTICATED)
+    desk_email, desk_secret = operators["user.desk"]
+    _, desk, _ = api.login(desk_email, password, desk_secret)
+    code, _ = api.call("ReleasePaperKillSwitch", kill_switch_request(), token=desk)
+    scan.record("G25", target, "authorization", "a trading role cannot operate a kill switch",
+                "PERMISSION_DENIED", code.name, code == grpc.StatusCode.PERMISSION_DENIED)
+    risk_email, risk_secret = operators["user.risk"]
+    _, risk, _ = api.login(risk_email, password, risk_secret)
+    code, body = api.call("ActivatePaperKillSwitch", kill_switch_request(), token=risk)
+    fields = pb_fields(body) if code == grpc.StatusCode.OK else {}
+    changed = fields.get(2, [0])[0] == 1
+    operated_by = fields.get(4, [b""])[0].decode()
+    scan.record("G26", target, "authorization", "a risk manager activates a kill switch and is named its operator",
+                "OK, changed, operated_by user.risk", f"{code.name}, changed={changed}, operated_by={operated_by}",
+                code == grpc.StatusCode.OK and changed and operated_by == "user.risk")
+    halted = "KILL_SWITCH_INSTRUMENT_INST.US_OPTION.SPY.500C"
+    code, body = api.call("SubmitPaperCombo", combo_request("intent.dast.halted"), token=desk)
+    fields = pb_fields(body) if code == grpc.StatusCode.OK else {}
+    approved = fields.get(2, [0])[0] == 1
+    reasons = [reason.decode() for reason in fields.get(3, [])]
+    scan.record("G27", target, "kill switch", "an active kill switch refuses a trader's combination on its leg",
+                f"OK, refused with {halted}", f"{code.name}, approved={approved}, reasons={reasons}",
+                code == grpc.StatusCode.OK and not approved and halted in reasons)
+    code, body = api.call("ReleasePaperKillSwitch", kill_switch_request(), token=risk)
+    fields = pb_fields(body) if code == grpc.StatusCode.OK else {}
+    changed = fields.get(2, [0])[0] == 1
+    active = [scope.decode() for scope in fields.get(3, [])]
+    scan.record("G28", target, "kill switch", "the risk manager releases it",
+                "OK, changed, none active", f"{code.name}, changed={changed}, active={active}",
+                code == grpc.StatusCode.OK and changed and not active)
+    code, _ = api.call("ActivatePaperKillSwitch", kill_switch_request("everything"), token=risk)
+    scan.record("G29", target, "malformed input", "an unknown kill-switch scope is refused",
+                "INVALID_ARGUMENT", code.name, code == grpc.StatusCode.INVALID_ARGUMENT)
     code, _ = api.call("CheckHealth", b"")
     scan.record("G99", target, "availability", "the API is still healthy after every probe",
                 "OK", code.name, code == grpc.StatusCode.OK)
+
+
+def scan_journal(scan: Scan, journal: Path) -> None:
+    """Reads the stopped API's PAPER journal. The scan changed one switch twice,
+    so the journal must name the risk manager for exactly those two changes."""
+    lines = journal.read_text(encoding="utf-8").splitlines() if journal.exists() else []
+    operations = json.loads(lines[-1])["state"].get("kill_switch_operations", []) if lines else []
+    observed = "; ".join(f"{op['action']} {op['scope']} by {op['operator']}" for op in operations) or "none"
+    recorded = [(op["action"], op["scope"], op["operator"]) for op in operations]
+    scan.record("J01", "trading-api", "audit", "the PAPER journal records the operator of every kill-switch change",
+                f"ACTIVATE and RELEASE of {KILL_SCOPE} by user.risk", observed,
+                recorded == [("ACTIVATE", KILL_SCOPE, "user.risk"), ("RELEASE", KILL_SCOPE, "user.risk")])
 
 
 # --- orchestration ----------------------------------------------------------------
@@ -543,7 +600,8 @@ def build_binaries() -> tuple[Path, Path]:
 
 def provision(admin: Path, directory: Path, password_file: Path) -> dict[str, tuple[str, bytes]]:
     operators = {}
-    for user, roles in (("user.trader", "trader"), ("user.viewer", "read_only"), ("user.lockout", "trader")):
+    for user, roles in (("user.trader", "trader"), ("user.viewer", "read_only"), ("user.lockout", "trader"),
+                        ("user.desk", "trader"), ("user.risk", "risk_manager")):
         email = f"{user.removeprefix('user.')}@example.com"
         result = subprocess.run(
             [str(admin), "operator-add", "--directory", str(directory), "--tenant-id", TENANT,
@@ -657,6 +715,11 @@ def main() -> int:
         wait_for_port(api_port, api_process)
         print("[+] Scanning the trading API", flush=True)
         scan_api(scan, Api(api_port), operators, operator_password)
+        # The journal is exclusively locked while the API runs, so it is read
+        # only after the API has stopped.
+        stop(api_process)
+        print("[+] Reading the PAPER journal", flush=True)
+        scan_journal(scan, workspace / "paper-journal.ndjson")
 
         print("[+] Probing unsafe startup configurations", flush=True)
         refused, observed = exits_nonzero(dashboard_command, env | {

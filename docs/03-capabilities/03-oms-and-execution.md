@@ -76,6 +76,15 @@ combination's `submitted_by`, and an idempotent retry must come from the same
 operator. This is local PAPER engineering evidence, not external-broker or
 production acceptance.
 
+The same route exposes `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch`
+(E3.3b). Each names one switch by its stable key: `global`, `account:<id>`,
+`strategy:<id>` or `instrument:<id>`. Each needs a session whose role grants
+kill-switch operation, which only `risk_manager` does, so a trader's session is
+refused (`PERMISSION_DENIED`). The PAPER journal records every change with its
+operator and the server's UTC time. A repeat that changes nothing records
+nothing. The local `follon-paper-status --activate/--deactivate` path is
+unchanged and records no operator.
+
 The Tauri desktop host has the equivalent `submit_combo_order` IPC command. Its
 `ComboOrderIntent` places each leg's operator-attested observation on the leg
 itself, so no leg can reach risk unpriced or priced from its limit. The native

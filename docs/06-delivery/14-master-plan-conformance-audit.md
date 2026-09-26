@@ -2738,6 +2738,64 @@ These are mandatory master-plan acceptance conditions and are currently open:
         trade a quantity that PAPER and controlled-LIVE now refuse. That is a research-to-live parity gap.
       - A venue's own odd-lot or mixed-lot handling is not modelled. No external gate moved.
 
+71. Authenticated PAPER kill-switch RPCs, with the operator recorded in the journal (2026-09-26, Architecture
+    and Security rows; E3.3b).
+    - **The gap.** A PAPER kill switch could be moved only by `follon-paper-status --activate/--deactivate`
+      on the machine that holds the journal. The journal recorded which switches were active, not who moved
+      them. The identity kernel's `KillSwitchOperate` permission, granted only to `risk_manager`, was
+      enforced nowhere.
+    - **What landed, as the operator decided.**
+      - `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` on the gRPC API. Each names one switch by its
+        stable key (`global`, `account:<id>`, `strategy:<id>` or `instrument:<id>`) and requires a bearer
+        session whose role grants `KillSwitchOperate` in the request's tenant. Authorization precedes every
+        other check. A trading role, another tenant, and a missing session are refused, and an unknown scope
+        is `INVALID_ARGUMENT`.
+      - `PaperTradingService::activate_kill_switch_as` and `release_kill_switch_as` journal each change with
+        the operator and the server's UTC time. A repeat that changes nothing journals nothing.
+      - The record is a versioned extension, written only when it is non-empty, so an existing journal
+        re-serializes byte-for-byte; both checked-in journals open unchanged. On reopen, each persisted
+        record's scope, action, operator and time are validated.
+      - `KillSwitchScope::from_key` is the public inverse of `as_key`, and the private journal parser now
+        delegates to it. The local CLI path is unchanged and records no operator.
+    - **Scanner.** `tools/dast_scan.py` provisions a second trader and a risk manager, and adds seven probes:
+      - no session (G24);
+      - a trading role refused (G25);
+      - a risk manager activating a switch and being named its operator (G26);
+      - the active switch refusing a trader's combination on its leg (G27);
+      - the release (G28);
+      - an unknown scope refused (G29);
+      - J01, run after the API stops: the journal names the risk manager for exactly those two changes. The
+        journal is exclusively locked while the API runs.
+      The scan rose from 69 to 76 probes, 0 failed.
+    - **Tests.**
+      - PAPER: a journaled change survives a reopen; a repeat records nothing; the switch refuses an order;
+        a malformed operator or time changes nothing; a local change writes no record. Also the validation
+        of persisted records, and the scope-key round trip.
+      - gRPC: the permission separation, operator attribution, the switch binding a trader's combination, a
+        malformed scope, another tenant, the release, failing closed without a route, and the server-time
+        format.
+    - **Rule 5.** 14 of 14 injected defects were caught:
+      - gRPC: authorizing `PaperTrade` instead, authorizing any portfolio reader, the release RPC
+        activating, and a fixed operator journaled;
+      - PAPER: a change not recorded, a no-op recorded, the operator unvalidated, records not persisted,
+        records not restored, an unknown persisted action or an unvalidated persisted operator accepted,
+        and the empty record always serialized;
+      - the extended scan itself, against two service defects: authorizing `PaperTrade`, and a fixed
+        operator.
+    - **A test bug of mine, fixed.** The first PAPER test read the journal while its service was open. On
+      Windows the exclusive lock refuses that read, even from the same process. The test now reads only a
+      closed journal, which is also why the scanner stops the API before J01.
+    - **Measured result.** The Rust workspace rose from 486 to 492 passed / 0 failed / 3 ignored.
+      The final `python tools/session_status.py` run measured all seven suites green, and the full evidence
+      pipeline exited 0, including step 23b's scan (76 probes, 0 failed).
+    - **Bounded remainder.**
+      - Sessions stay in memory, so a restart logs every operator out.
+      - There is no four-eyes approval on a kill-switch change.
+      - The Tauri desktop's IPC writes are still unauthenticated.
+      - Controlled-LIVE kill switches have no RPC.
+      - The operator directory has no managed secret store.
+      - The deployment review stays external, and the REST boundary stays read-only. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
