@@ -39,8 +39,9 @@ written authorization.
 1. Create a staging tenant and synthetic data set. Never use customer content.
 2. Capture starting release manifest, trusted-key digest, inventory digest,
    configuration fingerprint, and commit SHA.
-3. Run automated dependency/secret checks and the full test suite, then execute
-   the approved manual/dynamic cases. Preserve commands, redacted request IDs,
+3. Run automated dependency/secret checks, the full test suite, and
+   `python tools/dast_scan.py` (a repository-authored baseline, not a substitute
+   for the tester's own tools), then execute the approved manual/dynamic cases. Preserve commands, redacted request IDs,
    timestamps, versions, impact, and reproduction proof.
 4. Classify findings by business impact and exploit prerequisites; create an
    owner and due date. A critical/high finding blocks a paying-customer rollout

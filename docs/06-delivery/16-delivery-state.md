@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-25T09:02:36Z  
+**Measured at:** 2026-09-26T03:53:24Z  
 **Branch:** `main`  
-**HEAD:** `251f231` -- feat(backtest): carry advanced-account economics in the main artifact -- E3.1a (2026-09-25T14:09:33+05:30)  
-**Uncommitted paths:** 17
+**HEAD:** `9d9ecf9` -- feat(trading-api): authenticate and authorize the operator on the gRPC write path -- E3.3a (2026-09-25T14:34:15+05:30)  
+**Uncommitted paths:** 9
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -447,7 +447,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.2 | Property/model/fault coverage beyond the ten landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, smart routing, and — since 2026-09-25 — margin valuation and financing accrual, item 64). No named candidate remains; further property coverage is open-ended. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. Remainder: combination net prices and `lot_size` are not checked. | 5.5 / 5.7 |
 | E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes, kill-switch and LIVE write RPCs, a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
-| E3.4 | DAST (authenticated dynamic scan against a running deployment); SAST and dependency scanning are done | Security |
+| E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes, and it found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 
 ## The backlog that code cannot close
@@ -587,8 +587,20 @@ short — detail belongs in the conformance audit.
 - Rust workspace **464 → 476 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
-- **Next action:** E3.4, a repository-authored dynamic scan of a local
-  deployment that also exercises the new operator authentication.
+- Landed **E3.4**, as the operator decided: `tools/dast_scan.py`, pipeline
+  step 23b. It starts the real dashboard (production mode) and trading API (PAPER
+  route plus operator authentication) on loopback, and runs 69 network probes and
+  startup-refusal checks. It found one real defect, the dashboard's `Server`
+  header disclosing the exact Python version, which is now fixed with a contract
+  test. 11/11 injected service defects fail the scan, after two harness
+  weaknesses were fixed (audit item 68; Security row corrected in place).
+- Measured: Rust unchanged at **476**; the dashboard contract suite rose from 19
+  to 20 tests. The final `python tools/session_status.py` measurement recorded
+  all seven suites green, and the full pipeline, including step 23b, exited 0.
+- **Next action:** no named repository item remains in E3. What remains is
+  external: the 30 clean PAPER sessions, an independent penetration test and DAST,
+  legal review, paying users, and E2.1b's clean-machine capsule check.
+  Multi-account allocation stays gated by the roadmap.
 
 ### 2026-09-24 — session 5
 

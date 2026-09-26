@@ -766,6 +766,16 @@ def main() -> None:
         targets=[acceptance_target],
     )
 
+    # 23b. Repository-authored dynamic scan (E3.4). Starts the real dashboard
+    # and trading API on loopback and probes them over the network. It is not
+    # an independent DAST run or a penetration test and moves no gate.
+    dast_dir = VAR_DIR / "dast"
+    run_step(
+        "Step 23b: Dynamically scanning a local loopback deployment",
+        [sys.executable, "tools/dast_scan.py", "--output-dir", str(dast_dir)],
+        targets=[dast_dir / "dast-report.json", dast_dir / "dast-report.md"],
+    )
+
     # 24. Summary of Populated Evidence
     print("\n=================================================================")
     print("                    EVIDENCE INVENTORY SUMMARY                    ")

@@ -44,7 +44,9 @@ the dashboard proxy.
 
 These mechanisms do not provide a production vault/keychain, certificate
 issuance/rotation, HSM/KMS signing custody, out-of-band MFA enrollment or
-delivery, support operations, comprehensive SAST/DAST, an independent
-penetration test, or security operations for an exact deployment. Passkeys are
+delivery, support operations, an independent DAST product run, an independent
+penetration test, or security operations for an exact deployment.
+`tools/dast_scan.py` is a repository-authored dynamic scan of a local loopback
+deployment; it is evidence for engineering, not an independent assessment. Passkeys are
 also not implemented; TOTP is the current MFA method. See the
 [master-plan conformance audit](../06-delivery/14-master-plan-conformance-audit.md).

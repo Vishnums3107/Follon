@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import importlib.util
 import json
 import os
@@ -266,6 +267,23 @@ class DashboardServerContract(unittest.TestCase):
                 candidate = importlib.util.module_from_spec(spec)
                 with self.assertRaisesRegex(RuntimeError, "production dashboard mode requires"):
                     spec.loader.exec_module(candidate)
+
+    def test_server_header_discloses_no_runtime_version(self) -> None:
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
+        thread = Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for method in ("GET", "DELETE"):
+                connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+                connection.request(method, "/api/v1/health")
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+                self.assertEqual(response.getheader("Server"), "FollonEvidenceDashboard", method)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
 
     def test_security_headers_block_privileged_browser_features(self) -> None:
         handler = object.__new__(server.DashboardHandler)

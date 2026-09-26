@@ -446,7 +446,7 @@ does not expose privileged mutations through the read-only evidence server.
 | Secret ingress | Implemented interfaces; deployment gate | Managed-command/password/connection-string file boundaries and zeroizing broker material exist. Production mode refuses a direct database URL and requires a TLS connection string. A production vault/keychain, rotation operation, and custody evidence remain external. |
 | Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
-| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. DAST (an authenticated dynamic scan against a running deployment) and named security-operation ownership remain external. |
+| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. |
 | Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. |
 | MFA, short sessions, revocation, customer RBAC and tenant isolation | Implemented kernel/schema; deployment gate | Argon2id, password policy/rotation, TOTP with bounded challenges, hashed one-time recovery codes, lockout, opaque hashed 15-minute sessions, security-version revocation, five roles, tenant authorization, and PostgreSQL RLS schema are tested. Production enrollment, out-of-band delivery, support, and customer acceptance remain external. |
 | TLS and encryption at rest | TLS topology implemented; custody gate | Production Compose requires gRPC mTLS and a client-certificate dashboard proxy, pinned reviewed images, certificate secret files, and PostgreSQL `sslmode=require`. Certificate issuance/rotation, encrypted volume/KMS ownership, and deployed proof remain external. |
@@ -2605,6 +2605,58 @@ These are mandatory master-plan acceptance conditions and are currently open:
       - Kill-switch and LIVE writes have no RPC.
       - The separate deployment review is external.
     - This is not a production-readiness claim. No external gate moved.
+
+68. A repository-authored dynamic scan of a local deployment (2026-09-25, Security row; E3.4).
+    - **Scope, as the operator decided.** No DAST product was installed. Docker's engine was not running,
+      and ZAP would not cover gRPC. E3.4 therefore lands an in-repository harness and records it plainly
+      as a scan the repository wrote about itself.
+    - **What it does.**
+      - `tools/dast_scan.py` builds and starts the real `apps/desktop/server.py` in production mode, with
+        Basic authentication and a random password. It also starts the real `follon-trading-api`, with a
+        durable PAPER route and an operator directory provisioned through `follon-admin operator-add`.
+        Both bind to loopback.
+      - It probes both over the network: 69 probes in all.
+      - **Dashboard:** unauthenticated access to every route, five malformed-credential variants,
+        method tampering (six verbs), eight path-traversal encodings measured against a sentinel file
+        just outside the evidence root, security headers on served and refused responses,
+        server-version disclosure, CORS for untrusted and null origins, a 70 KB request line, a
+        malformed query, CRLF header injection, and credential rate limiting, including a locked-out
+        peer guessing right.
+      - **gRPC:** a missing, malformed, or forged session; a wrong password; a wrong and a replayed TOTP
+        code; a read-only role; a wrong tenant; a revoked session; lockout after five failures;
+        account enumeration; an undecodable and a 5 MiB message; an undeclared method; and health
+        after every probe.
+      - **Startup:** production mode with a short password, a PAPER route without a directory, and
+        plaintext non-loopback login. Each must refuse for its stated reason.
+      - It writes `dast-report.json` and `dast-report.md` with the binary hashes, and exits non-zero on
+        any failure.
+    - **What it found.** One real defect. The dashboard's `Server` header disclosed the exact runtime
+      (`FollonEvidenceDashboard/2.0 Python/3.12.10`) on every response. `DashboardHandler.version_string`
+      now returns only `FollonEvidenceDashboard`, and a contract test checks the live header on GET and on
+      an unsupported method. That test fails without the fix. The first run also exposed two probe bugs of
+      my own, both corrected:
+      - the header-injection probe read the JSON body rather than the headers;
+      - tonic reports an oversized message as `OUT_OF_RANGE`, not `RESOURCE_EXHAUSTED`.
+    - **Defect injection (rule 5).** Eleven defects were injected into the scanned services: dashboard
+      authentication, version disclosure, `X-Frame-Options`, rate limiting, CORS, the evidence path
+      check, the write permission, bearer-token form, the directory startup rule, identity lockout, and
+      TOTP replay. The final scan caught 11 of 11. The first pass exposed two weaknesses in the harness,
+      both fixed:
+      - a server that dropped the connection crashed the scanner instead of failing a probe. Transport
+        errors are now status 0, a failure, and any harness error is itself a failing probe, so the
+        report is still written;
+      - the startup probe "passed" because the second API could not open the running API's journal.
+        Each startup probe now uses its own route and journal and must fail with its stated message.
+      An interrupted injection run once left `apps/desktop/server.py` zeroed. It was restored from a
+      backup and verified against `HEAD`, and the injection harness now backs up each file to disk before
+      mutating it.
+    - **Measured result.** The scan measured 69 probes, 0 failed. The Rust workspace is unchanged at 476;
+      the dashboard contract suite rose from 19 to 20 tests. The final `python tools/session_status.py`
+      run measured all seven suites green, and the full pipeline, including step 23b, exited 0.
+    - **Bounded remainder.** This is not an independent DAST product run, a penetration test, or a scan
+      of a real deployment's network, TLS, proxy, or PostgreSQL. It covers no fuzzing campaign and no
+      authenticated crawl of the web bundle. The independent penetration test gate is unchanged at zero.
+      No external gate moved.
 
 ## Business-readiness decision
 

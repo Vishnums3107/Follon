@@ -1279,7 +1279,13 @@ def system_status() -> dict[str, object]:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "FollonEvidenceDashboard/2.0"
+    server_version = "FollonEvidenceDashboard"
+
+    def version_string(self) -> str:
+        # The stdlib default appends the exact Python version to every
+        # response's Server header, which hands a scanner the runtime to
+        # target. Report the product name only (found by tools/dast_scan.py).
+        return self.server_version
 
     TAURI_READ_ONLY_ORIGINS = frozenset({
         "http://tauri.localhost",
