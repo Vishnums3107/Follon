@@ -239,6 +239,46 @@ impl LiveRiskPolicy {
                 .then_some("LIMIT_PRICE_OFF_TICK_GRID"),
         }
     }
+
+    /// Tick-grid rejections for a combination (E3.6b). Each leg meets exactly
+    /// the rule a plain order on its instrument meets: it must be listed and
+    /// its protected limit price must sit on its grid. The net price limit
+    /// must then sit on the finest grid among the legs. That errs toward
+    /// refusal; a venue's own complex-order increment is not modelled.
+    pub(crate) fn combo_tick_rejections(&self, intent: &ComboIntent) -> Vec<&'static str> {
+        let mut reasons: Vec<&'static str> = intent
+            .legs
+            .iter()
+            .filter_map(|leg| self.tick_rejection(&leg.instrument_id, Some(leg.limit_price)))
+            .collect();
+        let finest = intent
+            .legs
+            .iter()
+            .filter_map(|leg| self.instrument_tick_sizes.get(&leg.instrument_id))
+            .min();
+        if finest.is_some_and(|tick| intent.price_limit.amount().scaled() % tick.scaled() != 0) {
+            reasons.push("COMBO_NET_PRICE_OFF_TICK_GRID");
+        }
+        reasons
+    }
+
+    /// Each leg's configured tick, for the decision evidence.
+    pub(crate) fn combo_tick_evidence(&self, intent: &ComboIntent) -> String {
+        intent
+            .legs
+            .iter()
+            .map(|leg| {
+                format!(
+                    "{}:{}",
+                    leg.instrument_id,
+                    self.instrument_tick_sizes
+                        .get(&leg.instrument_id)
+                        .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
 
 /// Operator permission for net short exposure at the controlled-live boundary.
@@ -5851,6 +5891,65 @@ mod tests {
         assert!(decision
             .evaluated_limits
             .contains("combo_net_debit=5.00000000"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_combo_legs_meet_the_plain_order_tick_rule_and_the_net_the_finest_grid() {
+        let path = journal_path("combo-ticks");
+        let decide = |ticks: &[(&str, &str)], near: &str, far: &str, cap: &str| {
+            let _ = fs::remove_file(&path);
+            let mut policy = policy_permitting_shorts();
+            policy
+                .instrument_tick_sizes
+                .remove("inst.us_option.spy.near");
+            policy
+                .instrument_tick_sizes
+                .remove("inst.us_option.spy.far");
+            for (instrument, tick) in ticks {
+                policy
+                    .instrument_tick_sizes
+                    .insert((*instrument).to_owned(), amount(tick));
+            }
+            let mut service = test_service_with_policy(LiveRunMode::Canary, &path, policy);
+            let mut intent = combo_intent("intent.live.combo.ticks");
+            intent.legs[0].limit_price = amount(near);
+            intent.legs[1].limit_price = amount(far);
+            intent.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount(cap));
+            let mut market = combo_market();
+            market.marks[0].mark_price = amount(near);
+            market.marks[1].mark_price = amount(far);
+            service
+                .evaluate_combo_risk(&intent, &market, "2026-01-02T14:30:02Z", false)
+                .expect("combination assessment")
+        };
+        let near = "inst.us_option.spy.near";
+        let far = "inst.us_option.spy.far";
+
+        let on_grid = decide(&[(near, "0.05"), (far, "0.01")], "7.50", "5", "2.51");
+        assert!(on_grid.approved, "{:?}", on_grid.reason_codes);
+        assert!(on_grid.evaluated_limits.contains(
+            "combo_tick_sizes=[inst.us_option.spy.near:0.05000000|inst.us_option.spy.far:0.01000000]"
+        ));
+        let unlisted = decide(&[(near, "0.01")], "7.50", "5", "2.50");
+        assert!(unlisted
+            .reason_codes
+            .contains(&"INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()));
+        let off_leg = decide(&[(near, "0.05"), (far, "0.01")], "7.52", "5.02", "2.50");
+        assert_eq!(
+            off_leg.reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        let off_net = decide(&[(near, "0.01"), (far, "0.01")], "7.50", "5", "2.505");
+        assert_eq!(
+            off_net.reason_codes,
+            vec!["COMBO_NET_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        let coarse = decide(&[(near, "0.05"), (far, "0.05")], "7.50", "5", "2.51");
+        assert_eq!(
+            coarse.reason_codes,
+            vec!["COMBO_NET_PRICE_OFF_TICK_GRID".to_owned()]
+        );
         let _ = fs::remove_file(&path);
     }
 

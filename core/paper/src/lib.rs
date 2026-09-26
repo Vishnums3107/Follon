@@ -1469,6 +1469,46 @@ impl PaperRiskPolicy {
         }
     }
 
+    /// Tick-grid rejections for a combination (E3.6b). Each leg meets exactly
+    /// the rule a plain order on its instrument meets: it must be listed and
+    /// its protected limit price must sit on its grid. The net price limit
+    /// must then sit on the finest grid among the legs. That errs toward
+    /// refusal; a venue's own complex-order increment is not modelled.
+    fn combo_tick_rejections(&self, intent: &ComboIntent) -> Vec<&'static str> {
+        let mut reasons: Vec<&'static str> = intent
+            .legs
+            .iter()
+            .filter_map(|leg| self.tick_rejection(&leg.instrument_id, Some(leg.limit_price)))
+            .collect();
+        let finest = intent
+            .legs
+            .iter()
+            .filter_map(|leg| self.instrument_tick_sizes.get(&leg.instrument_id))
+            .min();
+        if finest.is_some_and(|tick| intent.price_limit.amount().scaled() % tick.scaled() != 0) {
+            reasons.push("COMBO_NET_PRICE_OFF_TICK_GRID");
+        }
+        reasons
+    }
+
+    /// Each leg's configured tick, for the decision evidence.
+    fn combo_tick_evidence(&self, intent: &ComboIntent) -> String {
+        intent
+            .legs
+            .iter()
+            .map(|leg| {
+                format!(
+                    "{}:{}",
+                    leg.instrument_id,
+                    self.instrument_tick_sizes
+                        .get(&leg.instrument_id)
+                        .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
     /// Whether a projected per-instrument position breaches this policy.
     ///
     /// Shared by the single-order and combination gates so a combination leg is
@@ -3848,6 +3888,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         };
 
         let mut reasons = self.kill_switches.combo_rejection_reasons(intent);
+        reasons.extend(
+            self.risk_policy
+                .combo_tick_rejections(intent)
+                .into_iter()
+                .map(str::to_owned),
+        );
 
         // Each leg's own contract quantity is what the broker sees, so the
         // per-order quantity limit binds the largest leg rather than the
@@ -3975,7 +4021,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}]{}",
+                "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}],combo_tick_sizes=[{}]{}",
                 intent.legs.len(),
                 intent.combo_quantity,
                 intent.price_limit.kind(),
@@ -3998,6 +4044,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 available_cash,
                 market.oldest_observed_at()?,
                 leg_evidence.join("|"),
+                self.risk_policy.combo_tick_evidence(intent),
                 portfolio_risk_limits,
             ),
         })
@@ -6508,6 +6555,74 @@ mod tests {
         assert!(decision
             .evaluated_limits
             .contains("combo_protected_net_price=2.50000000"));
+    }
+
+    #[test]
+    fn combo_legs_meet_the_plain_order_tick_rule_and_the_net_the_finest_grid() {
+        let decide = |ticks: &[(&str, &str)], near: &str, far: &str, cap: &str| {
+            let mut service = service_permitting_shorts();
+            service
+                .risk_policy
+                .instrument_tick_sizes
+                .remove("inst.us_option.spy.near");
+            service
+                .risk_policy
+                .instrument_tick_sizes
+                .remove("inst.us_option.spy.far");
+            for (instrument, tick) in ticks {
+                service
+                    .risk_policy
+                    .instrument_tick_sizes
+                    .insert((*instrument).to_owned(), decimal("tick", tick).unwrap());
+            }
+            let mut intent = combo_intent("combo-000090", "2026-01-02T14:30:00Z");
+            intent.legs[0].limit_price = decimal("near", near).unwrap();
+            intent.legs[1].limit_price = decimal("far", far).unwrap();
+            intent.price_limit =
+                follon_domain::ComboPriceLimit::MaximumDebit(decimal("cap", cap).unwrap());
+            let mut market = combo_market("2026-01-02T14:30:00Z");
+            market.marks[0].mark_price = decimal("mark", near).unwrap();
+            market.marks[1].mark_price = decimal("mark", far).unwrap();
+            service
+                .evaluate_combo_risk(&intent, &market, "2026-01-02T14:30:02Z")
+                .unwrap()
+        };
+        let near = "inst.us_option.spy.near";
+        let far = "inst.us_option.spy.far";
+
+        // On every grid: approved, with each leg's tick in the evidence.
+        let on_grid = decide(&[(near, "0.05"), (far, "0.01")], "7.50", "5", "2.51");
+        assert!(on_grid.approved, "{:?}", on_grid.reason_codes);
+        assert!(on_grid.evaluated_limits.contains(
+            "combo_tick_sizes=[inst.us_option.spy.near:0.05000000|inst.us_option.spy.far:0.01000000]"
+        ));
+        // An unlisted leg is refused exactly as a plain order on it would be.
+        let unlisted = decide(&[(near, "0.01")], "7.50", "5", "2.50");
+        assert!(!unlisted.approved);
+        assert!(unlisted
+            .reason_codes
+            .contains(&"INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()));
+        assert!(unlisted
+            .evaluated_limits
+            .contains("inst.us_option.spy.far:UNCONFIGURED"));
+        // A leg price off its own grid.
+        let off_leg = decide(&[(near, "0.05"), (far, "0.01")], "7.52", "5.02", "2.50");
+        assert_eq!(
+            off_leg.reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        // A net limit off the finest leg grid, with every leg on its own.
+        let off_net = decide(&[(near, "0.01"), (far, "0.01")], "7.50", "5", "2.505");
+        assert_eq!(
+            off_net.reason_codes,
+            vec!["COMBO_NET_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        // The finest grid binds: a cent-stepped net against two nickel legs is refused.
+        let coarse = decide(&[(near, "0.05"), (far, "0.05")], "7.50", "5", "2.51");
+        assert_eq!(
+            coarse.reason_codes,
+            vec!["COMBO_NET_PRICE_OFF_TICK_GRID".to_owned()]
+        );
     }
 
     #[test]

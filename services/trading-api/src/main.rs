@@ -1262,7 +1262,11 @@ mod tests {
             "max_market_data_age_seconds": 5,
             "max_order_rate": 20,
             "order_rate_window_seconds": 60,
-            "instrument_tick_sizes": { "inst.us_equity.spy": "0.01" },
+            "instrument_tick_sizes": {
+                "inst.us_equity.spy": "0.01",
+                "inst.us_option.spy.500c": "0.01",
+                "inst.us_option.spy.505c": "0.01",
+            },
             "short_exposure": { "max_short_quantity": "1000" },
             "kill_switch_version": "kills.grpc.paper.v1",
             "adapter_kind": "IBKR_PAPER_MODEL",

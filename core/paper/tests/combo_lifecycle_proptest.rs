@@ -141,11 +141,13 @@ fn service() -> PaperTradingService<ReplayingAdapter> {
         short_exposure: Some(ShortExposurePolicy {
             max_short_quantity: dec("1000"),
         }),
-        // Combinations are not tick-checked; plain-order rules need a listing.
-        instrument_tick_sizes: std::collections::BTreeMap::from([(
-            "inst.us_equity.spy".to_owned(),
-            dec("0.01"),
-        )]),
+        // Every leg is tick-checked like a plain order (E3.6b); generated
+        // prices are whole cents, so each leg is listed at a one-cent tick.
+        instrument_tick_sizes: (0..4)
+            .map(instrument)
+            .chain(["inst.us_equity.spy".to_owned()])
+            .map(|instrument| (instrument, dec("0.01")))
+            .collect(),
     };
     let adapter = ReplayingAdapter {
         inner: IbkrPaperAdapter::new(&account).unwrap(),

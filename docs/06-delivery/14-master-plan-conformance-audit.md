@@ -2658,6 +2658,33 @@ These are mandatory master-plan acceptance conditions and are currently open:
       authenticated crawl of the web bundle. The independent penetration test gate is unchanged at zero.
       No external gate moved.
 
+69. Combination orders meet the tick grid a plain order meets (2026-09-26, rows 5.5 and 5.7; E3.6b).
+    - **The gap.** Item 61 added a required per-instrument tick table to PAPER and controlled-LIVE risk,
+      but only plain orders consulted it. A combination leg on an unlisted instrument, or with a leg
+      price off its grid, was approved. That contradicted the combination gate's own stated rule that a
+      leg is judged "by exactly the rule a plain order on the same instrument would meet". The gRPC route
+      test and the scanner's route config both carried such legs and were approved.
+    - **The rule, as the operator decided.**
+      - Each leg's instrument must be listed (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`), and each leg's
+        protected limit price must sit on its grid (`LIMIT_PRICE_OFF_TICK_GRID`).
+      - The net price limit must then sit on the finest grid among its legs
+        (`COMBO_NET_PRICE_OFF_TICK_GRID`). This errs toward refusal. A venue's own complex-order
+        increment is not modelled, so a cent-stepped net against two nickel-tick legs is refused even
+        where a venue might accept it.
+      - The decision evidence gains `combo_tick_sizes=[instrument:tick|...]`.
+      - One shared helper per policy (`combo_tick_rejections`) serves PAPER and controlled-LIVE.
+    - **Fixtures.** The gRPC route test, the scanner's route, and both combination lifecycle proptests
+      now list their leg instruments. The proptests' comments said "Combinations are not tick-checked",
+      and those comments were replaced.
+    - **Tests.** A PAPER and a controlled-LIVE regression each cover five cases: on every grid, an
+      unlisted leg, an off-grid leg, an off-grid net, and the finest grid binding. Rule 5: 4 of 4 injected
+      defects were caught (legs unchecked, net unchecked, coarsest instead of finest grid, and the LIVE
+      call site dropped).
+    - **Measured result.** The Rust workspace rose from 476 to 478 passed / 0 failed / 3
+      ignored; the final `python tools/session_status.py` run measured all seven suites green.
+    - **Bounded remainder.** Lot sizes are item E3.6c. The venue's own complex-order increment is not
+      modelled. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
