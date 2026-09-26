@@ -1504,6 +1504,12 @@ impl RiskPolicy {
     }
 
     /// Evaluates every executable request before an order exists.
+    ///
+    /// `bar` is the mark every price limit is judged against, so it must be
+    /// the intent's own instrument. Another instrument's close would price
+    /// the notional and the collar on the wrong asset. A decision against
+    /// that mark is not a decision at all, so it is an error rather than a
+    /// rejection, as PAPER treats a mismatched market observation.
     pub fn evaluate(
         &self,
         intent: &OrderIntent,
@@ -1511,6 +1517,11 @@ impl RiskPolicy {
         replay_time: &str,
     ) -> Result<RiskDecision, EngineError> {
         intent.validate()?;
+        if intent.instrument_id != bar.instrument_id {
+            return Err(EngineError(
+                "risk mark instrument does not match the intent".to_owned(),
+            ));
+        }
         let estimated_notional = intent.quantity.checked_mul(bar.close)?;
         let requested_price_deviation_bps = intent
             .limit_price
@@ -2381,6 +2392,15 @@ impl ReplayEngine {
                 "strategy intent does not match replay account or configuration".to_owned(),
             ));
         }
+        // This bar is the only mark the risk decision has. Refuse here, before
+        // the intent is recorded, so the stream never holds an intent with no
+        // decision. A strategy trades an instrument on that instrument's bar.
+        if intent.instrument_id != bar.instrument_id {
+            return Err(EngineError(
+                "strategy intent instrument does not match the market bar that produced it"
+                    .to_owned(),
+            ));
+        }
         if self
             .working_orders
             .contains_key(&format!("order-{}", intent.intent_id))
@@ -2698,6 +2718,12 @@ impl ReplayEngine {
         {
             return Err(EngineError(
                 "strategy intent does not match replay account or configuration".to_owned(),
+            ));
+        }
+        // The market snapshot is the news decision's only mark; see `process_bar`.
+        if intent.instrument_id != market.instrument_id {
+            return Err(EngineError(
+                "news intent instrument does not match its market snapshot".to_owned(),
             ));
         }
         if self
@@ -3443,6 +3469,135 @@ mod tests {
         assert!(decision
             .evaluated_limits
             .contains("requested_price_deviation_bps=500.00000000"));
+    }
+
+    /// Emits one market order for an instrument other than the one it observed.
+    struct TradesAnotherInstrument;
+
+    impl TradesAnotherInstrument {
+        fn intent(intent_id: &str, replay_time: &str) -> Result<OrderIntent, EngineError> {
+            Ok(OrderIntent {
+                intent_id: intent_id.to_owned(),
+                account_id: "acct-paper-001".to_owned(),
+                strategy_id: "strategy-cross-001".to_owned(),
+                instrument_id: "inst.us_equity.qqq".to_owned(),
+                correlation_id: "corr-cross-001".to_owned(),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(5)?,
+                order_type: OrderType::Market,
+                limit_price: None,
+                time_in_force: TimeInForce::Day,
+                rationale: "trades one instrument off another's observation".to_owned(),
+                created_at: replay_time.to_owned(),
+                strategy_version: "strategy-cross-v1".to_owned(),
+                configuration_version: "cfg-example-1".to_owned(),
+                environment: "SIMULATION".to_owned(),
+            })
+        }
+    }
+
+    impl Strategy for TradesAnotherInstrument {
+        fn on_bar(
+            &mut self,
+            _bar: &Bar,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Self::intent("intent-cross-bar-001", replay_time).map(Some)
+        }
+
+        fn on_news_sentiment(
+            &mut self,
+            _sentiment: &SentimentVector,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Self::intent("intent-cross-news-001", replay_time).map(Some)
+        }
+    }
+
+    fn event_types(store: &InMemoryEventStore) -> Vec<&str> {
+        store
+            .events()
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn risk_evaluation_refuses_a_mark_for_another_instrument() {
+        // SPY's close would price this QQQ order's notional and collar, and
+        // says nothing about QQQ's own price. There is no decision to make.
+        let policy = engine().policy;
+        let intent =
+            TradesAnotherInstrument::intent("intent-cross-risk-001", "2026-01-02T14:31:00Z")
+                .unwrap();
+        let error = policy
+            .evaluate(&intent, &bar(), "2026-01-02T14:31:00Z")
+            .unwrap_err();
+        assert_eq!(error.0, "risk mark instrument does not match the intent");
+
+        let mut own_mark = bar();
+        own_mark.instrument_id = intent.instrument_id.clone();
+        assert!(
+            policy
+                .evaluate(&intent, &own_mark, "2026-01-02T14:31:00Z")
+                .unwrap()
+                .approved
+        );
+    }
+
+    #[test]
+    fn replay_refuses_an_intent_for_another_instrument_before_recording_it() {
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let error = replay
+            .process_bar(
+                &mut store,
+                &mut TradesAnotherInstrument,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap_err();
+        // The bar was observed; nothing the strategy asked for was recorded.
+        assert_eq!(event_types(&store), vec!["market.bar.v1"]);
+        assert!(replay.working_orders.is_empty());
+        assert_eq!(
+            error.0,
+            "strategy intent instrument does not match the market bar that produced it"
+        );
+    }
+
+    #[test]
+    fn news_intent_for_another_instrument_is_refused_before_recording_it() {
+        let mut replay = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = TradesAnotherInstrument;
+        replay
+            .process_news_headline(&mut store, &mut strategy, news_headline())
+            .unwrap();
+        let error = replay
+            .process_news_sentiment(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                news_sentiment(),
+                bar(),
+                NewsShockContext {
+                    pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+                    current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                    baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            event_types(&store),
+            vec!["news.headline.v1", "news.sentiment.v1"]
+        );
+        assert!(replay.working_orders.is_empty());
+        assert_eq!(
+            error.0,
+            "news intent instrument does not match its market snapshot"
+        );
     }
 
     #[test]

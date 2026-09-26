@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-26T08:47:57Z  
+**Measured at:** 2026-09-26T09:12:53Z  
 **Branch:** `main`  
-**HEAD:** `2a2a972` -- feat(risk): refuse quantities that are not a whole number of lots -- E3.6c (2026-09-26T14:03:14+05:30)  
-**Uncommitted paths:** 11
+**HEAD:** `a42556c` -- feat(trading-api): authenticated PAPER kill-switch RPCs, journaled by operator -- E3.3b (2026-09-26T14:20:08+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 492 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 495 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
@@ -449,6 +449,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. **E3.3b done 2026-09-26 (audit item 71):** `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` require a session whose role grants kill-switch operation (`risk_manager`), and the PAPER journal records the operator and server time of every change. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes, LIVE write RPCs (orders and kill switches), a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
 | E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes when it landed, and 76 since E3.3b added the kill-switch RPCs. It found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
+| E3.7 | **Done 2026-09-26 (audit item 72).** Replay risk priced an intent from the bar that produced it, whatever that bar's instrument, so a QQQ order raised on SPY's bar was judged at SPY's price. `RiskPolicy::evaluate` now refuses a mark for another instrument, and the bar and news paths refuse such an intent before recording it, as PAPER does. Remainder: the engine holds no mark except the current bar, so one instrument cannot be traded on another's bar. | 5.4 |
 
 ## The backlog that code cannot close
 
@@ -512,6 +513,21 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-26 — session 8
+
+- Asked again to "complete the project". Baseline at `a42556c`: clean tree,
+  all seven suites green, Rust 492 passed / 0 failed / 3 ignored. The
+  remaining repository work is research-to-live parity in the replay engine,
+  which item 70 recorded.
+- Landed **E3.7**, a defect found while reading the replay order path. Replay
+  risk judged an intent against the bar that produced it, whatever that bar's
+  instrument was. It now refuses a mark for another instrument, before
+  recording the intent, as PAPER does. 3/3 injected defects were caught
+  (audit item 72).
+- Rust workspace **492 → 495 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0.
 
 ### 2026-09-26 — session 7
 

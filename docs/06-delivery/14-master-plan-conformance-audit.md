@@ -2796,6 +2796,41 @@ These are mandatory master-plan acceptance conditions and are currently open:
       - The operator directory has no managed secret store.
       - The deployment review stays external, and the REST boundary stays read-only. No external gate moved.
 
+72. Replay risk refuses to judge an intent against another instrument's mark (2026-09-26, row 5.4 and
+    research-to-live parity; E3.7).
+    - **The gap.** `ReplayEngine` checked that a strategy's intent named the replay account and
+      configuration, and nothing else. `RiskPolicy::evaluate` then priced the intent's notional and its
+      price collar from the close of whichever bar produced it. Neither the engine nor the Python worker
+      boundary required that bar to be the intent's own instrument. A strategy reacting to SPY's bar with
+      a QQQ order was therefore judged at SPY's price: its notional and collar were computed on the wrong
+      asset. PAPER refuses exactly this (`paper market observation instrument does not match intent`). The
+      news path had the same hole: the sentiment had to match its market snapshot, but the intent did not.
+      Both example strategies trade the bar's own instrument, so no checked-in evidence was affected.
+    - **The rule.** A decision needs a mark for the instrument being traded, and the engine holds only
+      the current bar. So a strategy trades an instrument on that instrument's own bar, and anything else
+      is an error rather than a rejection. A decision against an unusable mark is not a "no"; it is not a
+      decision, which is E1.2's rule for a stale PAPER observation. A multi-instrument strategy remains
+      possible: it may read any instrument's point-in-time history, and trades each one on its own bar.
+      - `RiskPolicy::evaluate` refuses a mark for another instrument, for any caller.
+      - `process_bar` and the news path refuse before the intent is recorded. The stream therefore never
+        holds an intent without a decision. Without that ordering, `evaluate` would still refuse, but only
+        after the intent was already on the stream.
+    - **Tests.** A direct evaluation test with an own-mark control, and a bar-path and a news-path test.
+      Each replay test asserts the exact recorded stream: the bar alone, or the headline and sentiment
+      alone.
+    - **Rule 5.** 3 of 3 injected defects were caught: `evaluate` accepting another instrument's mark; the
+      bar path relying on `evaluate`, which records the intent first; and the news path doing the same.
+      The first run of the two replay tests caught their defects on the error text rather than on the
+      recorded stream. Their assertions were reordered so that each catch rests on the stream, and both
+      were re-injected and caught there.
+    - **Measured result.** The Rust workspace rose from 492 to 495 passed / 0 failed / 3 ignored. The first
+      `python tools/session_status.py` run failed `cargo fmt` on one unformatted assertion. It was
+      formatted, every suite was re-measured, and the final run measured all seven suites green. The full
+      evidence pipeline exited 0, including step 23b's scan (76 probes, 0 failed).
+    - **Bounded remainder.** The replay engine still holds no mark except the current bar, so a strategy
+      cannot hedge one instrument on another's bar. That needs a point-in-time multi-instrument mark
+      model, which does not exist. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
