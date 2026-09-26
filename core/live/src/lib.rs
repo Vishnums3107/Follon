@@ -223,6 +223,11 @@ pub struct LiveRiskPolicy {
     /// instrument that is not listed is refused, and so is a limit price off
     /// its instrument's grid, before a broker can reject it.
     pub instrument_tick_sizes: BTreeMap<String, Decimal>,
+    /// Venue lot size per tradable instrument: the exact quantity increment.
+    /// A plain order or a combination leg whose quantity is not a whole
+    /// number of lots is refused, and so is one on an unlisted instrument,
+    /// before a broker can reject it.
+    pub instrument_lot_sizes: BTreeMap<String, Decimal>,
 }
 
 impl LiveRiskPolicy {
@@ -237,6 +242,22 @@ impl LiveRiskPolicy {
             Some(tick) => limit_price
                 .is_some_and(|price| price.scaled() % tick.scaled() != 0)
                 .then_some("LIMIT_PRICE_OFF_TICK_GRID"),
+        }
+    }
+
+    /// The lot-size rejection for one order quantity, if any (E3.6c). A plain
+    /// order's quantity and each combination leg's contract quantity meet
+    /// this same rule.
+    pub(crate) fn lot_rejection(
+        &self,
+        instrument_id: &str,
+        quantity: Decimal,
+    ) -> Option<&'static str> {
+        match self.instrument_lot_sizes.get(instrument_id) {
+            None => Some("INSTRUMENT_LOT_SIZE_UNCONFIGURED"),
+            Some(lot) => {
+                (quantity.scaled() % lot.scaled() != 0).then_some("ORDER_QUANTITY_OFF_LOT_SIZE")
+            }
         }
     }
 
@@ -264,21 +285,32 @@ impl LiveRiskPolicy {
 
     /// Each leg's configured tick, for the decision evidence.
     pub(crate) fn combo_tick_evidence(&self, intent: &ComboIntent) -> String {
-        intent
-            .legs
-            .iter()
-            .map(|leg| {
-                format!(
-                    "{}:{}",
-                    leg.instrument_id,
-                    self.instrument_tick_sizes
-                        .get(&leg.instrument_id)
-                        .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("|")
+        render_leg_entries(intent, &self.instrument_tick_sizes)
     }
+
+    /// Each leg's configured lot size, for the decision evidence.
+    pub(crate) fn combo_lot_evidence(&self, intent: &ComboIntent) -> String {
+        render_leg_entries(intent, &self.instrument_lot_sizes)
+    }
+}
+
+/// Each combination leg's entry in a per-instrument reference table, in leg
+/// order, with `UNCONFIGURED` for an instrument the table does not list.
+fn render_leg_entries(intent: &ComboIntent, table: &BTreeMap<String, Decimal>) -> String {
+    intent
+        .legs
+        .iter()
+        .map(|leg| {
+            format!(
+                "{}:{}",
+                leg.instrument_id,
+                table
+                    .get(&leg.instrument_id)
+                    .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Operator permission for net short exposure at the controlled-live boundary.
@@ -357,6 +389,21 @@ impl LiveRiskPolicy {
         {
             return Err(LiveError(
                 "controlled-live risk policy needs a positive tick size per listed instrument"
+                    .to_owned(),
+            ));
+        }
+        // The same holds for the lot table (E3.6c).
+        if self.instrument_lot_sizes.is_empty()
+            || self
+                .instrument_lot_sizes
+                .iter()
+                .any(|(instrument_id, lot)| {
+                    validate_canonical_id("lot-size instrument_id", instrument_id).is_err()
+                        || *lot <= Decimal::ZERO
+                })
+        {
+            return Err(LiveError(
+                "controlled-live risk policy needs a positive lot size per listed instrument"
                     .to_owned(),
             ));
         }
@@ -3042,6 +3089,12 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         {
             reasons.push(reason.to_owned());
         }
+        if let Some(reason) = self
+            .policy
+            .lot_rejection(&intent.instrument_id, intent.quantity)
+        {
+            reasons.push(reason.to_owned());
+        }
         if self.conflicts_with_working_order(&intent.instrument_id, intent.side) {
             reasons.push("SELF_TRADE_RISK".to_owned());
         }
@@ -3129,7 +3182,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             reasons.push("APPROVED".to_owned());
         }
         let evaluated_limits = format!(
-            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={}{}",
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={},instrument_lot_size={}{}",
             self.policy.max_order_quantity,
             self.policy.max_order_notional,
             self.policy.max_price_deviation_bps,
@@ -3152,6 +3205,10 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             available_cash,
             self.policy
                 .instrument_tick_sizes
+                .get(&intent.instrument_id)
+                .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string),
+            self.policy
+                .instrument_lot_sizes
                 .get(&intent.instrument_id)
                 .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string),
             portfolio_risk_limits,
@@ -4825,15 +4882,24 @@ fn configuration_fingerprint(
     }
     // Always present: every configuration now lists its tick sizes, and an
     // approval or journal bound to one tick table must not carry to another.
-    let tick_sizes = policy
-        .instrument_tick_sizes
-        .iter()
-        .map(|(instrument_id, tick)| format!("{instrument_id}:{tick}"))
-        .collect::<Vec<_>>()
-        .join("|");
+    let tick_sizes = render_instrument_table(&policy.instrument_tick_sizes);
     parts.push("live-instrument-ticks-v1");
     parts.push(&tick_sizes);
+    // Likewise the lot table (E3.6c).
+    let lot_sizes = render_instrument_table(&policy.instrument_lot_sizes);
+    parts.push("live-instrument-lots-v1");
+    parts.push(&lot_sizes);
     hash_fingerprint_parts(&parts)
+}
+
+/// A per-instrument reference table (ticks or lots) in its canonical,
+/// instrument-ordered form, for the configuration fingerprint.
+fn render_instrument_table(table: &BTreeMap<String, Decimal>) -> String {
+    table
+        .iter()
+        .map(|(instrument_id, value)| format!("{instrument_id}:{value}"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn intent_fingerprint(intent: &OrderIntent) -> Result<String, LiveError> {
@@ -5643,6 +5709,17 @@ mod tests {
             .into_iter()
             .map(|instrument| (instrument.to_owned(), amount("0.01")))
             .collect(),
+            // A lot of one: every whole quantity passes, so only a test that
+            // sets a coarser lot exercises the lot rule.
+            instrument_lot_sizes: [
+                "inst.us_equity.spy",
+                "inst.us_equity.qqq",
+                "inst.us_option.spy.near",
+                "inst.us_option.spy.far",
+            ]
+            .into_iter()
+            .map(|instrument| (instrument.to_owned(), amount("1")))
+            .collect(),
         }
     }
 
@@ -5949,6 +6026,56 @@ mod tests {
         assert_eq!(
             coarse.reason_codes,
             vec!["COMBO_NET_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_combo_leg_quantities_meet_the_plain_order_lot_rule() {
+        let path = journal_path("combo-lots");
+        let near = "inst.us_option.spy.near";
+        let far = "inst.us_option.spy.far";
+        // A ratio-2 near leg at 6.00 against a ratio-1 far leg at 5.00: each
+        // unit sends two near contracts and one far contract to the broker.
+        let decide = |lots: &[(&str, &str)], units: &str| {
+            let _ = fs::remove_file(&path);
+            let mut policy = policy_permitting_shorts();
+            policy.instrument_lot_sizes.remove(near);
+            policy.instrument_lot_sizes.remove(far);
+            for (instrument, lot) in lots {
+                policy
+                    .instrument_lot_sizes
+                    .insert((*instrument).to_owned(), amount(lot));
+            }
+            let mut service = test_service_with_policy(LiveRunMode::Canary, &path, policy);
+            let mut intent = combo_intent("intent.live.combo.lots");
+            intent.combo_quantity = amount(units);
+            intent.legs[0].ratio = 2;
+            intent.legs[0].limit_price = amount("6");
+            intent.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount("7"));
+            let mut market = combo_market();
+            market.marks[0].mark_price = amount("6");
+            service
+                .evaluate_combo_risk(&intent, &market, "2026-01-02T14:30:02Z", false)
+                .expect("combination assessment")
+        };
+
+        // Two units are not a whole near lot of 4; only each leg's own
+        // quantity (4 near, 2 far) can approve this.
+        let on_lot = decide(&[(near, "4"), (far, "2")], "2");
+        assert!(on_lot.approved, "{:?}", on_lot.reason_codes);
+        assert!(on_lot.evaluated_limits.contains(
+            "combo_lot_sizes=[inst.us_option.spy.near:4.00000000|inst.us_option.spy.far:2.00000000]"
+        ));
+        let off_lot = decide(&[(near, "2"), (far, "2")], "1");
+        assert_eq!(
+            off_lot.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        let unlisted = decide(&[(near, "1")], "2");
+        assert_eq!(
+            unlisted.reason_codes,
+            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
         );
         let _ = fs::remove_file(&path);
     }
@@ -6785,7 +6912,12 @@ mod tests {
     #[test]
     fn controlled_live_refuses_off_grid_limits_and_unlisted_instruments() {
         let path = journal_path("tick-grid");
-        let mut service = test_service(LiveRunMode::Shadow, &path);
+        // iwm's lot is listed, so only its missing tick can refuse it.
+        let mut policy = policy();
+        policy
+            .instrument_lot_sizes
+            .insert("inst.us_equity.iwm".to_owned(), amount("1"));
+        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, policy);
         let mut off_grid = intent("SHADOW", "intent.shadow.tick.001");
         off_grid.order_type = OrderType::Limit;
         // 5 bps from the mark, well inside the collar: only the grid is wrong.
@@ -6858,6 +6990,105 @@ mod tests {
             configuration_fingerprint(&account(), &policy(), &switches),
             configuration_fingerprint(&account(), &coarser, &switches),
             "an approval must not carry across a changed tick table"
+        );
+    }
+
+    #[test]
+    fn controlled_live_refuses_off_lot_quantities_and_instruments_without_a_lot_size() {
+        let path = journal_path("lot-size");
+        let mut policy = policy();
+        policy
+            .instrument_lot_sizes
+            .insert("inst.us_equity.spy".to_owned(), amount("5"));
+        policy.instrument_lot_sizes.remove("inst.us_equity.qqq");
+        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, policy);
+        // Two shares against a five-share lot; every other limit passes.
+        let LiveSubmitOutcome::ShadowRecorded { decision } = service
+            .record_shadow_intent(
+                intent("SHADOW", "intent.shadow.lot.001"),
+                market(),
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("shadow evidence")
+        else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert_eq!(
+            decision.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(decision
+            .evaluated_limits
+            .contains("instrument_lot_size=5.00000000"));
+
+        let mut whole_lot = intent("SHADOW", "intent.shadow.lot.002");
+        whole_lot.quantity = amount("5");
+        let LiveSubmitOutcome::ShadowRecorded { decision } = service
+            .record_shadow_intent(
+                whole_lot,
+                market(),
+                "2026-01-02T14:30:01Z",
+                "operator.requester.001",
+            )
+            .expect("shadow evidence")
+        else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(decision.approved, "{:?}", decision.reason_codes);
+
+        // qqq keeps its tick but has no lot size.
+        let mut unlisted = intent("SHADOW", "intent.shadow.lot.003");
+        unlisted.instrument_id = "inst.us_equity.qqq".to_owned();
+        let mut qqq = market();
+        qqq.instrument_id = "inst.us_equity.qqq".to_owned();
+        let LiveSubmitOutcome::ShadowRecorded { decision } = service
+            .record_shadow_intent(
+                unlisted,
+                qqq,
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+            .expect("shadow evidence")
+        else {
+            panic!("shadow mode must retain a shadow decision");
+        };
+        assert!(!decision.approved);
+        assert_eq!(
+            decision.reason_codes,
+            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
+        );
+        assert!(decision
+            .evaluated_limits
+            .contains("instrument_lot_size=UNCONFIGURED"));
+        assert_eq!(service.broker_mut().submitted, 0);
+        drop(service);
+        std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn a_live_lot_table_is_validated_and_bound_into_the_configuration_fingerprint() {
+        for broken in [
+            BTreeMap::new(),
+            BTreeMap::from([("inst.us_equity.spy".to_owned(), Decimal::ZERO)]),
+            BTreeMap::from([("INST.SPY".to_owned(), amount("1"))]),
+        ] {
+            let policy = LiveRiskPolicy {
+                instrument_lot_sizes: broken.clone(),
+                ..policy()
+            };
+            assert!(policy.validate().is_err(), "accepted lot table {broken:?}");
+        }
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").unwrap();
+        let mut round_lots = policy();
+        round_lots
+            .instrument_lot_sizes
+            .insert("inst.us_equity.spy".to_owned(), amount("100"));
+        assert_ne!(
+            configuration_fingerprint(&account(), &policy(), &switches),
+            configuration_fingerprint(&account(), &round_lots, &switches),
+            "an approval must not carry across a changed lot table"
         );
     }
 

@@ -2685,6 +2685,59 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** Lot sizes are item E3.6c. The venue's own complex-order increment is not
       modelled. No external gate moved.
 
+70. PAPER and controlled-LIVE risk refuse a quantity that is not a whole number of lots (2026-09-26, rows 5.5
+    and 5.7; E3.6c).
+    - **The gap.** Reference data carries a lot size per instrument (`core/instrument`: "exact minimum trade
+      quantity"), and nothing on a pre-trade path read it; `core/instrument` only checked that it is positive.
+      A PAPER or controlled-LIVE order for three shares of a five-share-lot instrument was approved and left
+      for the broker to reject, and so was a combination leg with a contract count off its lot.
+    - **The rule, as the operator decided.**
+      - A required `instrument_lot_sizes` table, mirroring item 61's tick table, in the PAPER,
+        controlled-LIVE and PAPER command-route configurations. An empty, non-positive or non-canonical
+        table is invalid.
+      - A plain order on an unlisted instrument is refused (`INSTRUMENT_LOT_SIZE_UNCONFIGURED`), and so is
+        a quantity that is not a whole multiple of its lot (`ORDER_QUANTITY_OFF_LOT_SIZE`).
+      - A combination leg meets the same rule with its own contract quantity, the unit count times the leg
+        ratio, because that is what the broker sees. A ratio-2 leg is judged on twice the unit count.
+      - The decision evidence gains `instrument_lot_size=` and `combo_lot_sizes=[instrument:lot|...]`.
+      - The table is bound into both configuration fingerprints (`paper-instrument-lots-v1`,
+        `live-instrument-lots-v1`), so a journal or LIVE approval cannot carry across a changed lot table.
+    - **Boundaries.** The table is required in the three JSON Schemas, all six configuration fixtures (each
+      lists `inst.us_equity.spy` at a lot of 1), both CLI loaders, the gRPC route, the desktop gateway, and
+      the scanner's route. Both checked-in journals were regenerated with the real status binaries; only the
+      configuration fingerprint and entry hash changed. `checked_in_journal_configuration.rs` failed for both
+      journals before the regeneration and passes after it.
+    - **Tests.**
+      - PAPER and controlled-LIVE each cover an off-lot plain order, an instrument with no lot, the table's
+        validation and fingerprint binding, and a ratio-2 combination: whole leg lots approved, an off-lot
+        leg refused, and an unlisted leg refused. The approved case uses a unit count that is not itself a
+        whole lot, so only the per-leg quantity can pass it.
+      - The gRPC route refuses a one-unit combination against its two-contract lots, and the desktop gateway
+        refuses a 10.5-share order.
+      - The two existing unlisted-tick tests now list `iwm`'s lot, so each still isolates the tick rule.
+    - **Rule 5.** 17 of 17 injected defects were caught:
+      - PAPER: plain orders unchecked, an unlisted instrument passing, whole units checked instead of lots,
+        legs unchecked, the unit count checked instead of each leg's quantity, an empty table accepted, and
+        the table left out of the fingerprint;
+      - controlled-LIVE: plain orders unchecked, an unlisted instrument passing, legs unchecked, the unit
+        count checked instead of each leg's quantity, a zero lot accepted, and the table left out of the
+        fingerprint;
+      - boundaries: each CLI loader substituting a fixed table (caught by the journal test), the gRPC route
+        ignoring configured lots, and the desktop gateway ignoring configured lots.
+    - **A stale statement corrected.** The desktop README still said "Combination net prices are not
+      tick-checked". Item 69 made that false and did not update the README. It now states the finest-leg-grid
+      rule, and the lot rule.
+    - **Measured result.** The Rust workspace rose from 478 to 486 passed / 0 failed / 3 ignored, and
+      the Tauri host from 29 to 30. The final `python tools/session_status.py` run measured all seven
+      suites green, and the full evidence pipeline exited 0, including step 23b's scan (69 probes, 0 failed).
+    - **Bounded remainder.**
+      - The tick and lot tables are not cross-checked for the same instruments. An instrument listed in only
+        one is refused at order time with that table's `..._UNCONFIGURED` code, not at startup.
+      - The rule binds order quantities, not broker fills. A fill is applied as the broker reports it.
+      - `core/backtest` carries the lot size as reference data and does not check it, so a backtest can still
+        trade a quantity that PAPER and controlled-LIVE now refuse. That is a research-to-live parity gap.
+      - A venue's own odd-lot or mixed-lot handling is not modelled. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

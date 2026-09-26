@@ -27,6 +27,9 @@
     "order_rate_window_seconds": 60,
     "instrument_tick_sizes": {
       "inst.us_equity.spy": "0.01"
+    },
+    "instrument_lot_sizes": {
+      "inst.us_equity.spy": "1"
     }
   },
   "kill_switch_version": "paper-kills-v1"

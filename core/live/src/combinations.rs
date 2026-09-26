@@ -382,6 +382,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 ))
             })?;
             let leg_quantity = intent.leg_quantity(leg)?;
+            // The lot rule binds what the broker sees, each leg's own contract
+            // quantity, exactly as it binds a plain order's (E3.6c).
+            if let Some(reason) = self.policy.lot_rejection(&leg.instrument_id, leg_quantity) {
+                reasons.push(reason.to_owned());
+            }
             largest_leg_quantity = largest_leg_quantity.max(leg_quantity);
             let deviation_bps = price_deviation_bps(mark.mark_price, leg.limit_price)?;
             widest_leg_deviation_bps = widest_leg_deviation_bps.max(deviation_bps);
@@ -506,7 +511,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             reasons.push("APPROVED".to_owned());
         }
         let evaluated_limits = format!(
-            "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},canary_submissions={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}],combo_tick_sizes=[{}]{}",
+            "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},canary_submissions={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}],combo_tick_sizes=[{}],combo_lot_sizes=[{}]{}",
             intent.legs.len(),
             intent.combo_quantity,
             intent.price_limit.kind(),
@@ -533,6 +538,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             market.oldest_observed_at()?,
             leg_evidence.join("|"),
             self.policy.combo_tick_evidence(intent),
+            self.policy.combo_lot_evidence(intent),
             portfolio_risk_limits,
         );
         Ok(LiveRiskDecision {

@@ -701,6 +701,11 @@ struct DesktopPaperConfiguration {
     /// version-1 `paper-command-route` document. An order for an unlisted
     /// instrument, or a limit off its grid, is refused before the broker.
     instrument_tick_sizes: std::collections::BTreeMap<String, String>,
+    /// Required lot size per tradable instrument, in the same shape as the
+    /// version-1 `paper-command-route` document. An order for an unlisted
+    /// instrument, or a quantity that is not a whole number of lots, is
+    /// refused before the broker.
+    instrument_lot_sizes: std::collections::BTreeMap<String, String>,
     /// Optional, explicitly bounded net-short permission, in the same shape
     /// as the version-1 `paper-command-route` document. Absent means every
     /// net short position -- and so almost every spread with a short leg --
@@ -805,6 +810,13 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
                 ))
             })
             .collect::<Result<_, _>>()?,
+        instrument_lot_sizes: document
+            .instrument_lot_sizes
+            .iter()
+            .map(|(instrument_id, lot)| {
+                Ok::<_, String>((instrument_id.clone(), decimal("instrument_lot_sizes", lot)?))
+            })
+            .collect::<Result<_, _>>()?,
     };
     let kill_switches = KillSwitchRegistry::new(document.kill_switch_version)
         .map_err(|error| format!("kill switch registry: {error}"))?;
@@ -868,6 +880,11 @@ mod tests {
                         "inst.us_equity.aapl": "0.01",
                         "inst.opt.spy.c500": "0.01",
                         "inst.opt.spy.c505": "0.01"
+                    }},
+                    "instrument_lot_sizes": {{
+                        "inst.us_equity.aapl": "1",
+                        "inst.opt.spy.c500": "1",
+                        "inst.opt.spy.c505": "1"
                     }},
                     {extra}
                     "kill_switch_version": "kill.desktop.test.v1",
@@ -1009,6 +1026,23 @@ mod tests {
         assert_eq!(receipt.status, CommandStatus::RiskRejected);
         assert!(receipt.order_id.is_none());
         assert!(receipt.message.contains("LIMIT_PRICE_OFF_TICK_GRID"));
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn submit_order_off_the_configured_lot_size_is_refused_before_the_broker() {
+        let (gateway, scratch, _journal) = test_gateway("submit-off-lot");
+        // 10.5 shares is inside every quantity and notional limit but is not a
+        // whole number of the configured one-share lots, so only the lot check
+        // can refuse it.
+        let mut intent = order_intent("intent.desktop.lot.001", OrderType::Market, None);
+        intent.quantity = "10.50000000".to_owned();
+        let receipt = gateway
+            .submit_order(intent)
+            .expect("a risk rejection is a normal, successful outcome");
+        assert_eq!(receipt.status, CommandStatus::RiskRejected);
+        assert!(receipt.order_id.is_none());
+        assert!(receipt.message.contains("ORDER_QUANTITY_OFF_LOT_SIZE"));
         cleanup(scratch);
     }
 

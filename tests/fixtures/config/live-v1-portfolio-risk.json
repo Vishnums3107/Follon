@@ -27,6 +27,9 @@
     "instrument_tick_sizes": {
       "inst.us_equity.spy": "0.01"
     },
+    "instrument_lot_sizes": {
+      "inst.us_equity.spy": "1"
+    },
     "portfolio_risk": {
       "policy_version": "portfolio-risk-v1",
       "max_gross_exposure": "5000",

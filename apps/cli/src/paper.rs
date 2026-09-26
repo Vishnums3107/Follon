@@ -68,6 +68,10 @@ struct PaperRiskDocument {
     /// strings. An order for an unlisted instrument, or a limit off its grid,
     /// is refused before it can reach the broker.
     instrument_tick_sizes: BTreeMap<String, String>,
+    /// Required venue lot size per tradable instrument, as exact decimal
+    /// strings. An order for an unlisted instrument, or a quantity that is
+    /// not a whole number of lots, is refused before it can reach the broker.
+    instrument_lot_sizes: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -299,6 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // configuration file should be able to turn on implicitly.
         short_exposure: None,
         instrument_tick_sizes: decimal_map(configuration.risk.instrument_tick_sizes)?,
+        instrument_lot_sizes: decimal_map(configuration.risk.instrument_lot_sizes)?,
     };
     let mut brokers = PaperBrokerRegistry::new();
     if schema_version == 1 {

@@ -796,6 +796,8 @@ struct PaperCommandRouteDocument {
     order_rate_window_seconds: u64,
     /// Required tick size per tradable instrument (exact decimal strings).
     instrument_tick_sizes: std::collections::BTreeMap<String, String>,
+    /// Required lot size per tradable instrument (exact decimal strings).
+    instrument_lot_sizes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     short_exposure: Option<PaperCommandShortExposureDocument>,
     kill_switch_version: String,
@@ -947,6 +949,16 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
                 Ok((
                     instrument_id.clone(),
                     route_decimal("instrument_tick_sizes", tick)?,
+                ))
+            })
+            .collect::<Result<_, String>>()?,
+        instrument_lot_sizes: document
+            .instrument_lot_sizes
+            .iter()
+            .map(|(instrument_id, lot)| {
+                Ok((
+                    instrument_id.clone(),
+                    route_decimal("instrument_lot_sizes", lot)?,
                 ))
             })
             .collect::<Result<_, String>>()?,
@@ -1267,6 +1279,14 @@ mod tests {
                 "inst.us_option.spy.500c": "0.01",
                 "inst.us_option.spy.505c": "0.01",
             },
+            // Two-contract lots make the lot rule observable at this
+            // boundary: the default two-unit request is whole lots on both
+            // legs, and a one-unit request is not.
+            "instrument_lot_sizes": {
+                "inst.us_equity.spy": "1",
+                "inst.us_option.spy.500c": "2",
+                "inst.us_option.spy.505c": "2",
+            },
             "short_exposure": { "max_short_quantity": "1000" },
             "kill_switch_version": "kills.grpc.paper.v1",
             "adapter_kind": "IBKR_PAPER_MODEL",
@@ -1580,6 +1600,30 @@ mod tests {
             .contains(&"MAX_ORDER_QUANTITY_EXCEEDED".to_owned()));
         assert!(response.order_id.is_none());
         assert_eq!(response.state, OmsOrderState::Unspecified as i32);
+        drop(service);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_combo_rpc_refuses_a_leg_quantity_off_the_routes_lot_table() {
+        let (service, _route, scratch) = configured_paper_service("off-lot");
+        let token = trader_token(&service).await;
+        // One unit sends one contract per leg against the route's
+        // two-contract lots; every other limit passes.
+        let mut request = paper_combo_request("intent.grpc.paper.combo.off.lot");
+        request.combo_quantity = "1".to_owned();
+        let response = service
+            .submit_paper_combo(authorized(request, &token))
+            .await
+            .expect("risk decision")
+            .into_inner();
+
+        assert!(!response.approved);
+        assert_eq!(
+            response.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(response.order_id.is_none());
         drop(service);
         let _ = std::fs::remove_dir_all(scratch);
     }

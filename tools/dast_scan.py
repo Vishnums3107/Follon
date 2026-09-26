@@ -562,7 +562,9 @@ def route_config(path: Path, journal: Path) -> None:
         "max_open_orders": 10, "max_position_quantity": "1000", "max_realized_loss": "10000",
         "max_market_data_age_seconds": 5, "max_order_rate": 20, "order_rate_window_seconds": 60,
         "instrument_tick_sizes": {"inst.us_equity.spy": "0.01", "inst.us_option.spy.500c": "0.01",
-                                 "inst.us_option.spy.505c": "0.01"}, "short_exposure": {"max_short_quantity": "1000"},
+                                 "inst.us_option.spy.505c": "0.01"},
+        "instrument_lot_sizes": {"inst.us_equity.spy": "1", "inst.us_option.spy.500c": "1",
+                                "inst.us_option.spy.505c": "1"}, "short_exposure": {"max_short_quantity": "1000"},
         "kill_switch_version": "kills.dast.v1", "adapter_kind": "IBKR_PAPER_MODEL", "journal_path": str(journal),
     }), encoding="utf-8")
 

@@ -56,17 +56,17 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-26T07:57:08Z  
+**Measured at:** 2026-09-26T08:29:47Z  
 **Branch:** `main`  
-**HEAD:** `8a13b02` -- feat(security): repository-authored dynamic scan of a local deployment -- E3.4 (2026-09-26T09:24:29+05:30)  
-**Uncommitted paths:** 9
+**HEAD:** `24fb724` -- fix(risk): check combination legs and net price against the tick grid -- E3.6b (2026-09-26T13:32:38+05:30)  
+**Uncommitted paths:** 24
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 478 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 486 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
-| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 29 | 0 | 0 |
+| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
 | Python suite (`pytest`) | **PASS** | 0 | 48 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
@@ -445,7 +445,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | --- | --- | --- |
 | E3.1 | **E3.1a done 2026-09-25 (audit item 66):** the main artifact (schema 3) and report carry the advanced-account economics, and the sidecar is gone. **Multi-account allocation is frozen** by `03-roadmap-and-gates.md` until the preceding gates are independently evidenced; the operator chose not to override the gate. | 5.4 |
 | E3.2 | Property/model/fault coverage beyond the ten landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, smart routing, and — since 2026-09-25 — margin valuation and financing accrual, item 64). No named candidate remains; further property coverage is open-ended. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
-| E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. **E3.6b done 2026-09-26 (audit item 69):** each combination leg meets the plain-order tick rule, and the net limit must sit on the finest leg grid. Remainder: `lot_size` is not checked (E3.6c). | 5.5 / 5.7 |
+| E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. **E3.6b done 2026-09-26 (audit item 69):** each combination leg meets the plain-order tick rule, and the net limit must sit on the finest leg grid. **E3.6c done 2026-09-26 (audit item 70):** a required per-instrument lot table in every configuration; an unlisted instrument, or a quantity that is not a whole number of lots, is refused for a plain order and for each combination leg's contract quantity. Remainder: `core/backtest` does not check lot sizes (a parity gap), and a venue's own odd-lot handling is not modelled. | 5.5 / 5.7 |
 | E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes, kill-switch and LIVE write RPCs, a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
 | E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes, and it found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
@@ -528,6 +528,17 @@ short — detail belongs in the conformance audit.
 - Rust workspace **476 → 478 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green.
+- Landed **E3.6c**. A required per-instrument lot table in every PAPER,
+  controlled-LIVE and route configuration. An unlisted instrument, or a
+  quantity that is not a whole number of lots, is refused for a plain order
+  and for each combination leg's own contract quantity. Both checked-in
+  journals were regenerated with the real CLIs. 17/17 injected defects were
+  caught (audit item 70). The desktop README's stale "net prices are not
+  tick-checked" line, left by E3.6b, is corrected.
+- Rust workspace **478 → 486 passed**, Tauri host **29 → 30**;
+  the final `python tools/session_status.py` measurement recorded all seven
+  suites green, and the full pipeline exited 0.
+- **Next action:** E3.3b, the authenticated PAPER kill-switch RPC.
 
 ### 2026-09-25 — session 6
 

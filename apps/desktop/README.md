@@ -39,17 +39,24 @@ so almost any spread with a short leg — is refused unless the operator-authore
 
 The UI never grants that permission itself.
 
-The same file must list the venue tick size of every instrument the operator
-may trade. An order for an unlisted instrument is refused with
-`INSTRUMENT_TICK_SIZE_UNCONFIGURED`, and a limit price off its instrument's
-grid with `LIMIT_PRICE_OFF_TICK_GRID`, before anything reaches the broker:
+The same file must list the venue tick size and lot size of every instrument
+the operator may trade. Each of these is refused before anything reaches the
+broker:
+
+- an order for an instrument missing from either table
+  (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`, `INSTRUMENT_LOT_SIZE_UNCONFIGURED`);
+- a limit price off its instrument's grid (`LIMIT_PRICE_OFF_TICK_GRID`);
+- a quantity that is not a whole number of lots (`ORDER_QUANTITY_OFF_LOT_SIZE`).
 
 ```json
-"instrument_tick_sizes": { "inst.us_equity.aapl": "0.01" }
+"instrument_tick_sizes": { "inst.us_equity.aapl": "0.01" },
+"instrument_lot_sizes": { "inst.us_equity.aapl": "1" }
 ```
 
-Combination net prices are not tick-checked; venues price combinations on
-their own increments.
+A combination leg meets the same rules on its own instrument, with its own
+contract quantity. The combination's net price limit must also sit on the
+finest tick among its legs (`COMBO_NET_PRICE_OFF_TICK_GRID`). A venue's own
+complex-order increment is not modelled.
 
 The packaged client reads its versioned evidence API from the loopback service
 at `http://127.0.0.1:8080`. The service grants cross-origin access only to the

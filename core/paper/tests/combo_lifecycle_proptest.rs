@@ -148,6 +148,12 @@ fn service() -> PaperTradingService<ReplayingAdapter> {
             .chain(["inst.us_equity.spy".to_owned()])
             .map(|instrument| (instrument, dec("0.01")))
             .collect(),
+        // Leg quantities are whole contracts, so a lot of one passes each.
+        instrument_lot_sizes: (0..4)
+            .map(instrument)
+            .chain(["inst.us_equity.spy".to_owned()])
+            .map(|instrument| (instrument, dec("1")))
+            .collect(),
     };
     let adapter = ReplayingAdapter {
         inner: IbkrPaperAdapter::new(&account).unwrap(),

@@ -17,6 +17,9 @@
   "instrument_tick_sizes": {
     "inst.us_equity.spy": "0.01"
   },
+  "instrument_lot_sizes": {
+    "inst.us_equity.spy": "1"
+  },
   "short_exposure": {
     "max_short_quantity": "100"
   },

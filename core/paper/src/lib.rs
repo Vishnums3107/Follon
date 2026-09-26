@@ -1436,6 +1436,11 @@ pub struct PaperRiskPolicy {
     /// instrument that is not listed is refused, and so is a limit price off
     /// its instrument's grid, before a broker can reject it.
     pub instrument_tick_sizes: BTreeMap<String, Decimal>,
+    /// Venue lot size per tradable instrument: the exact quantity increment.
+    /// A plain order or a combination leg whose quantity is not a whole
+    /// number of lots is refused, and so is one on an unlisted instrument,
+    /// before a broker can reject it.
+    pub instrument_lot_sizes: BTreeMap<String, Decimal>,
 }
 
 /// Operator permission for net short exposure, absent by default.
@@ -1469,6 +1474,18 @@ impl PaperRiskPolicy {
         }
     }
 
+    /// The lot-size rejection for one order quantity, if any (E3.6c). A plain
+    /// order's quantity and each combination leg's contract quantity meet
+    /// this same rule.
+    fn lot_rejection(&self, instrument_id: &str, quantity: Decimal) -> Option<&'static str> {
+        match self.instrument_lot_sizes.get(instrument_id) {
+            None => Some("INSTRUMENT_LOT_SIZE_UNCONFIGURED"),
+            Some(lot) => {
+                (quantity.scaled() % lot.scaled() != 0).then_some("ORDER_QUANTITY_OFF_LOT_SIZE")
+            }
+        }
+    }
+
     /// Tick-grid rejections for a combination (E3.6b). Each leg meets exactly
     /// the rule a plain order on its instrument meets: it must be listed and
     /// its protected limit price must sit on its grid. The net price limit
@@ -1493,20 +1510,12 @@ impl PaperRiskPolicy {
 
     /// Each leg's configured tick, for the decision evidence.
     fn combo_tick_evidence(&self, intent: &ComboIntent) -> String {
-        intent
-            .legs
-            .iter()
-            .map(|leg| {
-                format!(
-                    "{}:{}",
-                    leg.instrument_id,
-                    self.instrument_tick_sizes
-                        .get(&leg.instrument_id)
-                        .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("|")
+        render_leg_entries(intent, &self.instrument_tick_sizes)
+    }
+
+    /// Each leg's configured lot size, for the decision evidence.
+    fn combo_lot_evidence(&self, intent: &ComboIntent) -> String {
+        render_leg_entries(intent, &self.instrument_lot_sizes)
     }
 
     /// Whether a projected per-instrument position breaches this policy.
@@ -1563,6 +1572,20 @@ impl PaperRiskPolicy {
         {
             return Err(PaperError(
                 "paper risk policy needs a positive tick size per listed instrument".to_owned(),
+            ));
+        }
+        // The same holds for the lot table (E3.6c).
+        if self.instrument_lot_sizes.is_empty()
+            || self
+                .instrument_lot_sizes
+                .iter()
+                .any(|(instrument_id, lot)| {
+                    validate_canonical_id("lot-size instrument_id", instrument_id).is_err()
+                        || *lot <= Decimal::ZERO
+                })
+        {
+            return Err(PaperError(
+                "paper risk policy needs a positive lot size per listed instrument".to_owned(),
             ));
         }
         if self
@@ -3688,6 +3711,12 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         {
             reasons.push(reason.to_owned());
         }
+        if let Some(reason) = self
+            .risk_policy
+            .lot_rejection(&intent.instrument_id, intent.quantity)
+        {
+            reasons.push(reason.to_owned());
+        }
         if self.conflicts_with_working_order(&intent.instrument_id, intent.side) {
             reasons.push("SELF_TRADE_RISK".to_owned());
         }
@@ -3768,7 +3797,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={}{}",
+                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={},instrument_lot_size={}{}",
                 self.risk_policy.max_order_quantity,
                 self.risk_policy.max_order_notional,
                 self.risk_policy.max_price_deviation_bps,
@@ -3789,6 +3818,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 context.available_cash,
                 self.risk_policy
                     .instrument_tick_sizes
+                    .get(&intent.instrument_id)
+                    .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string),
+                self.risk_policy
+                    .instrument_lot_sizes
                     .get(&intent.instrument_id)
                     .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string),
                 portfolio_risk_limits,
@@ -3909,6 +3942,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 ))
             })?;
             let leg_quantity = intent.leg_quantity(leg)?;
+            // The lot rule binds what the broker sees, each leg's own contract
+            // quantity, exactly as it binds a plain order's (E3.6c).
+            if let Some(reason) = self
+                .risk_policy
+                .lot_rejection(&leg.instrument_id, leg_quantity)
+            {
+                reasons.push(reason.to_owned());
+            }
             largest_leg_quantity = largest_leg_quantity.max(leg_quantity);
             let deviation_bps = price_deviation_bps(mark.mark_price, leg.limit_price)?;
             widest_leg_deviation_bps = widest_leg_deviation_bps.max(deviation_bps);
@@ -4021,7 +4062,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}],combo_tick_sizes=[{}]{}",
+                "combo_legs={},combo_quantity={},combo_price_limit_kind={},combo_price_limit_amount={},combo_protected_net_price={},combo_net_debit={},combo_gross_notional={},largest_leg_quantity={},widest_leg_deviation_bps={},max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},available_cash={},oldest_observed_at={},legs=[{}],combo_tick_sizes=[{}],combo_lot_sizes=[{}]{}",
                 intent.legs.len(),
                 intent.combo_quantity,
                 intent.price_limit.kind(),
@@ -4045,6 +4086,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 market.oldest_observed_at()?,
                 leg_evidence.join("|"),
                 self.risk_policy.combo_tick_evidence(intent),
+                self.risk_policy.combo_lot_evidence(intent),
                 portfolio_risk_limits,
             ),
         })
@@ -5701,9 +5743,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         // Always present: every configuration now lists its tick sizes, and a
         // journal or decision made under one tick table must not be reopened
         // under another.
-        let tick_sizes = render_tick_sizes(&self.risk_policy.instrument_tick_sizes);
+        let tick_sizes = render_instrument_table(&self.risk_policy.instrument_tick_sizes);
         parts.push("paper-instrument-ticks-v1");
         parts.push(&tick_sizes);
+        // Likewise the lot table (E3.6c).
+        let lot_sizes = render_instrument_table(&self.risk_policy.instrument_lot_sizes);
+        parts.push("paper-instrument-lots-v1");
+        parts.push(&lot_sizes);
         hash_fingerprint_parts(&parts)
     }
 
@@ -5715,10 +5761,31 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     }
 }
 
-fn render_tick_sizes(tick_sizes: &BTreeMap<String, Decimal>) -> String {
-    tick_sizes
+/// A per-instrument reference table (ticks or lots) in its canonical,
+/// instrument-ordered form, for the configuration fingerprint.
+fn render_instrument_table(table: &BTreeMap<String, Decimal>) -> String {
+    table
         .iter()
-        .map(|(instrument_id, tick)| format!("{instrument_id}:{tick}"))
+        .map(|(instrument_id, value)| format!("{instrument_id}:{value}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Each combination leg's entry in a per-instrument reference table, in leg
+/// order, with `UNCONFIGURED` for an instrument the table does not list.
+fn render_leg_entries(intent: &ComboIntent, table: &BTreeMap<String, Decimal>) -> String {
+    intent
+        .legs
+        .iter()
+        .map(|leg| {
+            format!(
+                "{}:{}",
+                leg.instrument_id,
+                table
+                    .get(&leg.instrument_id)
+                    .map_or_else(|| "UNCONFIGURED".to_owned(), ToString::to_string)
+            )
+        })
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -6325,6 +6392,7 @@ mod tests {
             portfolio_risk: None,
             short_exposure: None,
             instrument_tick_sizes: test_tick_sizes(),
+            instrument_lot_sizes: test_lot_sizes(),
         }
     }
 
@@ -6338,6 +6406,15 @@ mod tests {
         .into_iter()
         .map(|instrument| (instrument.to_owned(), decimal("tick", "0.01").unwrap()))
         .collect()
+    }
+
+    /// A lot of one for each listed instrument: every whole quantity passes,
+    /// so only a test that sets a coarser lot exercises the lot rule.
+    fn test_lot_sizes() -> BTreeMap<String, Decimal> {
+        test_tick_sizes()
+            .into_keys()
+            .map(|instrument| (instrument, decimal("lot", "1").unwrap()))
+            .collect()
     }
 
     /// The same policy with net short exposure explicitly permitted, bounded at
@@ -6365,11 +6442,15 @@ mod tests {
     }
 
     fn service() -> PaperTradingService<IbkrPaperAdapter> {
+        service_with(policy())
+    }
+
+    fn service_with(policy: PaperRiskPolicy) -> PaperTradingService<IbkrPaperAdapter> {
         let account = account();
         let adapter = IbkrPaperAdapter::new(&account).unwrap();
         PaperTradingService::new(
             account,
-            policy(),
+            policy,
             KillSwitchRegistry::new("paper-kills-v1").unwrap(),
             adapter,
         )
@@ -6626,6 +6707,61 @@ mod tests {
     }
 
     #[test]
+    fn combo_leg_quantities_meet_the_plain_order_lot_rule() {
+        let near = "inst.us_option.spy.near";
+        let far = "inst.us_option.spy.far";
+        // The near leg carries a ratio of 2 at 6.00 and the far leg a ratio of
+        // 1 at 5.00, a 7.00 net debit: each unit sends two near contracts and
+        // one far contract to the broker.
+        let decide = |lots: &[(&str, &str)], units: &str| {
+            let mut service = service_permitting_shorts();
+            service.risk_policy.instrument_lot_sizes.remove(near);
+            service.risk_policy.instrument_lot_sizes.remove(far);
+            for (instrument, lot) in lots {
+                service
+                    .risk_policy
+                    .instrument_lot_sizes
+                    .insert((*instrument).to_owned(), decimal("lot", lot).unwrap());
+            }
+            let mut intent = combo_intent("combo-000091", "2026-01-02T14:30:00Z");
+            intent.combo_quantity = decimal("units", units).unwrap();
+            intent.legs[0].ratio = 2;
+            intent.legs[0].limit_price = decimal("near", "6").unwrap();
+            intent.price_limit =
+                follon_domain::ComboPriceLimit::MaximumDebit(decimal("cap", "7").unwrap());
+            let mut market = combo_market("2026-01-02T14:30:00Z");
+            market.marks[0].mark_price = decimal("mark", "6").unwrap();
+            service
+                .evaluate_combo_risk(&intent, &market, "2026-01-02T14:30:02Z")
+                .unwrap()
+        };
+
+        // Two units send four near and two far contracts: whole lots of 4 and
+        // 2. Two units are not a whole near lot, so only each leg's own
+        // quantity can approve this.
+        let on_lot = decide(&[(near, "4"), (far, "2")], "2");
+        assert!(on_lot.approved, "{:?}", on_lot.reason_codes);
+        assert!(on_lot.evaluated_limits.contains(
+            "combo_lot_sizes=[inst.us_option.spy.near:4.00000000|inst.us_option.spy.far:2.00000000]"
+        ));
+        // One unit sends a single far contract against a lot of 2.
+        let off_lot = decide(&[(near, "2"), (far, "2")], "1");
+        assert_eq!(
+            off_lot.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        // A leg with no lot size is refused exactly as a plain order on it would be.
+        let unlisted = decide(&[(near, "1")], "2");
+        assert_eq!(
+            unlisted.reason_codes,
+            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
+        );
+        assert!(unlisted.evaluated_limits.contains(
+            "combo_lot_sizes=[inst.us_option.spy.near:1.00000000|inst.us_option.spy.far:UNCONFIGURED]"
+        ));
+    }
+
+    #[test]
     fn combo_risk_charges_the_order_notional_limit_the_gross_not_the_net() {
         let mut service = service_permitting_shorts();
         // 400 units: gross 400 * 12.50 = 5,000... raise it until gross crosses
@@ -6698,7 +6834,13 @@ mod tests {
 
     #[test]
     fn an_order_for_an_instrument_without_a_configured_tick_is_refused() {
-        let mut service = service();
+        // iwm's lot is listed, so only its missing tick can refuse it.
+        let mut policy = policy();
+        policy.instrument_lot_sizes.insert(
+            "inst.us_equity.iwm".to_owned(),
+            decimal("lot", "1").unwrap(),
+        );
+        let mut service = service_with(policy);
         let mut unlisted = intent("intent-tick-003", "2026-01-02T14:30:00Z");
         unlisted.instrument_id = "inst.us_equity.iwm".to_owned();
         let mut iwm = market("2026-01-02T14:30:00Z");
@@ -6762,6 +6904,119 @@ mod tests {
             service().configuration_fingerprint(),
             coarser_service.configuration_fingerprint(),
             "a journal must not reopen under a changed tick table"
+        );
+    }
+
+    #[test]
+    fn an_order_off_its_instruments_lot_size_is_refused_before_the_broker() {
+        let mut policy = policy();
+        policy.instrument_lot_sizes.insert(
+            "inst.us_equity.spy".to_owned(),
+            decimal("lot", "5").unwrap(),
+        );
+        let mut service = service_with(policy);
+        // Three shares is a whole number but not a whole number of five-share
+        // lots, and every other limit passes.
+        let mut off_lot = intent("intent-lot-001", "2026-01-02T14:30:00Z");
+        off_lot.quantity = decimal("quantity", "3").unwrap();
+        let outcome = service
+            .submit_intent(
+                off_lot,
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:01Z",
+            )
+            .unwrap();
+        assert!(!outcome.decision.approved);
+        assert_eq!(
+            outcome.decision.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(
+            outcome.order_id.is_none(),
+            "an off-lot order reached the OMS"
+        );
+        assert!(outcome
+            .decision
+            .evaluated_limits
+            .contains("instrument_lot_size=5.00000000"));
+
+        let mut whole_lots = intent("intent-lot-002", "2026-01-02T14:30:00Z");
+        whole_lots.quantity = decimal("quantity", "10").unwrap();
+        assert!(
+            service
+                .submit_intent(
+                    whole_lots,
+                    market("2026-01-02T14:30:00Z"),
+                    "2026-01-02T14:30:02Z"
+                )
+                .unwrap()
+                .decision
+                .approved,
+            "a whole number of lots was refused"
+        );
+    }
+
+    #[test]
+    fn an_order_for_an_instrument_without_a_configured_lot_size_is_refused() {
+        let mut policy = policy();
+        policy.instrument_lot_sizes.remove("inst.us_equity.spy");
+        let mut service = service_with(policy);
+        // spy's tick is listed and a market order carries no limit, so only
+        // the missing lot size can refuse it.
+        let outcome = service
+            .submit_intent(
+                intent("intent-lot-003", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:01Z",
+            )
+            .unwrap();
+        assert!(!outcome.decision.approved);
+        assert_eq!(
+            outcome.decision.reason_codes,
+            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
+        );
+        assert!(outcome.order_id.is_none());
+        assert!(outcome
+            .decision
+            .evaluated_limits
+            .contains("instrument_lot_size=UNCONFIGURED"));
+
+        // A listed instrument's order is unaffected.
+        let mut qqq = intent("intent-lot-004", "2026-01-02T14:30:00Z");
+        qqq.instrument_id = "inst.us_equity.qqq".to_owned();
+        let mut qqq_market = market("2026-01-02T14:30:00Z");
+        qqq_market.instrument_id = "inst.us_equity.qqq".to_owned();
+        assert!(
+            service
+                .submit_intent(qqq, qqq_market, "2026-01-02T14:30:02Z")
+                .unwrap()
+                .decision
+                .approved
+        );
+    }
+
+    #[test]
+    fn a_lot_size_table_must_be_nonempty_positive_and_canonical() {
+        for broken in [
+            BTreeMap::new(),
+            BTreeMap::from([("inst.us_equity.spy".to_owned(), Decimal::ZERO)]),
+            BTreeMap::from([("INST.SPY".to_owned(), decimal("lot", "1").unwrap())]),
+        ] {
+            let policy = PaperRiskPolicy {
+                instrument_lot_sizes: broken.clone(),
+                ..policy()
+            };
+            assert!(policy.validate().is_err(), "accepted lot table {broken:?}");
+        }
+        let mut round_lots = policy();
+        round_lots.instrument_lot_sizes.insert(
+            "inst.us_equity.spy".to_owned(),
+            decimal("lot", "100").unwrap(),
+        );
+        assert_ne!(
+            service().configuration_fingerprint(),
+            service_with(round_lots).configuration_fingerprint(),
+            "a journal must not reopen under a changed lot table"
         );
     }
 
