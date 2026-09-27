@@ -444,7 +444,7 @@ does not expose privileged mutations through the read-only evidence server.
 | --- | --- | --- |
 | Strategy/broker secret separation | Implemented | Strategy workers cannot reach adapter or credential interfaces. |
 | Secret ingress | Implemented interfaces; deployment gate | Managed-command/password/connection-string file boundaries and zeroizing broker material exist. Production mode refuses a direct database URL and requires a TLS connection string. A production vault/keychain, rotation operation, and custody evidence remain external. |
-| Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. Production HSM/KMS custody and independent approval remain external. |
+| Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
 | Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. |
 | Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. |
@@ -3351,6 +3351,55 @@ These are mandatory master-plan acceptance conditions and are currently open:
       `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
       exited 0, including step 23b's scan (85 probes, 0 failed).
     - **Bounded remainder.** None of item 78's remains. No external gate moved.
+
+83. Journal, ledger and admin output paths refuse a dangling symbolic link (2026-09-27, Security row
+    "Immutable audit and signed release"; E3.11). Found while reading item 82's journal-open code.
+    - **The gap.** Four checks that say a path "must not be a symbolic link" first asked `path.exists()`:
+      the PAPER journal, the controlled-LIVE audit journal, the commercial ledger, and `follon-admin`'s
+      outputs. `exists()` follows a link, so for a dangling link it reports nothing there, and the check
+      passed. What followed depended on the writer. Each was measured on this machine, where Developer
+      Mode lets an ordinary account create links:
+      - The PAPER and LIVE journals and the commercial ledger open with `create(true)`, which follows the
+        link. A dangling link at the journal path opened, so the journal was created and written at
+        wherever the link pointed. Measured with the journals' own open options: `exists()` reported
+        false, and five bytes written through the link landed in the target file.
+      - `CommercialLedger::read_verified` treated the dangling link as an absent ledger, and reported a
+        verified empty ledger.
+      - `follon-admin` writes with exclusive creation or a hard link, and neither follows a link, so a
+        dangling output was still refused. But it was refused with an unrelated operating-system error.
+        For `release-keygen`'s trusted key, it also left a staging file behind.
+    - **The fix.** Each check reads `symlink_metadata`, which never follows a link. A link, dangling or
+      not, is refused; an absent path passes; any other error is returned rather than treated as absent.
+      The refusal texts are unchanged.
+    - **Tests.** Each is exercised with a real link. Where an account cannot create one, such as Windows
+      without Developer Mode, a test says so and returns, as the capsule's symlink test already does. On
+      this machine every link was created. None of the four checks had a test with a link before.
+      - PAPER and LIVE: a dangling link is refused by the journal and by the service's durable open, and
+        nothing is created at its target. A link to a real journal is refused.
+      - Commercial: a dangling link is refused by `open` and by `read_verified`, and nothing is created at
+        its target. A link to a real ledger is refused by both.
+      - `follon-admin`, through the real binary: `release-keygen` refuses a dangling link as its private
+        key and as its trusted key, with the symbolic-link refusal, writing nothing at the target and
+        staging nothing.
+    - **Rule 5.** 6 of 6 injected defects were caught:
+      - the `exists()` check restored in each of the four places. Each journal and the ledger then opened
+        through the dangling link. The admin binary failed with `AlreadyExists` instead of the refusal;
+      - the ledger's verified read no longer checking for a link. It then returned an empty ledger;
+      - the LIVE refusal narrowed to a link whose own length is non-zero. On this platform that is no
+        link.
+    - **Documentation.** The penetration-test runbook's required cases gain durable journal paths, with the
+      remainder below as a case to probe. The Security row notes this item.
+    - **Found and left for a decision.** `follon-admin release-keygen` writes the private key and then
+      publishes the trusted key. If the second write is refused, for this reason or because a different
+      trusted key already exists, the new private key stays on disk with no trusted key beside it. Deleting
+      key material automatically is a custody decision, so it is recorded here rather than changed.
+    - **Measured result.** The Rust workspace rose from 516 to 520 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (85 probes, 0 failed).
+    - **Bounded remainder.** Each check runs before its open, so a link swapped in between the two is not
+      refused. Closing that needs a no-follow open, `O_NOFOLLOW` on Unix and `FILE_FLAG_OPEN_REPARSE_POINT`
+      on Windows, which the repository does not use. Other file writers in the repository do not claim to
+      refuse links and are unchanged. No external gate moved.
 
 ## Business-readiness decision
 

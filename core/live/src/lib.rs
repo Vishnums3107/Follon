@@ -1664,15 +1664,20 @@ impl LiveAuditJournal {
     /// Opens and validates the full journal before any controlled-live action is allowed.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LiveError> {
         let path = path.as_ref().to_path_buf();
-        if path.exists()
-            && fs::symlink_metadata(&path)
-                .map_err(|error| LiveError(error.to_string()))?
-                .file_type()
-                .is_symlink()
-        {
-            return Err(LiveError(
-                "live audit journal path must not be a symbolic link".to_owned(),
-            ));
+        // `symlink_metadata` never follows a link, so a dangling one is
+        // refused too. The `exists()` check this replaced followed it, found
+        // nothing, and the open below created the journal at its target
+        // (E3.11).
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(LiveError(
+                    "live audit journal path must not be a symbolic link".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(LiveError(error.to_string()));
+            }
+            _ => {}
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| LiveError(error.to_string()))?;
@@ -9230,6 +9235,63 @@ mod tests {
         )
         .is_err());
         std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    /// Links `link` to `target`, which need not exist. Returns false where
+    /// this account cannot create a symbolic link, such as Windows without
+    /// Developer Mode, after saying so.
+    fn symlink_to(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(target, link);
+        if let Err(error) = &linked {
+            eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+        }
+        linked.is_ok()
+    }
+
+    #[test]
+    fn a_live_journal_refuses_a_symbolic_link_even_a_dangling_one() {
+        let target = journal_path("link-target");
+        let link = journal_path("link");
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_file(&link);
+        if !symlink_to(&target, &link) {
+            return;
+        }
+        let refusal = "live audit journal path must not be a symbolic link";
+
+        // Nothing exists at the target, so following the link finds nothing.
+        // Opening must not create the journal there.
+        assert_eq!(LiveAuditJournal::open(&link).err().unwrap().0, refusal);
+        assert!(!target.exists(), "the journal was created through the link");
+        let account = account();
+        let policy = policy();
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+        let activation = activation(LiveRunMode::Shadow, &account, &policy, &switches);
+        assert_eq!(
+            LiveTradingService::open_durable(
+                account,
+                policy,
+                activation,
+                switches,
+                TestBroker::new(),
+                &link,
+                "2026-01-02T14:31:00Z",
+            )
+            .err()
+            .unwrap()
+            .0,
+            refusal
+        );
+        assert!(!target.exists(), "the journal was created through the link");
+
+        // A link to a real journal is refused too.
+        drop(test_service(LiveRunMode::Shadow, &target));
+        assert_eq!(LiveAuditJournal::open(&link).err().unwrap().0, refusal);
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&target).unwrap();
     }
 
     #[test]

@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T15:03:35Z  
+**Measured at:** 2026-09-27T15:13:59Z  
 **Branch:** `main`  
-**HEAD:** `911a13a` -- feat(trading-api): authenticated controlled-LIVE kill-switch RPCs -- E3.3c (2026-09-27T20:17:33+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `ef24397` -- fix(paper): a refused legacy-route start leaves no journal behind -- E3.10b (2026-09-27T20:35:37+05:30)  
+**Uncommitted paths:** 8
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 516 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 520 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
@@ -453,6 +453,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. **E3.8b done 2026-09-27 (audit item 80):** that test's byte check no longer skips an edited input, a skip that under pytest hid a later input's failure. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
 | E3.9 | **Done 2026-09-27 (audit item 77).** The version-2 PAPER configuration schema declared neither the tick nor the lot table, so it rejected both version-2 fixtures that `follon-paper-status` reads. It now matches version 1, and `tests/security/test_configuration_contracts.py` holds 17 configuration fixtures to their schemas. Remainder: output and evidence documents are outside that test. | Architecture |
 | E3.10 | **Done 2026-09-27 (audit item 78).** PAPER opened its journal, creating the file, before validating its configuration, so a refused start left an empty journal. It now validates first, as controlled LIVE does. The desktop gateway's configuration comment, which claimed one file could serve both it and `follon-paper-status`, is corrected. **E3.10b done 2026-09-27 (audit item 82):** a composition that may only reopen a journal, the legacy route a version-1 configuration builds, opens it without creating anything, so its refusal leaves no file or directory either. | 5.5 / 5.10 |
+| E3.11 | **Done 2026-09-27 (audit item 83).** The PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs each refused a symbolic link only after `exists()`, which follows it, so a dangling link passed. Each journal and the ledger were then created at the link's target, and the ledger's verified read reported an empty ledger. Each now reads `symlink_metadata` and refuses any link. Remainder: the check precedes the open, so a link swapped in between is not refused; and a refused `release-keygen` trusted key leaves its new private key on disk, which is a custody decision. | Security |
 
 ## The backlog that code cannot close
 
@@ -660,6 +661,18 @@ short — detail belongs in the conformance audit.
   accepted, because the old legacy test used an absent path. 4/4 injected
   defects were caught (audit item 82).
 - Rust workspace **515 → 516 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0 with the scan at 85 probes.
+- Landed **E3.11**, a defect found while reading E3.10b's journal-open code.
+  Four "must not be a symbolic link" checks asked `exists()` first, which
+  follows a link, so a dangling link passed. The PAPER and LIVE journals and
+  the commercial ledger were then created at the link's target, and the
+  ledger's verified read reported an empty ledger. `follon-admin` was still
+  refused, but by an unrelated error, and it left a staging file. Each check
+  now refuses any link. 6/6 injected defects were caught (audit item 83).
+  Found and left for a decision: a refused `release-keygen` trusted key
+  leaves its new private key on disk.
+- Rust workspace **516 → 520 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green, and the full pipeline exited 0 with the scan at 85 probes.
 

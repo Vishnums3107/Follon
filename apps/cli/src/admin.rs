@@ -571,11 +571,18 @@ fn ensure_parent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `symlink_metadata` never follows a link, so a dangling one is refused too.
+/// The `exists()` check this replaced followed it and found nothing. The
+/// writes below never follow a link either, so it was still refused, but
+/// with an unrelated error, after staging a file it then left behind (E3.11).
 fn reject_symlink_output(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if path.exists() && fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err("refusing to write through a symbolic link".into());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("refusing to write through a symbolic link".into())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn required_positional<'a>(

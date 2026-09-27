@@ -2389,15 +2389,20 @@ impl FilePaperJournal {
     /// neither the file nor its directory.
     fn open_with(path: &Path, create: bool) -> Result<Option<Self>, PaperError> {
         let path = path.to_path_buf();
-        if path.exists()
-            && fs::symlink_metadata(&path)
-                .map_err(|error| PaperError(error.to_string()))?
-                .file_type()
-                .is_symlink()
-        {
-            return Err(PaperError(
-                "paper journal path must not be a symbolic link".to_owned(),
-            ));
+        // `symlink_metadata` never follows a link, so a dangling one is
+        // refused too. The `exists()` check this replaced followed it, found
+        // nothing, and the open below created the journal at its target
+        // (E3.11).
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PaperError(
+                    "paper journal path must not be a symbolic link".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(PaperError(error.to_string()));
+            }
+            _ => {}
         }
         if create {
             if let Some(parent) = path.parent() {
@@ -7280,6 +7285,59 @@ mod tests {
             .unwrap(),
         );
         drop(open().unwrap());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Links `link` to `target`, which need not exist. Returns false where
+    /// this account cannot create a symbolic link, such as Windows without
+    /// Developer Mode, after saying so.
+    fn symlink_to(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(target, link);
+        if let Err(error) = &linked {
+            eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+        }
+        linked.is_ok()
+    }
+
+    #[test]
+    fn a_paper_journal_refuses_a_symbolic_link_even_a_dangling_one() {
+        let directory =
+            std::env::temp_dir().join(format!("follon-paper-journal-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("elsewhere.ndjson");
+        let link = directory.join("journal.ndjson");
+        if !symlink_to(&target, &link) {
+            fs::remove_dir_all(&directory).unwrap();
+            return;
+        }
+        let refusal = "paper journal path must not be a symbolic link";
+
+        // Nothing exists at the target, so following the link finds nothing.
+        // Opening must not create the journal there.
+        assert_eq!(FilePaperJournal::open(&link).err().unwrap().0, refusal);
+        assert!(!target.exists(), "the journal was created through the link");
+        assert_eq!(
+            PaperTradingService::open_durable(
+                account(),
+                policy(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account()).unwrap(),
+                &link,
+            )
+            .err()
+            .unwrap()
+            .0,
+            refusal
+        );
+        assert!(!target.exists(), "the journal was created through the link");
+
+        // A link to a real journal is refused too.
+        drop(FilePaperJournal::open(&target).unwrap());
+        assert_eq!(FilePaperJournal::open(&link).err().unwrap().0, refusal);
         fs::remove_dir_all(&directory).unwrap();
     }
 
