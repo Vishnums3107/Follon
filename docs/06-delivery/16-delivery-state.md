@@ -576,6 +576,22 @@ short — detail belongs in the conformance audit.
 - Rust workspace **507 → 508 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green, and the full pipeline exited 0.
+- Checked, with nothing found: each of the nine pipeline outputs whose
+  producer's type claims to match a schema validates against that schema.
+- **Next action:** no repository item remains that has an obvious default.
+  Each of these needs an operator decision first:
+  - a replay lot change while an order is working (refuse the replay, or
+    model a venue cancel);
+  - whether PAPER journals survive a schema change, or need an explicit
+    migration;
+  - E3.3's remainders, which would extend IAM and the control plane, which
+    the settled direction keeps warm rather than extended: persisted
+    sessions, four-eyes on writes, authenticated Tauri IPC writes,
+    controlled-LIVE kill-switch RPCs (a LIVE route in the API process), and
+    a managed store for the operator directory.
+
+  The external gates are unchanged. The 30 clean PAPER sessions remain the
+  top priority.
 
 ### 2026-09-26 — session 8
 
