@@ -915,9 +915,11 @@ def validate_and_write() -> None:
         jsonschema.validate(instance=data, schema=schema)
         # Write canonical sorted JSON
         target_path = TARGET_DIR / filename
+        # LF on every platform: these are checked-in fixtures (audit item 75).
         target_path.write_text(
             json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         print(f"  [OK] {filename:<40} (validated against {schema_name})")
     print(f"\nAll {len(FIXTURES)} advanced fixtures successfully validated and published to {TARGET_DIR}.")

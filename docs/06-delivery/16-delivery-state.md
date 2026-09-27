@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T12:30:00Z  
+**Measured at:** 2026-09-27T12:49:35Z  
 **Branch:** `main`  
-**HEAD:** `4fc48a8` -- feat(replay): backtests meet PAPER's tick and lot rules -- E3.6d (2026-09-26T14:58:38+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `415d9aa` -- feat(replay): simulated fills print on the tick grid -- E3.6e (2026-09-27T18:03:36+05:30)  
+**Uncommitted paths:** 6
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -67,7 +67,7 @@ already produced a real defect here.
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 48 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 52 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -450,6 +450,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes when it landed, and 76 since E3.3b added the kill-switch RPCs. It found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 | E3.7 | **Done 2026-09-26 (audit item 72).** Replay risk priced an intent from the bar that produced it, whatever that bar's instrument, so a QQQ order raised on SPY's bar was judged at SPY's price. `RiskPolicy::evaluate` now refuses a mark for another instrument, and the bar and news paths refuse such an intent before recording it, as PAPER does. Remainder: the engine holds no mark except the current bar, so one instrument cannot be traded on another's bar. | 5.4 |
+| E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
 
 ## The backlog that code cannot close
 
@@ -530,6 +531,20 @@ short — detail belongs in the conformance audit.
 - Rust workspace **501 → 505 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green, and the full pipeline exited 0.
+- Landed **E3.8**, a defect found while checking E3.6e's evidence diff. The
+  repository had no `.gitattributes`, so this Windows checkout was CRLF where
+  CI's is LF. Every hash that covers checked-in bytes therefore differed by
+  platform for one commit: the configuration hash, the SDK bundle hash, and
+  the built-in strategy hash. `.gitattributes` now pins LF. This checkout was
+  refreshed without changing any committed content, and a new test names any
+  stale file. That test then caught the pipeline's fixture generator rewriting
+  32 checked-in fixtures with CRLF, which is fixed too. 6/6 injected defects
+  were caught, after one weak test was fixed (audit item 75).
+- Python **48 → 52 passed**; Rust unchanged at 505. The final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0. The published configuration and
+  Python bundle hashes now equal those computed from the repository's own
+  bytes.
 
 ### 2026-09-26 — session 8
 

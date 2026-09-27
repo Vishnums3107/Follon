@@ -2968,6 +2968,89 @@ These are mandatory master-plan acceptance conditions and are currently open:
       - Marks and P&L use bar closes as recorded. A bar is data, and an off-grid bar is not corrected.
       - The fill cap is still checked when an intent arrives (item 73). No external gate moved.
 
+75. One commit publishes one set of evidence hashes on every platform (2026-09-27, Reliability and
+    research-to-live parity; E3.8).
+    - **The gap.** Follon hashes several checked-in inputs byte for byte:
+      - the backtest CLI's `configuration_hash` covers the configuration file's bytes;
+      - the SDK's bundle hash covers each strategy file's bytes;
+      - the built-in strategy's `strategy_bundle_hash` covers `core/control-plane/src/lib.rs`, which
+        `follon-backtest` embeds with `include_str!`.
+
+      The repository had no `.gitattributes`, so each checkout used its platform's line endings. On the
+      development machine, Git for Windows' system configuration sets `core.autocrlf=true`, so 329 text
+      files were checked out with CRLF and 14 with mixed endings. CI checks out on `ubuntu-24.04` with LF.
+      Measured on one commit:
+      - `tests/fixtures/config/backtest-v1.json`: the pipeline published `configuration_hash`
+        `e860fca6…`, the hash of the CRLF bytes, while the repository's own bytes hash to `8e7d0f84…`;
+      - `python/examples/worker_buy_once_strategy.py` and the SDK's `bundle.py` differed the same way;
+      - the built-in strategy's hash followed whichever tool last wrote its source. A Git checkout wrote
+        it with CRLF, and during E3.6e `cargo fmt` rewrote it with LF.
+
+      One commit therefore published different evidence hashes on different platforms, and on one
+      machine from one tool run to the next. Nothing compared hashes across machines, so nothing failed.
+      This also stood in the way of item 57's still-unperformed clean-machine verification.
+    - **The rule.**
+      - `.gitattributes` checks every text file out with LF on every platform (`* text=auto eol=lf`).
+        `eol` overrides `core.autocrlf`. It also marks PNG, ICO, ICNS and PDF files binary.
+      - Every text file in the index was already LF, so no committed content changed:
+        `git add --renormalize .` staged nothing.
+      - `CONTRIBUTING.md` states the rule and how to repair a stale checkout.
+      - The new test caught a second writer on its first pipeline run. The pipeline regenerates the 32
+        checked-in `tests/fixtures/config/advanced/*.json` documents through
+        `tools/build_advanced_evidence_fixtures.py`, which wrote them in Python text mode, and so with
+        CRLF on Windows. Every pipeline run on this machine had rewritten them with CRLF. The generator
+        now writes `newline="\n"`. No other tool writes a checked-in file in text mode: the rest write
+        to `var/` or a temporary directory, or already pass `newline="\n"`.
+    - **This checkout.** Git does not rewrite an unmodified file when the rule changes, and
+      `git checkout-index --force --all` left every stale file as it was.
+      - One stale file was deleted and checked out again. That is the repair `CONTRIBUTING.md` now
+        describes.
+      - Each of the other 342 was rewritten with its index blob's exact bytes. A file was rewritten only
+        after its content, with CRLF normalised, matched that blob byte for byte, so no uncommitted change
+        could be lost.
+      - `git add -u` then refreshed the stale stat cache. The staged diff was empty.
+    - **Tests.** `tests/security/test_checkout_line_endings.py` is run by pytest and by CI's security job:
+      - every hashed input is `text=auto` and `eol=lf`, and an icon is not text;
+      - no tracked text file is checked out with CRLF or mixed endings, and each stale file is named;
+      - each hashed input holds its index blob's exact bytes. It is skipped only when it carries a real
+        content edit, never for a line-ending rewrite;
+      - the fixture generator, run into a temporary directory, writes exactly the checked-in set of files,
+        each byte-identical to its index blob. It needs `jsonschema`, which CI's security job does not
+        install, so it runs under pytest and is skipped there with that reason.
+    - **Rule 5.**
+      - Against the stale checkout, all three checkout tests failed without the attributes file. With it,
+        two of the three still failed, because the checkout was still stale.
+      - 6 of 6 injected defects were then caught: `eol=lf` dropped, the binary rules dropped, one hashed
+        input rewritten with CRLF (caught by both checkout tests), one other file given a single CRLF
+        line, the generator's text-mode write restored (all 32 fixtures fail), and one generated field
+        drifting from its checked-in fixture.
+      - The first CRLF injection exposed a weak test. `git status` reports a line-ending rewrite as a
+        change, so the byte test skipped the file instead of failing. It now skips only a content edit
+        that `git diff` sees, and the injection fails both tests.
+      - Two bugs in the first draft were fixed before it was relied on. Whitespace splitting misread
+        `ls-files --eol`, whose attribute column holds a space. Its failure hint also named
+        `checkout-index --force`, which rewrites nothing here.
+    - **Evidence effect.** Against the previous pipeline run's `var/`:
+      - the main backtest's `configuration_hash` moved from `e860fca6…` to `8e7d0f84…`, the hash of the
+        repository's own bytes;
+      - the Python-worker backtest's `strategy_bundle_hash` moved from `bf8f5bee…` to `88d5e002…`. The
+        same hash was recomputed from a `git archive` export with `core.autocrlf` off, which is
+        byte-identical to an LF checkout, and it matched. Without that flag, `git archive` applied
+        `core.autocrlf` as well, while HEAD had no attributes;
+      - both backtests' event streams are byte-identical, and the dataset hash, computed from parsed bars,
+        did not move.
+    - **Measured result.** The Python suite rose from 48 to 52 passed; the Rust workspace is unchanged at
+      505 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all seven
+      suites green on the LF checkout, and the full evidence pipeline exited 0, including step 23b's scan
+      (76 probes, 0 failed). After that run every tracked text file was still LF and the generated
+      fixtures were unchanged.
+    - **Bounded remainder.**
+      - A file an editor saves with CRLF is still hashed as saved until it is checked out again. The test
+        names it, but only when the suite runs.
+      - A capsule already carries its own copies of the bytes it hashes, so this changes which bytes a
+        fresh package hashes, not how an existing capsule verifies.
+      - Item 57's clean-machine verification is still not performed. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
