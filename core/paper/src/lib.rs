@@ -2660,14 +2660,21 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         broker: B,
         journal_path: impl AsRef<Path>,
     ) -> Result<Self, PaperError> {
+        // Validate the configuration before touching the journal, which
+        // `FilePaperJournal::open` creates when absent, so a refused start
+        // leaves no journal behind, as controlled LIVE does (E3.10).
+        let mut service = Self::new(account, risk_policy, kill_switches, broker)?;
         let journal = FilePaperJournal::open(journal_path)?;
         let latest = journal.latest().cloned();
-        if latest.is_none() && !broker.permits_empty_journal(&account.account_id) {
+        if latest.is_none()
+            && !service
+                .broker
+                .permits_empty_journal(&service.account.account_id)
+        {
             return Err(PaperError(
                 "legacy PAPER adapter routing may only reopen an existing journal".to_owned(),
             ));
         }
-        let mut service = Self::new(account, risk_policy, kill_switches, broker)?;
         if let Some(state) = latest {
             service.restore(state)?;
             // An external broker session never survives process recovery.
@@ -7161,6 +7168,40 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn a_refused_configuration_leaves_no_paper_journal() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-{}.ndjson",
+            std::process::id(),
+            "refused-configuration"
+        ));
+        let _ = fs::remove_file(&journal_path);
+        let open = |policy: PaperRiskPolicy| {
+            PaperTradingService::open_durable(
+                account(),
+                policy,
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account()).unwrap(),
+                &journal_path,
+            )
+        };
+        let mut unpaired = policy();
+        unpaired.instrument_lot_sizes.insert(
+            "inst.us_equity.iwm".to_owned(),
+            decimal("lot", "1").unwrap(),
+        );
+        assert!(open(unpaired).is_err());
+        assert!(
+            !journal_path.exists(),
+            "a refused configuration created a journal"
+        );
+
+        // The same path opens, and journals, once the configuration is valid.
+        drop(open(policy()).unwrap());
+        assert!(journal_path.exists());
+        fs::remove_file(&journal_path).unwrap();
     }
 
     #[test]

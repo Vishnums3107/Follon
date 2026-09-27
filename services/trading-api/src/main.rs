@@ -1437,6 +1437,8 @@ mod tests {
                 .expect("an unpaired table must refuse the route"),
             "PAPER command-route service: paper risk policy lists inst.us_option.spy.505c in only one of its tick and lot tables"
         );
+        // Refused before its journal is touched (E3.10).
+        assert!(!scratch.join("journal.ndjson").exists());
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T13:08:01Z  
+**Measured at:** 2026-09-27T13:12:18Z  
 **Branch:** `main`  
-**HEAD:** `c6f0c55` -- feat(risk): refuse tick and lot tables that list different instruments -- E3.6f (2026-09-27T18:34:13+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `f5607b7` -- fix(contracts): the v2 PAPER schema describes what its reader reads -- E3.9 (2026-09-27T18:39:05+05:30)  
+**Uncommitted paths:** 5
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 507 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 508 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
@@ -452,6 +452,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.7 | **Done 2026-09-26 (audit item 72).** Replay risk priced an intent from the bar that produced it, whatever that bar's instrument, so a QQQ order raised on SPY's bar was judged at SPY's price. `RiskPolicy::evaluate` now refuses a mark for another instrument, and the bar and news paths refuse such an intent before recording it, as PAPER does. Remainder: the engine holds no mark except the current bar, so one instrument cannot be traded on another's bar. | 5.4 |
 | E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
 | E3.9 | **Done 2026-09-27 (audit item 77).** The version-2 PAPER configuration schema declared neither the tick nor the lot table, so it rejected both version-2 fixtures that `follon-paper-status` reads. It now matches version 1, and `tests/security/test_configuration_contracts.py` holds 17 configuration fixtures to their schemas. Remainder: output and evidence documents are outside that test. | Architecture |
+| E3.10 | **Done 2026-09-27 (audit item 78).** PAPER opened its journal, creating the file, before validating its configuration, so a refused start left an empty journal. It now validates first, as controlled LIVE does. The desktop gateway's configuration comment, which claimed one file could serve both it and `follon-paper-status`, is corrected. Remainder: a start refused by the legacy-routing check can still leave an empty journal. | 5.5 / 5.10 |
 
 ## The backlog that code cannot close
 
@@ -564,6 +565,15 @@ short — detail belongs in the conformance audit.
   70 are corrected in place, because they had claimed every boundary
   changed. 6/6 injected defects were caught (audit item 77).
 - Python **52 → 55 passed**; Rust unchanged at 507. The final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0.
+- Landed **E3.10**, found while writing E3.6f's route test. A refused PAPER
+  start left an empty journal, because the journal was opened before the
+  configuration was validated. It is now validated first. Also corrected: a
+  desktop gateway comment that claimed one configuration file could serve
+  both the gateway and `follon-paper-status`. 2/2 injected defects were caught
+  (audit item 78).
+- Rust workspace **507 → 508 passed**; the final
   `python tools/session_status.py` measurement recorded all seven suites
   green, and the full pipeline exited 0.
 

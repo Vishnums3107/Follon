@@ -675,11 +675,11 @@ impl RiskOmsGateway for PaperOmsGateway {
 
 /// On-disk shape of the desktop's PAPER trading configuration.
 ///
-/// Intentionally mirrors the `PaperConfigurationDocument` shape parsed by
-/// `follon-paper-status` (`apps/cli/src/paper.rs`) closely enough that the
-/// same operator-authored file can back both the read-only CLI dashboard and
-/// this live desktop gateway, though the two are parsed independently to
-/// avoid a cross-workspace dependency between the CLI and Tauri crates.
+/// It is the flat version-1 `paper-command-route` document without that
+/// document's `schema_version` and `adapter_kind`. It is not the nested
+/// document `follon-paper-status` reads (`apps/cli/src/paper.rs`). Both
+/// refuse unknown fields, so one file cannot serve both. This comment
+/// previously claimed that it could.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DesktopPaperConfiguration {

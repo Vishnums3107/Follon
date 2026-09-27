@@ -3153,6 +3153,32 @@ These are mandatory master-plan acceptance conditions and are currently open:
       steps validate what they publish. JSON Schema cannot express item 76's pairing rule, so the services
       enforce it. No external gate moved.
 
+78. A refused PAPER start leaves no journal behind (2026-09-27, rows 5.5 and 5.10; E3.10).
+    - **The gap.** `PaperTradingService::open_durable` opened its journal before validating the account
+      and risk policy, and `FilePaperJournal::open` creates the file when it is absent. A configuration
+      refused at startup, such as item 76's unpaired tables, therefore left an empty journal at the
+      configured path. Controlled LIVE already validates before it opens its journal. Found while
+      writing item 76's route test.
+    - **The fix.** `open_durable` constructs the service first, which validates the account, the policy
+      and the broker route, and only then opens the journal. The legacy-routing check still runs after
+      the journal opens, because it needs to know whether the journal is empty. Every existing reopen
+      test passes unchanged.
+    - **Documentation corrected.** The desktop gateway's configuration comment said the file mirrored the
+      document `follon-paper-status` reads "closely enough that the same operator-authored file can back
+      both". That was false: the CLI's document is nested, the desktop's is flat, and both refuse unknown
+      fields. The desktop's is the version-1 `paper-command-route` document without its `schema_version`
+      and `adapter_kind`. The comment now says so, and says that it had claimed otherwise.
+    - **Tests.** A refused configuration leaves no journal at its path, and the same path opens and
+      journals once the configuration is valid. Item 76's gRPC route test now also asserts that no
+      journal exists after the refused start.
+    - **Rule 5.** Restoring the journal-first order was caught separately by the PAPER test and by the
+      route test (2 of 2).
+    - **Measured result.** The Rust workspace rose from 507 to 508 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (76 probes, 0 failed).
+    - **Bounded remainder.** A start refused by the legacy-routing check itself still happens after the
+      journal is opened, and can leave an empty journal. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
