@@ -11,9 +11,11 @@ follon-accounting = { path = "../../core/accounting" }
 follon-domain = { path = "../../core/domain" }
 follon-execution = { path = "../../core/execution" }
 follon-identity = { path = "../../core/identity" }
+follon-live = { path = "../../core/live" }
 follon-paper = { path = "../../core/paper" }
 follon-postgres = { path = "../../adapters/persistence/postgres" }
 follon-risk = { path = "../../core/risk" }
+follon-secrets = { path = "../../core/secrets" }
 prost = "0.14.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

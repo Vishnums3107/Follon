@@ -10,6 +10,12 @@
 //! directory serves one tenant, so a route is reachable only by that tenant's
 //! operators, and the PAPER journal records who submitted and who moved a
 //! switch.
+//!
+//! `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` need the same
+//! kill-switch permission, against a configured controlled-LIVE route. That
+//! route opens the controlled-LIVE journal with an adapter that refuses every
+//! broker operation, so it can halt controlled LIVE but never place, cancel or
+//! reconcile an order. The LIVE journal records the operator of every change.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -30,6 +36,10 @@ use follon_execution::{
     ParentOrder, PassiveMarketObservation, PassiveRepricePolicy,
 };
 use follon_identity::{IdentityService, LoginOutcome, OperatorDirectory, Permission};
+use follon_live::{
+    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest,
+    LiveBrokerSubmitResult, LiveConfiguration, LiveError, LiveKillSwitchScope, LiveTradingService,
+};
 use follon_paper::{
     IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperComboMarketData,
     PaperMarketData, PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
@@ -39,6 +49,7 @@ use follon_risk::{
     evaluate_portfolio_risk, CandidateOrder as CoreCandidateOrder, PortfolioRiskPolicy,
     PortfolioRiskSnapshot, RestingOrder as CoreRestingOrder, RiskPosition,
 };
+use follon_secrets::SecretMaterial;
 use serde::Deserialize;
 use tokio::signal;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -53,8 +64,8 @@ pub mod api {
 use api::trading_operating_system_server::{TradingOperatingSystem, TradingOperatingSystemServer};
 use api::{
     BeginOperatorLoginRequest, BeginOperatorLoginResponse, CompleteOperatorLoginRequest,
-    OperatorSession, PaperKillSwitchRequest, PaperKillSwitchResponse, RevokeOperatorSessionRequest,
-    RevokeOperatorSessionResponse,
+    LiveKillSwitchRequest, LiveKillSwitchResponse, OperatorSession, PaperKillSwitchRequest,
+    PaperKillSwitchResponse, RevokeOperatorSessionRequest, RevokeOperatorSessionResponse,
 };
 use api::{
     BucketLimit, CancelReplaceInstruction, ChildInstruction, ChildOrderKind, ComboLegInstruction,
@@ -67,12 +78,15 @@ use api::{
 };
 
 type PaperComboRoute = Arc<Mutex<PaperTradingService<IbkrPaperAdapter>>>;
+type LiveKillSwitchRoute = Arc<Mutex<LiveTradingService<KillSwitchOnlyLiveAdapter>>>;
 type OperatorIdentity = Arc<Mutex<IdentityService>>;
 
 #[derive(Clone)]
 struct OperatingSystemService {
     database: Option<Arc<Mutex<PostgresStore>>>,
     paper_combo_route: Option<PaperComboRoute>,
+    /// Controlled-LIVE kill switches only; `None` refuses every LIVE change.
+    live_kill_switch_route: Option<LiveKillSwitchRoute>,
     /// Operators allowed to call write RPCs; `None` refuses every write.
     identity: Option<OperatorIdentity>,
     transport_tls: bool,
@@ -136,6 +150,93 @@ impl OperatingSystemService {
             operated_by: operator.user_id,
             operated_at,
         }))
+    }
+
+    /// Activates or releases one controlled-LIVE kill switch, under exactly
+    /// the PAPER rule: authorization precedes every other check, and the LIVE
+    /// journal records the operator and the server's time (E3.3c).
+    fn operate_live_kill_switch(
+        &self,
+        request: Request<LiveKillSwitchRequest>,
+        activate: bool,
+    ) -> Result<Response<LiveKillSwitchResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        let operator = self
+            .identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::KillSwitchOperate,
+                now,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        let scope = LiveKillSwitchScope::from_key(&request.scope)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route = self.live_kill_switch_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "controlled-LIVE kill-switch route is not configured; no kill switch was changed",
+            )
+        })?;
+        let operated_at = utc_timestamp(now)?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("controlled-LIVE route lock poisoned"))?;
+        let changed = if activate {
+            service.activate_kill_switch(scope.clone(), &operator.user_id, &operated_at)
+        } else {
+            service.deactivate_kill_switch(&scope, &operator.user_id, &operated_at)
+        }
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(LiveKillSwitchResponse {
+            scope: scope.as_key(),
+            changed,
+            active_kill_switches: service.kill_switches().active_keys(),
+            operated_by: operator.user_id,
+            operated_at,
+        }))
+    }
+}
+
+/// The controlled-LIVE route's broker adapter. The route exists to move kill
+/// switches, which need no broker, so every broker operation is refused: this
+/// process can halt controlled LIVE but can never trade it.
+struct KillSwitchOnlyLiveAdapter;
+
+impl KillSwitchOnlyLiveAdapter {
+    fn refused<T>() -> Result<T, LiveError> {
+        Err(LiveError(
+            "the trading API's controlled-LIVE route operates kill switches only and holds no broker connection"
+                .to_owned(),
+        ))
+    }
+}
+
+impl LiveBrokerAdapter for KillSwitchOnlyLiveAdapter {
+    fn connect(&mut self, _: &str, _: &SecretMaterial) -> Result<(), LiveError> {
+        Self::refused()
+    }
+
+    fn submit(&mut self, _: &LiveBrokerOrderRequest) -> Result<LiveBrokerSubmitResult, LiveError> {
+        Self::refused()
+    }
+
+    fn cancel(&mut self, _: &str) -> Result<(), LiveError> {
+        Self::refused()
+    }
+
+    fn poll(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError> {
+        Self::refused()
+    }
+
+    fn snapshot(&mut self, _: &str) -> Result<LiveBrokerAccountSnapshot, LiveError> {
+        Self::refused()
+    }
+
+    fn reconnect(&mut self, _: &str, _: &SecretMaterial) -> Result<(), LiveError> {
+        Self::refused()
     }
 }
 
@@ -496,6 +597,20 @@ impl TradingOperatingSystem for OperatingSystemService {
         request: Request<PaperKillSwitchRequest>,
     ) -> Result<Response<PaperKillSwitchResponse>, Status> {
         self.operate_paper_kill_switch(request, false)
+    }
+
+    async fn activate_live_kill_switch(
+        &self,
+        request: Request<LiveKillSwitchRequest>,
+    ) -> Result<Response<LiveKillSwitchResponse>, Status> {
+        self.operate_live_kill_switch(request, true)
+    }
+
+    async fn release_live_kill_switch(
+        &self,
+        request: Request<LiveKillSwitchRequest>,
+    ) -> Result<Response<LiveKillSwitchResponse>, Status> {
+        self.operate_live_kill_switch(request, false)
     }
 
     async fn evaluate_portfolio_risk(
@@ -898,6 +1013,10 @@ struct RuntimeConfig {
     database_url: Option<String>,
     database_ca: Option<PathBuf>,
     paper_command_route: Option<PathBuf>,
+    /// The version-1 controlled-LIVE configuration `follon-live-status` reads.
+    live_configuration: Option<PathBuf>,
+    /// The controlled-LIVE journal that configuration's service writes.
+    live_journal: Option<PathBuf>,
     operator_directory: Option<PathBuf>,
     tls_certificate: Option<PathBuf>,
     tls_private_key: Option<PathBuf>,
@@ -918,6 +1037,8 @@ impl RuntimeConfig {
             database_url: database_url(production)?,
             database_ca: env_path("FOLLON_DATABASE_CA"),
             paper_command_route: env_path("FOLLON_TRADING_API_PAPER_CONFIG"),
+            live_configuration: env_path("FOLLON_TRADING_API_LIVE_CONFIG"),
+            live_journal: env_path("FOLLON_TRADING_API_LIVE_JOURNAL"),
             operator_directory: env_path("FOLLON_TRADING_API_OPERATOR_DIRECTORY"),
             tls_certificate: env_path("FOLLON_GRPC_TLS_CERTIFICATE"),
             tls_private_key: env_path("FOLLON_GRPC_TLS_PRIVATE_KEY"),
@@ -942,8 +1063,38 @@ impl RuntimeConfig {
             return Err("production PostgreSQL URL must require TLS".to_owned());
         }
         config.validate_paper_command_route_transport()?;
+        config.validate_live_kill_switch_route()?;
         config.validate_operator_authentication()?;
         Ok(config)
+    }
+
+    /// A controlled-LIVE kill-switch route needs its configuration and its
+    /// journal together, accepts changes only from authenticated operators,
+    /// and off loopback requires mutual TLS, exactly as a PAPER route does.
+    fn validate_live_kill_switch_route(&self) -> Result<(), String> {
+        match (&self.live_configuration, &self.live_journal) {
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => {}
+            _ => {
+                return Err(
+                    "a controlled-LIVE route requires both FOLLON_TRADING_API_LIVE_CONFIG and FOLLON_TRADING_API_LIVE_JOURNAL"
+                        .to_owned(),
+                )
+            }
+        }
+        if self.operator_directory.is_none() {
+            return Err(
+                "a controlled-LIVE route requires FOLLON_TRADING_API_OPERATOR_DIRECTORY".to_owned(),
+            );
+        }
+        if !self.bind.ip().is_loopback()
+            && (tls_identity_paths(self).is_none() || self.tls_client_ca.is_none())
+        {
+            return Err(
+                "a remote controlled-LIVE route requires server TLS and a client CA".to_owned(),
+            );
+        }
+        Ok(())
     }
 
     /// A PAPER route accepts writes only from authenticated operators, and
@@ -1055,6 +1206,32 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
         &document.journal_path,
     )
     .map_err(|error| format!("PAPER command-route service: {error}"))?;
+    Ok(Arc::new(Mutex::new(service)))
+}
+
+/// Opens the controlled-LIVE journal under the version-1 configuration
+/// `follon-live-status` reads, through the parser both share, so the journal
+/// opens only under the fingerprint it was written with. `opened_at` is the
+/// server's UTC time, which the LIVE journal records for the restart.
+fn live_kill_switch_route_from_paths(
+    configuration_path: &Path,
+    journal_path: &Path,
+    opened_at: &str,
+) -> Result<LiveKillSwitchRoute, String> {
+    let bytes = std::fs::read(configuration_path)
+        .map_err(|error| format!("cannot read controlled-LIVE configuration: {error}"))?;
+    let configuration = LiveConfiguration::from_json(&bytes)
+        .map_err(|error| format!("controlled-LIVE configuration: {error}"))?;
+    let service = LiveTradingService::open_durable(
+        configuration.account,
+        configuration.risk,
+        configuration.activation,
+        configuration.kill_switches,
+        KillSwitchOnlyLiveAdapter,
+        journal_path,
+        opened_at,
+    )
+    .map_err(|error| format!("controlled-LIVE route service: {error}"))?;
     Ok(Arc::new(Mutex::new(service)))
 }
 
@@ -1181,6 +1358,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(paper_combo_route_from_path)
         .transpose()
         .map_err(std::io::Error::other)?;
+    let live_kill_switch_route = match (&config.live_configuration, &config.live_journal) {
+        (Some(configuration), Some(journal)) => Some(
+            live_kill_switch_route_from_paths(
+                configuration,
+                journal,
+                &utc_timestamp(now_epoch_seconds().map_err(std::io::Error::other)?)
+                    .map_err(std::io::Error::other)?,
+            )
+            .map_err(std::io::Error::other)?,
+        ),
+        _ => None,
+    };
     let identity = config
         .operator_directory
         .as_deref()
@@ -1191,6 +1380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = OperatingSystemService {
         database,
         paper_combo_route: paper_combo_route.clone(),
+        live_kill_switch_route: live_kill_switch_route.clone(),
         identity: identity.clone(),
         transport_tls,
     };
@@ -1210,11 +1400,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.tls_config(tls)?;
     }
     eprintln!(
-        "follon-trading-api listening on {} (tls={}, production={}, paper_combo_route={}, operator_identity={})",
+        "follon-trading-api listening on {} (tls={}, production={}, paper_combo_route={}, live_kill_switch_route={}, operator_identity={})",
         config.bind,
         transport_tls,
         config.production,
         paper_combo_route.is_some(),
+        live_kill_switch_route.is_some(),
         identity.is_some()
     );
     server
@@ -1295,6 +1486,7 @@ mod tests {
         OperatingSystemService {
             database: None,
             paper_combo_route: None,
+            live_kill_switch_route: None,
             identity: None,
             transport_tls: false,
         }
@@ -1357,6 +1549,7 @@ mod tests {
             OperatingSystemService {
                 database: None,
                 paper_combo_route: Some(route.clone()),
+                live_kill_switch_route: None,
                 identity: Some(operator_identity()),
                 transport_tls: false,
             },
@@ -1501,11 +1694,46 @@ mod tests {
             database_url: None,
             database_ca: None,
             paper_command_route: None,
+            live_configuration: None,
+            live_journal: None,
             operator_directory: None,
             tls_certificate: None,
             tls_private_key: None,
             tls_client_ca: None,
         }
+    }
+
+    #[test]
+    fn a_live_route_needs_both_paths_an_operator_directory_and_remote_mutual_tls() {
+        let mut config = base_config();
+        assert!(config.validate_live_kill_switch_route().is_ok());
+        config.live_configuration = Some(PathBuf::from("live.json"));
+        assert_eq!(
+            config.validate_live_kill_switch_route().unwrap_err(),
+            "a controlled-LIVE route requires both FOLLON_TRADING_API_LIVE_CONFIG and FOLLON_TRADING_API_LIVE_JOURNAL"
+        );
+        let mut journal_only = base_config();
+        journal_only.live_journal = Some(PathBuf::from("live.ndjson"));
+        assert!(journal_only.validate_live_kill_switch_route().is_err());
+
+        config.live_journal = Some(PathBuf::from("live.ndjson"));
+        assert_eq!(
+            config.validate_live_kill_switch_route().unwrap_err(),
+            "a controlled-LIVE route requires FOLLON_TRADING_API_OPERATOR_DIRECTORY"
+        );
+        config.operator_directory = Some(PathBuf::from("operators.json"));
+        assert!(config.validate_live_kill_switch_route().is_ok());
+
+        config.bind = "0.0.0.0:50051".parse().expect("remote bind");
+        assert!(config.validate_live_kill_switch_route().is_err());
+        config.tls_certificate = Some(PathBuf::from("server.pem"));
+        config.tls_private_key = Some(PathBuf::from("server-key.pem"));
+        assert_eq!(
+            config.validate_live_kill_switch_route().unwrap_err(),
+            "a remote controlled-LIVE route requires server TLS and a client CA"
+        );
+        config.tls_client_ca = Some(PathBuf::from("clients.pem"));
+        assert!(config.validate_live_kill_switch_route().is_ok());
     }
 
     #[test]
@@ -1546,6 +1774,7 @@ mod tests {
         let service = OperatingSystemService {
             database: None,
             paper_combo_route: None,
+            live_kill_switch_route: None,
             identity: None,
             transport_tls,
         };
@@ -1992,6 +2221,198 @@ mod tests {
         drop(service);
         drop(route);
         let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    fn live_kill_switch_request(scope: &str) -> LiveKillSwitchRequest {
+        LiveKillSwitchRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            scope: scope.to_owned(),
+        }
+    }
+
+    /// Opens the controlled-LIVE route over the checked-in configuration and
+    /// a scratch journal, at the server's time, as `main` does.
+    fn open_live_route(journal: &Path) -> LiveKillSwitchRoute {
+        let configuration =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/config/live-v1.json");
+        let opened_at = utc_timestamp(now_epoch_seconds().unwrap()).unwrap();
+        live_kill_switch_route_from_paths(&configuration, journal, &opened_at)
+            .expect("configured controlled-LIVE route")
+    }
+
+    fn live_service(route: &LiveKillSwitchRoute) -> OperatingSystemService {
+        OperatingSystemService {
+            database: None,
+            paper_combo_route: None,
+            live_kill_switch_route: Some(route.clone()),
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_kill_switch_rpcs_require_kill_switch_operation_and_journal_the_operator() {
+        let sequence = PAPER_ROUTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let scratch = std::env::temp_dir().join(format!(
+            "follon-trading-api-live-kill-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("create LIVE route scratch");
+        let journal = scratch.join("live.ndjson");
+        let scope = "instrument:inst.us_equity.spy";
+        let code = |result: Result<Response<LiveKillSwitchResponse>, Status>| {
+            result.expect_err("the change must be refused").code()
+        };
+
+        let route = open_live_route(&journal);
+        let service = live_service(&route);
+        // No session, then a trader: trading does not grant kill-switch operation.
+        assert_eq!(
+            code(
+                service
+                    .activate_live_kill_switch(Request::new(live_kill_switch_request(scope)))
+                    .await
+            ),
+            tonic::Code::Unauthenticated
+        );
+        let trader = trader_token(&service).await;
+        for activate in [true, false] {
+            let request = authorized(live_kill_switch_request(scope), &trader);
+            let result = if activate {
+                service.activate_live_kill_switch(request).await
+            } else {
+                service.release_live_kill_switch(request).await
+            };
+            assert_eq!(code(result), tonic::Code::PermissionDenied);
+        }
+        assert!(route
+            .lock()
+            .unwrap()
+            .kill_switches()
+            .active_keys()
+            .is_empty());
+
+        // The risk manager activates it, and is recorded as the operator.
+        let risk = risk_token(&service).await;
+        let activated = service
+            .activate_live_kill_switch(authorized(live_kill_switch_request(scope), &risk))
+            .await
+            .expect("a risk manager operates kill switches")
+            .into_inner();
+        assert!(activated.changed);
+        assert_eq!(activated.scope, scope);
+        assert_eq!(activated.operated_by, "user.risk");
+        assert_eq!(activated.active_kill_switches, vec![scope.to_owned()]);
+        let repeat = service
+            .activate_live_kill_switch(authorized(live_kill_switch_request(scope), &risk))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!repeat.changed, "a repeat changes nothing");
+
+        // A malformed scope and another tenant are refused before the route.
+        assert_eq!(
+            code(
+                service
+                    .activate_live_kill_switch(authorized(
+                        live_kill_switch_request("instrument:Not Canonical"),
+                        &risk
+                    ))
+                    .await
+            ),
+            tonic::Code::InvalidArgument
+        );
+        let mut other_tenant = live_kill_switch_request(scope);
+        other_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            code(
+                service
+                    .release_live_kill_switch(authorized(other_tenant, &risk))
+                    .await
+            ),
+            tonic::Code::PermissionDenied
+        );
+
+        // The switch is durable: a restarted route still has it active.
+        drop(service);
+        drop(route);
+        let route = open_live_route(&journal);
+        assert_eq!(
+            route.lock().unwrap().kill_switches().active_keys(),
+            vec![scope.to_owned()]
+        );
+        let service = live_service(&route);
+        let risk = risk_token(&service).await;
+        let released = service
+            .release_live_kill_switch(authorized(live_kill_switch_request(scope), &risk))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(released.changed);
+        assert!(released.active_kill_switches.is_empty());
+        drop(service);
+        drop(route);
+
+        // The closed journal names the risk manager, at the server's time,
+        // for every change. A repeated activation is journaled too.
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let changes: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry["event_type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("live.kill_switch."))
+            })
+            .map(|entry| {
+                (
+                    entry["event_type"].as_str().unwrap().to_owned(),
+                    entry["actor"].as_str().unwrap().to_owned(),
+                    entry["state"]["active_kill_switches"].clone(),
+                )
+            })
+            .collect();
+        let active = serde_json::json!([scope]);
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    "live.kill_switch.activated.v1".to_owned(),
+                    "user.risk".to_owned(),
+                    active.clone()
+                ),
+                (
+                    "live.kill_switch.activated.v1".to_owned(),
+                    "user.risk".to_owned(),
+                    active
+                ),
+                (
+                    "live.kill_switch.deactivated.v1".to_owned(),
+                    "user.risk".to_owned(),
+                    serde_json::json!([])
+                ),
+            ]
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry["occurred_at"] == activated.operated_at.as_str()));
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn live_kill_switch_rpcs_fail_closed_without_a_configured_route() {
+        let mut service = service();
+        service.identity = Some(operator_identity());
+        let risk = risk_token(&service).await;
+        let status = service
+            .activate_live_kill_switch(authorized(live_kill_switch_request("global"), &risk))
+            .await
+            .expect_err("no route, no change");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

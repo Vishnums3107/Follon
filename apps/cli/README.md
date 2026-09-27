@@ -296,10 +296,11 @@ contain the required operating procedure and boundaries.
 
 ## Trading API operators
 
-`follon-trading-api` accepts its one write RPC, `SubmitPaperCombo`, only from
-an operator in the directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
-A configured PAPER route refuses to start without one. `follon-admin
-operator-add` provisions each operator:
+`follon-trading-api` accepts its write RPCs only from an operator in the
+directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`. They are
+`SubmitPaperCombo`, the PAPER kill-switch RPCs and the controlled-LIVE
+kill-switch RPCs. A configured PAPER or controlled-LIVE route refuses to start
+without that directory. `follon-admin operator-add` provisions each operator:
 
 ```powershell
 cargo run -p follon-cli --bin follon-admin -- operator-add --directory operators.json --tenant-id tenant.alpha --user-id user.trader --email trader@example.com --roles trader --password-file password.txt
@@ -311,7 +312,8 @@ cargo run -p follon-cli --bin follon-admin -- operator-add --directory operators
   enrolment in an authenticator. Every operator must pass this second factor.
 - One directory serves one tenant. Roles are `organization_admin`,
   `risk_manager`, `trader`, `read_only` and `auditor`; only `trader` grants
-  PAPER trading.
+  PAPER trading, and only `risk_manager` grants kill-switch operation, PAPER
+  or controlled LIVE.
 - A refused addition leaves the directory unchanged, and a successful one
   replaces it atomically.
 - The directory holds TOTP secrets, so it is secret material: keep it readable

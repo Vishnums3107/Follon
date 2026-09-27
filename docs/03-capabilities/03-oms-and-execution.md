@@ -85,6 +85,24 @@ operator and the server's UTC time. A repeat that changes nothing records
 nothing. The local `follon-paper-status --activate/--deactivate` path is
 unchanged and records no operator.
 
+`ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` (E3.3c) apply the same
+rule to controlled LIVE. They need a separate route, configured by
+`FOLLON_TRADING_API_LIVE_CONFIG` and `FOLLON_TRADING_API_LIVE_JOURNAL`:
+
+- The configuration is the version-1 document `follon-live-status` reads, and
+  both parse it with the same code. The journal therefore opens only under the
+  configuration fingerprint it was written with.
+- The route opens the LIVE journal with an adapter that refuses every broker
+  operation. It can halt controlled LIVE, but it can never place, cancel or
+  reconcile an order.
+- It refuses to start with only one of its two variables or without the
+  operator directory. Off loopback, it requires server TLS and a client CA.
+- The LIVE journal records each change with the operator as its actor and the
+  server's UTC time. A repeated activation is recorded too, and a release that
+  changes nothing records nothing.
+- While the route runs, the API holds the LIVE journal's exclusive lock, so no
+  other LIVE process can open that journal.
+
 The Tauri desktop host has the equivalent `submit_combo_order` IPC command. Its
 `ComboOrderIntent` places each leg's operator-attested observation on the leg
 itself, so no leg can reach risk unpriced or priced from its limit. The native

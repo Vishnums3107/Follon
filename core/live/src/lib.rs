@@ -24,6 +24,9 @@ use follon_domain::{
 use follon_instrument::{TradingCalendar, TradingSession};
 
 mod combinations;
+mod configuration;
+
+pub use configuration::LiveConfiguration;
 
 pub use combinations::{
     combo_intent_fingerprint, LiveBrokerComboExecution, LiveBrokerComboExecutionLeg,
@@ -1025,6 +1028,30 @@ impl LiveKillSwitchScope {
             Self::Strategy(value) => format!("strategy:{value}"),
             Self::Instrument(value) => format!("instrument:{value}"),
         }
+    }
+
+    /// Parses a scope from its stable key, the inverse of [`Self::as_key`]:
+    /// `global`, `account:<id>`, `strategy:<id>` or `instrument:<id>`, with a
+    /// canonical identity.
+    pub fn from_key(value: &str) -> Result<Self, LiveError> {
+        if value == "global" {
+            return Ok(Self::Global);
+        }
+        for (prefix, constructor) in [
+            ("account:", Self::Account as fn(String) -> Self),
+            ("strategy:", Self::Strategy as fn(String) -> Self),
+            ("instrument:", Self::Instrument as fn(String) -> Self),
+        ] {
+            if let Some(identifier) = value.strip_prefix(prefix) {
+                let scope = constructor(identifier.to_owned());
+                scope.validate()?;
+                return Ok(scope);
+            }
+        }
+        Err(LiveError(
+            "kill-switch scope must be global, account:<id>, strategy:<id> or instrument:<id>"
+                .to_owned(),
+        ))
     }
 
     fn validate(&self) -> Result<(), LiveError> {
@@ -5154,32 +5181,8 @@ fn parse_order_state(value: &str) -> Result<OrderState, LiveError> {
 }
 
 fn parse_kill_switch_scope(value: &str) -> Result<LiveKillSwitchScope, LiveError> {
-    if value == "global" {
-        return Ok(LiveKillSwitchScope::Global);
-    }
-    for (prefix, constructor) in [
-        (
-            "account:",
-            LiveKillSwitchScope::Account as fn(String) -> LiveKillSwitchScope,
-        ),
-        (
-            "strategy:",
-            LiveKillSwitchScope::Strategy as fn(String) -> LiveKillSwitchScope,
-        ),
-        (
-            "instrument:",
-            LiveKillSwitchScope::Instrument as fn(String) -> LiveKillSwitchScope,
-        ),
-    ] {
-        if let Some(identifier) = value.strip_prefix(prefix) {
-            let scope = constructor(identifier.to_owned());
-            scope.validate()?;
-            return Ok(scope);
-        }
-    }
-    Err(LiveError(
-        "persisted live kill-switch scope is invalid".to_owned(),
-    ))
+    LiveKillSwitchScope::from_key(value)
+        .map_err(|_| LiveError("persisted live kill-switch scope is invalid".to_owned()))
 }
 
 impl From<&OrderIntent> for PersistentIntent {

@@ -22,6 +22,11 @@ service TradingOperatingSystem {
   // journal records the operator and server time of every change.
   rpc ActivatePaperKillSwitch(PaperKillSwitchRequest) returns (PaperKillSwitchResponse);
   rpc ReleasePaperKillSwitch(PaperKillSwitchRequest) returns (PaperKillSwitchResponse);
+  // The same authorization for a configured controlled-LIVE kill-switch
+  // route, which holds no broker connection and can place no order. The LIVE
+  // journal records the operator and server time of every change.
+  rpc ActivateLiveKillSwitch(LiveKillSwitchRequest) returns (LiveKillSwitchResponse);
+  rpc ReleaseLiveKillSwitch(LiveKillSwitchRequest) returns (LiveKillSwitchResponse);
   rpc EvaluatePortfolioRisk(PortfolioRiskRequest) returns (PortfolioRiskResponse);
   rpc ValueMarginAccount(MarginAccountRequest) returns (MarginAccountResponse);
 }
@@ -269,6 +274,24 @@ message PaperKillSwitchResponse {
   // Every active PAPER kill switch after the request.
   repeated string active_kill_switches = 3;
   // The authenticated operator the PAPER journal records with a change.
+  string operated_by = 4;
+  // The server's UTC time for the request.
+  string operated_at = 5;
+}
+
+message LiveKillSwitchRequest {
+  string tenant_id = 1;
+  string scope = 2;
+}
+
+message LiveKillSwitchResponse {
+  string scope = 1;
+  // Whether this request changed the switch. The LIVE journal records a
+  // repeated activation too; a release that changes nothing records nothing.
+  bool changed = 2;
+  // Every active controlled-LIVE kill switch after the request.
+  repeated string active_kill_switches = 3;
+  // The authenticated operator the LIVE journal records as the actor.
   string operated_by = 4;
   // The server's UTC time for the request.
   string operated_at = 5;

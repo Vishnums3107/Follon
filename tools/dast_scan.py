@@ -2,18 +2,20 @@
 """Repository-authored dynamic scan of a local Follon deployment (E3.4).
 
 Starts the real evidence dashboard (production mode, Basic authentication)
-and the real ``follon-trading-api`` (a durable PAPER route behind operator
-authentication) on loopback, then probes both over the network:
+and the real ``follon-trading-api`` (a durable PAPER route and a
+controlled-LIVE kill-switch route behind operator authentication) on loopback,
+then probes both over the network:
 
 - the dashboard for authentication bypass, credential rate limiting, method
   tampering, path traversal, security headers, version disclosure, CORS,
   oversized requests, and leaked tracebacks;
 - the gRPC API for unauthenticated, malformed, forged, wrong-role, wrong-tenant
   and revoked sessions, password lockout, the TOTP second factor and its
-  replay, malformed and oversized messages, unknown methods, and the
-  kill-switch RPCs' separation of the risk-manager role from trading;
-- the stopped API's PAPER journal, for the operator of every kill-switch
-  change;
+  replay, malformed and oversized messages, unknown methods, and the PAPER
+  and controlled-LIVE kill-switch RPCs' separation of the risk-manager role
+  from trading;
+- the stopped API's PAPER and controlled-LIVE journals, for the operator of
+  every kill-switch change;
 - both binaries' startup refusals for unsafe configurations.
 
 This is a scan the repository wrote about itself. It is not an independent
@@ -49,6 +51,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 SERVICE = "/follon.trading.v1.TradingOperatingSystem/"
 TENANT = "tenant.alpha"
 KILL_SCOPE = "instrument:inst.us_option.spy.500c"
+LIVE_KILL_SCOPE = "instrument:inst.us_equity.spy"
+LIVE_CONFIGURATION = REPOSITORY_ROOT / "tests" / "fixtures" / "config" / "live-v1.json"
 EXE = ".exe" if os.name == "nt" else ""
 
 
@@ -571,6 +575,35 @@ def scan_api(scan: Scan, api: Api, operators: dict[str, tuple[str, bytes]], pass
     code, _ = api.call("ActivatePaperKillSwitch", kill_switch_request("everything"), token=risk)
     scan.record("G29", target, "malformed input", "an unknown kill-switch scope is refused",
                 "INVALID_ARGUMENT", code.name, code == grpc.StatusCode.INVALID_ARGUMENT)
+
+    # Controlled-LIVE kill switches: the same separation, on a route that
+    # holds no broker connection.
+    code, _ = api.call("ActivateLiveKillSwitch", kill_switch_request(LIVE_KILL_SCOPE))
+    scan.record("G30", target, "authentication", "a controlled-LIVE kill-switch change with no session is refused",
+                "UNAUTHENTICATED", code.name, code == grpc.StatusCode.UNAUTHENTICATED)
+    code, _ = api.call("ActivateLiveKillSwitch", kill_switch_request(LIVE_KILL_SCOPE), token=desk)
+    scan.record("G31", target, "authorization", "a trading role cannot operate a controlled-LIVE kill switch",
+                "PERMISSION_DENIED", code.name, code == grpc.StatusCode.PERMISSION_DENIED)
+    code, body = api.call("ActivateLiveKillSwitch", kill_switch_request(LIVE_KILL_SCOPE), token=risk)
+    fields = pb_fields(body) if code == grpc.StatusCode.OK else {}
+    changed = fields.get(2, [0])[0] == 1
+    active = [scope.decode() for scope in fields.get(3, [])]
+    operated_by = fields.get(4, [b""])[0].decode()
+    scan.record("G32", target, "authorization",
+                "a risk manager activates a controlled-LIVE kill switch and is named its operator",
+                f"OK, changed, {LIVE_KILL_SCOPE} active, operated_by user.risk",
+                f"{code.name}, changed={changed}, active={active}, operated_by={operated_by}",
+                code == grpc.StatusCode.OK and changed and active == [LIVE_KILL_SCOPE] and operated_by == "user.risk")
+    code, body = api.call("ReleaseLiveKillSwitch", kill_switch_request(LIVE_KILL_SCOPE), token=risk)
+    fields = pb_fields(body) if code == grpc.StatusCode.OK else {}
+    changed = fields.get(2, [0])[0] == 1
+    active = [scope.decode() for scope in fields.get(3, [])]
+    scan.record("G33", target, "kill switch", "the risk manager releases the controlled-LIVE switch",
+                "OK, changed, none active", f"{code.name}, changed={changed}, active={active}",
+                code == grpc.StatusCode.OK and changed and not active)
+    code, _ = api.call("ReleaseLiveKillSwitch", kill_switch_request("everything"), token=risk)
+    scan.record("G34", target, "malformed input", "an unknown controlled-LIVE kill-switch scope is refused",
+                "INVALID_ARGUMENT", code.name, code == grpc.StatusCode.INVALID_ARGUMENT)
     code, _ = api.call("CheckHealth", b"")
     scan.record("G99", target, "availability", "the API is still healthy after every probe",
                 "OK", code.name, code == grpc.StatusCode.OK)
@@ -586,6 +619,19 @@ def scan_journal(scan: Scan, journal: Path) -> None:
     scan.record("J01", "trading-api", "audit", "the PAPER journal records the operator of every kill-switch change",
                 f"ACTIVATE and RELEASE of {KILL_SCOPE} by user.risk", observed,
                 recorded == [("ACTIVATE", KILL_SCOPE, "user.risk"), ("RELEASE", KILL_SCOPE, "user.risk")])
+
+
+def scan_live_journal(scan: Scan, journal: Path) -> None:
+    """Reads the stopped API's controlled-LIVE journal. The scan changed one
+    switch twice, so exactly those two changes must name the risk manager."""
+    entries = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()] if journal.exists() else []
+    changes = [(entry["event_type"], entry["actor"], entry["state"]["active_kill_switches"])
+               for entry in entries if entry["event_type"].startswith("live.kill_switch.")]
+    observed = "; ".join(f"{kind} by {actor}, active {active}" for kind, actor, active in changes) or "none"
+    scan.record("J02", "trading-api", "audit", "the controlled-LIVE journal records the operator of every kill-switch change",
+                f"activated and deactivated {LIVE_KILL_SCOPE} by user.risk", observed,
+                changes == [("live.kill_switch.activated.v1", "user.risk", [LIVE_KILL_SCOPE]),
+                            ("live.kill_switch.deactivated.v1", "user.risk", [])])
 
 
 # --- orchestration ----------------------------------------------------------------
@@ -708,6 +754,8 @@ def main() -> int:
         api_env = base_env() | {
             "FOLLON_GRPC_BIND": f"127.0.0.1:{api_port}",
             "FOLLON_TRADING_API_PAPER_CONFIG": str(route),
+            "FOLLON_TRADING_API_LIVE_CONFIG": str(LIVE_CONFIGURATION),
+            "FOLLON_TRADING_API_LIVE_JOURNAL": str(workspace / "live-journal.ndjson"),
             "FOLLON_TRADING_API_OPERATOR_DIRECTORY": str(directory),
         }
         api_process = subprocess.Popen([str(api_binary)], cwd=REPOSITORY_ROOT, env=api_env,
@@ -718,8 +766,9 @@ def main() -> int:
         # The journal is exclusively locked while the API runs, so it is read
         # only after the API has stopped.
         stop(api_process)
-        print("[+] Reading the PAPER journal", flush=True)
+        print("[+] Reading the PAPER and controlled-LIVE journals", flush=True)
         scan_journal(scan, workspace / "paper-journal.ndjson")
+        scan_live_journal(scan, workspace / "live-journal.ndjson")
 
         print("[+] Probing unsafe startup configurations", flush=True)
         refused, observed = exits_nonzero(dashboard_command, env | {
@@ -737,17 +786,42 @@ def main() -> int:
             "requires FOLLON_TRADING_API_OPERATOR_DIRECTORY")
         scan.record("C02", "trading-api", "configuration", "a PAPER route refuses to start without an operator directory",
                     "a non-zero exit", observed, refused)
-        remote = {key: value for key, value in api_env.items() if key != "FOLLON_TRADING_API_PAPER_CONFIG"}
+        # With no route configured, only operator login is left to refuse.
+        remote = {key: value for key, value in api_env.items()
+                  if key not in ("FOLLON_TRADING_API_PAPER_CONFIG", "FOLLON_TRADING_API_LIVE_CONFIG",
+                                 "FOLLON_TRADING_API_LIVE_JOURNAL")}
         refused, observed = exits_nonzero([str(api_binary)], remote | {"FOLLON_GRPC_BIND": f"0.0.0.0:{free_port()}"},
                                           "operator login off loopback requires server TLS")
         scan.record("C03", "trading-api", "configuration", "operator login refuses a plaintext non-loopback bind",
+                    "a non-zero exit", observed, refused)
+        live_only = {key: value for key, value in api_env.items()
+                     if key not in ("FOLLON_TRADING_API_PAPER_CONFIG", "FOLLON_TRADING_API_OPERATOR_DIRECTORY")}
+        refused, observed = exits_nonzero([str(api_binary)], live_only | {
+            "FOLLON_GRPC_BIND": f"127.0.0.1:{free_port()}",
+            "FOLLON_TRADING_API_LIVE_JOURNAL": str(workspace / "live-journal-startup.ndjson")},
+            "a controlled-LIVE route requires FOLLON_TRADING_API_OPERATOR_DIRECTORY")
+        scan.record("C04", "trading-api", "configuration", "a controlled-LIVE route refuses to start without an operator directory",
+                    "a non-zero exit", observed, refused)
+        no_journal = {key: value for key, value in api_env.items()
+                      if key not in ("FOLLON_TRADING_API_PAPER_CONFIG", "FOLLON_TRADING_API_LIVE_JOURNAL")}
+        refused, observed = exits_nonzero([str(api_binary)], no_journal | {"FOLLON_GRPC_BIND": f"127.0.0.1:{free_port()}"},
+                                          "a controlled-LIVE route requires both")
+        scan.record("C05", "trading-api", "configuration", "a controlled-LIVE route refuses to start without its journal",
+                    "a non-zero exit", observed, refused)
+        remote_live = {key: value for key, value in api_env.items() if key != "FOLLON_TRADING_API_PAPER_CONFIG"}
+        refused, observed = exits_nonzero([str(api_binary)], remote_live | {
+            "FOLLON_GRPC_BIND": f"0.0.0.0:{free_port()}",
+            "FOLLON_TRADING_API_LIVE_JOURNAL": str(workspace / "live-journal-startup.ndjson")},
+            "a remote controlled-LIVE route requires server TLS and a client CA")
+        scan.record("C06", "trading-api", "configuration", "a controlled-LIVE route refuses a plaintext non-loopback bind",
                     "a non-zero exit", observed, refused)
 
         targets = [
             {"name": "dashboard", "entry_point": "apps/desktop/server.py", "mode": "production",
              "bind": "127.0.0.1", "entry_point_sha256": sha256_file(REPOSITORY_ROOT / "apps/desktop/server.py")},
             {"name": "trading-api", "entry_point": api_binary.name, "bind": "127.0.0.1",
-             "entry_point_sha256": sha256_file(api_binary), "paper_route": True, "operator_directory": True},
+             "entry_point_sha256": sha256_file(api_binary), "paper_route": True,
+             "live_kill_switch_route": True, "operator_directory": True},
         ]
     except Exception as error:  # noqa: BLE001 - any harness error must fail the scan, not skip the report
         scan.record("X00", "scanner", "harness", "the scan ran to completion",

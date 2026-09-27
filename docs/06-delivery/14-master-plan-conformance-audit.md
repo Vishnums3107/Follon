@@ -3244,6 +3244,83 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** An edited input is checked for line endings, not content, which is correct:
       its content is the edit. No external gate moved.
 
+81. Authenticated controlled-LIVE kill-switch RPCs, on a route that can never trade (2026-09-27, Architecture
+    and Security rows; E3.3c).
+    - **The gap.** A controlled-LIVE kill switch could be moved only through the `core/live` library.
+      `LiveTradingService::activate_kill_switch` journals the actor and time, but nothing called it
+      operationally. `follon-live-status` has no kill-switch flags, and the trading API had no LIVE route
+      at all. Item 71 recorded this as one of E3.3's remainders.
+    - **What landed, as the operator decided.** This is the explicit exception, recorded under Settled
+      direction item 3, to keeping IAM and the control plane warm rather than extended. The other E3.3
+      remainders stay open.
+      - `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` on the gRPC API, under exactly E3.3b's rule.
+        A bearer session whose role grants `KillSwitchOperate` in the request's tenant, which only
+        `risk_manager` does, is checked before anything else. A trading role, another tenant, a missing
+        session and a malformed scope are refused. With no route configured, the RPC fails closed.
+      - The route is configured by `FOLLON_TRADING_API_LIVE_CONFIG`, the version-1 document
+        `follon-live-status` reads, and `FOLLON_TRADING_API_LIVE_JOURNAL`. It refuses to start with only
+        one of the two, or without the operator directory. Off loopback it requires server TLS and a
+        client CA, as the PAPER route does.
+      - The route opens the LIVE journal at the server's UTC time with `KillSwitchOnlyLiveAdapter`, which
+        refuses every broker operation. The API process can halt controlled LIVE and can never place,
+        cancel or reconcile an order. While it runs it holds the journal's exclusive lock.
+      - Each change is journaled by `core/live`'s existing path, with the operator as the entry's actor
+        and the server's time. `core/live`'s rules are unchanged: a repeated activation is journaled, and
+        a release that changes nothing is not.
+    - **One parser for the LIVE configuration.** `follon-live-status` parsed its configuration privately.
+      A second copy in the API could drift, and a journal opens only under the exact configuration
+      fingerprint it was written with. The document, its validation and the portfolio-risk composition
+      therefore moved into `core/live` as `LiveConfiguration::from_json`, which both use, with the same
+      fields and rules. Only its errors changed: they are now `LiveError` values, and a JSON error gains
+      the prefix "invalid live configuration:". The CLI's composition test moved with it. `LiveKillSwitchScope::from_key` is the public inverse of
+      `as_key`, and the journal-restore parser now delegates to it.
+    - **Tests.**
+      - `core/live`: the checked-in LIVE journal opens under the parsed `live-v1.json` with the fingerprint
+        its first entry recorded. Also: the portfolio-risk composition, the document's strictness (an
+        unknown field, schema version 2, a `PAPER` activation mode, empty and oversized documents), and
+        the scope-key round trip.
+      - gRPC: the permission separation; operator attribution; a repeat reported as unchanged; a malformed
+        scope; another tenant; the switch surviving a route restart; the release; the closed journal
+        naming the risk manager for all three kill-switch entries; failing closed without a route; and the
+        startup rules.
+    - **Scanner.** `tools/dast_scan.py` configures the LIVE route over `tests/fixtures/config/live-v1.json`
+      and a scratch journal, and adds nine probes:
+      - G30 to G34: no session, a trading role, a risk manager activating a switch and being named its
+        operator, the release, and an unknown scope;
+      - J02, run after the API stops: the LIVE journal names the risk manager for exactly those two
+        changes;
+      - C04 to C06: a LIVE route refused without the operator directory, without its journal, and on a
+        plaintext non-loopback bind.
+
+      Adding the route exposed a harness gap. C03, which checks that operator login refuses a plaintext
+      remote bind, then inherited the LIVE variables and was refused for the LIVE reason. The harness
+      requires the exact reason, so it reported the probe failed rather than passing it. C03 now runs
+      with no route configured. The scan rose from 76 to 85 probes, 0 failed.
+    - **Rule 5.** 12 of 12 injected defects were caught:
+      - gRPC: authorizing `PaperTrade` instead, the release RPC activating, a fixed operator journaled,
+        a missing route answering as if a switch had moved, a route accepted without its journal, a route
+        accepted without the operator directory, and a remote route accepted without a client CA;
+      - the shared parser: the portfolio-risk block dropped (caught by the composition test), a fixed
+        kill-switch revision (caught because the checked-in journal no longer opens under it), and
+        `from_key` accepting any key as `global`;
+      - the extended scan, against two service defects. Authorizing `PaperTrade` failed G31 to G34 and
+        J02. A fixed operator failed only J02: the RPC response still named the real operator, and
+        only the stopped API's journal showed otherwise.
+    - **A stale statement corrected.** `apps/cli/README.md` still said the API had "its one write RPC,
+      `SubmitPaperCombo`". That became false with item 71's kill-switch RPCs. It now lists the write RPCs,
+      and says that only `risk_manager` grants kill-switch operation.
+    - **Measured result.** The Rust workspace rose from 509 to 515 passed / 0 failed / 3 ignored: four
+      `core/live` tests and three gRPC tests were added, and the CLI's composition test moved. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (85 probes, 0 failed).
+    - **Bounded remainder.**
+      - Sessions stay in memory, and there is no four-eyes rule on a kill-switch change.
+      - The Tauri desktop's IPC writes are unauthenticated, and the operator directory has no managed
+        secret store.
+      - There is still no LIVE order RPC and no operational controlled-LIVE trading process. The API's
+        route can only halt.
+      - The deployment review stays external. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
