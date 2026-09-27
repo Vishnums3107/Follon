@@ -3179,6 +3179,45 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** A start refused by the legacy-routing check itself still happens after the
       journal is opened, and can leave an empty journal. No external gate moved.
 
+79. A replay refuses to fill a working order off a lot size that changed while it worked (2026-09-27,
+    row 5.4 and research-to-live parity; E3.6g). This closes the second remainder item 73 recorded.
+    - **The gap.** Item 73 made the replay's risk rule require whole lots, and required a fill cap to be
+      whole lots of the traded instrument, both judged when the intent arrives. Reference data is
+      effective-dated. If an instrument's lot size changed while an order was still working, a later
+      fill could be off the new lot, and the replay filled it anyway. No venue executes that fill.
+    - **The rule, as the operator decided.** The replay refuses. It raises an error rather than model a
+      venue's response, which varies by venue and is not modelled anywhere in the repository.
+      - At each fill attempt, the fill quantity, which is the remaining quantity or the fill cap if
+        smaller, must be a whole number of lots under the fill bar's reference data. Otherwise the replay
+        stops with an error naming the order, the quantity, the instrument and its new lot.
+      - The check runs before anything about the attempt is recorded. The fill bar is the last event on
+        the stream.
+      - The fill bar's reference data now reaches the fill attempt whole. E3.6e passed only its tick; the
+        rounding still uses that tick.
+      - A change the order still fits is not refused.
+      - On the news path, the reference data that judged the order is the one it fills under, so the
+        check never fires there. It still applies.
+    - **Tests.** Across a lot change at the fill bar:
+      - three shares decided under a one-share lot are refused under five-share lots, with nothing after
+        the fill bar on the stream and no fill;
+      - four shares with a two-share fill cap are refused under four-share lots. The order is still whole
+        lots, but its capped fill is not;
+      - six shares under three-share lots fill as usual.
+    - **Rule 5.** 5 of 5 injected defects were caught: the guard removed; the guard checking the order's
+      full quantity instead of the capped fill; the guard checking against the tick; the guard moved to
+      after the fill is recorded (caught on the stream, not the error text, which is identical); and the
+      bar path passing no reference data to working orders (caught by this test and by E3.6e's grid
+      test).
+    - **Measured result.** The Rust workspace rose from 508 to 509 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (76 probes, 0 failed). Python measured 54 passed rather than 55.
+      Item 75's byte test skips any hashed input with uncommitted edits, and this slice edits one. pytest
+      then reports the whole test skipped, which hides the other inputs' checks. Item 80 removes that
+      skip.
+    - **Bounded remainder.** The tick analogue is not guarded. A working limit order whose limit falls
+      off a changed tick grid is still eligible, and its fill prints on the new grid against the trader
+      (item 74). The operator chose the lot guard only. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

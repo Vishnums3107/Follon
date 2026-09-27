@@ -2489,7 +2489,7 @@ impl ReplayEngine {
                 account_id,
                 &bar,
                 &mut working,
-                reference.map(|reference| reference.tick_size),
+                reference,
             )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
@@ -2646,7 +2646,7 @@ impl ReplayEngine {
                 account_id,
                 &bar,
                 &mut working,
-                reference.map(|reference| reference.tick_size),
+                reference,
             )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
@@ -2977,7 +2977,7 @@ impl ReplayEngine {
                 account_id,
                 market,
                 &mut working,
-                Some(reference.tick_size),
+                Some(reference),
             )? {
                 *latest_position = Some(position);
                 *latest_pnl = Some(pnl);
@@ -3018,8 +3018,8 @@ impl ReplayEngine {
         Ok(())
     }
 
-    /// `tick_size` is the bar's instrument's tick, from its reference data. It
-    /// is absent only for [`Self::process_bar`]'s unit tests.
+    /// `reference` is the bar's instrument's reference data, in force when the
+    /// order fills. It is absent only for [`Self::process_bar`]'s unit tests.
     #[allow(clippy::too_many_arguments)]
     fn attempt_simulated_fill(
         &mut self,
@@ -3029,7 +3029,7 @@ impl ReplayEngine {
         account_id: &str,
         bar: &Bar,
         working: &mut SimulatedWorkingOrder,
-        tick_size: Option<Decimal>,
+        reference: Option<&Instrument>,
     ) -> Result<Option<(PositionSnapshot, PnlSnapshot)>, EngineError> {
         let intent = working.order.intent.clone();
         let quantity = self
@@ -3038,6 +3038,20 @@ impl ReplayEngine {
             .map_or(working.remaining_quantity, |limit| {
                 std::cmp::min(working.remaining_quantity, limit)
             });
+        // Risk made the order whole lots under the reference data in force
+        // when it was decided. An effective-dated lot change while it works
+        // can leave this fill off the new lot, which no venue executes. The
+        // replay does not model the venue's response, so it refuses, before
+        // anything about the attempt is recorded (E3.6g).
+        if let Some(reference) = reference {
+            if !is_whole_multiple(quantity, reference.lot_size) {
+                return Err(EngineError(format!(
+                    "working order {} cannot fill {} after {}'s lot size changed to {}",
+                    working.order.order_id, quantity, reference.instrument_id, reference.lot_size
+                )));
+            }
+        }
+        let tick_size = reference.map(|reference| reference.tick_size);
         let next_fill_sequence = working
             .fill_sequence
             .checked_add(1)
@@ -4478,6 +4492,97 @@ mod tests {
         }
         let (prices, _) = replay_slipped_buy(&regridded);
         assert_eq!(prices, vec![price("100.30")]);
+    }
+
+    /// Decides a market buy on the 14:31 bar under a one-share lot, then
+    /// replays the 14:32 bar, from which SPY trades in `new_lot`-share lots.
+    /// Returns the 14:32 bar's result and every recorded event type.
+    fn replay_across_a_lot_change(
+        quantity: i64,
+        fill_cap: Option<i64>,
+        new_lot: i64,
+    ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
+        let mut instruments = InstrumentRegistry::default();
+        for version in [
+            spy_version(
+                "0.01",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-02T14:32:00Z"),
+            ),
+            spy_version("0.01", new_lot, "2026-01-02T14:32:00Z", None),
+        ] {
+            instruments.register(version).unwrap();
+        }
+        let calendar = spy_calendar();
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let mut replay = engine();
+        replay.fill_model.max_fill_quantity =
+            fill_cap.map(|cap| Decimal::from_integer(cap).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = SubmitsOnce::new(quantity, None);
+        let decided = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap();
+        assert!(only_decision(&decided.events).approved);
+        let result = replay.process_bar_with_market_preconditions(
+            &mut store,
+            &mut strategy,
+            "acct-paper-001",
+            "2026-01-02T14:32:00Z",
+            bar(),
+            &market,
+        );
+        let recorded = event_types(&store).into_iter().map(str::to_owned).collect();
+        (result, recorded)
+    }
+
+    #[test]
+    fn a_lot_change_under_a_working_order_refuses_the_replay() {
+        // Three shares were whole lots when decided. From the fill bar SPY
+        // trades in fives, so no venue would execute this fill.
+        let (result, recorded) = replay_across_a_lot_change(3, None, 5);
+        assert_eq!(
+            result.unwrap_err().0,
+            "working order order-intent-increments-001 cannot fill 3.00000000 after inst.us_equity.spy's lot size changed to 5.00000000"
+        );
+        // The fill bar is the last thing recorded: nothing about the attempt.
+        assert_eq!(recorded.last().map(String::as_str), Some("market.bar.v1"));
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|kind| *kind == "market.bar.v1")
+                .count(),
+            2
+        );
+        assert!(!recorded.iter().any(|kind| kind == "execution.fill.v1"));
+
+        // A fill cap can leave a whole-lot order's partial off the new lot:
+        // four shares are one lot of four, but a cap of two is not.
+        let (result, recorded) = replay_across_a_lot_change(4, Some(2), 4);
+        assert_eq!(
+            result.unwrap_err().0,
+            "working order order-intent-increments-001 cannot fill 2.00000000 after inst.us_equity.spy's lot size changed to 4.00000000"
+        );
+        assert_eq!(recorded.last().map(String::as_str), Some("market.bar.v1"));
+
+        // A change the order still fits is not refused: six shares are two
+        // lots of three, and fill as usual.
+        let (result, _) = replay_across_a_lot_change(6, None, 3);
+        assert_eq!(
+            fill_quantities(&result.unwrap().events),
+            vec![Decimal::from_integer(6).unwrap()]
+        );
     }
 
     #[test]
