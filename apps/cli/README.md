@@ -216,7 +216,8 @@ exists.
 Configuration v2 is the default and explicitly binds the current reviewed
 `adapter.ibkr.paper.*` / `venue.ibkr.paper` route into the journal fingerprint.
 V1 is accepted only to reopen an existing unchanged legacy IBKR PAPER journal;
-it cannot initialize a journal or describe a new route. After a clean final
+it cannot initialize a journal or describe a new route, and a refused v1 start
+creates neither a journal file nor its directory. After a clean final
 reconciliation with no working or `UNKNOWN` order, retain the v1 journal as
 immutable evidence and begin a separately named v2 journal.
 

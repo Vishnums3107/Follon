@@ -3321,6 +3321,37 @@ These are mandatory master-plan acceptance conditions and are currently open:
         route can only halt.
       - The deployment review stays external. No external gate moved.
 
+82. A refused legacy-route PAPER start leaves no journal behind (2026-09-27, rows 5.5 and 5.10; E3.10b).
+    This closes the remainder item 78 recorded.
+    - **The gap.** Item 78 made `PaperTradingService::open_durable` validate before it opens its journal.
+      One refusal still came after: a legacy composition, which `follon-paper-status` builds for a
+      version-1 configuration, may only reopen an existing journal. The check needs to know whether the
+      journal is empty, so it ran after `FilePaperJournal::open`, which creates an absent journal and its
+      directory. A version-1 start against a new path was therefore refused and left an empty file, and
+      any missing directories, behind.
+    - **The fix.** When the composition may not initialize a journal, `open_durable` opens it without
+      creating anything. An absent journal is refused before any file or directory exists. An existing
+      empty journal is refused and left as it was, as before. `FilePaperJournal::open`, which every other
+      caller uses, still creates an absent journal. The refusal's error text is unchanged.
+    - **Tests.** A legacy route refuses a path whose directory does not exist, and creates no directory.
+      It refuses a path in a directory that exists, and creates no file. It refuses an existing empty
+      file, and leaves it at zero bytes. It still reopens a journal the single-adapter composition
+      initialised.
+    - **Rule 5.** 4 of 4 injected defects were caught, each by that test at its intended assertion:
+      - the legacy route opening with creation, as before;
+      - the directory created even when the file is not;
+      - the file created in an existing directory, although its directory is not created;
+      - an existing empty journal accepted.
+
+      The last one was not caught before this slice. The existing legacy test used an absent path, so an
+      absent journal and an empty one were never told apart.
+    - **Documentation.** `apps/cli/README.md` says that a refused version-1 start creates neither a journal
+      file nor its directory.
+    - **Measured result.** The Rust workspace rose from 515 to 516 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (85 probes, 0 failed).
+    - **Bounded remainder.** None of item 78's remains. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -2378,8 +2378,17 @@ pub struct FilePaperJournal {
 
 impl FilePaperJournal {
     /// Opens and verifies an existing journal before accepting new snapshots.
+    /// An absent journal is created empty, with its directory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PaperError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_with(path.as_ref(), true)?
+            .ok_or_else(|| PaperError("paper journal was not created".to_owned()))
+    }
+
+    /// Opens and verifies a journal, creating it when absent only if `create`
+    /// is set. Otherwise an absent journal is `None` and nothing is created,
+    /// neither the file nor its directory.
+    fn open_with(path: &Path, create: bool) -> Result<Option<Self>, PaperError> {
+        let path = path.to_path_buf();
         if path.exists()
             && fs::symlink_metadata(&path)
                 .map_err(|error| PaperError(error.to_string()))?
@@ -2390,15 +2399,23 @@ impl FilePaperJournal {
                 "paper journal path must not be a symbolic link".to_owned(),
             ));
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| PaperError(error.to_string()))?;
+        if create {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| PaperError(error.to_string()))?;
+            }
         }
-        let mut file = OpenOptions::new()
-            .create(true)
+        let mut file = match OpenOptions::new()
+            .create(create)
             .read(true)
             .append(true)
             .open(&path)
-            .map_err(|error| PaperError(error.to_string()))?;
+        {
+            Ok(file) => file,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(PaperError(error.to_string())),
+        };
         file.try_lock_exclusive().map_err(|error| {
             PaperError(format!(
                 "paper journal is already open by another operator/process: {error}"
@@ -2474,13 +2491,13 @@ impl FilePaperJournal {
                 next_sequence += 1;
             }
         }
-        Ok(Self {
+        Ok(Some(Self {
             path,
             file,
             next_sequence,
             previous_hash,
             latest,
-        })
+        }))
     }
 
     /// Returns the journal location for deployment backup and restore controls.
@@ -2664,17 +2681,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         // `FilePaperJournal::open` creates when absent, so a refused start
         // leaves no journal behind, as controlled LIVE does (E3.10).
         let mut service = Self::new(account, risk_policy, kill_switches, broker)?;
-        let journal = FilePaperJournal::open(journal_path)?;
+        // A composition that may only reopen a journal opens it without
+        // creating one, so that refusal leaves nothing behind either (E3.10b).
+        let may_initialize = service
+            .broker
+            .permits_empty_journal(&service.account.account_id);
+        let journal = FilePaperJournal::open_with(journal_path.as_ref(), may_initialize)?
+            .filter(|journal| may_initialize || journal.latest().is_some())
+            .ok_or_else(|| {
+                PaperError(
+                    "legacy PAPER adapter routing may only reopen an existing journal".to_owned(),
+                )
+            })?;
         let latest = journal.latest().cloned();
-        if latest.is_none()
-            && !service
-                .broker
-                .permits_empty_journal(&service.account.account_id)
-        {
-            return Err(PaperError(
-                "legacy PAPER adapter routing may only reopen an existing journal".to_owned(),
-            ));
-        }
         if let Some(state) = latest {
             service.restore(state)?;
             // An external broker session never survives process recovery.
@@ -7202,6 +7221,66 @@ mod tests {
         drop(open(policy()).unwrap());
         assert!(journal_path.exists());
         fs::remove_file(&journal_path).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_route_refusal_leaves_no_paper_journal() {
+        let directory = std::env::temp_dir().join(format!(
+            "follon-paper-legacy-refusal-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let journal_path = directory.join("journal.ndjson");
+        let open = || {
+            let mut registry = PaperBrokerRegistry::new();
+            registry
+                .register_legacy_ibkr_paper_route(&account())
+                .unwrap();
+            PaperTradingService::open_durable(
+                account(),
+                policy(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                registry,
+                &journal_path,
+            )
+        };
+        let refusal = "legacy PAPER adapter routing may only reopen an existing journal";
+
+        // Legacy routing may only reopen, so it creates neither the journal
+        // nor its directory.
+        assert_eq!(open().err().unwrap().0, refusal);
+        assert!(
+            !directory.exists(),
+            "a legacy-route refusal created the journal's directory"
+        );
+
+        // Nor does it create the journal in a directory that exists.
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(open().err().unwrap().0, refusal);
+        assert!(
+            !journal_path.exists(),
+            "a legacy-route refusal created a journal"
+        );
+
+        // An empty journal that already existed is refused and left as it was.
+        fs::write(&journal_path, b"").unwrap();
+        assert_eq!(open().err().unwrap().0, refusal);
+        assert_eq!(fs::read(&journal_path).unwrap(), b"");
+
+        // A journal the single-adapter composition initialised still reopens.
+        fs::remove_file(&journal_path).unwrap();
+        drop(
+            PaperTradingService::open_durable(
+                account(),
+                policy(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account()).unwrap(),
+                &journal_path,
+            )
+            .unwrap(),
+        );
+        drop(open().unwrap());
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
