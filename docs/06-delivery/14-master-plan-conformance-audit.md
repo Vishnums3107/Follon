@@ -2898,6 +2898,76 @@ These are mandatory master-plan acceptance conditions and are currently open:
       - Reference data is enforced as configured, exactly as PAPER's table is, and a venue's own odd-lot
         handling is not modelled. The news path consults no calendar, as before. No external gate moved.
 
+74. Simulated fills print on the instrument's tick grid (2026-09-27, rows 5.4 and 5.5, research-to-live
+    parity; E3.6e). This closes the first remainder item 73 recorded.
+    - **The gap.** The fill model applies half the spread and the slippage in basis points, so a simulated
+      fill could print off the tick grid. The probe corpus's one-share buy at 20 bps of slippage on a
+      100.08 close filled at 100.28016, a price no venue prints. Item 73 made replay refuse an off-grid
+      limit, but its fills stayed off the grid. A backtest therefore paid a cost that PAPER and
+      controlled LIVE, which apply broker fills as reported, never see.
+    - **The rule.**
+      - In a replay with reference data, the modelled price is rounded onto the instrument's tick grid
+        against the trader. A buy rounds up, a sell rounds down, and a price already on the grid is
+        unchanged. Spread and slippage are estimates, so the grid price is never better than the
+        estimate. Rounding to the nearest tick would make some fills cheaper than the model's own
+        estimate.
+      - The limit is checked against the grid price, not the estimate. Risk already requires a limit to
+        sit on the grid (item 73). So the next grid price above a buy estimate inside its limit is at most
+        the limit, and rounding never makes a marketable on-grid limit unfillable.
+      - The grid is the fill bar's, from the reference data in force when the order fills rather than when
+        it was decided. A venue prints on the grid in force at execution.
+      - A sell estimated below one tick rounds to zero. That raises the existing non-positive-price error
+        rather than filling for nothing. A non-positive tick is an error. Without that guard, a zero tick
+        divides by zero and a negative tick rounds a buy down.
+      - `DeterministicFillModel::fill`, the reference-free public entry point, still prices off any grid,
+        and so does the crate's test-only `process_bar`. Every other replay carries reference data (item
+        73), so every fill it simulates rounds.
+    - **Evidence effect.** This changes backtest economics, which is why item 73 recorded it rather than
+      changing it.
+      - The probe corpus's base-cost fill moves from 100.28016 to 100.29, and its doubled-cost fill from
+        100.48032 to 100.49. Measured with the real binary, the two returns fall from 19.99 to 19.33 bps
+        and from 3.31 to 2.67 bps.
+      - `TRANSACTION_COST_SHOCK` degradation therefore rises from 16 to 17 bps. Each return truncates to
+        whole bps, so it is now 19 − 2 rather than 19 − 3. The test pinning it is updated, and it fails
+        without the rounding.
+      - The other two checked-in backtest configurations (`backtest-v1.json` and
+        `backtest-advanced-v1.json`) use zero spread and zero slippage, and no checked-in bar fixture has
+        a sub-cent price. Their fills were already on the cent grid and do not move.
+    - **Tests.**
+      - The rule itself: buys up and sells down, against the trader rather than to the nearest tick; an
+        on-grid price unchanged on either side; a grid at the decimal's own resolution; and a zero or
+        negative tick refused.
+      - The fill model on a dime grid and on a nickel grid. An on-grid buy and sell limit each fill exactly
+        at the limit. An off-grid limit, reachable only by a direct call, fills unrounded and refuses once
+        rounded. A sell below one tick is an error.
+      - The bar path: a slipped buy prints at 100.30 on a dime grid, and the ledger's average cost carries
+        that price. On a nickel grid it prints at 100.25. When the grid changes between the decision bar
+        and the fill bar, the fill bar's grid applies.
+      - The news path prints on the grid too.
+    - **Rule 5.** 11 of 11 injected defects were caught, each by a failing test:
+      - the rule: sells rounding up, buys rounding down, rounding to the nearest tick, an on-grid buy moved
+        a tick, the non-positive-tick guard dropped (a divide-by-zero panic), and a guard refusing only an
+        exactly zero tick (the negative tick then rounded a buy down to 100.27);
+      - the model: the limit checked before rounding, and the tick ignored (caught separately by the
+        control-plane tests and by the CLI's adversarial-probe test);
+      - the paths: the bar path and the news path each passing no tick.
+      - A second call site, for an order eligible on the bar that produced it, is unreachable: eligibility
+        is floored at the next bar. It passes the tick for consistency, and no test can reach it.
+    - **Stale descriptions corrected.** The desktop's "Execution realism model" panel said the "final
+      spread-and-slippage price" could never violate the limit. It now describes the grid rounding and
+      the grid price. The operations guide's replay capability list gained the same sentence.
+    - **Measured result.** The Rust workspace rose from 501 to 505 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (76 probes, 0 failed). Against the previous run's `var/`, the
+      main backtest's event stream is byte-identical. Its `strategy_bundle_hash` and the two fingerprints
+      built on it changed only because that hash covers `core/control-plane/src/lib.rs`, the built-in
+      strategy's source, which this slice edits.
+    - **Bounded remainder.**
+      - Price improvement, midpoint executions and sub-penny prints are not modelled. A fill prints on the
+        grid against the trader or not at all.
+      - Marks and P&L use bar closes as recorded. A bar is data, and an off-grid bar is not corrected.
+      - The fill cap is still checked when an intent arrives (item 73). No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -2649,7 +2649,10 @@ mod tests {
         // bar-by-bar construction makes that impossible, so this is a
         // genuine, computed zero rather than a hardcoded pass.
         assert_eq!(degradation("LOOKAHEAD_LEAKAGE_PROBE"), 0);
-        assert_eq!(degradation("TRANSACTION_COST_SHOCK"), 16);
+        // Fills round up onto the cent grid (E3.6e): 100.28016 -> 100.29 at
+        // base costs and 100.48032 -> 100.49 doubled. Each run's return
+        // truncates to whole bps, so this is 19 - 2; unrounded it was 19 - 3.
+        assert_eq!(degradation("TRANSACTION_COST_SHOCK"), 17);
         assert_eq!(degradation("PARAMETER_CLIFF_PROBE"), 19);
         assert_eq!(degradation("REGIME_STRESS_PROBE"), 1005);
         assert_eq!(parsed["gate_passed"], true);

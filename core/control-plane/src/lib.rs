@@ -1686,6 +1686,31 @@ fn is_whole_multiple(value: Decimal, increment: Decimal) -> bool {
     increment > Decimal::ZERO && value.scaled() % increment.scaled() == 0
 }
 
+/// Rounds a simulated fill price onto a positive tick grid against the
+/// trader: a buy rounds up and a sell rounds down. A price already on the grid
+/// is unchanged (E3.6e).
+fn round_to_tick_against_trader(
+    price: Decimal,
+    side: Side,
+    tick: Decimal,
+) -> Result<Decimal, EngineError> {
+    if tick <= Decimal::ZERO {
+        return Err(EngineError(
+            "a fill price cannot be rounded to a non-positive tick".to_owned(),
+        ));
+    }
+    let scaled = price.scaled();
+    let step = tick.scaled();
+    let floor = scaled - scaled.rem_euclid(step);
+    let rounded = match side {
+        Side::Buy if floor != scaled => floor
+            .checked_add(step)
+            .ok_or_else(|| EngineError("rounded fill price overflow".to_owned()))?,
+        _ => floor,
+    };
+    Ok(Decimal::from_scaled(rounded))
+}
+
 /// OMS order whose legal transitions are enforced independently of a broker.
 #[derive(Clone, Debug)]
 pub struct OmsOrder {
@@ -1944,6 +1969,11 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
 }
 
 /// Deterministic fill model used exclusively for non-live replay/simulation.
+///
+/// In a replay with reference data, the modelled price is then rounded onto
+/// the instrument's tick grid against the trader (E3.6e): a venue prints only
+/// grid prices, and the spread and slippage are estimates, so the grid price
+/// is never better than the estimate.
 #[derive(Clone, Debug)]
 pub struct DeterministicFillModel {
     /// Full quoted bid/ask spread in basis points. A fill pays half the spread.
@@ -1990,6 +2020,9 @@ impl DeterministicFillModel {
     }
 
     /// Produces a fill if the current bar can satisfy the order model.
+    ///
+    /// This prices the model alone, off any tick grid. A replay with reference
+    /// data also rounds the price onto the instrument's grid.
     pub fn fill(
         &self,
         order: &OmsOrder,
@@ -2002,6 +2035,7 @@ impl DeterministicFillModel {
             replay_time,
             order.intent.quantity,
             format!("exec-{}", order.intent.intent_id),
+            None,
         )
     }
 
@@ -2012,6 +2046,7 @@ impl DeterministicFillModel {
         replay_time: &str,
         quantity: Decimal,
         execution_id: String,
+        tick_size: Option<Decimal>,
     ) -> Result<Option<Fill>, EngineError> {
         if quantity <= Decimal::ZERO || quantity > order.intent.quantity {
             return Err(EngineError(
@@ -2045,6 +2080,10 @@ impl DeterministicFillModel {
         let price = match order.intent.side {
             Side::Buy => base_price.checked_add(adverse_adjustment)?,
             Side::Sell => base_price.checked_sub(adverse_adjustment)?,
+        };
+        let price = match tick_size {
+            Some(tick) => round_to_tick_against_trader(price, order.intent.side, tick)?,
+            None => price,
         };
         if price <= Decimal::ZERO {
             return Err(EngineError(
@@ -2450,6 +2489,7 @@ impl ReplayEngine {
                 account_id,
                 &bar,
                 &mut working,
+                reference.map(|reference| reference.tick_size),
             )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
@@ -2606,6 +2646,7 @@ impl ReplayEngine {
                 account_id,
                 &bar,
                 &mut working,
+                reference.map(|reference| reference.tick_size),
             )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
@@ -2936,6 +2977,7 @@ impl ReplayEngine {
                 account_id,
                 market,
                 &mut working,
+                Some(reference.tick_size),
             )? {
                 *latest_position = Some(position);
                 *latest_pnl = Some(pnl);
@@ -2976,6 +3018,9 @@ impl ReplayEngine {
         Ok(())
     }
 
+    /// `tick_size` is the bar's instrument's tick, from its reference data. It
+    /// is absent only for [`Self::process_bar`]'s unit tests.
+    #[allow(clippy::too_many_arguments)]
     fn attempt_simulated_fill(
         &mut self,
         sink: &mut impl EventSink,
@@ -2984,6 +3029,7 @@ impl ReplayEngine {
         account_id: &str,
         bar: &Bar,
         working: &mut SimulatedWorkingOrder,
+        tick_size: Option<Decimal>,
     ) -> Result<Option<(PositionSnapshot, PnlSnapshot)>, EngineError> {
         let intent = working.order.intent.clone();
         let quantity = self
@@ -3010,6 +3056,7 @@ impl ReplayEngine {
             self.clock.now(),
             quantity,
             execution_id,
+            tick_size,
         )?
         else {
             let audit = self.audit_event(
@@ -3326,7 +3373,20 @@ mod tests {
         tick_size: &str,
         lot_size: i64,
     ) -> (InstrumentRegistry, StaticTradingCalendar) {
-        let calendar = StaticTradingCalendar::new(
+        let mut instruments = InstrumentRegistry::default();
+        instruments
+            .register(spy_version(
+                tick_size,
+                lot_size,
+                "2026-01-01T00:00:00Z",
+                None,
+            ))
+            .unwrap();
+        (instruments, spy_calendar())
+    }
+
+    fn spy_calendar() -> StaticTradingCalendar {
+        StaticTradingCalendar::new(
             "cal.us_equities.nyse",
             vec![TradingSession {
                 exchange_date: "2026-01-02".to_owned(),
@@ -3334,29 +3394,34 @@ mod tests {
                 closes_at: "2026-01-02T21:00:00Z".to_owned(),
             }],
         )
-        .unwrap();
-        let mut instruments = InstrumentRegistry::default();
-        instruments
-            .register(InstrumentVersion {
-                instrument: Instrument {
-                    instrument_id: "inst.us_equity.spy".to_owned(),
-                    symbol: "SPY".to_owned(),
-                    exchange_symbol: "SPY".to_owned(),
-                    asset_class: AssetClass::Etf,
-                    venue: "venue.nyse_arca".to_owned(),
-                    currency: "USD".to_owned(),
-                    broker_ids: BTreeMap::new(),
-                    tick_size: Decimal::from_str(tick_size).unwrap(),
-                    lot_size: Decimal::from_integer(lot_size).unwrap(),
-                    multiplier: Decimal::from_integer(1).unwrap(),
-                    trading_calendar_id: "cal.us_equities.nyse".to_owned(),
-                },
-                effective_from: "2026-01-01T00:00:00Z".to_owned(),
-                effective_to: None,
-                reference_version: "reference-test-1".to_owned(),
-            })
-            .unwrap();
-        (instruments, calendar)
+        .unwrap()
+    }
+
+    /// One effective-dated version of SPY's reference data.
+    fn spy_version(
+        tick_size: &str,
+        lot_size: i64,
+        effective_from: &str,
+        effective_to: Option<&str>,
+    ) -> InstrumentVersion {
+        InstrumentVersion {
+            instrument: Instrument {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                symbol: "SPY".to_owned(),
+                exchange_symbol: "SPY".to_owned(),
+                asset_class: AssetClass::Etf,
+                venue: "venue.nyse_arca".to_owned(),
+                currency: "USD".to_owned(),
+                broker_ids: BTreeMap::new(),
+                tick_size: Decimal::from_str(tick_size).unwrap(),
+                lot_size: Decimal::from_integer(lot_size).unwrap(),
+                multiplier: Decimal::from_integer(1).unwrap(),
+                trading_calendar_id: "cal.us_equities.nyse".to_owned(),
+            },
+            effective_from: effective_from.to_owned(),
+            effective_to: effective_to.map(str::to_owned),
+            reference_version: "reference-test-1".to_owned(),
+        }
     }
 
     #[test]
@@ -3829,6 +3894,16 @@ mod tests {
             .collect()
     }
 
+    fn fill_prices(events: &[EventEnvelope]) -> Vec<Decimal> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::Fill(fill) => Some(fill.price),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn reference_data_tick_and_lot_rules_match_paper() {
         // SPY trading at a nickel tick in five-share lots. The engine policy
@@ -4035,6 +4110,14 @@ mod tests {
         let mut replay = news_engine();
         replay.fill_model.max_fill_quantity =
             fill_cap.map(|cap| Decimal::from_integer(cap).unwrap());
+        replay_news_order_on(replay, strategy, instruments)
+    }
+
+    fn replay_news_order_on(
+        mut replay: ReplayEngine,
+        strategy: &mut SubmitsOnce,
+        instruments: &InstrumentRegistry,
+    ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
         let mut store = InMemoryEventStore::default();
         replay
             .process_news_headline(&mut store, strategy, news_headline())
@@ -4203,6 +4286,211 @@ mod tests {
         assert!(negative_spread.validate().is_err());
         assert!(excessive_combined_cost.validate().is_err());
         assert!(zero_fill_cap.validate().is_err());
+    }
+
+    #[test]
+    fn a_fill_price_rounds_onto_the_tick_grid_against_the_trader() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+        let round = |value: &str, side: Side, tick: &str| {
+            round_to_tick_against_trader(price(value), side, price(tick)).unwrap()
+        };
+
+        // The probe corpus's base-cost estimate: a buy pays the next cent up,
+        // and a sell at the same estimate concedes the cent below it.
+        assert_eq!(round("100.28016", Side::Buy, "0.01"), price("100.29"));
+        assert_eq!(round("100.28016", Side::Sell, "0.01"), price("100.28"));
+        // Against the trader, not to the nearest tick.
+        assert_eq!(round("100.01", Side::Buy, "0.05"), price("100.05"));
+        assert_eq!(round("100.04", Side::Sell, "0.05"), price("100.00"));
+        // A price already on the grid is unchanged on either side.
+        for side in [Side::Buy, Side::Sell] {
+            assert_eq!(round("100.25", side, "0.05"), price("100.25"));
+        }
+        // A grid at the decimal's own resolution changes nothing.
+        assert_eq!(
+            round("100.28016", Side::Buy, "0.00000001"),
+            price("100.28016")
+        );
+
+        for tick in ["0", "-0.01"] {
+            assert_eq!(
+                round_to_tick_against_trader(price("100.28016"), Side::Buy, price(tick))
+                    .unwrap_err()
+                    .0,
+                "a fill price cannot be rounded to a non-positive tick"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fill_model_rounds_onto_the_grid_before_checking_the_limit() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+        // 20 bps of spread and 5 of slippage estimate a buy at 100.15 and a
+        // sell at 99.85 against the 100.00 close.
+        let model = DeterministicFillModel {
+            spread_bps: price("20"),
+            slippage_bps: price("5"),
+            flat_fee: Decimal::ZERO,
+            latency_bars: 0,
+            max_fill_quantity: None,
+        };
+        let fill_price = |side: Side,
+                          order_type: OrderType,
+                          limit: Option<&str>,
+                          tick: Option<&str>,
+                          bar: &Bar| {
+            model
+                .fill_quantity(
+                    &simulated_order(side, order_type, limit.map(price)),
+                    bar,
+                    "2026-01-02T14:31:00Z",
+                    Decimal::from_integer(1).unwrap(),
+                    "exec-grid-001".to_owned(),
+                    tick.map(price),
+                )
+                .map(|fill| fill.map(|fill| fill.price))
+        };
+        let market = |side, tick| fill_price(side, OrderType::Market, None, tick, &bar());
+        let limit = |side, limit, tick| fill_price(side, OrderType::Limit, limit, tick, &bar());
+
+        // A dime grid moves both estimates against the trader.
+        assert_eq!(
+            market(Side::Buy, Some("0.10")).unwrap(),
+            Some(price("100.20"))
+        );
+        assert_eq!(
+            market(Side::Sell, Some("0.10")).unwrap(),
+            Some(price("99.80"))
+        );
+        // Both estimates already sit on a nickel grid.
+        assert_eq!(
+            market(Side::Buy, Some("0.05")).unwrap(),
+            Some(price("100.15"))
+        );
+        assert_eq!(
+            market(Side::Sell, Some("0.05")).unwrap(),
+            Some(price("99.85"))
+        );
+
+        // Rounding cannot breach an on-grid limit: the next grid price above
+        // an estimate inside the limit is at most the limit itself.
+        assert_eq!(
+            limit(Side::Buy, Some("100.20"), Some("0.10")).unwrap(),
+            Some(price("100.20"))
+        );
+        assert_eq!(
+            limit(Side::Sell, Some("99.80"), Some("0.10")).unwrap(),
+            Some(price("99.80"))
+        );
+        // The limit is checked against the grid price, not the estimate. Risk
+        // refuses an off-grid limit before any order exists, so only a direct
+        // call reaches this: 100.15 is inside 100.17, and 100.20 is not.
+        assert_eq!(
+            limit(Side::Buy, Some("100.17"), None).unwrap(),
+            Some(price("100.15"))
+        );
+        assert_eq!(
+            limit(Side::Buy, Some("100.17"), Some("0.10")).unwrap(),
+            None
+        );
+
+        // A sell estimated under one tick rounds to zero, which no venue
+        // prints, so it is an error rather than a fill for nothing.
+        let mut sub_tick = bar();
+        for value in [
+            &mut sub_tick.open,
+            &mut sub_tick.high,
+            &mut sub_tick.low,
+            &mut sub_tick.close,
+        ] {
+            *value = price("0.05");
+        }
+        assert_eq!(
+            fill_price(Side::Sell, OrderType::Market, None, Some("0.10"), &sub_tick)
+                .unwrap_err()
+                .0,
+            "deterministic fill model produced a non-positive price"
+        );
+    }
+
+    /// Replays `SubmitsOnce`'s one-share market buy at 25 bps of slippage, an
+    /// estimate of 100.25 against the fill bar's 100.00 close, and returns
+    /// the fill prices and the resulting position.
+    fn replay_slipped_buy(instruments: &InstrumentRegistry) -> (Vec<Decimal>, PositionSnapshot) {
+        let calendar = spy_calendar();
+        let market = MarketPreconditions {
+            instruments,
+            calendar: &calendar,
+        };
+        let mut replay = engine();
+        replay.fill_model.slippage_bps = Decimal::from_integer(25).unwrap();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = SubmitsOnce::new(1, None);
+        let mut events = Vec::new();
+        let mut position = None;
+        for event_time in ["2026-01-02T14:31:00Z", "2026-01-02T14:32:00Z"] {
+            let result = replay
+                .process_bar_with_market_preconditions(
+                    &mut store,
+                    &mut strategy,
+                    "acct-paper-001",
+                    event_time,
+                    bar(),
+                    &market,
+                )
+                .unwrap();
+            position = result.position.or(position);
+            events.extend(result.events);
+        }
+        (fill_prices(&events), position.unwrap())
+    }
+
+    #[test]
+    fn replay_fills_print_on_the_instruments_tick_grid() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+
+        let (dime_grid, _) = market_dependencies_with("0.10", 1);
+        let (prices, position) = replay_slipped_buy(&dime_grid);
+        assert_eq!(prices, vec![price("100.30")]);
+        // The ledger is charged the grid price plus the 0.10 fee.
+        assert_eq!(position.average_cost, price("100.40"));
+
+        // On a nickel grid the estimate is already a price the venue prints.
+        let (nickel_grid, _) = market_dependencies_with("0.05", 1);
+        let (prices, position) = replay_slipped_buy(&nickel_grid);
+        assert_eq!(prices, vec![price("100.25")]);
+        assert_eq!(position.average_cost, price("100.35"));
+
+        // A working order prints on the grid in force when it fills, not the
+        // one in force when it was decided: a cent grid at 14:31 and a dime
+        // grid from 14:32, the fill bar.
+        let mut regridded = InstrumentRegistry::default();
+        for version in [
+            spy_version(
+                "0.01",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-02T14:32:00Z"),
+            ),
+            spy_version("0.10", 1, "2026-01-02T14:32:00Z", None),
+        ] {
+            regridded.register(version).unwrap();
+        }
+        let (prices, _) = replay_slipped_buy(&regridded);
+        assert_eq!(prices, vec![price("100.30")]);
+    }
+
+    #[test]
+    fn news_fills_print_on_the_instruments_tick_grid() {
+        let (dime_grid, _) = market_dependencies_with("0.10", 1);
+        let mut replay = news_engine();
+        replay.fill_model.slippage_bps = Decimal::from_integer(25).unwrap();
+        let (result, _) = replay_news_order_on(replay, &mut SubmitsOnce::new(1, None), &dime_grid);
+        // The same 100.25 estimate, filled at once on the news snapshot.
+        assert_eq!(
+            fill_prices(&result.unwrap().events),
+            vec![Decimal::from_str("100.30").unwrap()]
+        );
     }
 
     #[test]

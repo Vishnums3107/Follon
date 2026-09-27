@@ -1189,7 +1189,8 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
   appendDefinition(executionModel, [
     ["Quoted spread", "Buys pay and sells concede half of the configured full spread"],
     ["Slippage", "Configured basis points are applied unfavourably after half-spread"],
-    ["Limit protection", "The final spread-and-slippage price can never violate the order limit"],
+    ["Tick grid", "The spread-and-slippage price is rounded onto the instrument's tick grid against the trader: buys up, sells down"],
+    ["Limit protection", "The final grid price can never violate the order limit"],
     ["Latency", "A configured number of complete market bars must pass before fill eligibility"],
     ["Partial fills", "An optional per-bar quantity cap persists remaining quantity as a working order"],
     ["Trading halts", "Version-controlled venue or instrument halt windows block strategy evaluation"],
