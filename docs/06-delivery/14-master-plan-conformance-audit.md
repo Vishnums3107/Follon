@@ -3051,6 +3051,62 @@ These are mandatory master-plan acceptance conditions and are currently open:
         fresh package hashes, not how an existing capsule verifies.
       - Item 57's clean-machine verification is still not performed. No external gate moved.
 
+76. PAPER and controlled LIVE refuse at startup a policy whose tick and lot tables list different
+    instruments (2026-09-27, rows 5.5 and 5.7; E3.6f). This closes the first remainder item 70 recorded.
+    - **The gap.** Items 61 and 70 require a tick table and a lot table in every PAPER, controlled-LIVE
+      and PAPER command-route configuration, and each table was validated on its own. An instrument
+      listed in only one of them passed startup, and then every order on it was refused with the other
+      table's `..._UNCONFIGURED` code. A configuration mistake therefore surfaced at order time, during a
+      session, rather than when the service started.
+    - **The rule.**
+      - `PaperRiskPolicy::validate` and `LiveRiskPolicy::validate` refuse a policy that lists an
+        instrument in only one of the two tables, and name the first such instrument.
+      - Both services validate their policy when they are constructed or opened, and neither can replace
+        it afterwards. Every boundary therefore inherits the rule: both CLIs, the gRPC route and the
+        desktop gateway.
+      - PAPER and controlled LIVE each carry their own copy of the check, as they do every rule in their
+        gates (item E1.4a's decision).
+      - An instrument in neither table is still refused at order time, on both counts. That is now the
+        only way to reach either `..._UNCONFIGURED` code.
+      - No fingerprint changes. A configuration that validated before validates and fingerprints
+        identically, and every checked-in configuration (the six fixtures and the scanner's route)
+        already lists the same instruments in both tables.
+    - **Tests.**
+      - PAPER and controlled LIVE each refuse a policy with a lot-only instrument, and one with a
+        tick-only instrument, naming it, and the service refuses to start. A refused controlled-LIVE
+        service leaves no journal.
+      - The gRPC route refuses to start when its lot table omits a leg instrument that its tick table
+        lists.
+      - Six existing tests failed, because each built a service from a policy that listed an instrument
+        in one table only, which is now refused:
+        - PAPER's and controlled LIVE's no-tick tests now refuse an instrument in neither table, on both
+          counts, with both evidence fields;
+        - PAPER's no-lot test is replaced by the startup-rule test, and controlled LIVE's lot test keeps
+          its off-lot cases;
+        - controlled LIVE's two combination tests remove an unlisted leg from both tables.
+      - PAPER's two combination tests still passed, because they edit the tables after construction,
+        which bypasses validation. They were changed the same way, so they also model a state a validated
+        policy can reach. A combination's codes are sorted, so it lists the lot code first.
+    - **Rule 5.** 11 of 11 injected defects were caught:
+      - PAPER: the cross-check removed (caught separately by the PAPER test and by the gRPC route test),
+        only ticks checked against lots, and only lots checked against ticks;
+      - controlled LIVE: the same three;
+      - the order-time rules both environments still need: an unlisted instrument passing the tick rule,
+        and passing the lot rule, in each environment.
+    - **Documentation.** The lot-table descriptions in the three version-1 configuration schemas, and the
+      desktop README, state the rule. JSON Schema cannot express it, so the services enforce it.
+    - **Found and left for its own slice (E3.9).** The version-2 PAPER configuration schema declares
+      neither table and forbids additional properties. `follon-paper-status` reads version 2, and
+      `tests/fixtures/config/paper-v2.json` and `paper-v2-portfolio-risk.json` both fail validation
+      against that schema.
+    - **Measured result.** The Rust workspace rose from 505 to 507 passed / 0 failed / 3 ignored; the
+      Tauri host is unchanged at 30. The final `python tools/session_status.py` run measured all seven
+      suites green, and the full evidence pipeline exited 0, including step 23b's scan (76 probes, 0
+      failed).
+    - **Bounded remainder.** The tables remain the operator's configuration, and nothing checks them
+      against a venue's own reference data. A venue's odd-lot handling is not modelled. No external gate
+      moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

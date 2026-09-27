@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T12:49:35Z  
+**Measured at:** 2026-09-27T13:02:36Z  
 **Branch:** `main`  
-**HEAD:** `415d9aa` -- feat(replay): simulated fills print on the tick grid -- E3.6e (2026-09-27T18:03:36+05:30)  
-**Uncommitted paths:** 6
+**HEAD:** `47375a0` -- fix(repo): one commit publishes one set of hashes on every platform -- E3.8 (2026-09-27T18:21:41+05:30)  
+**Uncommitted paths:** 9
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 505 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 507 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
@@ -445,7 +445,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | --- | --- | --- |
 | E3.1 | **E3.1a done 2026-09-25 (audit item 66):** the main artifact (schema 3) and report carry the advanced-account economics, and the sidecar is gone. **Multi-account allocation is frozen** by `03-roadmap-and-gates.md` until the preceding gates are independently evidenced; the operator chose not to override the gate. | 5.4 |
 | E3.2 | Property/model/fault coverage beyond the ten landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, smart routing, and — since 2026-09-25 — margin valuation and financing accrual, item 64). No named candidate remains; further property coverage is open-ended. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
-| E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. **E3.6b done 2026-09-26 (audit item 69):** each combination leg meets the plain-order tick rule, and the net limit must sit on the finest leg grid. **E3.6c done 2026-09-26 (audit item 70):** a required per-instrument lot table in every configuration; an unlisted instrument, or a quantity that is not a whole number of lots, is refused for a plain order and for each combination leg's contract quantity. **E3.6d done 2026-09-26 (audit item 73):** the replay engine behind every backtest applies the same tick and lot rules, from the instrument's effective reference data, on the bar and news paths, and a fill cap must be a whole number of lots. **E3.6e done 2026-09-27 (audit item 74):** a simulated fill prints on the fill bar's tick grid, rounded against the trader (a buy up, a sell down) before its limit is checked. Remainder: a venue's own odd-lot handling, price improvement and midpoint prints are not modelled. | 5.4 / 5.5 / 5.7 |
+| E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. **E3.6b done 2026-09-26 (audit item 69):** each combination leg meets the plain-order tick rule, and the net limit must sit on the finest leg grid. **E3.6c done 2026-09-26 (audit item 70):** a required per-instrument lot table in every configuration; an unlisted instrument, or a quantity that is not a whole number of lots, is refused for a plain order and for each combination leg's contract quantity. **E3.6d done 2026-09-26 (audit item 73):** the replay engine behind every backtest applies the same tick and lot rules, from the instrument's effective reference data, on the bar and news paths, and a fill cap must be a whole number of lots. **E3.6e done 2026-09-27 (audit item 74):** a simulated fill prints on the fill bar's tick grid, rounded against the trader (a buy up, a sell down) before its limit is checked. **E3.6f done 2026-09-27 (audit item 76):** PAPER and controlled LIVE refuse at startup a policy whose tick and lot tables list different instruments. Remainder: a venue's own odd-lot handling, price improvement and midpoint prints are not modelled. | 5.4 / 5.5 / 5.7 |
 | E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. **E3.3b done 2026-09-26 (audit item 71):** `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` require a session whose role grants kill-switch operation (`risk_manager`), and the PAPER journal records the operator and server time of every change. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes, LIVE write RPCs (orders and kill switches), a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
 | E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes when it landed, and 76 since E3.3b added the kill-switch RPCs. It found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
@@ -545,6 +545,17 @@ short — detail belongs in the conformance audit.
   green, and the full pipeline exited 0. The published configuration and
   Python bundle hashes now equal those computed from the repository's own
   bytes.
+- Landed **E3.6f**, item 70's first remainder. PAPER and controlled LIVE
+  refuse at startup a policy that lists an instrument in only one of its
+  tick and lot tables, so the mistake no longer surfaces as order-time
+  refusals. Every boundary inherits the rule through service construction,
+  and the gRPC route has a test of it. Six existing tests built that state
+  and were rewritten. 11/11 injected defects were caught (audit item 76).
+  Found while documenting it: the version-2 PAPER configuration schema
+  rejects both version-2 fixtures (E3.9).
+- Rust workspace **505 → 507 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0.
 
 ### 2026-09-26 — session 8
 

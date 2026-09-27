@@ -1351,6 +1351,26 @@ mod tests {
     }
 
     fn configured_paper_service(name: &str) -> (OperatingSystemService, PaperComboRoute, PathBuf) {
+        let (config, scratch) = write_route_config(name, |_| {});
+        let route = paper_combo_route_from_path(&config).expect("configured PAPER combo route");
+        (
+            OperatingSystemService {
+                database: None,
+                paper_combo_route: Some(route.clone()),
+                identity: Some(operator_identity()),
+                transport_tls: false,
+            },
+            route,
+            scratch,
+        )
+    }
+
+    /// Writes the test route's configuration with `adjust` applied to it, and
+    /// returns the configuration's path and its scratch directory.
+    fn write_route_config(
+        name: &str,
+        adjust: impl FnOnce(&mut serde_json::Value),
+    ) -> (PathBuf, PathBuf) {
         let sequence = PAPER_ROUTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let scratch = std::env::temp_dir().join(format!(
             "follon-trading-api-paper-combo-{}-{sequence}-{name}",
@@ -1360,7 +1380,7 @@ mod tests {
         std::fs::create_dir_all(&scratch).expect("create route scratch");
         let journal = scratch.join("journal.ndjson");
         let config = scratch.join("route.json");
-        let document = serde_json::json!({
+        let mut document = serde_json::json!({
             "schema_version": 1,
             "account_id": "acct.grpc.paper.test",
             "currency": "USD",
@@ -1394,22 +1414,30 @@ mod tests {
             "adapter_kind": "IBKR_PAPER_MODEL",
             "journal_path": journal.to_string_lossy(),
         });
+        adjust(&mut document);
         std::fs::write(
             &config,
             serde_json::to_vec_pretty(&document).expect("serialize route config"),
         )
         .expect("write route config");
-        let route = paper_combo_route_from_path(&config).expect("configured PAPER combo route");
-        (
-            OperatingSystemService {
-                database: None,
-                paper_combo_route: Some(route.clone()),
-                identity: Some(operator_identity()),
-                transport_tls: false,
-            },
-            route,
-            scratch,
-        )
+        (config, scratch)
+    }
+
+    #[test]
+    fn a_route_listing_an_instrument_in_only_one_table_refuses_to_start() {
+        let (config, scratch) = write_route_config("unpaired-tables", |document| {
+            document["instrument_lot_sizes"]
+                .as_object_mut()
+                .expect("lot table")
+                .remove("inst.us_option.spy.505c");
+        });
+        assert_eq!(
+            paper_combo_route_from_path(&config)
+                .err()
+                .expect("an unpaired table must refuse the route"),
+            "PAPER command-route service: paper risk policy lists inst.us_option.spy.505c in only one of its tick and lot tables"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     fn paper_combo_request(intent_id: &str) -> SubmitPaperComboRequest {

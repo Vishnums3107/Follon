@@ -46,7 +46,7 @@
         "max_order_rate": { "type": "integer", "minimum": 1 },
         "order_rate_window_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
         "instrument_tick_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue tick size per tradable instrument. An order for an unlisted instrument, or a limit price off its instrument's grid, is refused before it can reach the broker." },
-        "instrument_lot_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue lot size per tradable instrument: the exact quantity increment. An order for an unlisted instrument, or a quantity (for a combination, each leg's contract quantity) that is not a whole number of lots, is refused before it can reach the broker." }
+        "instrument_lot_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue lot size per tradable instrument: the exact quantity increment. An order for an unlisted instrument, or a quantity (for a combination, each leg's contract quantity) that is not a whole number of lots, is refused before it can reach the broker. It must list exactly the instruments instrument_tick_sizes lists; a configuration that lists an instrument in only one of the two tables is refused at startup." }
       }
     }
   }

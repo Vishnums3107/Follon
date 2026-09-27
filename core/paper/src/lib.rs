@@ -1645,6 +1645,16 @@ impl PaperRiskPolicy {
                 "paper risk policy needs a positive lot size per listed instrument".to_owned(),
             ));
         }
+        // Each listed instrument needs both increments (E3.6f). One listed in
+        // a single table would pass startup, then be refused at order time
+        // with the other table's `..._UNCONFIGURED` code.
+        if let Some(instrument_id) =
+            unpaired_instrument(&self.instrument_tick_sizes, &self.instrument_lot_sizes)
+        {
+            return Err(PaperError(format!(
+                "paper risk policy lists {instrument_id} in only one of its tick and lot tables"
+            )));
+        }
         if self
             .short_exposure
             .as_ref()
@@ -5934,6 +5944,23 @@ fn render_instrument_table(table: &BTreeMap<String, Decimal>) -> String {
         .join("|")
 }
 
+/// The first instrument listed in exactly one of two per-instrument tables,
+/// checking the tick table's instruments before the lot table's.
+fn unpaired_instrument<'a>(
+    tick_sizes: &'a BTreeMap<String, Decimal>,
+    lot_sizes: &'a BTreeMap<String, Decimal>,
+) -> Option<&'a str> {
+    tick_sizes
+        .keys()
+        .find(|instrument_id| !lot_sizes.contains_key(*instrument_id))
+        .or_else(|| {
+            lot_sizes
+                .keys()
+                .find(|instrument_id| !tick_sizes.contains_key(*instrument_id))
+        })
+        .map(String::as_str)
+}
+
 /// Each combination leg's entry in a per-instrument reference table, in leg
 /// order, with `UNCONFIGURED` for an instrument the table does not list.
 fn render_leg_entries(intent: &ComboIntent, table: &BTreeMap<String, Decimal>) -> String {
@@ -6781,14 +6808,14 @@ mod tests {
     fn combo_legs_meet_the_plain_order_tick_rule_and_the_net_the_finest_grid() {
         let decide = |ticks: &[(&str, &str)], near: &str, far: &str, cap: &str| {
             let mut service = service_permitting_shorts();
-            service
-                .risk_policy
-                .instrument_tick_sizes
-                .remove("inst.us_option.spy.near");
-            service
-                .risk_policy
-                .instrument_tick_sizes
-                .remove("inst.us_option.spy.far");
+            for leg in ["inst.us_option.spy.near", "inst.us_option.spy.far"] {
+                service.risk_policy.instrument_tick_sizes.remove(leg);
+                // A leg with no tick is listed in neither table, as a
+                // validated policy requires (E3.6f).
+                if !ticks.iter().any(|(instrument, _)| *instrument == leg) {
+                    service.risk_policy.instrument_lot_sizes.remove(leg);
+                }
+            }
             for (instrument, tick) in ticks {
                 service
                     .risk_policy
@@ -6854,8 +6881,14 @@ mod tests {
         // one far contract to the broker.
         let decide = |lots: &[(&str, &str)], units: &str| {
             let mut service = service_permitting_shorts();
-            service.risk_policy.instrument_lot_sizes.remove(near);
-            service.risk_policy.instrument_lot_sizes.remove(far);
+            for leg in [near, far] {
+                service.risk_policy.instrument_lot_sizes.remove(leg);
+                // A leg with no lot is listed in neither table, as a
+                // validated policy requires (E3.6f).
+                if !lots.iter().any(|(instrument, _)| *instrument == leg) {
+                    service.risk_policy.instrument_tick_sizes.remove(leg);
+                }
+            }
             for (instrument, lot) in lots {
                 service
                     .risk_policy
@@ -6889,11 +6922,16 @@ mod tests {
             off_lot.reason_codes,
             vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
         );
-        // A leg with no lot size is refused exactly as a plain order on it would be.
+        // A leg on an unlisted instrument is refused exactly as a plain order
+        // on it would be, on both counts.
         let unlisted = decide(&[(near, "1")], "2");
+        // A combination's codes are sorted.
         assert_eq!(
             unlisted.reason_codes,
-            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
+            vec![
+                "INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned(),
+                "INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()
+            ]
         );
         assert!(unlisted.evaluated_limits.contains(
             "combo_lot_sizes=[inst.us_option.spy.near:1.00000000|inst.us_option.spy.far:UNCONFIGURED]"
@@ -6972,14 +7010,10 @@ mod tests {
     }
 
     #[test]
-    fn an_order_for_an_instrument_without_a_configured_tick_is_refused() {
-        // iwm's lot is listed, so only its missing tick can refuse it.
-        let mut policy = policy();
-        policy.instrument_lot_sizes.insert(
-            "inst.us_equity.iwm".to_owned(),
-            decimal("lot", "1").unwrap(),
-        );
-        let mut service = service_with(policy);
+    fn an_order_for_an_instrument_in_neither_table_is_refused_on_both_counts() {
+        // A validated policy lists an instrument in both tables or in neither
+        // (E3.6f), and iwm is in neither.
+        let mut service = service();
         let mut unlisted = intent("intent-tick-003", "2026-01-02T14:30:00Z");
         unlisted.instrument_id = "inst.us_equity.iwm".to_owned();
         let mut iwm = market("2026-01-02T14:30:00Z");
@@ -6992,12 +7026,18 @@ mod tests {
         assert!(!outcome.decision.approved);
         assert_eq!(
             outcome.decision.reason_codes,
-            vec!["INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()]
+            vec![
+                "INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned(),
+                "INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()
+            ]
         );
-        assert!(outcome
-            .decision
-            .evaluated_limits
-            .contains("instrument_tick_size=UNCONFIGURED"));
+        assert!(outcome.order_id.is_none());
+        for evidence in [
+            "instrument_tick_size=UNCONFIGURED",
+            "instrument_lot_size=UNCONFIGURED",
+        ] {
+            assert!(outcome.decision.evaluated_limits.contains(evidence));
+        }
 
         // A listed instrument's market order is unaffected.
         assert!(
@@ -7096,42 +7136,31 @@ mod tests {
     }
 
     #[test]
-    fn an_order_for_an_instrument_without_a_configured_lot_size_is_refused() {
-        let mut policy = policy();
-        policy.instrument_lot_sizes.remove("inst.us_equity.spy");
-        let mut service = service_with(policy);
-        // spy's tick is listed and a market order carries no limit, so only
-        // the missing lot size can refuse it.
-        let outcome = service
-            .submit_intent(
-                intent("intent-lot-003", "2026-01-02T14:30:00Z"),
-                market("2026-01-02T14:30:00Z"),
-                "2026-01-02T14:30:01Z",
+    fn the_tick_and_lot_tables_must_list_the_same_instruments() {
+        assert!(policy().validate().is_ok());
+        let iwm = "inst.us_equity.iwm";
+        let mut lot_only = policy();
+        lot_only
+            .instrument_lot_sizes
+            .insert(iwm.to_owned(), decimal("lot", "1").unwrap());
+        let mut tick_only = policy();
+        tick_only
+            .instrument_tick_sizes
+            .insert(iwm.to_owned(), decimal("tick", "0.01").unwrap());
+        for unpaired in [lot_only, tick_only] {
+            assert_eq!(
+                unpaired.validate().unwrap_err().0,
+                "paper risk policy lists inst.us_equity.iwm in only one of its tick and lot tables"
+            );
+            // The service refuses to start, before it can decide anything.
+            assert!(PaperTradingService::new(
+                account(),
+                unpaired,
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account()).unwrap(),
             )
-            .unwrap();
-        assert!(!outcome.decision.approved);
-        assert_eq!(
-            outcome.decision.reason_codes,
-            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
-        );
-        assert!(outcome.order_id.is_none());
-        assert!(outcome
-            .decision
-            .evaluated_limits
-            .contains("instrument_lot_size=UNCONFIGURED"));
-
-        // A listed instrument's order is unaffected.
-        let mut qqq = intent("intent-lot-004", "2026-01-02T14:30:00Z");
-        qqq.instrument_id = "inst.us_equity.qqq".to_owned();
-        let mut qqq_market = market("2026-01-02T14:30:00Z");
-        qqq_market.instrument_id = "inst.us_equity.qqq".to_owned();
-        assert!(
-            service
-                .submit_intent(qqq, qqq_market, "2026-01-02T14:30:02Z")
-                .unwrap()
-                .decision
-                .approved
-        );
+            .is_err());
+        }
     }
 
     #[test]

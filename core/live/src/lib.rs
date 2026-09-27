@@ -407,6 +407,16 @@ impl LiveRiskPolicy {
                     .to_owned(),
             ));
         }
+        // Each listed instrument needs both increments (E3.6f). One listed in
+        // a single table would pass startup, then be refused at order time
+        // with the other table's `..._UNCONFIGURED` code.
+        if let Some(instrument_id) =
+            unpaired_instrument(&self.instrument_tick_sizes, &self.instrument_lot_sizes)
+        {
+            return Err(LiveError(format!(
+                "controlled-live risk policy lists {instrument_id} in only one of its tick and lot tables"
+            )));
+        }
         if self
             .short_exposure
             .as_ref()
@@ -4902,6 +4912,23 @@ fn render_instrument_table(table: &BTreeMap<String, Decimal>) -> String {
         .join("|")
 }
 
+/// The first instrument listed in exactly one of two per-instrument tables,
+/// checking the tick table's instruments before the lot table's.
+fn unpaired_instrument<'a>(
+    tick_sizes: &'a BTreeMap<String, Decimal>,
+    lot_sizes: &'a BTreeMap<String, Decimal>,
+) -> Option<&'a str> {
+    tick_sizes
+        .keys()
+        .find(|instrument_id| !lot_sizes.contains_key(*instrument_id))
+        .or_else(|| {
+            lot_sizes
+                .keys()
+                .find(|instrument_id| !tick_sizes.contains_key(*instrument_id))
+        })
+        .map(String::as_str)
+}
+
 fn intent_fingerprint(intent: &OrderIntent) -> Result<String, LiveError> {
     intent.validate()?;
     let quantity = intent.quantity.to_string();
@@ -5977,12 +6004,14 @@ mod tests {
         let decide = |ticks: &[(&str, &str)], near: &str, far: &str, cap: &str| {
             let _ = fs::remove_file(&path);
             let mut policy = policy_permitting_shorts();
-            policy
-                .instrument_tick_sizes
-                .remove("inst.us_option.spy.near");
-            policy
-                .instrument_tick_sizes
-                .remove("inst.us_option.spy.far");
+            for leg in ["inst.us_option.spy.near", "inst.us_option.spy.far"] {
+                policy.instrument_tick_sizes.remove(leg);
+                // A leg with no tick is listed in neither table, or the
+                // service refuses to open (E3.6f).
+                if !ticks.iter().any(|(instrument, _)| *instrument == leg) {
+                    policy.instrument_lot_sizes.remove(leg);
+                }
+            }
             for (instrument, tick) in ticks {
                 policy
                     .instrument_tick_sizes
@@ -6040,8 +6069,14 @@ mod tests {
         let decide = |lots: &[(&str, &str)], units: &str| {
             let _ = fs::remove_file(&path);
             let mut policy = policy_permitting_shorts();
-            policy.instrument_lot_sizes.remove(near);
-            policy.instrument_lot_sizes.remove(far);
+            for leg in [near, far] {
+                policy.instrument_lot_sizes.remove(leg);
+                // A leg with no lot is listed in neither table, or the
+                // service refuses to open (E3.6f).
+                if !lots.iter().any(|(instrument, _)| *instrument == leg) {
+                    policy.instrument_tick_sizes.remove(leg);
+                }
+            }
             for (instrument, lot) in lots {
                 policy
                     .instrument_lot_sizes
@@ -6073,9 +6108,13 @@ mod tests {
             vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
         );
         let unlisted = decide(&[(near, "1")], "2");
+        // A combination's codes are sorted.
         assert_eq!(
             unlisted.reason_codes,
-            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
+            vec![
+                "INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned(),
+                "INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()
+            ]
         );
         let _ = fs::remove_file(&path);
     }
@@ -6912,12 +6951,7 @@ mod tests {
     #[test]
     fn controlled_live_refuses_off_grid_limits_and_unlisted_instruments() {
         let path = journal_path("tick-grid");
-        // iwm's lot is listed, so only its missing tick can refuse it.
-        let mut policy = policy();
-        policy
-            .instrument_lot_sizes
-            .insert("inst.us_equity.iwm".to_owned(), amount("1"));
-        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, policy);
+        let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, policy());
         let mut off_grid = intent("SHADOW", "intent.shadow.tick.001");
         off_grid.order_type = OrderType::Limit;
         // 5 bps from the mark, well inside the collar: only the grid is wrong.
@@ -6942,6 +6976,8 @@ mod tests {
             .evaluated_limits
             .contains("instrument_tick_size=0.01"));
 
+        // A validated policy lists an instrument in both tables or in neither
+        // (E3.6f), and iwm is in neither.
         let mut unlisted = intent("SHADOW", "intent.shadow.tick.002");
         unlisted.instrument_id = "inst.us_equity.iwm".to_owned();
         let mut iwm = market();
@@ -6960,8 +6996,17 @@ mod tests {
         assert!(!decision.approved);
         assert_eq!(
             decision.reason_codes,
-            vec!["INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned()]
+            vec![
+                "INSTRUMENT_TICK_SIZE_UNCONFIGURED".to_owned(),
+                "INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()
+            ]
         );
+        for evidence in [
+            "instrument_tick_size=UNCONFIGURED",
+            "instrument_lot_size=UNCONFIGURED",
+        ] {
+            assert!(decision.evaluated_limits.contains(evidence));
+        }
         assert_eq!(service.broker_mut().submitted, 0);
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");
@@ -6994,13 +7039,14 @@ mod tests {
     }
 
     #[test]
-    fn controlled_live_refuses_off_lot_quantities_and_instruments_without_a_lot_size() {
+    fn controlled_live_refuses_off_lot_quantities() {
+        // An instrument with no lot size is covered with the tick rule: a
+        // validated policy lists it in neither table (E3.6f).
         let path = journal_path("lot-size");
         let mut policy = policy();
         policy
             .instrument_lot_sizes
             .insert("inst.us_equity.spy".to_owned(), amount("5"));
-        policy.instrument_lot_sizes.remove("inst.us_equity.qqq");
         let mut service = test_service_with_policy(LiveRunMode::Shadow, &path, policy);
         // Two shares against a five-share lot; every other limit passes.
         let LiveSubmitOutcome::ShadowRecorded { decision } = service
@@ -7037,34 +7083,44 @@ mod tests {
             panic!("shadow mode must retain a shadow decision");
         };
         assert!(decision.approved, "{:?}", decision.reason_codes);
-
-        // qqq keeps its tick but has no lot size.
-        let mut unlisted = intent("SHADOW", "intent.shadow.lot.003");
-        unlisted.instrument_id = "inst.us_equity.qqq".to_owned();
-        let mut qqq = market();
-        qqq.instrument_id = "inst.us_equity.qqq".to_owned();
-        let LiveSubmitOutcome::ShadowRecorded { decision } = service
-            .record_shadow_intent(
-                unlisted,
-                qqq,
-                "2026-01-02T14:30:02Z",
-                "operator.requester.001",
-            )
-            .expect("shadow evidence")
-        else {
-            panic!("shadow mode must retain a shadow decision");
-        };
-        assert!(!decision.approved);
-        assert_eq!(
-            decision.reason_codes,
-            vec!["INSTRUMENT_LOT_SIZE_UNCONFIGURED".to_owned()]
-        );
-        assert!(decision
-            .evaluated_limits
-            .contains("instrument_lot_size=UNCONFIGURED"));
         assert_eq!(service.broker_mut().submitted, 0);
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn the_live_tick_and_lot_tables_must_list_the_same_instruments() {
+        let iwm = "inst.us_equity.iwm";
+        let mut lot_only = policy();
+        lot_only
+            .instrument_lot_sizes
+            .insert(iwm.to_owned(), amount("1"));
+        let mut tick_only = policy();
+        tick_only
+            .instrument_tick_sizes
+            .insert(iwm.to_owned(), amount("0.01"));
+        let path = journal_path("unpaired-tables");
+        for unpaired in [lot_only, tick_only] {
+            assert_eq!(
+                unpaired.validate().unwrap_err().0,
+                "controlled-live risk policy lists inst.us_equity.iwm in only one of its tick and lot tables"
+            );
+            // The service refuses to open, before it can decide anything.
+            let account = account();
+            let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("test switches");
+            let activation = activation(LiveRunMode::Shadow, &account, &unpaired, &switches);
+            assert!(LiveTradingService::open_durable(
+                account,
+                unpaired,
+                activation,
+                switches,
+                TestBroker::new(),
+                &path,
+                "2026-01-02T14:00:00Z",
+            )
+            .is_err());
+            assert!(!path.exists(), "a refused service created a journal");
+        }
     }
 
     #[test]

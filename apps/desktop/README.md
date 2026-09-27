@@ -40,10 +40,11 @@ so almost any spread with a short leg — is refused unless the operator-authore
 The UI never grants that permission itself.
 
 The same file must list the venue tick size and lot size of every instrument
-the operator may trade. Each of these is refused before anything reaches the
-broker:
+the operator may trade. Both tables must list the same instruments: a file
+that lists an instrument in only one of them is refused when the gateway
+starts. Each of these is refused before anything reaches the broker:
 
-- an order for an instrument missing from either table
+- an order for an instrument missing from both tables
   (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`, `INSTRUMENT_LOT_SIZE_UNCONFIGURED`);
 - a limit price off its instrument's grid (`LIMIT_PRICE_OFF_TICK_GRID`);
 - a quantity that is not a whole number of lots (`ORDER_QUANTITY_OFF_LOT_SIZE`).
