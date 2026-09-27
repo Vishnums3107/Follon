@@ -3213,10 +3213,36 @@ These are mandatory master-plan acceptance conditions and are currently open:
       exited 0, including step 23b's scan (76 probes, 0 failed). Python measured 54 passed rather than 55.
       Item 75's byte test skips any hashed input with uncommitted edits, and this slice edits one. pytest
       then reports the whole test skipped, which hides the other inputs' checks. Item 80 removes that
-      skip.
+      skip. **Corrected in place 2026-09-27 (item 80).** "Hides the other inputs' checks" overstated it.
+      The other inputs were still checked, and an earlier input's failure still failed the test. What
+      pytest hid was a failure in an input after the skipped one.
     - **Bounded remainder.** The tick analogue is not guarded. A working limit order whose limit falls
       off a changed tick grid is still eligible, and its fill prints on the new grid against the trader
       (item 74). The operator chose the lot guard only. No external gate moved.
+
+80. Item 75's byte check no longer skips an edited input (2026-09-27, Reliability; E3.8b).
+    - **The gap.** Item 75's `test_hashed_inputs_hold_the_repository_bytes` called `skipTest` for any
+      hashed input with uncommitted edits. That left the edited file entirely unchecked. It also misled
+      under pytest, which `session_status.py` runs. pytest does not report unittest subtests one by one,
+      so a skip in one subtest marked the whole test skipped. A CRLF input *after* the skipped one in
+      the list then failed its subtest, and pytest still reported the test as skipped. Measured: with
+      `core/control-plane/src/lib.rs` edited and `python/examples/worker_buy_once_strategy.py`
+      rewritten with CRLF, pytest reported `1 skipped`, while unittest, which CI runs, reported the
+      failure. Found because E3.6g's measurement read 54 Python tests passed rather than 55.
+    - **The fix.** An edited hashed input cannot match its index blob, so it is held to what matters:
+      no CRLF. An unedited one must still equal its blob exactly. The test never skips.
+    - **Rule 5.** With `lib.rs` edited and a later input rewritten with CRLF, the new test fails where the
+      old one was reported skipped. With `lib.rs` itself edited and rewritten with CRLF, the new test
+      fails where the old one skipped it. On a clean tree, and with an LF edit, all four checkout tests
+      pass and none skips.
+    - **Item 79 corrected in place.** It said the skip hid "the other inputs' checks". It hid a later
+      input's failure, not every check.
+    - **Measured result.** The Python suite measured 55 passed and none skipped, where E3.6g's run read 54
+      passed and one skipped. Rust is unchanged at 509. The final `python tools/session_status.py` run
+      measured all seven suites green, and the full evidence pipeline exited 0, including step 23b's scan
+      (76 probes, 0 failed).
+    - **Bounded remainder.** An edited input is checked for line endings, not content, which is correct:
+      its content is the edit. No external gate moved.
 
 ## Business-readiness decision
 

@@ -56,9 +56,9 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T14:24:01Z  
+**Measured at:** 2026-09-27T14:28:41Z  
 **Branch:** `main`  
-**HEAD:** `d9d8dc2` -- docs(delivery): session 9 next action and output-schema check (2026-09-27T18:43:57+05:30)  
+**HEAD:** `2c65c48` -- feat(replay): refuse to fill a working order off a changed lot size -- E3.6g (2026-09-27T19:55:26+05:30)  
 **Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
@@ -67,7 +67,7 @@ already produced a real defect here.
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 54 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 55 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -450,7 +450,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes when it landed, and 76 since E3.3b added the kill-switch RPCs. It found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 | E3.7 | **Done 2026-09-26 (audit item 72).** Replay risk priced an intent from the bar that produced it, whatever that bar's instrument, so a QQQ order raised on SPY's bar was judged at SPY's price. `RiskPolicy::evaluate` now refuses a mark for another instrument, and the bar and news paths refuse such an intent before recording it, as PAPER does. Remainder: the engine holds no mark except the current bar, so one instrument cannot be traded on another's bar. | 5.4 |
-| E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
+| E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. **E3.8b done 2026-09-27 (audit item 80):** that test's byte check no longer skips an edited input, a skip that under pytest hid a later input's failure. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
 | E3.9 | **Done 2026-09-27 (audit item 77).** The version-2 PAPER configuration schema declared neither the tick nor the lot table, so it rejected both version-2 fixtures that `follon-paper-status` reads. It now matches version 1, and `tests/security/test_configuration_contracts.py` holds 17 configuration fixtures to their schemas. Remainder: output and evidence documents are outside that test. | Architecture |
 | E3.10 | **Done 2026-09-27 (audit item 78).** PAPER opened its journal, creating the file, before validating its configuration, so a refused start left an empty journal. It now validates first, as controlled LIVE does. The desktop gateway's configuration comment, which claimed one file could serve both it and `follon-paper-status`, is corrected. Remainder: a start refused by the legacy-routing check can still leave an empty journal. | 5.5 / 5.10 |
 
@@ -613,6 +613,13 @@ short — detail belongs in the conformance audit.
   green, and the full pipeline exited 0. Python read 54, not 55. E3.8's byte
   test skipped itself because this slice edits a hashed input, a weakness
   fixed next.
+- Landed **E3.8b**. That skip left the edited file unchecked. Under pytest
+  it also reported the whole test skipped, which hid a CRLF failure in any
+  input after it; unittest, which CI runs, reported the failure. An edited
+  input is now checked for CRLF instead, and the test never skips (audit
+  item 80). Python measured 55 passed, none skipped; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0.
 
 
 - Asked again to "complete the project". Baseline at `a42556c`: clean tree,

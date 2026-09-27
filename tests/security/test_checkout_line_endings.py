@@ -66,16 +66,21 @@ class CheckoutLineEndingTests(unittest.TestCase):
     def test_hashed_inputs_hold_the_repository_bytes(self) -> None:
         for path in HASHED_INPUTS:
             with self.subTest(path=path):
+                work = (REPOSITORY_ROOT / path).read_bytes()
                 # `git diff` compares content after the LF rule, so a
-                # line-ending conversion alone is not a change it skips.
+                # line-ending conversion alone is not an edit.
                 edited = subprocess.run(
                     ["git", "diff", "--quiet", "--", path], cwd=REPOSITORY_ROOT
                 ).returncode
                 if edited:
-                    self.skipTest(f"{path} has uncommitted edits")
-                # `cat-file` prints the index blob itself, with no conversion.
-                blob = git("cat-file", "blob", f":{path}")
-                self.assertEqual((REPOSITORY_ROOT / path).read_bytes(), blob)
+                    # An edited file cannot match its blob, but must still be
+                    # LF. Skipping it instead left it unchecked, and under
+                    # pytest reported the whole test skipped, hiding a later
+                    # input's failure (audit item 80).
+                    self.assertNotIn(b"\r\n", work)
+                else:
+                    # `cat-file` prints the index blob itself, with no conversion.
+                    self.assertEqual(work, git("cat-file", "blob", f":{path}"))
 
     @unittest.skipUnless(
         importlib.util.find_spec("jsonschema"), "the fixture generator needs jsonschema"
