@@ -23,7 +23,13 @@
     "max_realized_loss": "100",
     "max_market_data_age_seconds": 60,
     "max_order_rate": 20,
-    "order_rate_window_seconds": 60
+    "order_rate_window_seconds": 60,
+    "instrument_tick_sizes": {
+      "inst.us_equity.spy": "0.01"
+    },
+    "instrument_lot_sizes": {
+      "inst.us_equity.spy": "1"
+    }
   },
   "kill_switch_version": "live-kills-v1",
   "activation": {

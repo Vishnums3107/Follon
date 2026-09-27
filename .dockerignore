@@ -1,8 +1,10 @@
 .git
 target
+**/target
 node_modules
 **/node_modules
 dist
+**/dist
 var
 data
 secrets

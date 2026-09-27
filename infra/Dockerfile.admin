@@ -6,6 +6,7 @@ COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY apps apps
 COPY core core
 COPY adapters adapters
+COPY services services
 RUN cargo build --release -p follon-cli --bin follon-admin
 
 FROM debian:bookworm-slim

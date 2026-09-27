@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import importlib.util
 import json
 import os
@@ -267,6 +268,23 @@ class DashboardServerContract(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "production dashboard mode requires"):
                     spec.loader.exec_module(candidate)
 
+    def test_server_header_discloses_no_runtime_version(self) -> None:
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
+        thread = Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for method in ("GET", "DELETE"):
+                connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+                connection.request(method, "/api/v1/health")
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+                self.assertEqual(response.getheader("Server"), "FollonEvidenceDashboard", method)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
     def test_security_headers_block_privileged_browser_features(self) -> None:
         handler = object.__new__(server.DashboardHandler)
         captured: dict[str, str] = {}
@@ -280,6 +298,32 @@ class DashboardServerContract(unittest.TestCase):
         self.assertEqual(captured["Cross-Origin-Opener-Policy"], "same-origin")
         self.assertIn("payment=()", captured["Permissions-Policy"])
         self.assertIn("form-action 'none'", captured["Content-Security-Policy"])
+
+    def test_workspace_projection_carries_schema_3_advanced_economics(self) -> None:
+        advanced = {"advanced_report_schema_version": 1, "margin": {"net_liquidation_value": "10.00000000"}}
+        for name, schema, economics in (
+            ("backtest-v3.json", 3, advanced),
+            ("backtest-v3-malformed.json", 3, "not-an-object"),
+            ("backtest-v2.json", 2, None),
+        ):
+            payload = {
+                "artifact_schema_version": schema,
+                "artifact_fingerprint": "a" * 64,
+                "event_output_hash": "b" * 64,
+                "performance": {},
+                "report": {},
+                "specification": {},
+                "specification_fingerprint": "d" * 64,
+            }
+            if economics is not None:
+                payload["advanced_account"] = economics
+            (EVIDENCE_ROOT / name).write_text(json.dumps(payload), encoding="utf-8")
+        snapshot = server.workspace_snapshot()
+        projected = {item["artifact"]: item["advanced_account"] for item in snapshot["backtests"]}
+        self.assertEqual(projected["backtest-v3.json"], advanced)
+        # A malformed section is dropped rather than passed through.
+        self.assertIsNone(projected["backtest-v3-malformed.json"])
+        self.assertIsNone(projected["backtest-v2.json"])
 
     def test_workspace_projection_integrates_typed_feature_evidence(self) -> None:
         (EVIDENCE_ROOT / "market-bars.csv").write_text(

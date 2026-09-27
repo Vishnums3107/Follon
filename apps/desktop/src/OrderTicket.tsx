@@ -7,9 +7,22 @@ type OrderType = "MARKET" | "LIMIT";
 type TimeInForce = "DAY" | "GTC";
 
 type CommandReceipt = Readonly<{
-  command: "SUBMIT_ORDER";
+  command: "SUBMIT_ORDER" | "CANCEL_ORDER" | "CLOSE_POSITION";
   requestId: string;
-  status: "ACCEPTED_FOR_RISK" | "RISK_REJECTED" | "PENDING_SUBMIT";
+  status:
+    | "ACCEPTED_FOR_RISK"
+    | "RISK_REJECTED"
+    | "PENDING_SUBMIT"
+    | "ACKNOWLEDGED"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "PENDING_CANCEL"
+    | "PENDING_REPLACE"
+    | "CANCELLED"
+    | "REJECTED"
+    | "EXPIRED"
+    | "UNKNOWN"
+    | "PENDING_POSITION_CLOSE";
   orderId: string | null;
   message: string;
 }>;
@@ -38,6 +51,9 @@ type TicketDraft = Readonly<{
   environment?: ExecutionEnvironment;
   timeInForce?: TimeInForce;
   rationale?: string;
+  referencePrice?: string;
+  referenceObservedAt?: string;
+  cancelOrderId?: string;
 }>;
 
 function draftStorageKey(accountId: string, environment: ExecutionEnvironment): string {
@@ -85,13 +101,36 @@ function generatedId(prefix: string): string | undefined {
   return uuid === undefined ? undefined : `${prefix}.${uuid.toLowerCase()}`;
 }
 
-function isSubmitReceipt(value: unknown, requestId: string): value is CommandReceipt {
+function isCommandReceipt(
+  value: unknown,
+  command: CommandReceipt["command"],
+  requestId: string,
+): value is CommandReceipt {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const receipt = value as Record<string, unknown>;
-  return receipt.command === "SUBMIT_ORDER" && receipt.requestId === requestId &&
-    (receipt.status === "ACCEPTED_FOR_RISK" || receipt.status === "RISK_REJECTED" || receipt.status === "PENDING_SUBMIT") &&
+  const allowedStatuses: Readonly<Record<CommandReceipt["command"], ReadonlySet<string>>> = {
+    SUBMIT_ORDER: new Set([
+      "ACCEPTED_FOR_RISK", "RISK_REJECTED", "PENDING_SUBMIT", "ACKNOWLEDGED",
+      "PARTIALLY_FILLED", "FILLED", "REJECTED", "EXPIRED", "UNKNOWN",
+    ]),
+    CANCEL_ORDER: new Set(["PENDING_CANCEL", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "UNKNOWN"]),
+    CLOSE_POSITION: new Set([
+      "ACCEPTED_FOR_RISK", "RISK_REJECTED", "PENDING_SUBMIT", "ACKNOWLEDGED",
+      "PARTIALLY_FILLED", "FILLED", "REJECTED", "EXPIRED", "UNKNOWN", "PENDING_POSITION_CLOSE",
+    ]),
+  };
+  return receipt.command === command && receipt.requestId === requestId &&
+    typeof receipt.status === "string" && allowedStatuses[command].has(receipt.status) &&
     (receipt.orderId === null || (typeof receipt.orderId === "string" && /^[a-z0-9._-]+$/.test(receipt.orderId))) &&
     typeof receipt.message === "string" && receipt.message.length > 0;
+}
+
+function isSubmitReceipt(value: unknown, requestId: string): value is CommandReceipt {
+  return isCommandReceipt(value, "SUBMIT_ORDER", requestId);
+}
+
+function isCancelableStatus(status: CommandReceipt["status"]): boolean {
+  return status === "PENDING_SUBMIT" || status === "ACKNOWLEDGED" || status === "PARTIALLY_FILLED";
 }
 
 export function OrderTicket({
@@ -110,6 +149,9 @@ export function OrderTicket({
   const environment: ExecutionEnvironment = defaultEnvironment;
   const [timeInForce, setTimeInForce] = useState<TimeInForce>(draft.timeInForce ?? "DAY");
   const [rationale, setRationale] = useState(draft.rationale ?? "");
+  const [referencePrice, setReferencePrice] = useState(draft.referencePrice ?? "");
+  const [referenceObservedAt, setReferenceObservedAt] = useState(draft.referenceObservedAt ?? "");
+  const [cancelOrderId, setCancelOrderId] = useState(draft.cancelOrderId ?? "");
   const [status, setStatus] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [routeStatus, setRouteStatus] = useState<CommandRouteStatus>(() => ({
@@ -152,8 +194,11 @@ export function OrderTicket({
       environment,
       timeInForce,
       rationale,
+      referencePrice,
+      referenceObservedAt,
+      cancelOrderId,
     });
-  }, [accountId, instrumentId, intentId, correlationId, createdAt, quantity, orderType, limitPrice, environment, timeInForce, rationale]);
+  }, [accountId, instrumentId, intentId, correlationId, createdAt, quantity, orderType, limitPrice, environment, timeInForce, rationale, referencePrice, referenceObservedAt, cancelOrderId]);
 
   const currentDraft = (): TicketDraft => ({
     accountId,
@@ -167,6 +212,9 @@ export function OrderTicket({
     environment,
     timeInForce,
     rationale,
+    referencePrice,
+    referenceObservedAt,
+    cancelOrderId,
   });
 
   const restoreDraft = (nextAccountId: string, nextDraft: TicketDraft): void => {
@@ -180,6 +228,9 @@ export function OrderTicket({
     setLimitPrice(nextDraft.limitPrice ?? "");
     setTimeInForce(nextDraft.timeInForce ?? "DAY");
     setRationale(nextDraft.rationale ?? "");
+    setReferencePrice(nextDraft.referencePrice ?? "");
+    setReferenceObservedAt(nextDraft.referenceObservedAt ?? "");
+    setCancelOrderId(nextDraft.cancelOrderId ?? "");
   };
 
   const handleAccountChange = (nextAccountId: string): void => {
@@ -199,6 +250,9 @@ export function OrderTicket({
     setLimitPrice("");
     setTimeInForce("DAY");
     setRationale("");
+    setReferencePrice("");
+    setReferenceObservedAt("");
+    setCancelOrderId("");
     setStatus("Draft inputs cleared.");
   };
 
@@ -212,7 +266,8 @@ export function OrderTicket({
     if (!intentId.trim()) setIntentId(intent);
     if (!correlationId.trim()) setCorrelationId(correlation);
     if (!createdAt.trim()) setCreatedAt(canonicalTimestamp());
-    setStatus("Generated stable canonical IDs; existing IDs and creation time were preserved.");
+    if (!referenceObservedAt.trim()) setReferenceObservedAt(canonicalTimestamp());
+    setStatus("Generated stable canonical IDs and timestamps; existing values were preserved.");
   };
 
   const handleSubmit = async (side: "BUY" | "SELL"): Promise<void> => {
@@ -226,6 +281,12 @@ export function OrderTicket({
     }
     if (orderType === "LIMIT" && !limitPrice.trim()) {
       setStatus("A limit price is required for a LIMIT intent.");
+      return;
+    }
+    if (!referencePrice.trim() || !referenceObservedAt.trim()) {
+      setStatus(
+        "There is no live market-data feed wired into this desktop host: enter the reference price you are actually observing right now, and when you observed it, before Risk/OMS preflight.",
+      );
       return;
     }
     setSubmitting(true);
@@ -250,13 +311,97 @@ export function OrderTicket({
           configurationVersion: "risk.v1",
           environment,
           parentIntentId: null,
+          referencePrice: referencePrice.trim(),
+          referenceObservedAt: referenceObservedAt.trim(),
         },
       });
       if (!isSubmitReceipt(receipt, requestId)) {
         throw new Error("The native Risk/OMS route returned a receipt that does not match this submit request.");
       }
       const order = receipt.orderId === null ? "" : ` (${receipt.orderId})`;
+      setCancelOrderId(
+        receipt.orderId !== null && isCancelableStatus(receipt.status) ? receipt.orderId : "",
+      );
       setStatus(`${receipt.status}: ${receipt.message}${order}. The draft remains available until authoritative lifecycle evidence is reviewed.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleCancel = async (): Promise<void> => {
+    if (!routeStatus.routeAvailable || !isNativeHost()) {
+      setStatus(routeStatus.message);
+      return;
+    }
+    if (!accountId.trim() || !cancelOrderId.trim()) {
+      setStatus("Account ID and OMS order ID are required before cancellation.");
+      return;
+    }
+    const requestId = generatedId("request.cancel.desktop");
+    const cancelCorrelationId = generatedId("correlation.cancel.desktop");
+    if (requestId === undefined || cancelCorrelationId === undefined) {
+      setStatus("Secure identifier generation is unavailable; cancellation was not sent.");
+      return;
+    }
+    setSubmitting(true);
+    setStatus("Routing cancellation to OMS…");
+    try {
+      const receipt = await invoke<unknown>("cancel_order", {
+        intent: {
+          requestId,
+          accountId: accountId.trim(),
+          orderId: cancelOrderId.trim(),
+          correlationId: cancelCorrelationId,
+          environment,
+        },
+      });
+      if (!isCommandReceipt(receipt, "CANCEL_ORDER", requestId)) {
+        throw new Error("The native Risk/OMS route returned a receipt that does not match this cancellation request.");
+      }
+      setStatus(`${receipt.status}: ${receipt.message}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleClosePosition = async (): Promise<void> => {
+    if (!routeStatus.routeAvailable || !isNativeHost()) {
+      setStatus(routeStatus.message);
+      return;
+    }
+    if (!accountId.trim() || !instrumentId.trim() || !rationale.trim() || !referencePrice.trim() || !referenceObservedAt.trim()) {
+      setStatus("Account, instrument, rationale, reference price, and observation time are required before closing a position.");
+      return;
+    }
+    const requestId = generatedId("request.close.desktop");
+    const closeCorrelationId = generatedId("correlation.close.desktop");
+    if (requestId === undefined || closeCorrelationId === undefined) {
+      setStatus("Secure identifier generation is unavailable; position close was not sent.");
+      return;
+    }
+    setSubmitting(true);
+    setStatus("Routing position close through Risk/OMS…");
+    try {
+      const receipt = await invoke<unknown>("close_position", {
+        intent: {
+          requestId,
+          accountId: accountId.trim(),
+          instrumentId: instrumentId.trim().toLowerCase(),
+          correlationId: closeCorrelationId,
+          environment,
+          rationale: rationale.trim(),
+          referencePrice: referencePrice.trim(),
+          referenceObservedAt: referenceObservedAt.trim(),
+        },
+      });
+      if (!isCommandReceipt(receipt, "CLOSE_POSITION", requestId)) {
+        throw new Error("The native Risk/OMS route returned a receipt that does not match this position-close request.");
+      }
+      setStatus(`${receipt.status}: ${receipt.message}.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -384,7 +529,41 @@ export function OrderTicket({
             required
           />
         </label>
+        <label>
+          Reference price
+          <input
+            className="f-input"
+            inputMode="decimal"
+            value={referencePrice}
+            onChange={(event) => setReferencePrice(event.target.value)}
+            placeholder="Price you are observing right now"
+            required
+          />
+        </label>
+        <label>
+          Reference observed at (UTC)
+          <input
+            className="f-input"
+            value={referenceObservedAt}
+            onChange={(event) => setReferenceObservedAt(event.target.value)}
+            placeholder="2026-09-03T12:30:00Z"
+            required
+          />
+        </label>
+        <label>
+          OMS order ID to cancel
+          <input
+            className="f-input"
+            value={cancelOrderId}
+            onChange={(event) => setCancelOrderId(event.target.value)}
+            placeholder="order-00000001"
+          />
+        </label>
       </div>
+      <p className="order-ticket-status">
+        There is no live market-data feed wired into this desktop host: Risk/OMS evaluates the price collar and
+        notional limits against the reference price and time you enter above, not an automatic quote.
+      </p>
       <div className="order-ticket-actions">
         <button
           className="f-btn f-btn--primary"
@@ -415,6 +594,22 @@ export function OrderTicket({
           onClick={handleClearDraft}
         >
           Clear Draft
+        </button>
+        <button
+          className="f-btn"
+          type="button"
+          disabled={submitting || !routeStatus.routeAvailable || !cancelOrderId.trim()}
+          onClick={() => void handleCancel()}
+        >
+          Cancel OMS Order
+        </button>
+        <button
+          className="f-btn f-btn--danger"
+          type="button"
+          disabled={submitting || !routeStatus.routeAvailable}
+          onClick={() => void handleClosePosition()}
+        >
+          Close Position
         </button>
       </div>
       {status !== null && <p className="order-ticket-status">{status}</p>}

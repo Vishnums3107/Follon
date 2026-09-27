@@ -83,6 +83,8 @@ impl NlpSentimentEngine {
             }
         }
 
+        let tokens = tokenize_words(text_lower);
+
         let dictionary = [
             ("apple", "aapl.us"),
             ("aapl", "aapl.us"),
@@ -103,7 +105,7 @@ impl NlpSentimentEngine {
         ];
 
         for (keyword, instrument) in dictionary {
-            if text_lower.contains(keyword) && !resolved.contains(&instrument.to_string()) {
+            if contains_keyword(&tokens, keyword) && !resolved.contains(&instrument.to_string()) {
                 resolved.push(instrument.to_string());
             }
         }
@@ -113,41 +115,38 @@ impl NlpSentimentEngine {
 
     /// Categorizes headline text into an [`EventTaxonomy`].
     fn classify_taxonomy(&self, text_lower: &str) -> EventTaxonomy {
-        if text_lower.contains("cpi") || text_lower.contains("inflation") {
+        let tokens = tokenize_words(text_lower);
+        let has = |keyword: &str| contains_keyword(&tokens, keyword);
+
+        if has("cpi") || has("inflation") {
             EventTaxonomy::MacroCpi
-        } else if text_lower.contains("fed")
-            || text_lower.contains("fomc")
-            || text_lower.contains("rate cut")
-            || text_lower.contains("rate hike")
-        {
+        } else if has("fed") || has("fomc") || has("rate cut") || has("rate hike") {
             EventTaxonomy::MacroFedRate
-        } else if text_lower.contains("earnings")
-            || text_lower.contains("eps")
-            || text_lower.contains("q1")
-            || text_lower.contains("q2")
-            || text_lower.contains("q3")
-            || text_lower.contains("q4")
+        } else if has("earnings") || has("eps") || has("q1") || has("q2") || has("q3") || has("q4")
         {
             EventTaxonomy::EarningsRelease
-        } else if text_lower.contains("acquire")
-            || text_lower.contains("merger")
-            || text_lower.contains("buyout")
-            || text_lower.contains("deal")
+        } else if has("acquire")
+            || has("acquires")
+            || has("acquired")
+            || has("acquiring")
+            || has("merger")
+            || has("mergers")
+            || has("buyout")
+            || has("buyouts")
+            || has("deal")
+            || has("deals")
         {
             EventTaxonomy::MergerAcquisition
-        } else if text_lower.contains("fda")
-            || text_lower.contains("trial")
-            || text_lower.contains("drug")
-        {
+        } else if has("fda") || has("trial") || has("trials") || has("drug") || has("drugs") {
             EventTaxonomy::FdaDecision
-        } else if text_lower.contains("guidance")
-            || text_lower.contains("outlook")
-            || text_lower.contains("forecast")
+        } else if has("guidance")
+            || has("outlook")
+            || has("forecast")
+            || has("forecasts")
+            || has("forecasted")
         {
             EventTaxonomy::GuidanceRevision
-        } else if text_lower.contains("lawsuit")
-            || text_lower.contains("litigation")
-            || text_lower.contains("sec investigation")
+        } else if has("lawsuit") || has("lawsuits") || has("litigation") || has("sec investigation")
         {
             EventTaxonomy::Litigation
         } else {
@@ -157,6 +156,7 @@ impl NlpSentimentEngine {
 
     /// Scores financial sentiment polarity in integer basis points (-10000 to +10000).
     fn calculate_polarity_bps(&self, text_lower: &str) -> i32 {
+        let tokens = tokenize_words(text_lower);
         let positive_words = [
             "beat",
             "beats",
@@ -190,12 +190,12 @@ impl NlpSentimentEngine {
         let mut neg_count = 0i32;
 
         for word in positive_words {
-            if text_lower.contains(word) {
+            if contains_keyword(&tokens, word) {
                 pos_count += 1;
             }
         }
         for word in negative_words {
-            if text_lower.contains(word) {
+            if contains_keyword(&tokens, word) {
                 neg_count += 1;
             }
         }
@@ -215,10 +215,12 @@ impl NlpSentimentEngine {
         if polarity_bps == 0 {
             return 5000;
         }
+        let tokens = tokenize_words(text_lower);
         let high_confidence_markers = [
             "reports",
             "quarterly",
             "official",
+            "officials",
             "sec",
             "q1",
             "q2",
@@ -226,13 +228,14 @@ impl NlpSentimentEngine {
             "q4",
             "earnings",
             "revenue",
+            "revenues",
             "cpi",
             "fed",
             "fda",
         ];
         let marker_matches = high_confidence_markers
             .iter()
-            .filter(|m| text_lower.contains(**m))
+            .filter(|m| contains_keyword(&tokens, m))
             .count();
 
         let base_confidence = 7500u32; // 75.00%
@@ -242,14 +245,51 @@ impl NlpSentimentEngine {
 
     /// Extracts numerical surprise deltas in basis points.
     fn extract_surprise_bps(&self, text_lower: &str) -> i32 {
-        if text_lower.contains("beat") || text_lower.contains("record") {
+        let tokens = tokenize_words(text_lower);
+        let has = |keyword: &str| contains_keyword(&tokens, keyword);
+        if has("beat") || has("beats") || has("beating") || has("record") {
             250 // +2.50% default surprise delta
-        } else if text_lower.contains("miss") || text_lower.contains("cut") {
+        } else if has("miss") || has("misses") || has("missed") || has("cut") || has("cuts") {
             -250 // -2.50% default surprise delta
         } else {
             0
         }
     }
+}
+
+/// Splits lowercase text into alphanumeric word tokens on any non-alphanumeric
+/// boundary (whitespace, punctuation, symbols). This is the basis for
+/// whole-word keyword matching: raw substring `.contains()` checks are prone
+/// to false positives on short keywords (e.g. `"fed"` inside `"federal"` or
+/// `"fedex"`, or `"gain"` inside `"against"`), which whole-word tokenization
+/// eliminates.
+fn tokenize_words(text_lower: &str) -> Vec<&str> {
+    text_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Returns true when `keyword` appears in `tokens` as a contiguous run of
+/// whole-word matches. `keyword` is itself tokenized the same way as the
+/// source text, so:
+///   - a single-word keyword (the common case, e.g. `"fed"`) reduces to an
+///     exact-token equality check rather than a substring scan;
+///   - a multi-word phrase keyword (e.g. `"rate cut"`, `"sec investigation"`)
+///     still requires its words to appear adjacently and in order, so
+///     legitimate phrase-level matches are preserved rather than broken by
+///     over-tokenizing;
+///   - a keyword containing punctuation (e.g. `"s&p"`) tokenizes to the same
+///     word sequence (`["s", "p"]`) as the equivalent text, so it still
+///     matches "S&P", "S & P", etc. as adjacent whole words.
+fn contains_keyword(tokens: &[&str], keyword: &str) -> bool {
+    let keyword_tokens = tokenize_words(keyword);
+    if keyword_tokens.is_empty() || keyword_tokens.len() > tokens.len() {
+        return false;
+    }
+    tokens
+        .windows(keyword_tokens.len())
+        .any(|window| window == keyword_tokens.as_slice())
 }
 
 #[cfg(test)]
@@ -303,5 +343,81 @@ mod tests {
         assert_eq!(vec.instrument_id, "spy.us");
         assert_eq!(vec.taxonomy, EventTaxonomy::MacroCpi);
         assert!(vec.sentiment_polarity_bps > 0);
+    }
+
+    /// Regression test for the `"fed"` substring-collision bug: "FedEx" must
+    /// not be treated as containing the macro-policy keyword `"fed"`. Before
+    /// the word-boundary fix this headline both spuriously resolved a
+    /// `spy.us` entity vector and was misclassified as `MacroFedRate` instead
+    /// of `EarningsRelease`.
+    #[test]
+    fn test_nlp_fedex_headline_is_not_confused_with_fed_policy() {
+        let engine = NlpSentimentEngine::new();
+        let headline = NewsHeadline {
+            news_id: "news.003".to_owned(),
+            source: NewsSource::DowJones,
+            headline: "FedEx Reports Record Q3 Earnings Beat & Raises Forecast".to_owned(),
+            raw_body_hash: "c".repeat(64),
+            sequence_number: 3,
+            event_time_ns: 3000,
+            receive_time_ns: 3050,
+            entity_tickers: vec!["fdx.us".to_owned()],
+        };
+
+        let vectors = engine.extract_sentiment_vectors(&headline).expect("nlp");
+        // Only the explicitly supplied FedEx ticker resolves; "FedEx" must not
+        // spuriously trigger the "fed" -> spy.us macro-policy entity mapping.
+        assert_eq!(vectors.len(), 1);
+        assert!(vectors.iter().all(|v| v.instrument_id != "spy.us"));
+        let vec = &vectors[0];
+        assert_eq!(vec.instrument_id, "fdx.us");
+        assert_eq!(vec.taxonomy, EventTaxonomy::EarningsRelease);
+    }
+
+    /// Regression test for the `"disapproval"` substring-collision bug:
+    /// `"disapproval"` must not be treated as containing the positive
+    /// keyword `"approval"`. With no other polarity keyword present, the
+    /// headline should score neutral rather than spuriously positive.
+    #[test]
+    fn test_nlp_disapproval_does_not_match_positive_approval_keyword() {
+        let engine = NlpSentimentEngine::new();
+        let headline = NewsHeadline {
+            news_id: "news.004".to_owned(),
+            source: NewsSource::DowJones,
+            headline: "Regulators Voice Disapproval of the Merger".to_owned(),
+            raw_body_hash: "d".repeat(64),
+            sequence_number: 4,
+            event_time_ns: 4000,
+            receive_time_ns: 4050,
+            entity_tickers: vec!["aapl.us".to_owned()],
+        };
+
+        let vectors = engine.extract_sentiment_vectors(&headline).expect("nlp");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].sentiment_polarity_bps, 0);
+    }
+
+    /// Regression test for the `"against"` substring-collision bug:
+    /// `"against"` must not be treated as containing the positive keyword
+    /// `"gain"`. The only real polarity keyword in this headline is the
+    /// negative `"lawsuit"`, so the score must be negative rather than
+    /// spuriously canceled out to neutral.
+    #[test]
+    fn test_nlp_against_does_not_match_positive_gain_keyword() {
+        let engine = NlpSentimentEngine::new();
+        let headline = NewsHeadline {
+            news_id: "news.005".to_owned(),
+            source: NewsSource::DowJones,
+            headline: "Company Files Lawsuit Against Regulator".to_owned(),
+            raw_body_hash: "e".repeat(64),
+            sequence_number: 5,
+            event_time_ns: 5000,
+            receive_time_ns: 5050,
+            entity_tickers: vec!["aapl.us".to_owned()],
+        };
+
+        let vectors = engine.extract_sentiment_vectors(&headline).expect("nlp");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].sentiment_polarity_bps, -9000);
     }
 }

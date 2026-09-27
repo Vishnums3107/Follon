@@ -14,6 +14,7 @@ follon-commercial = { path = "../../core/commercial" }
 follon-domain = { path = "../../core/domain" }
 follon-execution = { path = "../../core/execution" }
 follon-fx = { path = "../../core/fx" }
+follon-identity = { path = "../../core/identity" }
 follon-instrument = { path = "../../core/instrument" }
 follon-live = { path = "../../core/live" }
 follon-market-data = { path = "../../core/market-data" }
@@ -39,6 +40,10 @@ path = "src/backtest.rs"
 [[bin]]
 name = "follon-build-bars"
 path = "src/build_bars.rs"
+
+[[bin]]
+name = "follon-repair-quotes"
+path = "src/repair_quotes.rs"
 
 [[bin]]
 name = "follon-paper-status"

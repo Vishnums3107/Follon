@@ -1,9 +1,16 @@
 # Dashboard feature integration and remaining-work status
 
-**Implementation snapshot: 2026-09-07; fabricated-evidence remediation: 2026-09-10.** The desktop
-dashboard provides twelve (12) functional, workspace-specific read-only views over every capability
-across all 12 Enduring Capabilities (DUR-01 through DUR-12) and 25+ advanced schema categories.
-It contains zero unverified synthetic data and enforces strict read-only guarantees.
+**Implementation snapshot: 2026-09-07; fabricated-evidence remediation: 2026-09-10; second
+fabricated-evidence remediation: 2026-09-20.** The desktop dashboard provides twelve (12) functional,
+workspace-specific read-only views over every capability across all 12 Enduring Capabilities (DUR-01
+through DUR-12). It enforces strict read-only guarantees. The "zero unverified synthetic data" claim
+below was not true for 29 of the platform's 32 advanced-evidence schema categories until the
+2026-09-20 remediation (see [master-plan conformance audit, item 45](14-master-plan-conformance-audit.md)):
+those categories (including SOLO-04 Market Scanner, DATA-03 News Revision Timeline, and RES-02
+Strategy Composition Studio) had no real computation behind them at all and were populated from
+hand-typed example data copied into `var/` and rendered as if it were live evidence. They now render
+their honest, already-existing empty state instead. 3 further categories have real Rust logic that
+simply isn't wired into any CLI or the evidence pipeline yet.
 
 On 2026-09-10 four decorative visuals in `apps/desktop/src/workspaces.ts` — the causal-lineage DAG
 in Replay & Incidents, the attention/cognitive-load gauge in Command Center, the factor-exposure bar
@@ -113,17 +120,19 @@ action so the read-only dashboard cannot rewrite audit history.
 | Controlled LIVE | SHADOW/CANARY monitoring, audit, incidents, positions, reconciliation, 60-session gate | Monitoring integrated; no connected live adapter/control plane |
 | Operations workbench | Risk, attribution, alerts, schedule, journal, configuration and reproducibility identities | Integrated |
 | Options | Frozen chain, fixed-point European analytics/Greeks, expiry scenarios, expiration exercise/assignment settlement capability, declared-book reconciliation | Integrated; external broker-backed acceptance remains absent |
-| Commercial and deployment | Ledger, provisioning/subscription facts, artifact inventory, release/readiness status, SBOM, key custody, signed manifest, retention & privacy plans/receipts | Fully integrated and generated locally into 75 immutable evidence artifacts via pipeline generator |
+| Commercial and deployment | Ledger, provisioning/subscription facts, artifact inventory, release/readiness status, SBOM, key custody, signed manifest, retention & privacy plans/receipts | Fully integrated and generated locally into 42 immutable evidence artifacts via pipeline generator |
 
-At the 2026-09-07 snapshot, the pipeline generator (`tools/generate_pipeline_evidence.py`)
-populates 75 immutable evidence artifacts in `var/` across all 12 Enduring Capabilities
-(DUR-01 through DUR-12), including all 32 canonical advanced fixtures across 32 schema categories,
-complete CycloneDX SBOM (314 locked dependencies), cryptographic Ed25519 signed release manifest,
-self-host deployment readiness verification, commercial privacy & retention runbook receipts,
-and external acceptance audit gate counts. All twelve typed dashboards and advanced category
-views are available to their owning workspaces with zero unpopulated evidence panels (SOLO-04
-Explainable Market Scanner, DATA-03 News Revision Timeline, and RES-02 Strategy Composition Studio
-are fully typed and populated).
+**Corrected 2026-09-20** (see [master-plan conformance audit, item 45](14-master-plan-conformance-audit.md)
+for the full record): at the 2026-09-07 snapshot, the pipeline generator (`tools/
+generate_pipeline_evidence.py`) was believed to populate 75 immutable evidence artifacts in `var/`,
+including "all 32 canonical advanced fixtures across 32 schema categories," with "zero unpopulated
+evidence panels." That count was only reached by copying 32 hand-typed example JSON documents into
+`var/` and rendering them as if they were computed evidence; 29 of the 32 (including SOLO-04
+Explainable Market Scanner, DATA-03 News Revision Timeline, and RES-02 Strategy Composition Studio)
+have no real computation behind them anywhere in the codebase, and the other 3 have real Rust logic
+that nothing invokes. The pipeline generator now publishes only genuinely computed or genuinely
+copied artifacts -- **42** of them -- and those 32 panels render their honest, already-existing empty
+state instead of invented numbers.
 
 ## Deliberately excluded privileged actions
 

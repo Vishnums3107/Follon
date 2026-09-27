@@ -179,6 +179,14 @@ html[data-signal-mode="mono"] .f-text-sell {
 .f-btn--ghost:hover:not(:disabled) {
   background: var(--color-surface-2);
 }
+.f-btn--danger {
+  border-color: var(--color-signal-sell);
+  color: var(--color-signal-sell);
+}
+.f-btn--danger:hover:not(:disabled) {
+  background: rgba(233, 79, 55, 0.12);
+  border-color: var(--color-signal-sell);
+}
 .signal-mode-toggle {
   gap: 4px;
   font-size: 0.75rem;

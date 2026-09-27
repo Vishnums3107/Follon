@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 PROTOCOL_VERSION = 1
@@ -433,7 +433,7 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 executed_at = normalize_execution_time(
                     execution.time, arguments.tws_timezone
                 )
-            except (BridgeFailure, ValueError):
+            except (BridgeFailure, ValueError, ZoneInfoNotFoundError):
                 return
             self.emitted_executions.add(execution_id)
             self.events.put(
@@ -584,10 +584,29 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
             with self.app.condition:
                 existing = self.app.order_by_client.get(client_order_id)
                 if existing is not None:
+                    state = self.app.orders.get(client_order_id, {}).get("state", "UNKNOWN")
+                    if state in {"ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED"}:
+                        return {
+                            "status": "ACKNOWLEDGED",
+                            "broker_order_id": f"ibkr-paper-order-{existing}",
+                            "reason": None,
+                        }
+                    if state == "REJECTED":
+                        return {
+                            "status": "REJECTED",
+                            "broker_order_id": None,
+                            "reason": "IBKR_PAPER_REJECTED",
+                        }
+                    if state == "CANCELLED":
+                        return {
+                            "status": "REJECTED",
+                            "broker_order_id": None,
+                            "reason": "IBKR_PAPER_CANCELLED",
+                        }
                     return {
-                        "status": "ACKNOWLEDGED",
-                        "broker_order_id": f"ibkr-paper-order-{existing}",
-                        "reason": None,
+                        "status": "UNKNOWN",
+                        "broker_order_id": None,
+                        "reason": "IBKR_SUBMIT_OUTCOME_UNKNOWN",
                     }
                 if self.app.next_order_id is None:
                     raise BridgeFailure("IBKR next order ID is unavailable")

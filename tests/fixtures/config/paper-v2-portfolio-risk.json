@@ -1,0 +1,73 @@
+{
+  "schema_version": 2,
+  "configuration_id": "config.paper.portfolio-risk",
+  "configuration_version": "v2",
+  "account": {
+    "account_id": "acct.paper.001",
+    "currency": "USD",
+    "initial_cash": "100000",
+    "environment": "PAPER"
+  },
+  "adapter": {
+    "adapter_id": "adapter.ibkr.paper.001",
+    "venue_id": "venue.ibkr.paper",
+    "environment": "PAPER"
+  },
+  "risk": {
+    "policy_version": "paper-risk-v1",
+    "trading_calendar_id": "cal.us_equities.nyse.v1",
+    "max_order_quantity": "100",
+    "max_order_notional": "50000",
+    "max_price_deviation_bps": "100",
+    "max_open_orders": 10,
+    "max_position_quantity": "1000",
+    "max_realized_loss": "10000",
+    "max_market_data_age_seconds": 5,
+    "max_order_rate": 20,
+    "order_rate_window_seconds": 60,
+    "instrument_tick_sizes": {
+      "inst.us_equity.spy": "0.01"
+    },
+    "instrument_lot_sizes": {
+      "inst.us_equity.spy": "1"
+    },
+    "portfolio_risk": {
+      "policy_version": "portfolio-risk-v1",
+      "max_gross_exposure": "500000",
+      "max_abs_net_exposure": "500000",
+      "max_leverage_bps": "20000",
+      "max_concentration_bps": "6000",
+      "max_drawdown_bps": "3000",
+      "max_daily_loss": "5000",
+      "max_margin_utilization_bps": "4000",
+      "allowed_instruments": [],
+      "restricted_instruments": [],
+      "sector_limits": {
+        "index": "250000"
+      },
+      "asset_class_limits": {
+        "equity": "500000"
+      },
+      "currency_limits": {
+        "USD": "500000"
+      },
+      "strategy_limits": {
+        "strategy.paper.001": "300000"
+      },
+      "instrument_buckets": {
+        "inst.us_equity.spy": {
+          "asset_class": "equity",
+          "currency": "USD",
+          "sector": "index"
+        }
+      },
+      "margin_rates": {
+        "equity": {
+          "initial_bps": 5000,
+          "maintenance_bps": 2500
+        }
+      }
+    }
+  },
+  "kill_switch_version": "paper-kills-v1"
+}

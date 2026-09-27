@@ -7,70 +7,14 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use follon_cli::write_immutable;
-use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
+use follon_domain::validate_utc_timestamp;
 use follon_live::{
-    LiveAccount, LiveActivation, LiveActivationRequest, LiveBrokerAccountSnapshot,
-    LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest, LiveBrokerSubmitResult, LiveError,
-    LiveKillSwitchRegistry, LiveRiskPolicy, LiveRunMode, LiveTradingService,
+    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest,
+    LiveBrokerSubmitResult, LiveConfiguration, LiveError, LiveTradingService,
 };
-use follon_secrets::{SecretMaterial, SecretReference};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LiveConfigurationDocument {
-    schema_version: u32,
-    configuration_id: String,
-    configuration_version: String,
-    account: LiveAccountDocument,
-    risk: LiveRiskDocument,
-    kill_switch_version: String,
-    activation: LiveActivationDocument,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LiveAccountDocument {
-    account_id: String,
-    currency: String,
-    initial_cash: String,
-    max_deployed_capital: String,
-    environment: String,
-    credential_reference: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LiveRiskDocument {
-    policy_version: String,
-    trading_calendar_id: String,
-    max_order_quantity: String,
-    max_order_notional: String,
-    max_price_deviation_bps: String,
-    canary_max_order_notional: String,
-    canary_max_orders: u32,
-    max_open_orders: usize,
-    max_position_quantity: String,
-    max_realized_loss: String,
-    max_market_data_age_seconds: u64,
-    max_order_rate: u32,
-    order_rate_window_seconds: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LiveActivationDocument {
-    activation_id: String,
-    mode: String,
-    requested_by: String,
-    approved_by: String,
-    activated_at: String,
-    expires_at: String,
-}
+use follon_secrets::SecretMaterial;
 
 struct CommandArguments {
     journal_path: PathBuf,
@@ -122,49 +66,13 @@ impl LiveBrokerAdapter for OfflineLiveAdapter {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = parse_arguments(env::args().skip(1).collect())?;
-    let (configuration, configuration_hash) = load_configuration(&arguments.configuration_path)?;
-    let account = LiveAccount {
-        account_id: configuration.account.account_id,
-        currency: configuration.account.currency,
-        initial_cash: decimal(&configuration.account.initial_cash)?,
-        max_deployed_capital: decimal(&configuration.account.max_deployed_capital)?,
-        environment: configuration.account.environment,
-        credential_reference: SecretReference::new(configuration.account.credential_reference)?,
-    };
-    let risk = LiveRiskPolicy {
-        version: configuration.risk.policy_version,
-        trading_calendar_id: configuration.risk.trading_calendar_id,
-        max_order_quantity: decimal(&configuration.risk.max_order_quantity)?,
-        max_order_notional: decimal(&configuration.risk.max_order_notional)?,
-        max_price_deviation_bps: decimal(&configuration.risk.max_price_deviation_bps)?,
-        canary_max_order_notional: decimal(&configuration.risk.canary_max_order_notional)?,
-        canary_max_orders: configuration.risk.canary_max_orders,
-        max_open_orders: configuration.risk.max_open_orders,
-        max_position_quantity: decimal(&configuration.risk.max_position_quantity)?,
-        max_realized_loss: decimal(&configuration.risk.max_realized_loss)?,
-        max_market_data_age_seconds: configuration.risk.max_market_data_age_seconds,
-        max_order_rate: configuration.risk.max_order_rate,
-        order_rate_window_seconds: configuration.risk.order_rate_window_seconds,
-    };
-    let switches = LiveKillSwitchRegistry::new(configuration.kill_switch_version)?;
-    let activation = LiveActivation::for_configuration(
-        LiveActivationRequest {
-            activation_id: configuration.activation.activation_id,
-            mode: parse_mode(&configuration.activation.mode)?,
-            requested_by: configuration.activation.requested_by,
-            approved_by: configuration.activation.approved_by,
-            activated_at: configuration.activation.activated_at,
-            expires_at: configuration.activation.expires_at,
-        },
-        &account,
-        &risk,
-        &switches,
-    )?;
+    let configuration = load_configuration(&arguments.configuration_path)?;
+    let configuration_hash = configuration.content_hash.clone();
     let service = LiveTradingService::open_durable(
-        account,
-        risk,
-        activation,
-        switches,
+        configuration.account,
+        configuration.risk,
+        configuration.activation,
+        configuration.kill_switches,
         OfflineLiveAdapter,
         &arguments.journal_path,
         &arguments.opened_at,
@@ -241,14 +149,6 @@ fn parse_arguments(arguments: Vec<String>) -> Result<CommandArguments, Box<dyn s
     })
 }
 
-fn parse_mode(value: &str) -> Result<LiveRunMode, Box<dyn std::error::Error>> {
-    match value {
-        "SHADOW" => Ok(LiveRunMode::Shadow),
-        "CANARY" => Ok(LiveRunMode::Canary),
-        _ => Err("live activation mode must be SHADOW or CANARY".into()),
-    }
-}
-
 fn required<'a>(
     values: &'a [String],
     index: usize,
@@ -261,43 +161,10 @@ fn required<'a>(
         .ok_or_else(|| format!("{flag} requires a value").into())
 }
 
-fn load_configuration(
-    path: &Path,
-) -> Result<(LiveConfigurationDocument, String), Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
-    if bytes.is_empty() || bytes.len() > 1024 * 1024 {
-        return Err("live configuration must be between 1 byte and 1 MiB".into());
-    }
-    let document: LiveConfigurationDocument = serde_json::from_slice(&bytes)?;
-    if document.schema_version != 1 {
-        return Err("unsupported live configuration schema version".into());
-    }
-    for (name, value) in [
-        ("live configuration_id", document.configuration_id.as_str()),
-        ("live account_id", document.account.account_id.as_str()),
-        (
-            "live activation_id",
-            document.activation.activation_id.as_str(),
-        ),
-        (
-            "live activation requester",
-            document.activation.requested_by.as_str(),
-        ),
-        (
-            "live activation approver",
-            document.activation.approved_by.as_str(),
-        ),
-    ] {
-        validate_canonical_id(name, value)?;
-    }
-    if document.configuration_version.is_empty() {
-        return Err("live configuration_version is required".into());
-    }
-    Ok((document, format!("{:x}", Sha256::digest(bytes))))
-}
-
-fn decimal(value: &str) -> Result<Decimal, follon_domain::DecimalError> {
-    Decimal::from_str(value)
+/// Reads the version-1 controlled-LIVE configuration through the parser the
+/// trading API shares (`follon_live::LiveConfiguration`).
+fn load_configuration(path: &Path) -> Result<LiveConfiguration, Box<dyn std::error::Error>> {
+    Ok(LiveConfiguration::from_json(&fs::read(path)?)?)
 }
 
 #[cfg(test)]
@@ -317,7 +184,6 @@ mod tests {
             arguments.configuration_path,
             PathBuf::from("tests/fixtures/config/live-v1.json")
         );
-        assert!(parse_mode("PAPER").is_err());
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)

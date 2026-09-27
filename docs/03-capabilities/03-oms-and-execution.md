@@ -43,11 +43,76 @@ The order-management system owns client IDs, broker IDs, the lifecycle state mac
   must support a native atomic combination or reject before transmitting any
   leg; the planner never authorizes legging risk.
 
-These are deterministic planning contracts, not broker acceptance evidence.
-The versioned gRPC API exposes scheduled execution algorithms through arrival
-price, the full cancel-before-replace passive sequence, and synchronized
-net-price-protected option-combination plans. An adapter must still map a combo
-to a native atomic broker order or reject it before transmitting any leg.
+The planning methods are deterministic contracts, not broker acceptance
+evidence. The versioned gRPC API exposes scheduled execution algorithms through
+arrival price, the full cancel-before-replace passive sequence, and synchronized
+net-price-protected option-combination plans.
+
+The same API also has a distinct `SubmitPaperCombo` command. It exists only
+when `FOLLON_TRADING_API_PAPER_CONFIG` names a valid version-1 PAPER command
+route. That route converts the protobuf request into the canonical
+`ComboIntent`, requires one independently supplied observation per leg, and
+calls `PaperTradingService::submit_combo_intent`; it cannot fall back to the
+planning method. The configured service owns the durable journal, exact risk
+policy, kill switches, adapter model, idempotency record, and optional explicit
+short-exposure bound. With no configured route the RPC fails closed and no
+planning response is presented as an order outcome. A configured command route
+may bind to loopback without TLS; a non-loopback bind additionally requires a
+server TLS identity and client CA, so the write method is not exposed on an
+unauthenticated remote socket.
+
+Every call also needs an authenticated operator. A configured route requires
+the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
+`BeginOperatorLogin` and `CompleteOperatorLogin` check a password and then a
+mandatory TOTP code, and return a bearer session. `SubmitPaperCombo` refuses
+three kinds of caller before it reads the intent:
+
+- a caller with no session, or a malformed one (`UNAUTHENTICATED`);
+- a session whose role does not grant PAPER trading (`PERMISSION_DENIED`);
+- a session presented for another tenant (`PERMISSION_DENIED`).
+
+The directory serves one tenant. The PAPER journal records the operator as the
+combination's `submitted_by`, and an idempotent retry must come from the same
+operator. This is local PAPER engineering evidence, not external-broker or
+production acceptance.
+
+The same route exposes `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch`
+(E3.3b). Each names one switch by its stable key: `global`, `account:<id>`,
+`strategy:<id>` or `instrument:<id>`. Each needs a session whose role grants
+kill-switch operation, which only `risk_manager` does, so a trader's session is
+refused (`PERMISSION_DENIED`). The PAPER journal records every change with its
+operator and the server's UTC time. A repeat that changes nothing records
+nothing. The local `follon-paper-status --activate/--deactivate` path is
+unchanged and records no operator.
+
+`ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` (E3.3c) apply the same
+rule to controlled LIVE. They need a separate route, configured by
+`FOLLON_TRADING_API_LIVE_CONFIG` and `FOLLON_TRADING_API_LIVE_JOURNAL`:
+
+- The configuration is the version-1 document `follon-live-status` reads, and
+  both parse it with the same code. The journal therefore opens only under the
+  configuration fingerprint it was written with.
+- The route opens the LIVE journal with an adapter that refuses every broker
+  operation. It can halt controlled LIVE, but it can never place, cancel or
+  reconcile an order.
+- It refuses to start with only one of its two variables or without the
+  operator directory. Off loopback, it requires server TLS and a client CA.
+- The LIVE journal records each change with the operator as its actor and the
+  server's UTC time. A repeated activation is recorded too, and a release that
+  changes nothing records nothing.
+- While the route runs, the API holds the LIVE journal's exclusive lock, so no
+  other LIVE process can open that journal.
+
+The Tauri desktop host has the equivalent `submit_combo_order` IPC command. Its
+`ComboOrderIntent` places each leg's operator-attested observation on the leg
+itself, so no leg can reach risk unpriced or priced from its limit. The native
+PAPER gateway converts it into one `ComboIntent` and calls the same
+`submit_combo_intent`; the in-process paper model fills the whole group
+atomically only when the net price at those observations satisfies the
+approved protection, sign included, and otherwise leaves it resting. Existing
+`cancel_order` reaches combinations and its receipt reads both order maps. The
+desktop's optional `short_exposure` bound lives only in the operator-authored
+configuration file, never in the UI.
 
 ## Safety requirements
 

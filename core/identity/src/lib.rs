@@ -15,6 +15,13 @@ use rand_core::{OsRng, RngCore};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+pub mod directory;
+
+pub use directory::{
+    decode_base32, encode_base32, totp_provisioning_uri, OperatorDirectory, OperatorRecord,
+    OPERATOR_DIRECTORY_SCHEMA_VERSION,
+};
+
 const LOGIN_FAILURE_LIMIT: u8 = 5;
 const LOCKOUT_SECONDS: i64 = 15 * 60;
 const MFA_CHALLENGE_SECONDS: i64 = 5 * 60;
@@ -34,6 +41,18 @@ impl fmt::Display for IdentityError {
 }
 
 impl std::error::Error for IdentityError {}
+
+/// Marker used by manual `Debug` implementations below to redact fields that
+/// hold live secret material (password hashes, MFA seeds, bearer tokens) so
+/// that an accidental `{:?}` log line or panic message never prints them in
+/// cleartext.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
 
 /// Customer roles with deliberately non-overlapping operational intent.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -100,18 +119,63 @@ impl Role {
             ),
         }
     }
+
+    /// Stable lowercase name used in provisioned operator directories.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OrganizationAdmin => "organization_admin",
+            Self::RiskManager => "risk_manager",
+            Self::Trader => "trader",
+            Self::ReadOnly => "read_only",
+            Self::Auditor => "auditor",
+        }
+    }
+
+    /// Parses a stable role name; an unknown name is refused, never defaulted.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::OrganizationAdmin,
+            Self::RiskManager,
+            Self::Trader,
+            Self::ReadOnly,
+            Self::Auditor,
+        ]
+        .into_iter()
+        .find(|role| role.name() == name)
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct UserRecord {
     user_id: String,
     tenant_id: String,
     password_hash: String,
     mfa_secret: Option<Vec<u8>>,
     recovery_code_hashes: BTreeSet<[u8; 32]>,
+    /// Time-step (epoch seconds / `TOTP_STEP_SECONDS`) of the most recently
+    /// accepted TOTP code for this user, so a code cannot be replayed to
+    /// authenticate a second session within the ±1 step tolerance window.
+    last_accepted_totp_step: Option<i64>,
     roles: BTreeSet<Role>,
     enabled: bool,
     security_version: u64,
+}
+
+impl fmt::Debug for UserRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserRecord")
+            .field("user_id", &self.user_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("password_hash", &Redacted)
+            .field("mfa_secret", &self.mfa_secret.as_ref().map(|_| Redacted))
+            .field("recovery_code_hashes", &Redacted)
+            .field("last_accepted_totp_step", &self.last_accepted_totp_step)
+            .field("roles", &self.roles)
+            .field("enabled", &self.enabled)
+            .field("security_version", &self.security_version)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -137,7 +201,7 @@ struct SessionRecord {
 
 /// Successful session response. The opaque token is returned once and is not
 /// stored in plaintext by the identity service.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SessionGrant {
     /// Bearer token for the HTTP/gRPC authorization header.
     pub token: String,
@@ -145,8 +209,18 @@ pub struct SessionGrant {
     pub expires_at_epoch_seconds: i64,
 }
 
+impl fmt::Debug for SessionGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionGrant")
+            .field("token", &Redacted)
+            .field("expires_at_epoch_seconds", &self.expires_at_epoch_seconds)
+            .finish()
+    }
+}
+
 /// Password-login outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum LoginOutcome {
     /// A second factor is required to issue the session.
     MfaRequired {
@@ -157,6 +231,25 @@ pub enum LoginOutcome {
     },
     /// Session issued for a user without enrolled MFA.
     Authenticated(SessionGrant),
+}
+
+impl fmt::Debug for LoginOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MfaRequired {
+                expires_at_epoch_seconds,
+                ..
+            } => formatter
+                .debug_struct("MfaRequired")
+                .field("challenge_token", &Redacted)
+                .field("expires_at_epoch_seconds", expires_at_epoch_seconds)
+                .finish(),
+            Self::Authenticated(session) => formatter
+                .debug_tuple("Authenticated")
+                .field(session)
+                .finish(),
+        }
+    }
 }
 
 /// Verified authorization context for downstream tenant-scoped operations.
@@ -171,13 +264,30 @@ pub struct AuthorizationContext {
 }
 
 /// Stateful IAM service suitable for a transactional persistence adapter.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct IdentityService {
     users: BTreeMap<String, UserRecord>,
     email_index: BTreeMap<(String, String), String>,
     failures: BTreeMap<String, LoginFailures>,
     challenges: BTreeMap<[u8; 32], MfaChallengeRecord>,
     sessions: BTreeMap<[u8; 32], SessionRecord>,
+}
+
+impl fmt::Debug for IdentityService {
+    /// Reports only structural counts. `users` holds password hashes and MFA
+    /// seeds, so this deliberately never dumps the underlying maps: a summary
+    /// is enough for debugging and keeps secret material out of logs/panics
+    /// even if a field is later added without a redacted `Debug` of its own.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityService")
+            .field("user_count", &self.users.len())
+            .field("email_index_count", &self.email_index.len())
+            .field("failures_tracked", &self.failures.len())
+            .field("active_challenges", &self.challenges.len())
+            .field("active_sessions", &self.sessions.len())
+            .finish()
+    }
 }
 
 impl IdentityService {
@@ -219,6 +329,61 @@ impl IdentityService {
                 password_hash,
                 mfa_secret: None,
                 recovery_code_hashes: BTreeSet::new(),
+                last_accepted_totp_step: None,
+                roles,
+                enabled: true,
+                security_version: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Loads one provisioned user whose password was already hashed offline.
+    ///
+    /// The hash must be an Argon2id PHC string, so a server never holds a
+    /// plaintext password and never accepts a weaker scheme. The same
+    /// identity, email, and role rules as [`Self::create_user`] apply.
+    pub fn import_user(
+        &mut self,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        email: impl Into<String>,
+        password_hash: &str,
+        mfa_secret: Option<Vec<u8>>,
+        roles: BTreeSet<Role>,
+    ) -> Result<(), IdentityError> {
+        let user_id = user_id.into();
+        let tenant_id = tenant_id.into();
+        validate_canonical_id("user_id", &user_id).map_err(|error| IdentityError(error.0))?;
+        validate_canonical_id("tenant_id", &tenant_id).map_err(|error| IdentityError(error.0))?;
+        let normalized_email = normalize_email(&email.into())?;
+        validate_argon2id_hash(password_hash)?;
+        if mfa_secret.as_ref().is_some_and(|secret| secret.len() < 20) {
+            return Err(IdentityError(
+                "TOTP secret must contain at least 160 bits".to_owned(),
+            ));
+        }
+        if roles.is_empty() {
+            return Err(IdentityError("user must have at least one role".to_owned()));
+        }
+        if self.users.contains_key(&user_id)
+            || self
+                .email_index
+                .contains_key(&(tenant_id.clone(), normalized_email.clone()))
+        {
+            return Err(IdentityError("user already exists".to_owned()));
+        }
+        self.email_index
+            .insert((tenant_id.clone(), normalized_email), user_id.clone());
+        self.users.insert(
+            user_id.clone(),
+            UserRecord {
+                user_id,
+                tenant_id,
+                password_hash: password_hash.to_owned(),
+                mfa_secret,
+                recovery_code_hashes: BTreeSet::new(),
+                last_accepted_totp_step: None,
                 roles,
                 enabled: true,
                 security_version: 1,
@@ -250,6 +415,7 @@ impl IdentityService {
             .ok_or_else(|| IdentityError("user not found".to_owned()))?;
         user.mfa_secret = Some(secret);
         user.recovery_code_hashes.clear();
+        user.last_accepted_totp_step = None;
         user.security_version = user
             .security_version
             .checked_add(1)
@@ -287,7 +453,14 @@ impl IdentityService {
             self.record_failure(&user_id, now_epoch_seconds)?;
             return Err(authentication_failed());
         }
-        self.failures.remove(&user_id);
+        // Failures are intentionally NOT cleared here: when MFA is enrolled,
+        // the login is not yet complete, and clearing the account-level
+        // failure counter on every password success would let an attacker who
+        // already knows a valid password mint unlimited fresh MFA challenges
+        // (each with its own per-challenge attempt budget) with no
+        // account-level lockout ever accumulating across attempts. The
+        // counter is cleared only once an entire login (password, plus MFA
+        // when required) actually succeeds.
         if self
             .users
             .get(&user_id)
@@ -311,13 +484,17 @@ impl IdentityService {
                 expires_at_epoch_seconds,
             })
         } else {
+            self.failures.remove(&user_id);
             Ok(LoginOutcome::Authenticated(
                 self.issue_session(&user_id, now_epoch_seconds)?,
             ))
         }
     }
 
-    /// Completes a TOTP challenge with ±1 time-step clock tolerance.
+    /// Completes a TOTP challenge with ±1 time-step clock tolerance. Wrong
+    /// codes and reused accounts count against the same account-level lockout
+    /// as password failures, so an attacker cannot bypass it by repeatedly
+    /// calling `begin_login` to mint fresh MFA challenges.
     pub fn complete_totp(
         &mut self,
         challenge_token: &str,
@@ -340,20 +517,37 @@ impl IdentityService {
             self.challenges.remove(&challenge_hash);
             return Err(authentication_failed());
         }
-        let secret = self
+        if self.is_locked(&user_id, now_epoch_seconds) {
+            self.challenges.remove(&challenge_hash);
+            return Err(authentication_failed());
+        }
+        let (secret, last_accepted_step) = self
             .users
             .get(&user_id)
             .filter(|user| user.enabled)
-            .and_then(|user| user.mfa_secret.as_ref())
+            .and_then(|user| {
+                user.mfa_secret
+                    .as_ref()
+                    .map(|secret| (secret.clone(), user.last_accepted_totp_step))
+            })
             .ok_or_else(authentication_failed)?;
-        if !verify_totp(secret, code, now_epoch_seconds) {
-            if let Some(challenge) = self.challenges.get_mut(&challenge_hash) {
-                challenge.attempts = challenge.attempts.saturating_add(1);
+        match verify_totp(&secret, code, now_epoch_seconds, last_accepted_step) {
+            Some(accepted_step) => {
+                if let Some(user) = self.users.get_mut(&user_id) {
+                    user.last_accepted_totp_step = Some(accepted_step);
+                }
+                self.challenges.remove(&challenge_hash);
+                self.failures.remove(&user_id);
+                self.issue_session(&user_id, now_epoch_seconds)
             }
-            return Err(authentication_failed());
+            None => {
+                if let Some(challenge) = self.challenges.get_mut(&challenge_hash) {
+                    challenge.attempts = challenge.attempts.saturating_add(1);
+                }
+                self.record_failure(&user_id, now_epoch_seconds)?;
+                Err(authentication_failed())
+            }
         }
-        self.challenges.remove(&challenge_hash);
-        self.issue_session(&user_id, now_epoch_seconds)
     }
 
     /// Rotates and returns ten one-time MFA recovery codes. Only hashes remain
@@ -407,6 +601,10 @@ impl IdentityService {
             self.challenges.remove(&challenge_hash);
             return Err(authentication_failed());
         }
+        if self.is_locked(&user_id, now_epoch_seconds) {
+            self.challenges.remove(&challenge_hash);
+            return Err(authentication_failed());
+        }
         let recovery_hash = token_hash(recovery_code);
         let valid = self
             .users
@@ -417,6 +615,7 @@ impl IdentityService {
             if let Some(challenge) = self.challenges.get_mut(&challenge_hash) {
                 challenge.attempts = challenge.attempts.saturating_add(1);
             }
+            self.record_failure(&user_id, now_epoch_seconds)?;
             return Err(authentication_failed());
         }
         let user = self
@@ -425,6 +624,7 @@ impl IdentityService {
             .ok_or_else(authentication_failed)?;
         user.recovery_code_hashes.remove(&recovery_hash);
         self.challenges.remove(&challenge_hash);
+        self.failures.remove(&user_id);
         self.issue_session(&user_id, now_epoch_seconds)
     }
 
@@ -650,6 +850,22 @@ fn validate_password(password: &str) -> Result<(), IdentityError> {
     Ok(())
 }
 
+/// Validates a new password against the policy and returns its Argon2id PHC
+/// hash, for provisioning a user offline.
+pub fn hash_new_password(password: &str) -> Result<String, IdentityError> {
+    validate_password(password)?;
+    hash_password(password)
+}
+
+fn validate_argon2id_hash(encoded: &str) -> Result<(), IdentityError> {
+    match PasswordHash::new(encoded) {
+        Ok(hash) if hash.algorithm.as_str() == "argon2id" && hash.hash.is_some() => Ok(()),
+        _ => Err(IdentityError(
+            "password hash must be an Argon2id PHC string".to_owned(),
+        )),
+    }
+}
+
 fn hash_password(password: &str) -> Result<String, IdentityError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -690,7 +906,9 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-fn totp_code(secret: &[u8], epoch_seconds: i64) -> Result<String, IdentityError> {
+/// Returns the RFC 6238 six-digit TOTP code (HMAC-SHA1, 30-second step) for
+/// one secret at one instant, as an authenticator app computes it.
+pub fn totp_code(secret: &[u8], epoch_seconds: i64) -> Result<String, IdentityError> {
     if epoch_seconds < 0 || secret.len() < 20 {
         return Err(authentication_failed());
     }
@@ -707,15 +925,50 @@ fn totp_code(secret: &[u8], epoch_seconds: i64) -> Result<String, IdentityError>
     Ok(format!("{:06}", binary % 1_000_000))
 }
 
-fn verify_totp(secret: &[u8], code: &str, epoch_seconds: i64) -> bool {
+/// Verifies a TOTP code with ±1 time-step clock tolerance. `last_accepted_step`
+/// is the time-step (epoch seconds / `TOTP_STEP_SECONDS`) most recently
+/// accepted for this user, if any; a candidate step at or before it is
+/// rejected even when the code is otherwise mathematically valid, so a single
+/// intercepted code cannot be replayed to authenticate a second, independent
+/// session within the tolerance window. On success, returns the newly
+/// accepted step so the caller can persist it.
+fn verify_totp(
+    secret: &[u8],
+    code: &str,
+    epoch_seconds: i64,
+    last_accepted_step: Option<i64>,
+) -> Option<i64> {
     if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
+        return None;
     }
     [-TOTP_STEP_SECONDS, 0, TOTP_STEP_SECONDS]
         .into_iter()
         .filter_map(|offset| epoch_seconds.checked_add(offset))
-        .filter_map(|timestamp| totp_code(secret, timestamp).ok())
-        .any(|expected| expected.as_bytes() == code.as_bytes())
+        .filter_map(|timestamp| {
+            let step = timestamp.div_euclid(TOTP_STEP_SECONDS);
+            totp_code(secret, timestamp)
+                .ok()
+                .map(|expected| (step, expected))
+        })
+        .filter(|(step, _)| last_accepted_step.is_none_or(|last| *step > last))
+        .find(|(_, expected)| constant_time_eq(expected.as_bytes(), code.as_bytes()))
+        .map(|(step, _)| step)
+}
+
+/// Compares two byte slices for equality without early-exiting on the first
+/// mismatched byte, so the comparison time does not leak how many leading
+/// bytes of a guessed TOTP code were correct. Lengths are compared up front:
+/// that leaks nothing secret here since both operands are always fixed-width
+/// six-digit codes.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -855,6 +1108,216 @@ mod tests {
                 4_000,
             )
             .is_ok());
+    }
+
+    /// Returns a 6-digit code guaranteed not to satisfy `verify_totp` for
+    /// `secret` at `epoch_seconds` (within the ±1 step tolerance), so tests
+    /// can force a wrong-code MFA failure deterministically.
+    fn guaranteed_wrong_totp(secret: &[u8], epoch_seconds: i64) -> String {
+        let valid: Vec<String> = [-TOTP_STEP_SECONDS, 0, TOTP_STEP_SECONDS]
+            .into_iter()
+            .filter_map(|offset| epoch_seconds.checked_add(offset))
+            .filter_map(|timestamp| totp_code(secret, timestamp).ok())
+            .collect();
+        (0..1_000_000_u32)
+            .map(|candidate| format!("{candidate:06}"))
+            .find(|code| !valid.contains(code))
+            .expect("some 6-digit code must be wrong")
+    }
+
+    #[test]
+    fn repeated_mfa_failures_across_new_challenges_lock_the_account() {
+        let mut identity = IdentityService::default();
+        identity
+            .create_user(
+                "user.dave",
+                "tenant.acme",
+                "dave@example.com",
+                "Correct-Horse-3!",
+                roles(Role::Trader),
+            )
+            .unwrap();
+        let secret = b"12345678901234567890".to_vec();
+        identity
+            .set_totp_secret("user.dave", secret.clone())
+            .unwrap();
+
+        // Each iteration calls begin_login again (as a valid-password
+        // attacker would) to mint a brand-new MFA challenge, then submits a
+        // wrong TOTP code against it. Even though every challenge is fresh
+        // and its own per-challenge attempt budget is nowhere near
+        // exhausted, the account-level lockout must still trip after
+        // LOGIN_FAILURE_LIMIT cumulative wrong codes.
+        for attempt in 0..LOGIN_FAILURE_LIMIT {
+            let now = 10_000 + i64::from(attempt);
+            let LoginOutcome::MfaRequired {
+                challenge_token, ..
+            } = identity
+                .begin_login("tenant.acme", "dave@example.com", "Correct-Horse-3!", now)
+                .unwrap()
+            else {
+                panic!("MFA should be required")
+            };
+            let wrong_code = guaranteed_wrong_totp(&secret, now);
+            assert_eq!(
+                identity
+                    .complete_totp(&challenge_token, &wrong_code, now)
+                    .unwrap_err(),
+                authentication_failed()
+            );
+        }
+
+        // The account is now locked even though the password is correct and
+        // no single challenge ever hit its own per-challenge attempt cap.
+        assert_eq!(
+            identity
+                .begin_login(
+                    "tenant.acme",
+                    "dave@example.com",
+                    "Correct-Horse-3!",
+                    10_005,
+                )
+                .unwrap_err(),
+            authentication_failed()
+        );
+    }
+
+    #[test]
+    fn accepted_totp_code_cannot_be_replayed_for_a_second_session() {
+        let mut identity = IdentityService::default();
+        identity
+            .create_user(
+                "user.erin",
+                "tenant.acme",
+                "erin@example.com",
+                "Correct-Horse-6!",
+                roles(Role::ReadOnly),
+            )
+            .unwrap();
+        let secret = b"12345678901234567890".to_vec();
+        identity
+            .set_totp_secret("user.erin", secret.clone())
+            .unwrap();
+
+        let LoginOutcome::MfaRequired {
+            challenge_token: first_token,
+            ..
+        } = identity
+            .begin_login(
+                "tenant.acme",
+                "erin@example.com",
+                "Correct-Horse-6!",
+                20_000,
+            )
+            .unwrap()
+        else {
+            panic!("MFA should be required")
+        };
+        let code = totp_code(&secret, 20_000).unwrap();
+        identity
+            .complete_totp(&first_token, &code, 20_000)
+            .expect("first use of the code must succeed");
+
+        // A second, independent login mints its own fresh challenge...
+        let LoginOutcome::MfaRequired {
+            challenge_token: second_token,
+            ..
+        } = identity
+            .begin_login(
+                "tenant.acme",
+                "erin@example.com",
+                "Correct-Horse-6!",
+                20_005,
+            )
+            .unwrap()
+        else {
+            panic!("MFA should be required")
+        };
+        // ...but replaying the exact same, still mathematically-valid code
+        // must be rejected: its time-step was already consumed.
+        assert_eq!(
+            identity
+                .complete_totp(&second_token, &code, 20_005)
+                .unwrap_err(),
+            authentication_failed()
+        );
+
+        // A fresh code for a later time-step still works, proving only the
+        // already-consumed step is rejected, not TOTP verification overall.
+        let LoginOutcome::MfaRequired {
+            challenge_token: third_token,
+            ..
+        } = identity
+            .begin_login(
+                "tenant.acme",
+                "erin@example.com",
+                "Correct-Horse-6!",
+                20_050,
+            )
+            .unwrap()
+        else {
+            panic!("MFA should be required")
+        };
+        let later_code = totp_code(&secret, 20_050).unwrap();
+        assert!(identity
+            .complete_totp(&third_token, &later_code, 20_050)
+            .is_ok());
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets_for_every_sensitive_type() {
+        let mut identity = IdentityService::default();
+        identity
+            .create_user(
+                "user.frank",
+                "tenant.acme",
+                "frank@example.com",
+                "Correct-Horse-2!",
+                roles(Role::Trader),
+            )
+            .unwrap();
+        let secret = identity.enroll_totp("user.frank").unwrap();
+        let secret_hex = hex(&secret);
+
+        let user_record = identity.users.get("user.frank").unwrap().clone();
+        let password_hash = user_record.password_hash.clone();
+        let user_debug = format!("{user_record:?}");
+        assert!(!user_debug.contains(&secret_hex));
+        assert!(!user_debug.contains(&password_hash));
+        assert!(user_debug.contains("user.frank"));
+        assert!(user_debug.contains("<redacted>"));
+
+        let outcome = identity
+            .begin_login(
+                "tenant.acme",
+                "frank@example.com",
+                "Correct-Horse-2!",
+                40_000,
+            )
+            .unwrap();
+        let outcome_debug = format!("{outcome:?}");
+        assert!(outcome_debug.contains("<redacted>"));
+        let LoginOutcome::MfaRequired {
+            challenge_token, ..
+        } = outcome
+        else {
+            panic!("MFA should be required")
+        };
+        assert!(!outcome_debug.contains(&challenge_token));
+
+        let code = totp_code(&secret, 40_000).unwrap();
+        let session = identity
+            .complete_totp(&challenge_token, &code, 40_000)
+            .unwrap();
+        let session_debug = format!("{session:?}");
+        assert!(!session_debug.contains(&session.token));
+        assert!(session_debug.contains("<redacted>"));
+
+        let service_debug = format!("{identity:?}");
+        assert!(!service_debug.contains(&secret_hex));
+        assert!(!service_debug.contains(&password_hash));
+        assert!(!service_debug.contains(&session.token));
+        assert!(!service_debug.contains(&challenge_token));
     }
 
     #[test]

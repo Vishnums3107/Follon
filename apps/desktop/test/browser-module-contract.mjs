@@ -40,8 +40,10 @@ async function verifyModule(relativePath) {
 
 await verifyModule("main.js");
 assert.deepEqual([...visited].sort(), [
+  "ComboTicket.js",
   "OrderTicket.js",
   "catalog.js",
+  "combo-intent.js",
   "command-palette.js",
   "evidence.js",
   "main.js",
@@ -103,7 +105,11 @@ assert.doesNotMatch(workspaces, /window\.alert/u);
 assert.doesNotMatch(workspaces, /5 Integrated/u);
 assert.doesNotMatch(workspaces, /Apple Reports Record Q3 Earnings/u);
 assert.match(orderTicket, /function isSubmitReceipt/u);
-assert.match(orderTicket, /receipt\.command === "SUBMIT_ORDER"/u);
+assert.match(orderTicket, /isCommandReceipt\(value, "SUBMIT_ORDER", requestId\)/u);
+assert.match(orderTicket, /invoke<unknown>\("cancel_order"/u);
+assert.match(orderTicket, /invoke<unknown>\("close_position"/u);
+assert.match(orderTicket, /Cancel OMS Order/u);
+assert.match(orderTicket, /Close Position/u);
 assert.match(orderTicket, /handleAccountChange/u);
 const submitHandlerStart = orderTicket.indexOf("const handleSubmit");
 const submitHandler = orderTicket.slice(submitHandlerStart, orderTicket.indexOf("return (", submitHandlerStart));

@@ -1340,9 +1340,21 @@ pub fn plan_passive_repricing(
             Side::Sell => observation.best_ask,
         };
         if let Some(hard_limit) = parent.limit_price {
+            // Clamp to the most aggressive price on the tick grid that still
+            // respects the hard limit. An operator-typed limit need not be on
+            // the grid, and a venue rejects an off-grid replacement after the
+            // working child's cancel has already been confirmed.
+            let tick = policy.tick_size.scaled();
+            let below = hard_limit.scaled() - hard_limit.scaled().rem_euclid(tick);
             candidate = match parent.side {
-                Side::Buy => candidate.min(hard_limit),
-                Side::Sell => candidate.max(hard_limit),
+                Side::Buy => candidate.min(Decimal::from_scaled(below)),
+                Side::Sell => {
+                    candidate.max(Decimal::from_scaled(if below == hard_limit.scaled() {
+                        below
+                    } else {
+                        below + tick
+                    }))
+                }
             };
         }
         let more_aggressive = match parent.side {
@@ -1464,9 +1476,13 @@ fn compare_quotes(side: Side, left: &VenueQuote, right: &VenueQuote) -> Ordering
         (Ok(left_price), Ok(right_price), Side::Sell) => right_price.cmp(&left_price),
         _ => Ordering::Equal,
     };
+    // Larger size first as the last tie-break: several quotes from one venue
+    // (depth) that otherwise tie must route the same whatever order they
+    // arrive in. Quotes still tied after this are identical.
     price_order
         .then_with(|| left.latency_rank.cmp(&right.latency_rank))
         .then_with(|| left.venue.cmp(&right.venue))
+        .then_with(|| right.available_quantity.cmp(&left.available_quantity))
 }
 
 /// Versioned trading capabilities declared for a specific venue.
@@ -1566,12 +1582,12 @@ pub fn smart_route_with_capabilities(
         }
     }
 
-    // 2. Validate quotes: every quoted venue MUST have an authoritative capability record
-    let required_kind = if parent.limit_price.is_some() {
-        ChildOrderKind::Limit
-    } else {
-        ChildOrderKind::Market
-    };
+    // 2. Validate quotes: every quoted venue MUST have an authoritative capability record.
+    // Every routed child is a marketable limit at its venue's quote price,
+    // exactly as `smart_route` emits, so slippage is capped at the quoted
+    // level even for a market parent. A venue must therefore accept limit
+    // orders whatever the parent's kind.
+    let required_kind = ChildOrderKind::Limit;
 
     for quote in quotes {
         validate_canonical_id("venue", &quote.venue)?;
@@ -2050,13 +2066,12 @@ fn trailing_price(
 }
 
 /// Net-price protection for a synchronized listed-option combination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComboPriceLimit {
-    /// Total debit per combination may not exceed this positive amount.
-    MaximumDebit(Decimal),
-    /// Total credit per combination may not be below this positive amount.
-    MinimumCredit(Decimal),
-}
+///
+/// Re-exported from `core/domain` rather than defined here: pre-trade risk
+/// assesses a combination's protected net price before any plan exists, so the
+/// contract has to sit below the planner. Call sites that imported it from this
+/// crate are unaffected.
+pub use follon_domain::ComboPriceLimit;
 
 /// One ratio leg in a synchronized option combination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2142,26 +2157,11 @@ pub fn plan_option_combo(
             limit_price: leg.limit_price,
         });
     }
-    match price_limit {
-        ComboPriceLimit::MaximumDebit(limit) => {
-            if limit <= Decimal::ZERO
-                || protected_net_price < Decimal::ZERO
-                || protected_net_price > limit
-            {
-                return Err(ExecutionError(
-                    "option combination exceeds maximum debit".to_owned(),
-                ));
-            }
-        }
-        ComboPriceLimit::MinimumCredit(limit) => {
-            let credit = Decimal::ZERO.checked_sub(protected_net_price)?;
-            if limit <= Decimal::ZERO || credit < limit {
-                return Err(ExecutionError(
-                    "option combination is below minimum credit".to_owned(),
-                ));
-            }
-        }
-    }
+    // One definition of the protection check, shared with the risk gate, so a
+    // combination cannot pass one and fail the other.
+    price_limit
+        .check_net_price(protected_net_price)
+        .map_err(|error| ExecutionError(error.0))?;
     Ok(OptionComboPlan {
         combo_id: combo_id.to_owned(),
         combo_quantity,
@@ -2407,6 +2407,114 @@ mod tests {
             plan.initial.child_order_id
         );
         assert_eq!(plan.replacements[0].replacement.quantity, parent.quantity);
+    }
+
+    #[test]
+    fn passive_replacement_clamped_to_an_off_grid_hard_limit_stays_on_the_tick_grid() {
+        // Shrunk by `passive_repricing_proptest`: a sell collared at 3.86999999
+        // on a 0.01 grid used to be replaced at exactly 3.86999999, which a
+        // venue rejects after the working child's cancel is confirmed.
+        let observations = [PassiveMarketObservation {
+            observed_after_seconds: 5,
+            best_bid: amount("3.73"),
+            best_ask: amount("3.78"),
+        }];
+        let policy = PassiveRepricePolicy {
+            initial_limit_price: amount("3.87"),
+            tick_size: amount("0.01"),
+            maximum_chase_bps: 100,
+            maximum_replacements: 1,
+            minimum_replace_interval_seconds: 1,
+        };
+        let mut sell = parent("1");
+        sell.side = Side::Sell;
+        sell.limit_price = Some(amount("3.86999999"));
+        let plan = plan_passive_repricing(&sell, &policy, &observations).expect("sell plan");
+        // The nearest on-grid price at or above the collar is 3.87, the initial
+        // price itself, so there is nothing to improve on and no replacement.
+        assert!(plan.replacements.is_empty());
+
+        sell.limit_price = Some(amount("3.85999999"));
+        let plan = plan_passive_repricing(&sell, &policy, &observations).expect("sell plan");
+        assert_eq!(
+            plan.replacements[0].replacement.limit_price,
+            Some(amount("3.86"))
+        );
+
+        let mut buy = parent("1");
+        buy.limit_price = Some(amount("3.75000001"));
+        let buy_policy = PassiveRepricePolicy {
+            initial_limit_price: amount("3.70"),
+            maximum_chase_bps: 500,
+            ..policy
+        };
+        let buy_observations = [PassiveMarketObservation {
+            observed_after_seconds: 5,
+            best_bid: amount("3.77"),
+            best_ask: amount("3.80"),
+        }];
+        let plan = plan_passive_repricing(&buy, &buy_policy, &buy_observations).expect("buy plan");
+        assert_eq!(
+            plan.replacements[0].replacement.limit_price,
+            Some(amount("3.75"))
+        );
+    }
+
+    #[test]
+    fn tied_depth_from_one_venue_routes_the_same_in_any_order() {
+        // Two levels from one venue tie on all-in price, rank and venue; the
+        // larger routes first, whatever order the book lists them in.
+        let level = |size: &str| VenueQuote {
+            venue: "venue.a".to_owned(),
+            available_quantity: amount(size),
+            price: amount("99"),
+            fee_per_unit: Decimal::ZERO,
+            latency_rank: 0,
+        };
+        let parent = parent("5");
+        let forward = smart_route(&parent, &[level("3"), level("4")]).expect("route");
+        let reverse = smart_route(&parent, &[level("4"), level("3")]).expect("route");
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.children[0].quantity, amount("4"));
+        assert_eq!(forward.children[1].quantity, amount("1"));
+    }
+
+    #[test]
+    fn a_market_parent_routes_as_marketable_limits_through_both_routers() {
+        let mut market_parent = parent("5");
+        market_parent.limit_price = None;
+        let quotes = [VenueQuote {
+            venue: "venue.a".to_owned(),
+            available_quantity: amount("9"),
+            price: amount("99.5"),
+            fee_per_unit: Decimal::ZERO,
+            latency_rank: 0,
+        }];
+        let capability = |kinds: &[ChildOrderKind]| VenueCapability {
+            venue: "venue.a".to_owned(),
+            capability_version: "cap.a.v1".to_owned(),
+            supported_order_kinds: kinds.iter().copied().collect(),
+            supports_iceberg: false,
+            min_quantity: None,
+            max_quantity: None,
+        };
+        let plain = smart_route(&market_parent, &quotes).expect("plain route");
+        let (gated, _) = smart_route_with_capabilities(
+            &market_parent,
+            &quotes,
+            &[capability(&[ChildOrderKind::Limit])],
+        )
+        .expect("gated route");
+        assert_eq!(gated, plain);
+        assert_eq!(gated.children[0].kind, ChildOrderKind::Limit);
+        assert_eq!(gated.children[0].limit_price, Some(amount("99.5")));
+        // A venue that cannot take a limit order cannot receive a routed child.
+        assert!(smart_route_with_capabilities(
+            &market_parent,
+            &quotes,
+            &[capability(&[ChildOrderKind::Market])],
+        )
+        .is_err());
     }
 
     #[test]

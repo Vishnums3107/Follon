@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/paper-command-route.schema.json",
+  "title": "Follon PAPER Command Route Configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "account_id",
+    "currency",
+    "initial_cash",
+    "risk_policy_version",
+    "trading_calendar_id",
+    "max_order_quantity",
+    "max_order_notional",
+    "max_price_deviation_bps",
+    "max_open_orders",
+    "max_position_quantity",
+    "max_realized_loss",
+    "max_market_data_age_seconds",
+    "max_order_rate",
+    "order_rate_window_seconds",
+    "instrument_tick_sizes",
+    "instrument_lot_sizes",
+    "kill_switch_version",
+    "adapter_kind",
+    "journal_path"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "account_id": { "$ref": "#/$defs/canonicalId" },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "initial_cash": { "$ref": "#/$defs/decimal" },
+    "risk_policy_version": { "type": "string", "minLength": 1 },
+    "trading_calendar_id": { "$ref": "#/$defs/canonicalId" },
+    "max_order_quantity": { "$ref": "#/$defs/positiveDecimal" },
+    "max_order_notional": { "$ref": "#/$defs/positiveDecimal" },
+    "max_price_deviation_bps": { "$ref": "#/$defs/basisPoints" },
+    "max_open_orders": { "type": "integer", "minimum": 1 },
+    "max_position_quantity": { "$ref": "#/$defs/positiveDecimal" },
+    "max_realized_loss": { "$ref": "#/$defs/decimal" },
+    "max_market_data_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+    "max_order_rate": { "type": "integer", "minimum": 1 },
+    "order_rate_window_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+    "instrument_tick_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue tick size per tradable instrument. An order for an unlisted instrument, or a limit price off its instrument's grid, is refused before it can reach the broker." },
+    "instrument_lot_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue lot size per tradable instrument: the exact quantity increment. An order for an unlisted instrument, or a quantity (for a combination, each leg's contract quantity) that is not a whole number of lots, is refused before it can reach the broker. It must list exactly the instruments instrument_tick_sizes lists; a configuration that lists an instrument in only one of the two tables is refused at startup." },
+    "short_exposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_short_quantity"],
+      "properties": {
+        "max_short_quantity": { "$ref": "#/$defs/positiveDecimal" }
+      }
+    },
+    "kill_switch_version": { "type": "string", "minLength": 1 },
+    "adapter_kind": { "const": "IBKR_PAPER_MODEL" },
+    "journal_path": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
+    "positiveDecimal": { "type": "string", "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$" },
+    "basisPoints": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,3})(?:\\.[0-9]{1,8})?$" }
+  }
+}

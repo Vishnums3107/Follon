@@ -6,23 +6,29 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use follon_accounting::{Currency, FxBook, FxQuote, MarginPolicy, MarginRate};
 use follon_backtest::{
     AdvancedBacktestAccount, AdvancedBacktestReport, AdvancedInstrumentTerms,
     AdversarialProbeResult, AdversarialResearchGate, BacktestCapitalCheck,
-    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec,
+    BacktestExecutionCharges, BacktestInput, BacktestRunner, BacktestSpec, CompletedBacktest,
     CounterfactualDeltaMetrics, CounterfactualEngine, CounterfactualIntervention,
     CounterfactualInterventionType, CounterfactualScenario, DatasetManifest, ExperimentRecord,
     FileExperimentStore,
 };
 use follon_cli::{sha256_text, write_immutable};
+use follon_commercial::TrustedReleaseKey;
 use follon_control_plane::{
-    import_historical_bars, BuyOnceStrategy, DeterministicFillModel, MarketPreconditions,
-    ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity,
+    build_strategy_bundle, extract_strategy_bundle, import_historical_bars, read_strategy_capsule,
+    sign_strategy_capsule, verify_capsule_signature, write_capsule_signature, BuyOnceStrategy,
+    CapsuleContents, DeterministicFillModel, HistoricalBar, MarketPreconditions,
+    ProcessStrategyWorker, ReplayEngine, RiskPolicy, StrategyWorkerIdentity, StrategyWorkerSandbox,
     StrategyWorkerServicesConfig,
 };
-use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, Fill, Side};
+use follon_domain::{
+    validate_canonical_id, validate_utc_timestamp, Decimal, Fill, Side, DECIMAL_SCALE,
+};
 use follon_instrument::{
     AssetClass, Instrument, InstrumentRegistry, InstrumentVersion, StaticTradingCalendar,
     TradingHalt, TradingSession,
@@ -37,7 +43,7 @@ const BUILTIN_STRATEGY_SOURCE: &str = include_str!("../../../core/control-plane/
 
 enum StrategyMode {
     Builtin,
-    Python(PythonWorkerArguments),
+    Python(Box<PythonWorkerArguments>),
 }
 
 struct PythonWorkerArguments {
@@ -48,27 +54,38 @@ struct PythonWorkerArguments {
     strategy_id: String,
     strategy_version: String,
     bundle_hash: String,
+    /// Present only for a capsule replay; see [`StrategyWorkerSandbox`].
+    sandbox: Option<StrategyWorkerSandbox>,
 }
 
 impl PythonWorkerArguments {
+    /// Interpreter arguments for the worker protocol.
+    ///
+    /// A sandboxed worker also runs with `-S`, so no `site` directory is on
+    /// its path: a capsule whose strategy imports anything it did not vendor
+    /// fails its replay instead of silently resolving against whatever
+    /// happens to be installed.
     fn protocol_arguments(&self) -> Vec<OsString> {
-        [
-            "-m",
-            "follon_strategy_sdk.worker",
-            "--strategy-file",
-            &self.strategy_file,
-            "--class-name",
-            &self.class_name,
-            "--bundle-root",
-            &self.bundle_root,
-            "--strategy-id",
-            &self.strategy_id,
-            "--strategy-version",
-            &self.strategy_version,
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect()
+        let isolation: &[&str] = if self.sandbox.is_some() { &["-S"] } else { &[] };
+        isolation
+            .iter()
+            .copied()
+            .chain([
+                "-m",
+                "follon_strategy_sdk.worker",
+                "--strategy-file",
+                &self.strategy_file,
+                "--class-name",
+                &self.class_name,
+                "--bundle-root",
+                &self.bundle_root,
+                "--strategy-id",
+                &self.strategy_id,
+                "--strategy-version",
+                &self.strategy_version,
+            ])
+            .map(OsString::from)
+            .collect()
     }
 }
 
@@ -319,18 +336,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match subcommand.as_str() {
             "adversarial" => return run_adversarial(&raw_args[1..]),
             "counterfactual" => return run_counterfactual(&raw_args[1..]),
+            "capsule-package" => return run_capsule_package(&raw_args[1..]),
+            "capsule-verify" => return run_capsule_verify(&raw_args[1..]),
+            "capsule-sign" => return run_capsule_sign(&raw_args[1..]),
             _ => {}
         }
     }
     let arguments = parse_arguments(raw_args)?;
-    let configuration = load_runtime_configuration(&arguments.configuration_path)?;
-    let document = &configuration.document;
     if let Some(parent) = arguments.artifact_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let outputs = evaluate_backtest(
+        &arguments.input_path,
+        &arguments.configuration_path,
+        arguments.action_path.as_deref(),
+        arguments.strategy_mode,
+    )?;
+    let event_path = arguments.artifact_path.with_extension("events.ndjson");
+    let report_path = arguments.artifact_path.with_extension("report.md");
+    let manifest_path = arguments.artifact_path.with_extension("manifest.json");
+    write_immutable(&arguments.artifact_path, &outputs.artifact_json)?;
+    write_immutable(&event_path, &outputs.event_stream)?;
+    write_immutable(&report_path, &outputs.report)?;
+    write_immutable(&manifest_path, &outputs.completion_manifest)?;
+    if let Some(experiment) = arguments.experiment {
+        let record = ExperimentRecord::from_artifact(
+            experiment.experiment_id,
+            experiment.run_id,
+            BTreeMap::new(),
+            &outputs.completed.artifact,
+        )?;
+        let mut store = FileExperimentStore::open(experiment.catalog_path)?;
+        store.record(record)?;
+    }
+    eprintln!("artifact: {}", arguments.artifact_path.display());
+    eprintln!("event stream: {}", event_path.display());
+    eprintln!("report: {}", report_path.display());
+    eprintln!("completion manifest: {}", manifest_path.display());
+    eprintln!(
+        "artifact fingerprint: {}",
+        outputs.completed.artifact.fingerprint()
+    );
+    eprintln!("configuration hash: {}", outputs.configuration_hash);
+    Ok(())
+}
 
-    let bars = import_historical_bars(&fs::read_to_string(&arguments.input_path)?)?;
-    let corporate_actions = match &arguments.action_path {
+/// Every output of one deterministic backtest, held in memory.
+///
+/// `main` publishes these as immutable files; a capsule replay instead
+/// compares `completion_manifest` byte for byte with a sealed receipt.
+struct EvaluationOutputs {
+    completed: CompletedBacktest,
+    configuration_hash: String,
+    artifact_json: String,
+    event_stream: String,
+    report: String,
+    completion_manifest: String,
+}
+
+fn evaluate_backtest(
+    input_path: &Path,
+    configuration_path: &Path,
+    action_path: Option<&Path>,
+    strategy_mode: StrategyMode,
+) -> Result<EvaluationOutputs, Box<dyn std::error::Error>> {
+    let configuration = load_runtime_configuration(configuration_path)?;
+    let document = &configuration.document;
+
+    let bars = import_historical_bars(&fs::read_to_string(input_path)?)?;
+    let corporate_actions = match action_path {
         Some(path) => import_corporate_actions(&fs::read_to_string(path)?)?,
         None => Vec::new(),
     };
@@ -346,7 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &dataset_bars,
         &corporate_actions,
     )?;
-    let (strategy_bundle_hash, strategy_id, strategy_version) = match &arguments.strategy_mode {
+    let (strategy_bundle_hash, strategy_id, strategy_version) = match &strategy_mode {
         StrategyMode::Builtin => (
             format!("{:x}", Sha256::digest(BUILTIN_STRATEGY_SOURCE.as_bytes())),
             document.strategy.strategy_id.clone(),
@@ -399,7 +473,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bars,
         corporate_actions,
     };
-    let completed = match arguments.strategy_mode {
+    let mut completed = match strategy_mode {
         StrategyMode::Builtin => {
             let mut strategy = BuyOnceStrategy::new(
                 &document.account.account_id,
@@ -419,15 +493,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 strategy_bundle_hash,
                 environment: "SIMULATION".to_owned(),
             };
-            let mut strategy = ProcessStrategyWorker::spawn_with_services(
-                &worker.program,
-                worker.protocol_arguments(),
-                identity,
-                StrategyWorkerServicesConfig {
-                    currency: document.account.currency.clone(),
-                    initial_cash: configuration.initial_cash,
-                },
-            )?;
+            let services = StrategyWorkerServicesConfig {
+                currency: document.account.currency.clone(),
+                initial_cash: configuration.initial_cash,
+            };
+            let mut strategy = match &worker.sandbox {
+                Some(sandbox) => ProcessStrategyWorker::spawn_sandboxed_with_services(
+                    &worker.program,
+                    worker.protocol_arguments(),
+                    identity,
+                    services,
+                    sandbox,
+                )?,
+                None => ProcessStrategyWorker::spawn_with_services(
+                    &worker.program,
+                    worker.protocol_arguments(),
+                    identity,
+                    services,
+                )?,
+            };
             runner.run(&mut strategy, &input, &market)?
         }
     };
@@ -436,31 +520,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &input.corporate_actions,
         &configuration.advanced_account,
     )?;
-    let event_path = arguments.artifact_path.with_extension("events.ndjson");
-    let report_path = arguments.artifact_path.with_extension("report.md");
-    let manifest_path = arguments.artifact_path.with_extension("manifest.json");
+    // The advanced economics travel inside the artifact itself (schema 3),
+    // so its hash and fingerprint bind them; there is no sidecar to read.
+    completed.artifact = completed.artifact.with_advanced_account(advanced_report);
     let artifact_json = completed.artifact.canonical_json();
     let event_stream = completed.canonical_events.join("\n") + "\n";
     let report = completed.artifact.markdown_report();
-    write_immutable(&arguments.artifact_path, &artifact_json)?;
-    write_immutable(&event_path, &event_stream)?;
-    write_immutable(&report_path, &report)?;
-    let advanced_artifact = advanced_report.canonical_json();
-    let advanced_report_text = advanced_report.markdown_report();
-    let advanced_artifact_path = arguments
-        .artifact_path
-        .with_extension("advanced-account.json");
-    let advanced_report_path = arguments.artifact_path.with_extension("advanced-report.md");
-    write_immutable(&advanced_artifact_path, &advanced_artifact)?;
-    write_immutable(&advanced_report_path, &advanced_report_text)?;
-    let advanced_manifest = format!(
-        "{{\"artifact_sha256\":\"{}\",\"report_sha256\":\"{}\"}}",
-        sha256_text(&advanced_artifact),
-        sha256_text(&advanced_report_text),
-    );
     let completion_manifest = format!(
-        "{{\"advanced_account\":{},\"artifact_fingerprint\":\"{}\",\"artifact_sha256\":\"{}\",\"configuration_hash\":\"{}\",\"event_output_hash\":\"{}\",\"events_sha256\":\"{}\",\"manifest_schema_version\":2,\"report_sha256\":\"{}\",\"specification_fingerprint\":\"{}\"}}",
-        advanced_manifest,
+        "{{\"artifact_fingerprint\":\"{}\",\"artifact_sha256\":\"{}\",\"configuration_hash\":\"{}\",\"event_output_hash\":\"{}\",\"events_sha256\":\"{}\",\"manifest_schema_version\":3,\"report_sha256\":\"{}\",\"specification_fingerprint\":\"{}\"}}",
         completed.artifact.fingerprint(),
         sha256_text(&artifact_json),
         configuration.content_hash,
@@ -469,32 +536,314 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sha256_text(&report),
         completed.artifact.specification_fingerprint,
     );
-    write_immutable(&manifest_path, &completion_manifest)?;
-    if let Some(experiment) = arguments.experiment {
-        let record = ExperimentRecord::from_artifact(
-            experiment.experiment_id,
-            experiment.run_id,
-            BTreeMap::new(),
-            &completed.artifact,
-        )?;
-        let mut store = FileExperimentStore::open(experiment.catalog_path)?;
-        store.record(record)?;
+    Ok(EvaluationOutputs {
+        completed,
+        configuration_hash: configuration.content_hash,
+        artifact_json,
+        event_stream,
+        report,
+        completion_manifest,
+    })
+}
+
+/// `follon-backtest capsule-package`: seals a portable capsule around a real
+/// Python-worker evaluation.
+///
+/// Nothing is taken on trust. The strategy archive is rebuilt from the bundle
+/// and SDK trees and must open exactly as the SDK's lock describes. It must
+/// hash to the bundle hash the evaluation's own specification recorded, which
+/// is the hash the worker announced and the runner verified. The
+/// configuration must hash to what the evaluation and its completion manifest
+/// recorded, and the completion manifest must hash-bind the artifact. The
+/// capsule's own copies are then replayed in a sandbox, and a manifest is
+/// sealed only if that replay reproduces the completion manifest byte for
+/// byte. The evaluation must have run without corporate actions, because the
+/// replay supplies none.
+fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (positional, flags) = parse_flag_values(
+        arguments,
+        &[
+            "--bundle-root",
+            "--sdk-root",
+            "--lock",
+            "--config",
+            "--evaluation",
+            "--bars",
+            "--python",
+            "--packaged-at",
+            "--output",
+        ],
+        &[],
+    )?;
+    if !positional.is_empty() {
+        return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> --python <interpreter> --packaged-at <utc> --output <dir>".into());
     }
-    eprintln!("artifact: {}", arguments.artifact_path.display());
-    eprintln!("event stream: {}", event_path.display());
-    eprintln!("report: {}", report_path.display());
-    eprintln!("completion manifest: {}", manifest_path.display());
-    eprintln!(
-        "advanced account artifact: {}",
-        advanced_artifact_path.display()
+    let flag = |name: &str| flags[name].as_str();
+
+    let lock_bytes = fs::read(flag("--lock"))?;
+    let lock = follon_control_plane::StrategyBundleLock::parse(&lock_bytes)?;
+    let archive = build_strategy_bundle(
+        Path::new(flag("--bundle-root")),
+        Path::new(flag("--sdk-root")),
+        &lock.runtime,
+    )?;
+    let configuration_path = PathBuf::from(flag("--config"));
+    let configuration_bytes = fs::read(&configuration_path)?;
+    load_runtime_configuration(&configuration_path)?;
+    let evaluation_path = PathBuf::from(flag("--evaluation"));
+    let artifact_bytes = fs::read(&evaluation_path)?;
+    let receipt_bytes = fs::read(evaluation_path.with_extension("manifest.json"))?;
+    let contents = CapsuleContents::new(lock_bytes, archive, configuration_bytes, receipt_bytes)?;
+
+    let receipt: serde_json::Value = serde_json::from_slice(contents.receipt())?;
+    if receipt
+        .get("artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(format!("{:x}", Sha256::digest(&artifact_bytes)).as_str())
+    {
+        return Err("the completion manifest does not bind this evaluation artifact".into());
+    }
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact_bytes)?;
+    let specification = artifact
+        .get("specification")
+        .ok_or("evaluation artifact has no specification")?;
+    let recorded = |field: &str| {
+        specification
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("evaluation specification has no {field}"))
+    };
+    if recorded("strategy_bundle_hash")? != contents.lock.strategy_bundle_hash {
+        return Err("the evaluation was not run with this strategy bundle".into());
+    }
+    if recorded("configuration_hash")? != format!("{:x}", Sha256::digest(contents.configuration()))
+    {
+        return Err("the evaluation was not run with this configuration".into());
+    }
+    let dataset = |field: &str| {
+        specification
+            .get("dataset")
+            .and_then(|dataset| dataset.get(field))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("evaluation dataset has no {field}"))
+    };
+    let replay_command = format!(
+        "follon-backtest capsule-verify <capsule-dir> --bars <{} {} bars, dataset content hash {}> --python <{} interpreter>",
+        dataset("dataset_id")?,
+        dataset("dataset_version")?,
+        dataset("content_hash")?,
+        contents.lock.runtime,
     );
-    eprintln!(
-        "advanced account report: {}",
-        advanced_report_path.display()
+
+    let reproduced = replay_capsule(&contents, Path::new(flag("--bars")), flag("--python"))?;
+    let manifest = contents.seal(
+        flag("--packaged-at"),
+        &replay_command,
+        reproduced.as_bytes(),
+    )?;
+    let output = PathBuf::from(flag("--output"));
+    contents.write_sealed(&manifest, &output)?;
+    let sealed = read_strategy_capsule(&output)?;
+    println!(
+        "{} {}",
+        sealed.manifest.capsule_id,
+        sealed.manifest.export_disposition.as_str()
     );
-    eprintln!("artifact fingerprint: {}", completed.artifact.fingerprint());
-    eprintln!("configuration hash: {}", configuration.content_hash);
+    eprintln!("capsule: {}", output.display());
+    eprintln!("bundle hash: {}", sealed.manifest.bundle_sha256);
+    eprintln!(
+        "evaluation receipt: {}",
+        sealed.manifest.evaluation_receipt_id
+    );
     Ok(())
+}
+
+/// `follon-backtest capsule-verify`: re-checks a sealed capsule and replays it.
+///
+/// Every static binding is recomputed from the capsule's files, then the
+/// capsule's own strategy and SDK are replayed in a sandbox. Success means the
+/// replay reproduced the sealed evaluation receipt byte for byte.
+fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (positional, flags) =
+        parse_flag_values(arguments, &["--bars", "--python"], &["--trusted-key"])?;
+    let [capsule_directory] = positional.as_slice() else {
+        return Err(
+            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> --python <interpreter> [--trusted-key <key.json>]"
+                .into(),
+        );
+    };
+    let sealed = read_strategy_capsule(Path::new(capsule_directory))?;
+    let signer = match (flags.get("--trusted-key"), &sealed.signature) {
+        (Some(path), _) => {
+            let key = TrustedReleaseKey::parse_canonical(&fs::read_to_string(path)?)?;
+            verify_capsule_signature(&sealed, &key.key_id, &key.public_key_hex)?;
+            format!("signed by trusted key {}", key.key_id)
+        }
+        (None, Some(signature)) => format!(
+            "signature by {} present but not checked: no --trusted-key given",
+            signature.key_id
+        ),
+        (None, None) => "unsigned".to_owned(),
+    };
+    let reproduced = replay_capsule(
+        &sealed.contents,
+        Path::new(&flags["--bars"]),
+        &flags["--python"],
+    )?;
+    if reproduced.as_bytes() != sealed.contents.receipt() {
+        return Err("capsule replay did not reproduce its evaluation receipt".into());
+    }
+    println!(
+        "{} {}: replay reproduced {}; {signer}",
+        sealed.manifest.capsule_id,
+        sealed.manifest.export_disposition.as_str(),
+        sealed.manifest.evaluation_receipt_id
+    );
+    Ok(())
+}
+
+/// `follon-backtest capsule-sign`: adds a detached Ed25519 signature to a
+/// sealed capsule that does not yet carry one.
+///
+/// The capsule is fully re-read first, so only a capsule whose every binding
+/// holds can be signed. The key is the PKCS#8 file `follon-admin
+/// release-keygen` writes; its bytes are zeroed after use. A signature says who
+/// sealed the capsule; `capsule-verify --trusted-key` checks it.
+fn run_capsule_sign(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (positional, flags) = parse_flag_values(
+        arguments,
+        &["--private-key", "--key-id", "--signed-at"],
+        &[],
+    )?;
+    let [capsule_directory] = positional.as_slice() else {
+        return Err("usage: follon-backtest capsule-sign <capsule-dir> --private-key <key.pk8> --key-id <id> --signed-at <utc>".into());
+    };
+    let directory = Path::new(capsule_directory);
+    let sealed = read_strategy_capsule(directory)?;
+    let mut private_key = fs::read(&flags["--private-key"])?;
+    let signed = sign_strategy_capsule(
+        &sealed,
+        &private_key,
+        &flags["--key-id"],
+        &flags["--signed-at"],
+    );
+    private_key.fill(0);
+    let signature = signed?;
+    write_capsule_signature(directory, &signature)?;
+    println!("{}", signature.to_json());
+    Ok(())
+}
+
+/// Replays a capsule's own strategy and SDK and returns the completion
+/// manifest the replay produced.
+///
+/// The archive is extracted into a fresh temporary directory, which is
+/// removed afterwards. The worker's only import root is the extracted SDK, its
+/// working directory is the temporary directory, and it runs with `-S`, so
+/// neither the caller's environment nor installed packages can stand in for
+/// the capsule's contents.
+fn replay_capsule(
+    contents: &CapsuleContents,
+    bars: &Path,
+    python: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !Path::new(python).is_absolute() {
+        return Err(
+            "--python must be an absolute interpreter path; the worker receives no PATH".into(),
+        );
+    }
+    let workspace = ReplayWorkspace::create()?;
+    let extracted = extract_strategy_bundle(
+        &contents.sources,
+        &contents.lock.entry_point,
+        &workspace.path.join("bundle"),
+    )?;
+    let configuration_path = workspace.path.join("configuration.json");
+    fs::write(&configuration_path, contents.configuration())?;
+    let text = |path: &Path| {
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or("capsule replay path is not UTF-8")
+    };
+    let worker = PythonWorkerArguments {
+        program: python.to_owned(),
+        strategy_file: text(&extracted.strategy_file)?,
+        class_name: contents.lock.entry_point.class_name.clone(),
+        bundle_root: text(&extracted.strategy_root)?,
+        strategy_id: contents.strategy_id.clone(),
+        strategy_version: contents.strategy_version.clone(),
+        bundle_hash: contents.lock.strategy_bundle_hash.clone(),
+        sandbox: Some(StrategyWorkerSandbox {
+            python_path: extracted.sdk_search_path.clone(),
+            working_directory: workspace.path.clone(),
+        }),
+    };
+    let outputs = evaluate_backtest(
+        bars,
+        &configuration_path,
+        None,
+        StrategyMode::Python(Box::new(worker)),
+    )?;
+    Ok(outputs.completion_manifest)
+}
+
+/// A temporary replay directory, removed when dropped.
+struct ReplayWorkspace {
+    path: PathBuf,
+}
+
+impl ReplayWorkspace {
+    fn create() -> Result<Self, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!(
+            "follon-capsule-replay-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ReplayWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Positional arguments, then each flag's value keyed by the flag.
+type FlagValues = (Vec<String>, BTreeMap<String, String>);
+
+/// Splits `--flag value` pairs from positional arguments. Each `required`
+/// flag must appear exactly once, each `optional` flag at most once, and no
+/// other flag is accepted.
+fn parse_flag_values(
+    arguments: &[String],
+    required: &[&str],
+    optional: &[&str],
+) -> Result<FlagValues, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    let mut values = BTreeMap::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument.starts_with("--") {
+            if !required.contains(&argument.as_str()) && !optional.contains(&argument.as_str()) {
+                return Err(format!("unsupported argument: {argument}").into());
+            }
+            let value = required_argument(arguments, index + 1, argument)?.to_owned();
+            if values.insert(argument.clone(), value).is_some() {
+                return Err(format!("{argument} may be specified only once").into());
+            }
+            index += 2;
+        } else {
+            positional.push(argument.clone());
+            index += 1;
+        }
+    }
+    if let Some(missing) = required.iter().find(|flag| !values.contains_key(**flag)) {
+        return Err(format!("{missing} is required").into());
+    }
+    Ok((positional, values))
 }
 
 #[derive(Deserialize)]
@@ -502,7 +851,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct AdversarialConfigDocument {
     strategy_version: String,
     evaluated_at: String,
+    #[serde(default)]
     probes: Vec<AdversarialProbeDocument>,
+    #[serde(default)]
+    execute: Option<AdversarialExecuteDocument>,
 }
 
 #[derive(Deserialize)]
@@ -515,6 +867,45 @@ struct AdversarialProbeDocument {
     threshold_bps: i64,
 }
 
+/// Configuration for actually executing the 5 standardized stress probes
+/// against a real deterministic backtest, instead of certifying
+/// operator-attested figures. See [`execute_adversarial_probes`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialExecuteDocument {
+    /// Path to a `backtest-*.json`-shaped configuration, resolved relative to
+    /// the directory containing this adversarial config file.
+    backtest_configuration: String,
+    /// Path to the historical-bar CSV, resolved the same way.
+    historical_bars: String,
+    /// Seed for the deterministic perturbations used by the noise and regime
+    /// probes (independent of the backtest configuration's own `seed`).
+    #[serde(default)]
+    seed: u64,
+    probes: Vec<AdversarialExecuteProbeDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialExecuteProbeDocument {
+    probe_name: String,
+    probe_description: String,
+    threshold_bps: i64,
+}
+
+/// Certifies adversarial probe results into a composite score and pass/fail
+/// gate via `AdversarialResearchGate::evaluate_probes`.
+///
+/// The config file selects one of two modes. `probes` (a `passed` /
+/// `degradation_bps` value per probe) is operator-attested: this command does
+/// not run any stress probe itself, and those figures must already reflect a
+/// real stress test performed by a separate tool or human operator. `execute`
+/// instead names a real backtest configuration and historical-bar corpus;
+/// this command then actually drives the built-in deterministic strategy
+/// through 5 genuine perturbed replays (see [`execute_adversarial_probes`])
+/// and computes `passed`/`degradation_bps` from their real output. Either way
+/// the final certification step — aggregation, composite score, and gate
+/// decision — is the same unchanged `AdversarialResearchGate`.
 fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() || arguments.len() > 2 {
         return Err("usage: follon-backtest adversarial <config.json> [output.json]".into());
@@ -529,17 +920,30 @@ fn run_adversarial(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     let doc: AdversarialConfigDocument = serde_json::from_str(&content)?;
     validate_utc_timestamp("evaluated_at", &doc.evaluated_at)?;
 
-    let probes: Vec<AdversarialProbeResult> = doc
-        .probes
-        .into_iter()
-        .map(|p| AdversarialProbeResult {
-            probe_name: p.probe_name,
-            probe_description: p.probe_description,
-            passed: p.passed,
-            degradation_bps: p.degradation_bps,
-            threshold_bps: p.threshold_bps,
-        })
-        .collect();
+    let probes: Vec<AdversarialProbeResult> = match (doc.execute, doc.probes) {
+        (Some(_), probes) if !probes.is_empty() => {
+            return Err(
+                "adversarial config cannot combine 'execute' with attested 'probes' results".into(),
+            );
+        }
+        (Some(execute), _) => {
+            let base_dir = input_path.parent().unwrap_or_else(|| Path::new("."));
+            execute_adversarial_probes(base_dir, &execute)?
+        }
+        (None, probes) if probes.is_empty() => {
+            return Err("adversarial config must specify 'probes' or 'execute'".into());
+        }
+        (None, probes) => probes
+            .into_iter()
+            .map(|p| AdversarialProbeResult {
+                probe_name: p.probe_name,
+                probe_description: p.probe_description,
+                passed: p.passed,
+                degradation_bps: p.degradation_bps,
+                threshold_bps: p.threshold_bps,
+            })
+            .collect(),
+    };
 
     let eval =
         AdversarialResearchGate::evaluate_probes(&doc.strategy_version, probes, &doc.evaluated_at)?;
@@ -573,6 +977,21 @@ struct CounterfactualConfigDocument {
     delta_metrics: Option<CounterfactualDeltaMetricsDocument>,
     #[serde(default)]
     metrics: Option<CounterfactualMetricsDocument>,
+    #[serde(default)]
+    execute: Option<CounterfactualExecuteDocument>,
+}
+
+/// Configuration for actually executing the declared `interventions` against
+/// a real deterministic backtest, instead of certifying operator-attested
+/// figures. See [`execute_counterfactual_scenario`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterfactualExecuteDocument {
+    /// Path to a `backtest-*.json`-shaped configuration, resolved relative to
+    /// the directory containing this counterfactual config file.
+    backtest_configuration: String,
+    /// Path to the historical-bar CSV, resolved the same way.
+    historical_bars: String,
 }
 
 #[derive(Deserialize)]
@@ -618,6 +1037,21 @@ fn parse_intervention_type(
     }
 }
 
+/// Reads an operator-supplied counterfactual scenario (baseline run identity
+/// and interventions) from a JSON config file and certifies it via
+/// `CounterfactualEngine::evaluate_scenario`.
+///
+/// The config file selects one of three ways to obtain the baseline/
+/// counterfactual figures. `metrics` and `delta_metrics` are
+/// operator-attested: this command does not simulate any intervention
+/// itself, and those figures must already come from a real counterfactual
+/// run performed by a separate tool or human operator. `execute` instead
+/// names a real backtest configuration and historical-bar corpus; this
+/// command then actually drives the built-in deterministic strategy through
+/// two genuine replays — one unperturbed, one with every declared
+/// intervention applied (see [`execute_counterfactual_scenario`]) — and
+/// computes the metrics from their real output. Either way the final
+/// certification step is the same unchanged `CounterfactualEngine`.
 fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.is_empty() || arguments.len() > 2 {
         return Err("usage: follon-backtest counterfactual <config.json> [output.json]".into());
@@ -643,7 +1077,34 @@ fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
         });
     }
 
-    let scenario = if let Some(m) = doc.metrics {
+    let scenario = if let Some(execute) = doc.execute {
+        if doc.metrics.is_some() || doc.delta_metrics.is_some() {
+            return Err(
+                "counterfactual config cannot combine 'execute' with 'metrics' or 'delta_metrics'"
+                    .into(),
+            );
+        }
+        if interventions.is_empty() {
+            return Err("counterfactual scenario requires at least one intervention".into());
+        }
+        let base_dir = input_path.parent().unwrap_or_else(|| Path::new("."));
+        let m = execute_counterfactual_scenario(base_dir, &execute, &interventions, doc.seed)?;
+        CounterfactualEngine::evaluate_scenario(
+            &doc.baseline_run_id,
+            doc.seed,
+            interventions,
+            m.baseline_fills,
+            m.counterfactual_fills,
+            m.baseline_pnl_cents,
+            m.counterfactual_pnl_cents,
+            m.baseline_max_drawdown_bps,
+            m.counterfactual_max_drawdown_bps,
+            m.baseline_rejections,
+            m.counterfactual_rejections,
+            &doc.divergence_event_id,
+            &doc.created_at,
+        )?
+    } else if let Some(m) = doc.metrics {
         CounterfactualEngine::evaluate_scenario(
             &doc.baseline_run_id,
             doc.seed,
@@ -689,7 +1150,7 @@ fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
         }
     } else {
         return Err(
-            "counterfactual config must specify either 'metrics' or 'delta_metrics'".into(),
+            "counterfactual config must specify 'execute', 'metrics', or 'delta_metrics'".into(),
         );
     };
 
@@ -702,6 +1163,622 @@ fn run_counterfactual(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
     eprintln!("scenario id: {}", scenario.scenario_id);
     eprintln!("baseline run id: {}", scenario.baseline_run_id);
     Ok(())
+}
+
+/// Immutable inputs shared by every genuine replay a counterfactual
+/// intervention or adversarial probe drives, factored out of a loaded
+/// `RuntimeConfiguration` so each perturbed rerun only has to name what it
+/// actually changes: bars, risk policy, fill model, or entry threshold.
+struct ReplayContext<'a> {
+    account_id: &'a str,
+    currency: &'a str,
+    initial_cash: Decimal,
+    strategy_id: &'a str,
+    strategy_version: &'a str,
+    configuration_id: &'a str,
+    configuration_version: &'a str,
+    configuration_hash: &'a str,
+    engine_version: &'a str,
+    seed: u64,
+    instruments: &'a InstrumentRegistry,
+    calendar: &'a StaticTradingCalendar,
+    dataset_id: &'a str,
+    dataset_version: &'a str,
+    reference_data_version: &'a str,
+    universe_id: &'a str,
+}
+
+impl<'a> ReplayContext<'a> {
+    fn from_configuration(
+        document: &'a BacktestConfigurationDocument,
+        configuration: &'a RuntimeConfiguration,
+    ) -> Self {
+        Self {
+            account_id: &document.account.account_id,
+            currency: &document.account.currency,
+            initial_cash: configuration.initial_cash,
+            strategy_id: &document.strategy.strategy_id,
+            strategy_version: &document.strategy.strategy_version,
+            configuration_id: &document.configuration_id,
+            configuration_version: &document.configuration_version,
+            configuration_hash: &configuration.content_hash,
+            engine_version: &document.engine_version,
+            seed: document.seed,
+            instruments: &configuration.instruments,
+            calendar: &configuration.calendar,
+            dataset_id: &document.dataset.dataset_id,
+            dataset_version: &document.dataset.dataset_version,
+            reference_data_version: &document.dataset.reference_data_version,
+            universe_id: &document.dataset.universe_id,
+        }
+    }
+
+    /// Executes one complete, independent, single-use replay of the built-in
+    /// `BuyOnceStrategy` against the given bars and economics. No corporate
+    /// actions are supported at this boundary: a counterfactual or
+    /// adversarial rerun perturbs price, cost, timing, or risk-limit inputs,
+    /// not corporate-action evidence.
+    fn run(
+        &self,
+        bars: Vec<HistoricalBar>,
+        risk_policy: RiskPolicy,
+        fill_model: DeterministicFillModel,
+        entry_threshold: Decimal,
+    ) -> Result<CompletedBacktest, Box<dyn std::error::Error>> {
+        let dataset_bars: Vec<_> = bars
+            .iter()
+            .map(|bar| (bar.event_time.clone(), bar.bar.clone()))
+            .collect();
+        let dataset = DatasetManifest::from_market_data(
+            self.dataset_id,
+            self.dataset_version,
+            self.reference_data_version,
+            self.universe_id,
+            &dataset_bars,
+            &[],
+        )?;
+        let starts_at = dataset.starts_at.clone();
+        let ends_at = dataset.ends_at.clone();
+        let strategy_bundle_hash =
+            format!("{:x}", Sha256::digest(BUILTIN_STRATEGY_SOURCE.as_bytes()));
+        let spec = BacktestSpec {
+            strategy_bundle_hash,
+            dataset,
+            configuration_id: self.configuration_id.to_owned(),
+            configuration_version: self.configuration_version.to_owned(),
+            configuration_hash: self.configuration_hash.to_owned(),
+            seed: self.seed,
+            engine_version: self.engine_version.to_owned(),
+            starts_at: starts_at.clone(),
+            ends_at,
+        };
+        let market = MarketPreconditions {
+            instruments: self.instruments,
+            calendar: self.calendar,
+        };
+        let mut runner = BacktestRunner::new(
+            spec,
+            ReplayEngine::new(
+                starts_at,
+                self.engine_version,
+                self.configuration_version,
+                risk_policy,
+                fill_model,
+            )?,
+        )?;
+        let input = BacktestInput {
+            account_id: self.account_id.to_owned(),
+            currency: self.currency.to_owned(),
+            initial_cash: self.initial_cash,
+            bars,
+            corporate_actions: Vec::new(),
+        };
+        let mut strategy = BuyOnceStrategy::new(
+            self.account_id,
+            self.strategy_id,
+            self.strategy_version,
+            self.configuration_version,
+            entry_threshold,
+        );
+        Ok(runner.run(&mut strategy, &input, &market)?)
+    }
+}
+
+/// Converts a [`Decimal`] to an exact integer count of `unit_scale`-sized
+/// units (for example `DECIMAL_SCALE / 100` for cents, or `DECIMAL_SCALE` for
+/// integer basis points already expressed as a whole-number `Decimal`),
+/// truncating any remaining fraction.
+fn decimal_to_scaled_i64(
+    value: Decimal,
+    unit_scale: i128,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    i64::try_from(value.scaled() / unit_scale).map_err(|_| "decimal value out of i64 range".into())
+}
+
+/// Counts `risk.decision.v1` canonical events carrying `"approved":false`,
+/// the exact rejection marker every real pre-trade risk decision emits.
+fn count_risk_rejections(canonical_events: &[String]) -> i64 {
+    canonical_events
+        .iter()
+        .filter(|event| {
+            event.contains("\"event_type\":\"risk.decision.v1\"")
+                && event.contains("\"approved\":false")
+        })
+        .count() as i64
+}
+
+/// Real fill count, total (realized plus unrealized) P&L in cents, maximum
+/// drawdown in basis points, and risk-rejection count derived from one
+/// genuinely completed replay.
+fn summarize_run(
+    completed: &CompletedBacktest,
+) -> Result<(i64, i64, i64, i64), Box<dyn std::error::Error>> {
+    let fills = i64::try_from(completed.artifact.performance.trade_count)
+        .map_err(|_| "trade count out of i64 range")?;
+    let total_pnl = completed
+        .artifact
+        .report
+        .realized_pnl
+        .checked_add(completed.artifact.report.unrealized_pnl)?;
+    let pnl_cents = decimal_to_scaled_i64(total_pnl, DECIMAL_SCALE / 100)?;
+    let drawdown_bps = decimal_to_scaled_i64(
+        completed.artifact.performance.max_drawdown_bps,
+        DECIMAL_SCALE,
+    )?;
+    let rejections = count_risk_rejections(&completed.canonical_events);
+    Ok((fills, pnl_cents, drawdown_bps, rejections))
+}
+
+/// Applies a basis-point shift to a [`Decimal`]: `10_000 + bps` parts per
+/// ten-thousand of the original value. A negative `bps` shrinks it.
+fn shift_by_bps(value: Decimal, bps: i64) -> Result<Decimal, Box<dyn std::error::Error>> {
+    let multiplier =
+        Decimal::from_integer(10_000 + bps)?.checked_div(Decimal::from_integer(10_000)?)?;
+    Ok(value.checked_mul(multiplier)?)
+}
+
+/// Scales every OHLC field of every bar from `start_index` onward by the same
+/// `shock_bps` basis-point factor, preserving each bar's internal ordering
+/// (open/close within [low, high]) exactly because all four fields move by
+/// the identical positive multiplier.
+fn shock_bars_from(
+    bars: &[HistoricalBar],
+    start_index: usize,
+    shock_bps: i64,
+) -> Result<Vec<HistoricalBar>, Box<dyn std::error::Error>> {
+    let mut result = bars.to_vec();
+    for historical in result.iter_mut().skip(start_index) {
+        historical.bar.open = shift_by_bps(historical.bar.open, shock_bps)?;
+        historical.bar.high = shift_by_bps(historical.bar.high, shock_bps)?;
+        historical.bar.low = shift_by_bps(historical.bar.low, shock_bps)?;
+        historical.bar.close = shift_by_bps(historical.bar.close, shock_bps)?;
+        historical.bar.validate()?;
+    }
+    Ok(result)
+}
+
+/// Removes `count` consecutive bars starting at `start_index`, simulating a
+/// missing-data gap. At least one bar must remain.
+fn drop_bars(
+    bars: &[HistoricalBar],
+    start_index: usize,
+    count: usize,
+) -> Result<Vec<HistoricalBar>, Box<dyn std::error::Error>> {
+    let mut result = bars.to_vec();
+    let start = start_index.min(result.len());
+    let end = start.saturating_add(count).min(result.len());
+    result.drain(start..end);
+    if result.is_empty() {
+        return Err("DATA_BAR_CORRUPTION would remove every bar".into());
+    }
+    Ok(result)
+}
+
+/// Deterministic pseudo-random basis-point offset in `[-magnitude, magnitude]`
+/// for one bar, derived from a scenario seed and the bar's index so the same
+/// seed always reproduces byte-identical perturbed bars.
+fn deterministic_bps_offset(seed: u64, index: usize, magnitude_bps: i64) -> i64 {
+    if magnitude_bps <= 0 {
+        return 0;
+    }
+    let digest = Sha256::digest(format!("{seed}:{index}").as_bytes());
+    let raw = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    let span = u32::try_from(2 * magnitude_bps + 1).unwrap_or(u32::MAX);
+    i64::from(raw % span) - magnitude_bps
+}
+
+/// Applies an independent deterministic +/- `magnitude_bps` noise offset to
+/// every bar's OHLC fields, simulating microstructure jitter.
+fn jitter_bars(
+    bars: &[HistoricalBar],
+    seed: u64,
+    magnitude_bps: i64,
+) -> Result<Vec<HistoricalBar>, Box<dyn std::error::Error>> {
+    let mut result = bars.to_vec();
+    for (index, historical) in result.iter_mut().enumerate() {
+        let offset = deterministic_bps_offset(seed, index, magnitude_bps);
+        historical.bar.open = shift_by_bps(historical.bar.open, offset)?;
+        historical.bar.high = shift_by_bps(historical.bar.high, offset)?;
+        historical.bar.low = shift_by_bps(historical.bar.low, offset)?;
+        historical.bar.close = shift_by_bps(historical.bar.close, offset)?;
+        historical.bar.validate()?;
+    }
+    Ok(result)
+}
+
+/// Applies a `RISK_COLLAR_ADJUSTMENT` intervention to a cloned risk policy.
+/// `parameter_name` selects which pre-trade limit changes; every other field
+/// keeps its baseline value.
+fn apply_risk_override(
+    base: &RiskPolicy,
+    parameter_name: &str,
+    counterfactual_value: &str,
+) -> Result<RiskPolicy, Box<dyn std::error::Error>> {
+    let mut policy = base.clone();
+    match parameter_name {
+        "max_quantity" => policy.max_quantity = decimal(counterfactual_value)?,
+        "max_notional" => policy.max_notional = decimal(counterfactual_value)?,
+        "max_price_deviation_bps" => policy.max_price_deviation_bps = decimal(counterfactual_value)?,
+        "global_kill_switch" => {
+            policy.global_kill_switch = counterfactual_value.parse::<bool>().map_err(|_| {
+                "RISK_COLLAR_ADJUSTMENT global_kill_switch counterfactual_value must be true or false"
+            })?
+        }
+        other => return Err(format!("unknown RISK_COLLAR_ADJUSTMENT parameter_name: {other}").into()),
+    }
+    policy.validate()?;
+    Ok(policy)
+}
+
+/// Applies a `NETWORK_LATENCY_INJECTION` intervention to a cloned fill model.
+fn apply_latency_override(
+    base: &DeterministicFillModel,
+    counterfactual_value: &str,
+) -> Result<DeterministicFillModel, Box<dyn std::error::Error>> {
+    let mut model = base.clone();
+    model.latency_bars = counterfactual_value.parse::<u32>().map_err(|_| {
+        "NETWORK_LATENCY_INJECTION counterfactual_value must be a non-negative integer bar count"
+    })?;
+    model.validate()?;
+    Ok(model)
+}
+
+/// Doubles slippage and the flat fee, used by `TRANSACTION_COST_SHOCK`.
+fn double_costs(
+    base: &DeterministicFillModel,
+) -> Result<DeterministicFillModel, Box<dyn std::error::Error>> {
+    let mut model = base.clone();
+    let two = Decimal::from_integer(2)?;
+    model.slippage_bps = model.slippage_bps.checked_mul(two)?;
+    model.flat_fee = model.flat_fee.checked_mul(two)?;
+    model.validate()?;
+    Ok(model)
+}
+
+/// Resolves a path declared inside a counterfactual/adversarial config file
+/// relative to that config file's own directory, so a checked-in fixture
+/// works regardless of the caller's working directory.
+fn resolve_relative(base_dir: &Path, declared: &str) -> PathBuf {
+    base_dir.join(declared)
+}
+
+/// Actually executes a counterfactual scenario: one unperturbed baseline
+/// replay and one replay with every declared intervention applied, both
+/// through the exact same deterministic `BuyOnceStrategy` kernel used by
+/// `follon-backtest run`. Returns the real fill/P&L/drawdown/rejection
+/// figures `CounterfactualEngine::evaluate_scenario` certifies.
+///
+/// `RISK_COLLAR_ADJUSTMENT`, `NETWORK_LATENCY_INJECTION`, `DATA_BAR_CORRUPTION`,
+/// and `VOLATILITY_SHOCK` interventions are applied in the order declared;
+/// `DATA_BAR_CORRUPTION`/`VOLATILITY_SHOCK` locate their starting bar
+/// deterministically from the scenario's `seed`. Only the built-in strategy
+/// is supported — a Python-worker-driven backtest still requires
+/// operator-attested `metrics`/`delta_metrics`.
+fn execute_counterfactual_scenario(
+    base_dir: &Path,
+    execute: &CounterfactualExecuteDocument,
+    interventions: &[CounterfactualIntervention],
+    seed: u64,
+) -> Result<CounterfactualMetricsDocument, Box<dyn std::error::Error>> {
+    let configuration =
+        load_runtime_configuration(&resolve_relative(base_dir, &execute.backtest_configuration))?;
+    let document = &configuration.document;
+    let bars = import_historical_bars(&fs::read_to_string(resolve_relative(
+        base_dir,
+        &execute.historical_bars,
+    ))?)?;
+    let context = ReplayContext::from_configuration(document, &configuration);
+
+    let baseline = context.run(
+        bars.clone(),
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+
+    let mut risk_policy = configuration.risk_policy.clone();
+    let mut fill_model = configuration.fill_model.clone();
+    let mut counterfactual_bars = bars.clone();
+    for intervention in interventions {
+        match intervention.intervention_type {
+            CounterfactualInterventionType::RiskCollarAdjustment => {
+                risk_policy = apply_risk_override(
+                    &risk_policy,
+                    &intervention.parameter_name,
+                    &intervention.counterfactual_value,
+                )?;
+            }
+            CounterfactualInterventionType::NetworkLatencyInjection => {
+                fill_model =
+                    apply_latency_override(&fill_model, &intervention.counterfactual_value)?;
+            }
+            CounterfactualInterventionType::DataBarCorruption => {
+                let count: usize = intervention.counterfactual_value.parse().map_err(|_| {
+                    "DATA_BAR_CORRUPTION counterfactual_value must be a non-negative integer bar count"
+                })?;
+                let start_index = (seed as usize) % counterfactual_bars.len();
+                counterfactual_bars = drop_bars(&counterfactual_bars, start_index, count)?;
+            }
+            CounterfactualInterventionType::VolatilityShock => {
+                let shock_bps: i64 = intervention.counterfactual_value.parse().map_err(|_| {
+                    "VOLATILITY_SHOCK counterfactual_value must be a signed integer basis-point shock"
+                })?;
+                let start_index = (seed as usize) % counterfactual_bars.len();
+                counterfactual_bars =
+                    shock_bars_from(&counterfactual_bars, start_index, shock_bps)?;
+            }
+        }
+    }
+    let counterfactual = context.run(
+        counterfactual_bars,
+        risk_policy,
+        fill_model,
+        configuration.entry_threshold,
+    )?;
+
+    let (baseline_fills, baseline_pnl_cents, baseline_max_drawdown_bps, baseline_rejections) =
+        summarize_run(&baseline)?;
+    let (
+        counterfactual_fills,
+        counterfactual_pnl_cents,
+        counterfactual_max_drawdown_bps,
+        counterfactual_rejections,
+    ) = summarize_run(&counterfactual)?;
+    Ok(CounterfactualMetricsDocument {
+        baseline_fills,
+        counterfactual_fills,
+        baseline_pnl_cents,
+        counterfactual_pnl_cents,
+        baseline_max_drawdown_bps,
+        counterfactual_max_drawdown_bps,
+        baseline_rejections,
+        counterfactual_rejections,
+    })
+}
+
+/// Actually executes the 5 standardized adversarial stress probes against a
+/// real deterministic backtest, returning genuine `passed`/`degradation_bps`
+/// results for `AdversarialResearchGate::evaluate_probes` to certify. Only
+/// the built-in strategy is supported — a Python-worker-driven backtest
+/// still requires operator-attested `probes` results.
+fn execute_adversarial_probes(
+    base_dir: &Path,
+    execute: &AdversarialExecuteDocument,
+) -> Result<Vec<AdversarialProbeResult>, Box<dyn std::error::Error>> {
+    if execute.probes.len() < 5 {
+        return Err("adversarial execute requires all 5 standardized stress probes".into());
+    }
+    let configuration =
+        load_runtime_configuration(&resolve_relative(base_dir, &execute.backtest_configuration))?;
+    let document = &configuration.document;
+    let bars = import_historical_bars(&fs::read_to_string(resolve_relative(
+        base_dir,
+        &execute.historical_bars,
+    ))?)?;
+    let context = ReplayContext::from_configuration(document, &configuration);
+
+    let baseline = context.run(
+        bars.clone(),
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let baseline_return_bps =
+        decimal_to_scaled_i64(baseline.artifact.performance.return_bps, DECIMAL_SCALE)?;
+
+    let mut results = Vec::with_capacity(execute.probes.len());
+    for probe in &execute.probes {
+        let degradation_bps = match probe.probe_name.as_str() {
+            "LOOKAHEAD_LEAKAGE_PROBE" => {
+                run_lookahead_probe(&context, &configuration, &bars, &baseline)?
+            }
+            "PRICE_JITTER_PROBE" => run_jitter_probe(
+                &context,
+                &configuration,
+                &bars,
+                execute.seed,
+                baseline_return_bps,
+            )?,
+            "TRANSACTION_COST_SHOCK" => {
+                run_cost_shock_probe(&context, &configuration, &bars, baseline_return_bps)?
+            }
+            "PARAMETER_CLIFF_PROBE" => run_parameter_cliff_probe(&context, &configuration, &bars)?,
+            "REGIME_STRESS_PROBE" => run_regime_stress_probe(
+                &context,
+                &configuration,
+                &bars,
+                execute.seed,
+                baseline_return_bps,
+            )?,
+            other => {
+                return Err(
+                    format!("unknown standardized probe_name for execute mode: {other}").into(),
+                )
+            }
+        };
+        results.push(AdversarialProbeResult {
+            probe_name: probe.probe_name.clone(),
+            probe_description: probe.probe_description.clone(),
+            passed: degradation_bps <= probe.threshold_bps,
+            degradation_bps,
+            threshold_bps: probe.threshold_bps,
+        });
+    }
+    Ok(results)
+}
+
+/// Reruns the replay against the first three-quarters of the bars only and
+/// compares its equity curve against the full baseline's over that shared
+/// prefix. A real look-ahead leak would move an earlier decision when later
+/// bars are removed, showing up as a nonzero divergence; the engine's
+/// bar-by-bar construction makes that structurally impossible, so this
+/// proves the invariant on this corpus rather than assuming it.
+fn run_lookahead_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    baseline: &CompletedBacktest,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let keep = (bars.len() * 3 / 4).max(1);
+    if keep >= bars.len() {
+        return Err(
+            "LOOKAHEAD_LEAKAGE_PROBE requires enough bars to truncate a quarter of them".into(),
+        );
+    }
+    let truncated_bars = bars[..keep].to_vec();
+    let truncated = context.run(
+        truncated_bars,
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let mut max_bps: i64 = 0;
+    for point in &truncated.artifact.performance.equity_curve {
+        let Some(full_point) = baseline
+            .artifact
+            .performance
+            .equity_curve
+            .iter()
+            .find(|candidate| candidate.event_time == point.event_time)
+        else {
+            continue;
+        };
+        let diff = if full_point.total_equity >= point.total_equity {
+            full_point.total_equity.checked_sub(point.total_equity)?
+        } else {
+            point.total_equity.checked_sub(full_point.total_equity)?
+        };
+        let denominator = if point.total_equity > Decimal::ZERO {
+            point.total_equity
+        } else {
+            Decimal::from_integer(1)?
+        };
+        let bps = diff
+            .checked_mul(Decimal::from_integer(10_000)?)?
+            .checked_div(denominator)?;
+        max_bps = max_bps.max(decimal_to_scaled_i64(bps, DECIMAL_SCALE)?);
+    }
+    Ok(max_bps)
+}
+
+/// Reruns the replay with deterministic +/-20bps per-bar microstructure
+/// noise and measures the return degradation against the baseline.
+fn run_jitter_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    seed: u64,
+    baseline_return_bps: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    const JITTER_MAGNITUDE_BPS: i64 = 20;
+    let jittered_bars = jitter_bars(bars, seed, JITTER_MAGNITUDE_BPS)?;
+    let jittered = context.run(
+        jittered_bars,
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let jittered_return_bps =
+        decimal_to_scaled_i64(jittered.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    Ok((baseline_return_bps - jittered_return_bps).max(0))
+}
+
+/// Reruns the replay with slippage and the flat fee doubled and measures the
+/// return degradation against the baseline.
+fn run_cost_shock_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    baseline_return_bps: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let costed_fill_model = double_costs(&configuration.fill_model)?;
+    let costed = context.run(
+        bars.to_vec(),
+        configuration.risk_policy.clone(),
+        costed_fill_model,
+        configuration.entry_threshold,
+    )?;
+    let costed_return_bps =
+        decimal_to_scaled_i64(costed.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    Ok((baseline_return_bps - costed_return_bps).max(0))
+}
+
+/// Reruns the replay with the entry threshold shifted +/-10bps and measures
+/// the largest resulting return swing, revealing whether the configured
+/// threshold sits on a fragile decision boundary.
+fn run_parameter_cliff_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+) -> Result<i64, Box<dyn std::error::Error>> {
+    const NEIGHBOR_SHIFT_BPS: i64 = 10;
+    let baseline = context.run(
+        bars.to_vec(),
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let baseline_return_bps =
+        decimal_to_scaled_i64(baseline.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    let mut max_swing: i64 = 0;
+    for shift in [NEIGHBOR_SHIFT_BPS, -NEIGHBOR_SHIFT_BPS] {
+        let neighbor_threshold = shift_by_bps(configuration.entry_threshold, shift)?;
+        let neighbor = context.run(
+            bars.to_vec(),
+            configuration.risk_policy.clone(),
+            configuration.fill_model.clone(),
+            neighbor_threshold,
+        )?;
+        let neighbor_return_bps =
+            decimal_to_scaled_i64(neighbor.artifact.performance.return_bps, DECIMAL_SCALE)?;
+        max_swing = max_swing.max((baseline_return_bps - neighbor_return_bps).abs());
+    }
+    Ok(max_swing)
+}
+
+/// Reruns the replay with a -15% price shock applied to every bar from a
+/// seed-selected point onward, simulating a sudden regime change, and
+/// measures the return degradation against the baseline.
+fn run_regime_stress_probe(
+    context: &ReplayContext<'_>,
+    configuration: &RuntimeConfiguration,
+    bars: &[HistoricalBar],
+    seed: u64,
+    baseline_return_bps: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    const REGIME_SHOCK_BPS: i64 = -1_500;
+    let start_index = (bars.len() / 2) + ((seed as usize) % bars.len().max(1).div_ceil(2).max(1));
+    let start_index = start_index.min(bars.len().saturating_sub(1));
+    let shocked_bars = shock_bars_from(bars, start_index, REGIME_SHOCK_BPS)?;
+    let shocked = context.run(
+        shocked_bars,
+        configuration.risk_policy.clone(),
+        configuration.fill_model.clone(),
+        configuration.entry_threshold,
+    )?;
+    let shocked_return_bps =
+        decimal_to_scaled_i64(shocked.artifact.performance.return_bps, DECIMAL_SCALE)?;
+    Ok((baseline_return_bps - shocked_return_bps).max(0))
 }
 
 fn parse_arguments(arguments: Vec<String>) -> Result<CommandArguments, Box<dyn std::error::Error>> {
@@ -755,8 +1832,9 @@ fn parse_arguments(arguments: Vec<String>) -> Result<CommandArguments, Box<dyn s
                         .to_owned(),
                     bundle_hash: required_argument(&arguments, index + 7, "--python-worker")?
                         .to_owned(),
+                    sandbox: None,
                 };
-                strategy_mode = StrategyMode::Python(worker);
+                strategy_mode = StrategyMode::Python(Box::new(worker));
                 index += 7;
             }
             "--experiment" => {
@@ -1470,5 +2548,232 @@ mod tests {
         assert!(content.contains("\"cf.latency-shock.001\""));
         assert!(content.contains("\"NETWORK_LATENCY_INJECTION\""));
         let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn counterfactual_execute_mode_runs_a_real_intervention_and_computes_genuine_deltas() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/counterfactual-execute-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-execute-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_counterfactual(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        // A real ~$100 buy is rejected once max_notional drops to $50: the
+        // baseline's one fill and small unrealized gain disappear, and a
+        // genuine MAX_NOTIONAL_EXCEEDED risk rejection is recorded — not a
+        // caller-supplied number.
+        assert!(content.contains("\"fill_count_delta\":-1"));
+        assert!(content.contains("\"risk_rejection_count_delta\":1"));
+        assert!(content.contains("\"max_drawdown_delta_bps\":-53"));
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn counterfactual_execute_mode_rejects_an_unknown_risk_parameter() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/counterfactual-execute-v1.json");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        document["interventions"][0]["parameter_name"] =
+            serde_json::Value::String("not_a_real_risk_parameter".to_owned());
+        let fixtures_dir = fixture.parent().unwrap();
+        document["execute"]["backtest_configuration"] = serde_json::Value::String(
+            fixtures_dir
+                .join("backtest-probe-v1.json")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        document["execute"]["historical_bars"] = serde_json::Value::String(
+            fixtures_dir
+                .join("../historical-bars/probe-corpus-one-minute.csv")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let config_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-bad-parameter-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&config_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-counterfactual-bad-parameter-out-{}.json",
+            std::process::id()
+        ));
+        let args = vec![
+            config_path.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        let error = run_counterfactual(&args).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown RISK_COLLAR_ADJUSTMENT parameter_name"));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn adversarial_execute_mode_runs_real_probes_and_computes_genuine_degradation() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/adversarial-execute-v1.json");
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-execute-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let args = vec![
+            fixture.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_adversarial(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let probes = parsed["probes"].as_array().unwrap();
+        let degradation = |name: &str| -> i64 {
+            probes
+                .iter()
+                .find(|probe| probe["probe_name"] == name)
+                .unwrap()["degradation_bps"]
+                .as_i64()
+                .unwrap()
+        };
+        // A real look-ahead leak would move the truncated run's equity curve
+        // away from the full run's over their shared prefix; the engine's
+        // bar-by-bar construction makes that impossible, so this is a
+        // genuine, computed zero rather than a hardcoded pass.
+        assert_eq!(degradation("LOOKAHEAD_LEAKAGE_PROBE"), 0);
+        // Fills round up onto the cent grid (E3.6e): 100.28016 -> 100.29 at
+        // base costs and 100.48032 -> 100.49 doubled. Each run's return
+        // truncates to whole bps, so this is 19 - 2; unrounded it was 19 - 3.
+        assert_eq!(degradation("TRANSACTION_COST_SHOCK"), 17);
+        assert_eq!(degradation("PARAMETER_CLIFF_PROBE"), 19);
+        assert_eq!(degradation("REGIME_STRESS_PROBE"), 1005);
+        assert_eq!(parsed["gate_passed"], true);
+        assert_eq!(parsed["composite_robustness_score_bps"], 10_000);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn adversarial_execute_mode_fails_the_gate_when_real_degradation_exceeds_the_operators_threshold(
+    ) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/adversarial-execute-v1.json");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        // The real REGIME_STRESS_PROBE measurement is 1005bps (see the test
+        // above); tightening its allowed threshold below that must fail the
+        // gate on a genuine measured number, not a caller-supplied one.
+        document["execute"]["probes"][4]["threshold_bps"] = serde_json::Value::from(100);
+        let fixtures_dir = fixture.parent().unwrap();
+        document["execute"]["backtest_configuration"] = serde_json::Value::String(
+            fixtures_dir
+                .join("backtest-probe-v1.json")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        document["execute"]["historical_bars"] = serde_json::Value::String(
+            fixtures_dir
+                .join("../historical-bars/probe-corpus-one-minute.csv")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let config_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-strict-threshold-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&config_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let output_path = std::env::temp_dir().join(format!(
+            "follon-adversarial-strict-threshold-out-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let args = vec![
+            config_path.to_str().unwrap().to_owned(),
+            output_path.to_str().unwrap().to_owned(),
+        ];
+        run_adversarial(&args).unwrap();
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["gate_passed"], false);
+        assert!(parsed["blocking_failure_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("REGIME_STRESS_PROBE")));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn jitter_bars_perturbs_every_bar_but_keeps_ohlc_valid() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let jittered = jitter_bars(&bars, 11, 20).unwrap();
+        assert_eq!(bars.len(), jittered.len());
+        assert!(bars
+            .iter()
+            .zip(&jittered)
+            .any(|(original, perturbed)| original.bar.close != perturbed.bar.close));
+        for historical in &jittered {
+            historical.bar.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn shock_bars_from_preserves_ohlc_ordering_under_a_large_negative_shock() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let shocked = shock_bars_from(&bars, bars.len() / 2, -1_500).unwrap();
+        for historical in shocked.iter().skip(bars.len() / 2) {
+            historical.bar.validate().unwrap();
+        }
+        assert_eq!(
+            shocked[0].bar.close, bars[0].bar.close,
+            "bars before the shock start index are untouched"
+        );
+        assert!(shocked[bars.len() / 2].bar.close < bars[bars.len() / 2].bar.close);
+    }
+
+    #[test]
+    fn drop_bars_removes_exactly_the_requested_range() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let dropped = drop_bars(&bars, 10, 5).unwrap();
+        assert_eq!(dropped.len(), bars.len() - 5);
+        assert_eq!(dropped[9].event_time, bars[9].event_time);
+        assert_eq!(dropped[10].event_time, bars[15].event_time);
+    }
+
+    #[test]
+    fn drop_bars_refuses_to_remove_every_bar() {
+        let fixture_csv = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/historical-bars/probe-corpus-one-minute.csv"),
+        )
+        .unwrap();
+        let bars = import_historical_bars(&fixture_csv).unwrap();
+        let count = bars.len();
+        assert!(drop_bars(&bars, 0, count).is_err());
     }
 }

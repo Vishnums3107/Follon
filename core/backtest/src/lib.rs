@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use follon_accounting::{
     accrue_financing, value_margin_account, AccountingError, Currency, FinancingBalance,
-    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot,
+    FinancingKind, FxBook, MarginPolicy, MarginPosition, MarginSnapshot, ShortTaxLot, TaxLot,
+    TaxLotBook, TaxLotSelection,
 };
 use follon_control_plane::{
     EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
@@ -264,6 +265,13 @@ pub struct BacktestLedger {
     currency: String,
     cash: Decimal,
     positions: BTreeMap<String, LedgerPosition>,
+    /// Independent FIFO long-lot cost-basis ledger, kept in lockstep with
+    /// `positions` from the same fills. `LedgerPosition` tracks a single
+    /// running average cost; this book retains individual acquisition lots
+    /// so a real disposal reports an auditable, tax-lot-accurate realized
+    /// gain/loss. This ledger is long-only (see `apply_fill`'s sell branch),
+    /// so every disposal is a genuine long-lot sale, never a short cover.
+    tax_lots: TaxLotBook,
     execution_ids: BTreeSet<String>,
     corporate_action_ids: BTreeSet<String>,
     entries: Vec<AccountingEntry>,
@@ -285,6 +293,7 @@ impl BacktestLedger {
             currency,
             cash: initial_cash,
             positions: BTreeMap::new(),
+            tax_lots: TaxLotBook::default(),
             execution_ids: BTreeSet::new(),
             corporate_action_ids: BTreeSet::new(),
             entries: Vec::new(),
@@ -360,6 +369,7 @@ impl BacktestLedger {
                 (Decimal::ZERO.checked_sub(fill.quantity)?, proceeds)
             }
         };
+        self.apply_tax_lot_fill(fill)?;
         self.fees = self.fees.checked_add(fill.fee)?;
         self.execution_ids.insert(fill.execution_id.clone());
         self.entries.push(AccountingEntry {
@@ -371,6 +381,56 @@ impl BacktestLedger {
             cash_delta,
         });
         Ok(())
+    }
+
+    /// Applies one fill to the independent FIFO tax-lot book. A buy acquires
+    /// a new lot at its exact all-in unit cost (price plus fee); a sell
+    /// disposes existing lots FIFO. The sell branch of `apply_fill` above
+    /// already refuses a sell exceeding the held quantity before this is
+    /// reached, so a disposal here can never exceed available lots. Lot
+    /// selection is fixed at FIFO rather than exposing a configurable
+    /// policy — a bounded simplification, not a correctness gap.
+    fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), BacktestError> {
+        let currency = Currency::new(self.currency.clone())?;
+        match fill.side {
+            Side::Buy => {
+                let gross = fill.price.checked_mul(fill.quantity)?;
+                let unit_cost = gross.checked_add(fill.fee)?.checked_div(fill.quantity)?;
+                self.tax_lots.acquire(TaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency,
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: fill.quantity,
+                    unit_cost,
+                })?;
+            }
+            Side::Sell => {
+                self.tax_lots.dispose(
+                    &format!("taxdisposal-{}", fill.execution_id),
+                    &fill.instrument_id,
+                    &currency,
+                    fill.quantity,
+                    fill.price,
+                    fill.fee,
+                    &fill.executed_at,
+                    TaxLotSelection::Fifo,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaining open FIFO tax lots for one instrument, oldest first.
+    pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
+        self.tax_lots.lots(instrument_id)
+    }
+
+    /// Cumulative FIFO-realized tax P&L in the ledger's reporting currency,
+    /// independent of each position's average-cost realized P&L.
+    pub fn realized_tax_pnl(&self) -> Result<Decimal, BacktestError> {
+        let currency = Currency::new(self.currency.clone())?;
+        Ok(self.tax_lots.realized(&currency))
     }
 
     /// Applies split or cash-dividend economics to held positions.
@@ -702,6 +762,15 @@ pub struct AdvancedBacktestAccount {
     charges_by_currency: BTreeMap<Currency, BacktestExecutionCharges>,
     financing_by_currency: BTreeMap<Currency, Decimal>,
     delistings: Vec<DelistingSettlement>,
+    /// Independent FIFO cost-basis ledger, kept in lockstep with `positions`
+    /// from the same fills, covering both the long and short side. Unlike
+    /// `positions`' single running average price, this retains individual
+    /// acquisition/short-open lots so a real disposal or cover reports an
+    /// auditable, tax-lot-accurate realized gain/loss. A fill that crosses
+    /// through zero (e.g. a sell that closes a long and opens a short in one
+    /// execution) closes the existing side's lots and opens a new lot on the
+    /// other side, splitting the fill's fee proportionally between the two.
+    tax_lots: TaxLotBook,
 }
 
 impl AdvancedBacktestAccount {
@@ -720,6 +789,7 @@ impl AdvancedBacktestAccount {
             charges_by_currency: BTreeMap::new(),
             financing_by_currency: BTreeMap::new(),
             delistings: Vec::new(),
+            tax_lots: TaxLotBook::default(),
         })
     }
 
@@ -808,6 +878,9 @@ impl AdvancedBacktestAccount {
                 .checked_mul(prior_units)?
                 .checked_add(fill.price.checked_mul(fill.quantity)?)?
                 .checked_div(projected_units)?;
+            // Tax-lot wiring: a pure addition to the existing side (or a
+            // brand-new position from flat), never a crossing fill.
+            self.apply_tax_lot_open(fill, terms, fill.side, fill.quantity, fill.fee)?;
         } else {
             let closing = absolute_decimal(projected.quantity)?.min(fill.quantity);
             let direction = if projected.quantity > Decimal::ZERO {
@@ -820,6 +893,32 @@ impl AdvancedBacktestAccount {
                     .checked_mul(closing)?
                     .checked_mul(terms.multiplier)?,
             )?;
+            // Tax-lot wiring: close out `closing` units of the existing side
+            // (a long dispose or a short cover). A fill quantity exceeding
+            // what closes the existing side crosses through zero and opens a
+            // new lot on the *other* side for the remainder; the fill's one
+            // fee is split proportionally between the two legs so they sum
+            // exactly to `fill.fee` (the remainder leg takes the exact
+            // remainder rather than its own independently rounded share, so
+            // fixed-point division never drops or invents a fraction of a
+            // cent).
+            let remainder = fill.quantity.checked_sub(closing)?;
+            let closing_fee = if remainder == Decimal::ZERO {
+                fill.fee
+            } else {
+                fill.fee.checked_mul(closing)?.checked_div(fill.quantity)?
+            };
+            let remainder_fee = fill.fee.checked_sub(closing_fee)?;
+            self.apply_tax_lot_close(
+                fill,
+                terms,
+                projected.quantity > Decimal::ZERO,
+                closing,
+                closing_fee,
+            )?;
+            if remainder > Decimal::ZERO {
+                self.apply_tax_lot_open(fill, terms, fill.side, remainder, remainder_fee)?;
+            }
             if projected_quantity == Decimal::ZERO {
                 projected.average_price = Decimal::ZERO;
             } else if (projected.quantity > Decimal::ZERO && projected_quantity < Decimal::ZERO)
@@ -842,6 +941,106 @@ impl AdvancedBacktestAccount {
         totals.exchange = totals.exchange.checked_add(charges.exchange)?;
         totals.regulatory = totals.regulatory.checked_add(charges.regulatory)?;
         Ok(())
+    }
+
+    /// Applies the "opening" leg of a fill to the independent tax-lot ledger:
+    /// a buy acquires a new long lot; a sell opens a new short lot. This is
+    /// always either the entire fill (a pure addition to the existing side,
+    /// or a brand-new position from flat) or the crossing remainder after
+    /// [`Self::apply_tax_lot_close`] has closed out the opposite side --
+    /// `quantity`/`fee` are already the exact amount attributable to this
+    /// leg in either case.
+    fn apply_tax_lot_open(
+        &mut self,
+        fill: &Fill,
+        terms: &AdvancedInstrumentTerms,
+        side: Side,
+        quantity: Decimal,
+        fee: Decimal,
+    ) -> Result<(), BacktestError> {
+        let gross = fill.price.checked_mul(quantity)?;
+        match side {
+            Side::Buy => {
+                let unit_cost = gross.checked_add(fee)?.checked_div(quantity)?;
+                self.tax_lots.acquire(TaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency: terms.currency.clone(),
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: quantity,
+                    unit_cost,
+                })?;
+            }
+            Side::Sell => {
+                let unit_proceeds = gross.checked_sub(fee)?.checked_div(quantity)?;
+                self.tax_lots.open_short(ShortTaxLot {
+                    lot_id: format!("taxlot-{}", fill.execution_id),
+                    instrument_id: fill.instrument_id.clone(),
+                    currency: terms.currency.clone(),
+                    opened_at: fill.executed_at.clone(),
+                    remaining_quantity: quantity,
+                    unit_proceeds,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the "closing" leg of a fill to the independent tax-lot
+    /// ledger: closing a prior long position disposes long lots FIFO;
+    /// closing a prior short position covers short lots FIFO. `quantity` is
+    /// bounded by the prior position's own size, so this can never exceed
+    /// available lots (mirroring the same invariant `core/paper`/`core/live`
+    /// already rely on for their long-only `dispose` calls).
+    fn apply_tax_lot_close(
+        &mut self,
+        fill: &Fill,
+        terms: &AdvancedInstrumentTerms,
+        closing_long: bool,
+        quantity: Decimal,
+        fee: Decimal,
+    ) -> Result<(), BacktestError> {
+        if closing_long {
+            self.tax_lots.dispose(
+                &format!("taxdisposal-{}", fill.execution_id),
+                &fill.instrument_id,
+                &terms.currency,
+                quantity,
+                fill.price,
+                fee,
+                &fill.executed_at,
+                TaxLotSelection::Fifo,
+            )?;
+        } else {
+            self.tax_lots.cover(
+                &format!("taxcover-{}", fill.execution_id),
+                &fill.instrument_id,
+                &terms.currency,
+                quantity,
+                fill.price,
+                fee,
+                &fill.executed_at,
+                TaxLotSelection::Fifo,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remaining open FIFO long tax lots for one instrument, oldest first.
+    pub fn tax_lots(&self, instrument_id: &str) -> &[TaxLot] {
+        self.tax_lots.lots(instrument_id)
+    }
+
+    /// Remaining open FIFO short tax lots for one instrument, oldest first.
+    pub fn short_tax_lots(&self, instrument_id: &str) -> &[ShortTaxLot] {
+        self.tax_lots.short_lots(instrument_id)
+    }
+
+    /// Cumulative FIFO-realized tax P&L (long disposals and short covers
+    /// combined) in one currency, independent of `AdvancedBacktestPosition`'s
+    /// average-cost `realized_pnl`.
+    pub fn tax_realized_pnl(&self, currency: &Currency) -> Decimal {
+        self.tax_lots.realized(currency)
     }
 
     /// Applies a fill only when the resulting account satisfies initial margin.
@@ -1252,7 +1451,15 @@ impl AdvancedBacktestReport {
     /// Renders the advanced-account margin and economics evidence for review.
     pub fn markdown_report(&self) -> String {
         format!(
-            "# Follon Advanced Backtest Report\n\n| Metric | Exact value |\n| --- | ---: |\n| Base currency | {} |\n| Net liquidation value | {} |\n| Initial margin | {} |\n| Maintenance margin | {} |\n| Excess liquidity | {} |\n| Margin call | {} |\n| Realized P&L | {} |\n| Unrealized P&L | {} |\n| Execution charges | {} |\n| Financing charges | {} |\n\n",
+            "# Follon Advanced Backtest Report\n\n{}",
+            self.markdown_table()
+        )
+    }
+
+    /// The metric table shared by the standalone and embedded reports.
+    fn markdown_table(&self) -> String {
+        format!(
+            "| Metric | Exact value |\n| --- | ---: |\n| Base currency | {} |\n| Net liquidation value | {} |\n| Initial margin | {} |\n| Maintenance margin | {} |\n| Excess liquidity | {} |\n| Margin call | {} |\n| Realized P&L | {} |\n| Unrealized P&L | {} |\n| Execution charges | {} |\n| Financing charges | {} |\n\n",
             self.margin.base_currency.as_str(),
             self.margin.net_liquidation_value,
             self.margin.initial_margin,
@@ -1392,6 +1599,10 @@ pub struct BacktestArtifact {
     pub accounting_entries: Vec<AccountingEntry>,
     /// Exact performance summary and equity curve.
     pub performance: PerformanceReport,
+    /// Complete advanced-account economics for the same event stream, when
+    /// attached. These are the authoritative economics: `report` comes from
+    /// the single-currency, long-only ledger that builds the events.
+    pub advanced_account: Option<AdvancedBacktestReport>,
 }
 
 impl BacktestArtifact {
@@ -1427,26 +1638,58 @@ impl BacktestArtifact {
             report,
             accounting_entries,
             performance,
+            advanced_account: None,
         })
     }
 
-    /// Stable digest of the complete portable result, including its report.
+    /// Attaches the advanced-account economics derived from this artifact's
+    /// own event stream, which makes it an artifact schema version 3.
+    pub fn with_advanced_account(mut self, advanced_account: AdvancedBacktestReport) -> Self {
+        self.advanced_account = Some(advanced_account);
+        self
+    }
+
+    /// Artifact schema version: 3 when advanced economics are attached.
+    pub fn schema_version(&self) -> u32 {
+        if self.advanced_account.is_some() {
+            3
+        } else {
+            2
+        }
+    }
+
+    /// Stable digest of the complete portable result, including its report
+    /// and, when attached, the advanced-account economics.
     pub fn fingerprint(&self) -> String {
-        sha256(&format!(
+        let mut preimage = format!(
             "specification={}\nevents={}\nreport={}\nperformance={}\nentries={}\n",
             self.specification_fingerprint,
             self.event_output_hash,
             self.report.canonical_json(),
             self.performance.canonical_json(),
             accounting_entries_json(&self.accounting_entries),
-        ))
+        );
+        if let Some(advanced_account) = &self.advanced_account {
+            preimage.push_str(&format!(
+                "advanced_account={}\n",
+                advanced_account.canonical_json()
+            ));
+        }
+        sha256(&preimage)
     }
 
     /// Portable canonical JSON suitable for an immutable result artifact.
     pub fn canonical_json(&self) -> String {
+        let advanced_account = self
+            .advanced_account
+            .as_ref()
+            .map(|report| format!("\"advanced_account\":{},", report.canonical_json()))
+            .unwrap_or_default();
         format!(
-            "{{\"accounting_entries\":{},\"artifact_schema_version\":2,\"artifact_fingerprint\":\"{}\",\"event_output_hash\":\"{}\",\"performance\":{},\"report\":{},\"specification\":{},\"specification_fingerprint\":\"{}\"}}",
+            "{{\"accounting_entries\":{},{}\"artifact_schema_version\":{},\"artifact_fingerprint\":\"{}\",\"event_output_hash\":\"{}\",\"performance\":{},\"report\":{},\"specification\":{},\"specification_fingerprint\":\"{}\"}}",
             accounting_entries_json(&self.accounting_entries),
+            advanced_account,
+            self.schema_version(),
             self.fingerprint(),
             self.event_output_hash,
             self.performance.canonical_json(),
@@ -1527,6 +1770,17 @@ impl BacktestArtifact {
                 entry.cash_delta,
             )
             .expect("writing to a string cannot fail");
+        }
+        if let Some(advanced_account) = &self.advanced_account {
+            report.push_str(
+                "\n## Advanced account\n\n\
+                 These are the complete economics of this run: multi-currency cash, \
+                 long and short positions, margin, financing, and attributed charges, \
+                 derived from the same canonical event stream. The Performance, \
+                 Positions, and Accounting entries sections above come from the \
+                 single-currency, long-only ledger used to build the events.\n\n",
+            );
+            report.push_str(&advanced_account.markdown_table());
         }
         report
     }
@@ -2229,6 +2483,10 @@ mod tests {
         }
     }
 
+    fn amount(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
     #[test]
     fn identical_specifications_have_identical_fingerprints() {
         let dataset = DatasetManifest {
@@ -2314,7 +2572,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ledger_fifo_tax_lots_track_disposal_cost_basis_independent_of_average_cost() {
+        let mut ledger = BacktestLedger::new("USD", Decimal::from_integer(1_000).unwrap()).unwrap();
+        ledger
+            .apply_fill(&Fill {
+                execution_id: "exec-tax-001".to_owned(),
+                order_id: "order-tax-001".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(2).unwrap(),
+                price: Decimal::from_integer(100).unwrap(),
+                fee: Decimal::from_str("0.20").unwrap(),
+                executed_at: "2026-01-02T14:30:00Z".to_owned(),
+            })
+            .unwrap();
+        ledger
+            .apply_fill(&Fill {
+                execution_id: "exec-tax-002".to_owned(),
+                order_id: "order-tax-002".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(2).unwrap(),
+                price: Decimal::from_integer(120).unwrap(),
+                fee: Decimal::from_str("0.20").unwrap(),
+                executed_at: "2026-01-02T14:31:00Z".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(ledger.tax_lots("inst.us_equity.spy").len(), 2);
+
+        ledger
+            .apply_fill(&Fill {
+                execution_id: "exec-tax-003".to_owned(),
+                order_id: "order-tax-003".to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                side: Side::Sell,
+                quantity: Decimal::from_integer(2).unwrap(),
+                price: Decimal::from_integer(130).unwrap(),
+                fee: Decimal::from_str("0.20").unwrap(),
+                executed_at: "2026-01-02T14:32:00Z".to_owned(),
+            })
+            .unwrap();
+
+        // FIFO must fully consume the $100 lot (all-in unit cost 100.10),
+        // leaving the $120 lot (all-in unit cost 120.10) untouched.
+        let remaining = ledger.tax_lots("inst.us_equity.spy");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].unit_cost, Decimal::from_str("120.10").unwrap());
+        // realized = proceeds(260) - fifo cost basis(200.20) - fee(0.20) = 59.60
+        assert_eq!(
+            ledger.realized_tax_pnl().unwrap(),
+            Decimal::from_str("59.60").unwrap()
+        );
+
+        // The ledger's own blended average-cost realized P&L is a distinct
+        // figure: average cost across both lots is 110.10/unit, so
+        // realized = (130 - 110.10) * 2 - 0.20 = 39.60 -- proving the
+        // tax-lot book is an independent ledger, not a relabeling of the
+        // figure that already existed.
+        let report = ledger
+            .report(&BTreeMap::from([(
+                "inst.us_equity.spy".to_owned(),
+                Decimal::from_integer(130).unwrap(),
+            )]))
+            .unwrap();
+        assert_eq!(
+            report.positions[0].realized_pnl,
+            Decimal::from_str("39.60").unwrap()
+        );
+    }
+
     fn market_dependencies() -> (
+        follon_instrument::InstrumentRegistry,
+        follon_instrument::StaticTradingCalendar,
+    ) {
+        market_dependencies_with_lot(1)
+    }
+
+    /// SPY's session and reference data at an explicit lot size.
+    fn market_dependencies_with_lot(
+        lot_size: i64,
+    ) -> (
         follon_instrument::InstrumentRegistry,
         follon_instrument::StaticTradingCalendar,
     ) {
@@ -2343,7 +2681,7 @@ mod tests {
                     currency: "USD".to_owned(),
                     broker_ids: BTreeMap::new(),
                     tick_size: Decimal::from_str("0.01").unwrap(),
-                    lot_size: Decimal::from_integer(1).unwrap(),
+                    lot_size: Decimal::from_integer(lot_size).unwrap(),
                     multiplier: Decimal::from_integer(1).unwrap(),
                     trading_calendar_id: "cal.us_equities.nyse".to_owned(),
                 },
@@ -2383,12 +2721,22 @@ mod tests {
     }
 
     fn runner_input() -> BacktestInput {
+        // `BuyOnceStrategy` submits its one order on the first bar it sees
+        // (14:30), but a newly created order is never eligible until the
+        // following bar (see `ReplayEngine::process_bar`'s `eligible_on_bar`
+        // comment), so the fill actually happens on the second bar (14:31),
+        // still at the pre-split price level. The split then lands between
+        // the second and third bars, adjusting the now-filled position; the
+        // third bar (14:32, already at the post-split price level) is only
+        // present so replay has a tick that crosses the split's
+        // `effective_at` boundary and applies it.
         let first = bar();
-        let mut second = bar();
-        second.open = Decimal::from_integer(50).unwrap();
-        second.high = Decimal::from_integer(51).unwrap();
-        second.low = Decimal::from_integer(49).unwrap();
-        second.close = Decimal::from_integer(50).unwrap();
+        let second = bar();
+        let mut third = bar();
+        third.open = Decimal::from_integer(50).unwrap();
+        third.high = Decimal::from_integer(51).unwrap();
+        third.low = Decimal::from_integer(49).unwrap();
+        third.close = Decimal::from_integer(50).unwrap();
         BacktestInput {
             account_id: "acct-paper-001".to_owned(),
             currency: "USD".to_owned(),
@@ -2402,11 +2750,15 @@ mod tests {
                     event_time: "2026-01-02T14:31:00Z".to_owned(),
                     bar: second,
                 },
+                HistoricalBar {
+                    event_time: "2026-01-02T14:32:00Z".to_owned(),
+                    bar: third,
+                },
             ],
             corporate_actions: vec![CorporateAction::Split {
                 action_id: "action-split-001".to_owned(),
                 instrument_id: "inst.us_equity.spy".to_owned(),
-                effective_at: "2026-01-02T14:30:30Z".to_owned(),
+                effective_at: "2026-01-02T14:31:30Z".to_owned(),
                 ratio: Decimal::from_integer(2).unwrap(),
             }],
         }
@@ -2435,7 +2787,7 @@ mod tests {
             seed: 7,
             engine_version: "engine-v1".to_owned(),
             starts_at: "2026-01-02T14:30:00Z".to_owned(),
-            ends_at: "2026-01-02T14:31:00Z".to_owned(),
+            ends_at: "2026-01-02T14:32:00Z".to_owned(),
         }
     }
 
@@ -2492,7 +2844,7 @@ mod tests {
         assert_eq!(first.artifact.accounting_entries.len(), 2);
         assert_eq!(first.artifact.performance.trade_count, 1);
         assert_eq!(first.artifact.performance.corporate_action_count, 1);
-        assert_eq!(first.artifact.performance.equity_curve.len(), 2);
+        assert_eq!(first.artifact.performance.equity_curve.len(), 3);
         assert!(first
             .artifact
             .markdown_report()
@@ -2505,6 +2857,103 @@ mod tests {
             "b".repeat(64)
         );
         assert_eq!(artifact_json["performance"]["trade_count"], 1);
+        assert!(artifact_json.get("advanced_account").is_none());
+    }
+
+    #[test]
+    fn a_backtest_refuses_an_order_its_reference_data_does_not_permit() {
+        // `BuyOnceStrategy` buys one share. PAPER and controlled LIVE refuse
+        // that against a five-share lot, so the backtest must as well (E3.6d).
+        let input = runner_input();
+        let spec = runner_spec(&input);
+        let (instruments, calendar) = market_dependencies_with_lot(5);
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let completed = BacktestRunner::new(spec, runner_engine())
+            .unwrap()
+            .run(&mut runner_strategy(), &input, &market)
+            .unwrap();
+
+        assert_eq!(completed.artifact.performance.trade_count, 0);
+        assert!(completed.artifact.report.positions.is_empty());
+        let decisions: Vec<serde_json::Value> = completed
+            .canonical_events
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event_type"] == "risk.decision.v1")
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0]["payload"];
+        assert_eq!(decision["approved"], false);
+        assert_eq!(
+            decision["reason_codes"],
+            serde_json::json!(["ORDER_QUANTITY_OFF_LOT_SIZE"])
+        );
+        assert!(decision["evaluated_limits"]
+            .as_str()
+            .unwrap()
+            .ends_with(",instrument_tick_size=0.01000000,instrument_lot_size=5.00000000"));
+    }
+
+    #[test]
+    fn attached_advanced_economics_make_a_schema_3_artifact_bound_by_its_fingerprint() {
+        let input = runner_input();
+        let spec = runner_spec(&input);
+        let (instruments, calendar) = market_dependencies();
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let plain = BacktestRunner::new(spec, runner_engine())
+            .unwrap()
+            .run(&mut runner_strategy(), &input, &market)
+            .unwrap()
+            .artifact;
+        let usd = Currency::new("USD").unwrap();
+        let policy = MarginPolicy {
+            base_currency: usd.clone(),
+            maximum_fx_age_seconds: 0,
+            rates: BTreeMap::from([(
+                "equity".to_owned(),
+                follon_accounting::MarginRate {
+                    initial_bps: 10_000,
+                    maintenance_bps: 10_000,
+                },
+            )]),
+        };
+        let economics = |cash: &str| {
+            AdvancedBacktestAccount::new(BTreeMap::from([(usd.clone(), amount(cash))]))
+                .unwrap()
+                .report(&BTreeMap::new(), &FxBook::default(), &policy, 0)
+                .unwrap()
+        };
+
+        let attached = plain.clone().with_advanced_account(economics("1000"));
+        assert_eq!(attached.schema_version(), 3);
+        let json: serde_json::Value = serde_json::from_str(&attached.canonical_json()).unwrap();
+        assert_eq!(json["artifact_schema_version"], 3);
+        assert_eq!(
+            json["advanced_account"]["margin"]["net_liquidation_value"],
+            "1000.00000000"
+        );
+        assert_eq!(json["artifact_fingerprint"], attached.fingerprint());
+        assert!(attached.markdown_report().contains("## Advanced account"));
+        assert!(attached
+            .markdown_report()
+            .contains("| Net liquidation value | 1000.00000000 |"));
+        // The fingerprint covers the economics, and a plain artifact is unchanged.
+        assert_ne!(attached.fingerprint(), plain.fingerprint());
+        assert_ne!(
+            attached.fingerprint(),
+            plain
+                .clone()
+                .with_advanced_account(economics("999"))
+                .fingerprint()
+        );
+        assert_eq!(plain.schema_version(), 2);
+        assert!(!plain.markdown_report().contains("## Advanced account"));
     }
 
     #[test]
@@ -2686,6 +3135,120 @@ mod tests {
             report.margin.net_liquidation_value,
             Decimal::from_str("11194.50").unwrap()
         );
+    }
+
+    #[test]
+    fn advanced_account_tracks_a_pure_short_position_in_the_tax_lot_ledger() {
+        let usd = Currency::new("USD").unwrap();
+        let mut account =
+            AdvancedBacktestAccount::new(BTreeMap::from([(usd.clone(), amount("10000"))])).unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: true,
+            borrow_available: amount("10"),
+            borrow_rate_bps: 100,
+        };
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.short-open-1".to_owned(),
+                    order_id: "order.short-open-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: amount("5"),
+                    price: amount("100"),
+                    fee: amount("5"),
+                    executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: amount("5"),
+                    exchange: Decimal::ZERO,
+                    regulatory: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        // A pure short-open is a `same_direction` addition from flat: no
+        // long lot is ever touched, and the short lot's all-in proceeds are
+        // net of the fee -- (5*100 - 5) / 5 = 99.
+        assert!(account.tax_lots("inst.us_equity.spy").is_empty());
+        let short_lots = account.short_tax_lots("inst.us_equity.spy");
+        assert_eq!(short_lots.len(), 1);
+        assert_eq!(short_lots[0].remaining_quantity, amount("5"));
+        assert_eq!(short_lots[0].unit_proceeds, amount("99"));
+        assert_eq!(account.tax_realized_pnl(&usd), Decimal::ZERO);
+    }
+
+    #[test]
+    fn advanced_account_crossing_fill_splits_tax_lots_and_fee_across_both_sides() {
+        let usd = Currency::new("USD").unwrap();
+        let mut account =
+            AdvancedBacktestAccount::new(BTreeMap::from([(usd.clone(), amount("10000"))])).unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: true,
+            borrow_available: amount("10"),
+            borrow_rate_bps: 100,
+        };
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.cross-buy-1".to_owned(),
+                    order_id: "order.cross-buy-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Buy,
+                    quantity: amount("5"),
+                    price: amount("100"),
+                    fee: amount("5"),
+                    executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: amount("5"),
+                    exchange: Decimal::ZERO,
+                    regulatory: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        // One 8-share sell crosses the entire 5-share long position: the
+        // first 5 shares close the long lot (dispose), and the remaining 3
+        // open a brand-new short lot -- all from one fill, one execution_id.
+        account
+            .apply_fill(
+                &Fill {
+                    execution_id: "execution.cross-sell-1".to_owned(),
+                    order_id: "order.cross-sell-1".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: amount("8"),
+                    price: amount("120"),
+                    fee: amount("8"),
+                    executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                },
+                &terms,
+                BacktestExecutionCharges {
+                    commission: amount("8"),
+                    exchange: Decimal::ZERO,
+                    regulatory: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        // The long lot's cost basis included the buy's fee (5*100+5)/5=101/
+        // share, so disposing all 5 at 120 with a proportional closing fee
+        // of 8*(5/8)=5 realizes exactly (5*120) - (5*101) - 5 = 90.
+        assert!(account.tax_lots("inst.us_equity.spy").is_empty());
+        assert_eq!(account.tax_realized_pnl(&usd), amount("90"));
+        // The crossing remainder (3 shares) opens a fresh short lot at the
+        // same fill price, net of its own proportional fee share
+        // (8 - 5 = 3): (3*120 - 3) / 3 = 119/share.
+        let short_lots = account.short_tax_lots("inst.us_equity.spy");
+        assert_eq!(short_lots.len(), 1);
+        assert_eq!(short_lots[0].remaining_quantity, amount("3"));
+        assert_eq!(short_lots[0].unit_proceeds, amount("119"));
     }
 
     #[test]

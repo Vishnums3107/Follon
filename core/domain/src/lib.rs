@@ -208,6 +208,12 @@ pub fn validate_canonical_id(name: &str, value: &str) -> Result<(), DomainError>
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DomainError(pub String);
 
+impl From<DecimalError> for DomainError {
+    fn from(error: DecimalError) -> Self {
+        Self(error.0)
+    }
+}
+
 impl fmt::Display for DomainError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -402,6 +408,236 @@ impl OrderIntent {
             ));
         }
         Ok(())
+    }
+}
+
+/// Net-price protection for one atomic multi-leg combination.
+///
+/// This is a domain contract rather than an execution-planner detail: pre-trade
+/// risk has to reason about the protected net price of a combination before any
+/// plan exists, so the same type is used by `core/execution`'s planner, by the
+/// risk gate, and by the environment services.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComboPriceLimit {
+    /// Total debit per combination unit may not exceed this positive amount.
+    MaximumDebit(Decimal),
+    /// Total credit per combination unit may not fall below this positive amount.
+    MinimumCredit(Decimal),
+}
+
+impl ComboPriceLimit {
+    /// Stable wire representation of the protection kind.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MaximumDebit(_) => "MAXIMUM_DEBIT",
+            Self::MinimumCredit(_) => "MINIMUM_CREDIT",
+        }
+    }
+
+    /// The positive protection amount, whichever kind this is.
+    pub const fn amount(self) -> Decimal {
+        match self {
+            Self::MaximumDebit(amount) | Self::MinimumCredit(amount) => amount,
+        }
+    }
+
+    /// Checks a signed protected net price against this protection.
+    ///
+    /// The sign convention is fixed across the repository: a **positive** net
+    /// price is a debit the account pays, a **negative** net price is a credit
+    /// the account receives. A debit-protected combination that priced to a
+    /// credit is refused rather than silently accepted, because an operator who
+    /// asked for a maximum debit did not ask to be filled at an unreviewed
+    /// credit — the economics are not the ones they approved.
+    pub fn check_net_price(self, protected_net_price: Decimal) -> Result<(), DomainError> {
+        match self {
+            Self::MaximumDebit(limit) => {
+                if limit <= Decimal::ZERO
+                    || protected_net_price < Decimal::ZERO
+                    || protected_net_price > limit
+                {
+                    return Err(DomainError(
+                        "combination exceeds its maximum debit".to_owned(),
+                    ));
+                }
+            }
+            Self::MinimumCredit(limit) => {
+                let credit = Decimal::ZERO.checked_sub(protected_net_price)?;
+                if limit <= Decimal::ZERO || credit < limit {
+                    return Err(DomainError(
+                        "combination is below its minimum credit".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One ratio leg of a multi-leg combination intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComboIntentLeg {
+    /// Canonical instrument identity for this leg.
+    pub instrument_id: String,
+    /// Economic side for this leg.
+    pub side: Side,
+    /// Positive contracts per combination unit.
+    pub ratio: u32,
+    /// Positive protected leg price used to prove the net price.
+    pub limit_price: Decimal,
+}
+
+/// A strategy or operator request for one atomic multi-leg combination.
+///
+/// This is the combination analogue of [`OrderIntent`], and exists for the same
+/// reason: it is the *only* shape a risk gate is willing to assess. A
+/// combination must never be decomposed into independently marketable legs —
+/// either an adapter executes every leg atomically or it rejects the request
+/// before transmitting any of them — so the risk gate assesses the combination
+/// as a single economic unit and the OMS tracks it as a single order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComboIntent {
+    /// Intent identity, and the OMS idempotency key it derives.
+    pub intent_id: String,
+    /// Target account identity.
+    pub account_id: String,
+    /// Originating strategy identity.
+    pub strategy_id: String,
+    /// Correlates the resulting causal chain.
+    pub correlation_id: String,
+    /// Exact ratio legs, executed as one atomic group.
+    pub legs: Vec<ComboIntentLeg>,
+    /// Positive number of combination units requested.
+    pub combo_quantity: Decimal,
+    /// Net-price protection for the whole combination.
+    pub price_limit: ComboPriceLimit,
+    /// Time in force for the combination as a unit.
+    pub time_in_force: TimeInForce,
+    /// Human-readable strategy rationale or signal reference.
+    pub rationale: String,
+    /// UTC creation time supplied by the replay clock.
+    pub created_at: String,
+    /// Immutable strategy-bundle version.
+    pub strategy_version: String,
+    /// Immutable configuration version.
+    pub configuration_version: String,
+    /// Requested execution environment.
+    pub environment: String,
+}
+
+/// Inclusive leg-count bounds for one combination.
+///
+/// The lower bound is two because a one-leg "combination" is a plain order and
+/// must take the plain order path, which has strictly more risk coverage. The
+/// upper bound matches `core/execution`'s planner and the paper broker request.
+pub const COMBO_LEG_BOUNDS: std::ops::RangeInclusive<usize> = 2..=16;
+
+/// Inclusive bounds for a single leg's ratio.
+pub const COMBO_LEG_RATIO_BOUNDS: std::ops::RangeInclusive<u32> = 1..=10_000;
+
+impl ComboIntent {
+    /// Validates every field required before risk can assess the combination.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        for (name, value) in [
+            ("combo intent_id", self.intent_id.as_str()),
+            ("combo account_id", self.account_id.as_str()),
+            ("combo strategy_id", self.strategy_id.as_str()),
+            ("combo correlation_id", self.correlation_id.as_str()),
+        ] {
+            validate_canonical_id(name, value)?;
+        }
+        validate_utc_timestamp("combo intent created_at", &self.created_at)?;
+        if self.combo_quantity <= Decimal::ZERO || self.rationale.is_empty() {
+            return Err(DomainError(
+                "combo intent quantity and rationale are required".to_owned(),
+            ));
+        }
+        if !COMBO_LEG_BOUNDS.contains(&self.legs.len()) {
+            return Err(DomainError(format!(
+                "combo intent must contain between {} and {} legs",
+                COMBO_LEG_BOUNDS.start(),
+                COMBO_LEG_BOUNDS.end()
+            )));
+        }
+        // Duplicate instruments are refused rather than netted. Netting them
+        // here would change the economics the operator approved, and it would
+        // also defeat the aggregate position projection the risk gate performs
+        // per instrument.
+        let mut seen: Vec<&str> = Vec::with_capacity(self.legs.len());
+        for leg in &self.legs {
+            validate_canonical_id("combo leg instrument_id", &leg.instrument_id)?;
+            if seen.contains(&leg.instrument_id.as_str()) {
+                return Err(DomainError(
+                    "combo intent legs must reference distinct instruments".to_owned(),
+                ));
+            }
+            seen.push(leg.instrument_id.as_str());
+            if !COMBO_LEG_RATIO_BOUNDS.contains(&leg.ratio) {
+                return Err(DomainError(format!(
+                    "combo leg ratio must be between {} and {}",
+                    COMBO_LEG_RATIO_BOUNDS.start(),
+                    COMBO_LEG_RATIO_BOUNDS.end()
+                )));
+            }
+            if leg.limit_price <= Decimal::ZERO {
+                return Err(DomainError(
+                    "combo leg limit price must be positive".to_owned(),
+                ));
+            }
+        }
+        if self.price_limit.amount() <= Decimal::ZERO {
+            return Err(DomainError(
+                "combo price limit must be a positive amount".to_owned(),
+            ));
+        }
+        self.price_limit
+            .check_net_price(self.protected_net_price()?)
+    }
+
+    /// The signed protected net price of one combination unit.
+    ///
+    /// Positive is a debit the account pays; negative is a credit it receives.
+    pub fn protected_net_price(&self) -> Result<Decimal, DomainError> {
+        let mut net = Decimal::ZERO;
+        for leg in &self.legs {
+            let ratio = Decimal::from_integer(i64::from(leg.ratio))?;
+            let leg_net = leg.limit_price.checked_mul(ratio)?;
+            net = match leg.side {
+                Side::Buy => net.checked_add(leg_net)?,
+                Side::Sell => net.checked_sub(leg_net)?,
+            };
+        }
+        Ok(net)
+    }
+
+    /// The exact contract quantity for one leg, after applying its ratio.
+    pub fn leg_quantity(&self, leg: &ComboIntentLeg) -> Result<Decimal, DomainError> {
+        let ratio = Decimal::from_integer(i64::from(leg.ratio))?;
+        Ok(self.combo_quantity.checked_mul(ratio)?)
+    }
+
+    /// The absolute gross notional the whole combination puts at risk.
+    ///
+    /// Every leg contributes its own magnitude regardless of side, because a
+    /// two-sided combination still exposes the account to both legs until it
+    /// is closed. A net-price view would understate that exposure, which is
+    /// the exact failure mode an aggregate risk limit exists to prevent.
+    pub fn gross_notional(&self) -> Result<Decimal, DomainError> {
+        let mut gross = Decimal::ZERO;
+        for leg in &self.legs {
+            let quantity = self.leg_quantity(leg)?;
+            gross = gross.checked_add(quantity.checked_mul(leg.limit_price)?)?;
+        }
+        Ok(gross)
+    }
+
+    /// The signed quantity this combination projects onto one instrument.
+    pub fn projected_leg_delta(&self, leg: &ComboIntentLeg) -> Result<Decimal, DomainError> {
+        let quantity = self.leg_quantity(leg)?;
+        Ok(match leg.side {
+            Side::Buy => quantity,
+            Side::Sell => Decimal::ZERO.checked_sub(quantity)?,
+        })
     }
 }
 
@@ -970,6 +1206,189 @@ fn json_strings(values: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decimal(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
+    /// A long call vertical: buy the 500 strike, sell the 510, for a net debit.
+    fn vertical_spread() -> ComboIntent {
+        ComboIntent {
+            intent_id: "combo-000001".to_owned(),
+            account_id: "acct-paper-001".to_owned(),
+            strategy_id: "strat.vertical".to_owned(),
+            correlation_id: "corr-combo-000001".to_owned(),
+            legs: vec![
+                ComboIntentLeg {
+                    instrument_id: "inst.us_option.spy.20260320.c500".to_owned(),
+                    side: Side::Buy,
+                    ratio: 1,
+                    limit_price: decimal("7.50"),
+                },
+                ComboIntentLeg {
+                    instrument_id: "inst.us_option.spy.20260320.c510".to_owned(),
+                    side: Side::Sell,
+                    ratio: 1,
+                    limit_price: decimal("5.00"),
+                },
+            ],
+            combo_quantity: decimal("4"),
+            price_limit: ComboPriceLimit::MaximumDebit(decimal("2.50")),
+            time_in_force: TimeInForce::Day,
+            rationale: "capped-risk directional expression".to_owned(),
+            created_at: "2026-01-02T14:30:00Z".to_owned(),
+            strategy_version: "bundle-1".to_owned(),
+            configuration_version: "cfg-1".to_owned(),
+            environment: "PAPER".to_owned(),
+        }
+    }
+
+    #[test]
+    fn combo_intent_prices_a_debit_spread_exactly() {
+        let intent = vertical_spread();
+        intent.validate().unwrap();
+        // 7.50 paid less 5.00 received, per one-lot combination unit.
+        assert_eq!(intent.protected_net_price().unwrap(), decimal("2.50"));
+        // Four units at ratio 1 on each leg.
+        assert_eq!(intent.leg_quantity(&intent.legs[0]).unwrap(), decimal("4"));
+        assert_eq!(
+            intent.projected_leg_delta(&intent.legs[0]).unwrap(),
+            decimal("4")
+        );
+        assert_eq!(
+            intent.projected_leg_delta(&intent.legs[1]).unwrap(),
+            decimal("-4")
+        );
+    }
+
+    #[test]
+    fn combo_gross_notional_counts_both_legs_not_the_net() {
+        let intent = vertical_spread();
+        // 4 * 7.50 + 4 * 5.00 = 50, not the 10 a net-price view would report.
+        // The short leg is a real obligation until the combination is closed,
+        // so an aggregate limit must see it.
+        assert_eq!(intent.gross_notional().unwrap(), decimal("50"));
+        assert!(intent.gross_notional().unwrap() > intent.protected_net_price().unwrap());
+    }
+
+    #[test]
+    fn combo_intent_prices_a_credit_spread_exactly() {
+        let mut intent = vertical_spread();
+        intent.legs[0].side = Side::Sell;
+        intent.legs[1].side = Side::Buy;
+        intent.price_limit = ComboPriceLimit::MinimumCredit(decimal("2.00"));
+        intent.validate().unwrap();
+        assert_eq!(intent.protected_net_price().unwrap(), decimal("-2.50"));
+    }
+
+    #[test]
+    fn combo_price_limit_refuses_the_wrong_economics_not_just_the_wrong_magnitude() {
+        // A combination that prices to a credit cannot satisfy a *debit*
+        // protection, even though a credit is "cheaper" than any debit cap.
+        // The operator approved a debit structure; filling a credit one is a
+        // different trade.
+        let mut credit = vertical_spread();
+        credit.legs[0].side = Side::Sell;
+        credit.legs[1].side = Side::Buy;
+        assert_eq!(credit.protected_net_price().unwrap(), decimal("-2.50"));
+        assert!(credit.validate().is_err());
+
+        // And the mirror: a debit structure cannot satisfy a credit protection.
+        let mut debit = vertical_spread();
+        debit.price_limit = ComboPriceLimit::MinimumCredit(decimal("1.00"));
+        assert!(debit.validate().is_err());
+    }
+
+    #[test]
+    fn combo_price_limit_refuses_a_breach_by_the_smallest_representable_amount() {
+        let mut intent = vertical_spread();
+        assert_eq!(intent.protected_net_price().unwrap(), decimal("2.50"));
+        intent.price_limit =
+            ComboPriceLimit::MaximumDebit(Decimal::from_scaled(decimal("2.50").scaled() - 1));
+        assert!(intent.validate().is_err());
+        // Exactly at the limit is accepted; one unit beyond is not.
+        intent.price_limit = ComboPriceLimit::MaximumDebit(decimal("2.50"));
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn combo_intent_refuses_a_single_leg_and_an_oversized_group() {
+        // One leg is a plain order, and the plain-order path carries strictly
+        // more risk coverage, so it must not be reachable through this type.
+        let mut single = vertical_spread();
+        single.legs.truncate(1);
+        assert!(single.validate().is_err());
+
+        let mut oversized = vertical_spread();
+        let template = oversized.legs[0].clone();
+        while oversized.legs.len() <= *COMBO_LEG_BOUNDS.end() {
+            let index = oversized.legs.len();
+            oversized.legs.push(ComboIntentLeg {
+                instrument_id: format!("inst.us_option.spy.20260320.c{index}"),
+                ..template.clone()
+            });
+        }
+        assert!(oversized.legs.len() > *COMBO_LEG_BOUNDS.end());
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn combo_intent_refuses_duplicate_instruments_rather_than_netting_them() {
+        let mut intent = vertical_spread();
+        intent.legs[1].instrument_id = intent.legs[0].instrument_id.clone();
+        assert!(intent.validate().is_err());
+    }
+
+    #[test]
+    fn combo_intent_refuses_malformed_legs_quantities_and_identities() {
+        let mut zero_ratio = vertical_spread();
+        zero_ratio.legs[0].ratio = 0;
+        assert!(zero_ratio.validate().is_err());
+
+        let mut huge_ratio = vertical_spread();
+        huge_ratio.legs[0].ratio = *COMBO_LEG_RATIO_BOUNDS.end() + 1;
+        assert!(huge_ratio.validate().is_err());
+
+        let mut free_leg = vertical_spread();
+        free_leg.legs[0].limit_price = Decimal::ZERO;
+        assert!(free_leg.validate().is_err());
+
+        let mut no_units = vertical_spread();
+        no_units.combo_quantity = Decimal::ZERO;
+        assert!(no_units.validate().is_err());
+
+        let mut negative_protection = vertical_spread();
+        negative_protection.price_limit = ComboPriceLimit::MaximumDebit(Decimal::ZERO);
+        assert!(negative_protection.validate().is_err());
+
+        let mut display_symbol = vertical_spread();
+        display_symbol.legs[0].instrument_id = "SPY 500C".to_owned();
+        assert!(display_symbol.validate().is_err());
+
+        let mut unexplained = vertical_spread();
+        unexplained.rationale.clear();
+        assert!(unexplained.validate().is_err());
+
+        let mut local_time = vertical_spread();
+        local_time.created_at = "2026-01-02T14:30:00+00:00".to_owned();
+        assert!(local_time.validate().is_err());
+    }
+
+    #[test]
+    fn combo_price_limit_reports_a_stable_kind_and_amount() {
+        assert_eq!(
+            ComboPriceLimit::MaximumDebit(decimal("2.50")).kind(),
+            "MAXIMUM_DEBIT"
+        );
+        assert_eq!(
+            ComboPriceLimit::MinimumCredit(decimal("2.50")).kind(),
+            "MINIMUM_CREDIT"
+        );
+        assert_eq!(
+            ComboPriceLimit::MinimumCredit(decimal("2.50")).amount(),
+            decimal("2.50")
+        );
+    }
 
     #[test]
     fn decimal_is_exact_and_stably_rendered() {

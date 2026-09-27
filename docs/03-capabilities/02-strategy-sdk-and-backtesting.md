@@ -62,8 +62,11 @@ artifacts. The portable artifact embeds this complete specification, and a
 completion manifest binds each output file by SHA-256. A result without this
 record is exploratory output, not a reproducible decision artifact.
 
-Every CLI replay additionally produces a hashed advanced-account JSON and
-Markdown sidecar. Explicit `advanced_account` configuration supplies FX,
+Every CLI replay also derives the advanced-account economics from its own
+event stream and carries them inside the main artifact, as artifact schema
+version 3. The artifact fingerprint and SHA-256 cover them, and the Markdown
+report gains an "Advanced account" section. There is no separate sidecar to
+read. Explicit `advanced_account` configuration supplies FX,
 margin, borrow, financing, and terminal-lifecycle economics. Older v1
 configuration files receive a deterministic, fully-paid cash-account profile
 from their own immutable account and instrument data: 100% margin, no inferred

@@ -1,6 +1,6 @@
 """Supported, broker-independent contracts for Follon strategies."""
 
-from .bundle import StrategyBundle, strategy_bundle_hash
+from .bundle import StrategyBundle, strategy_bundle_hash, strategy_bundle_lock
 from .models import (
     Bar,
     EventTaxonomy,
@@ -53,4 +53,5 @@ __all__ = [
     "TimedBar",
     "TimeInForce",
     "strategy_bundle_hash",
+    "strategy_bundle_lock",
 ]

@@ -774,17 +774,24 @@ async function initializeDashboard(): Promise<void> {
 
   await Promise.all([loadFeatureDefinitions(), refreshSystemStatus()]);
   await refreshServerEvidence(true);
+  let workspaceLoadError: unknown;
   try {
     await refreshWorkspaceSnapshot();
   } catch (error) {
+    workspaceLoadError = error;
+  }
+  await openWorkspace(workspaceRoute(), { scroll: false, history: false });
+  if (workspaceLoadError !== undefined) {
+    // openWorkspace() unconditionally repaints workspaceCanvasRoot from the
+    // fallback snapshot, so the error must render after it, not before, or it
+    // is wiped out before the user ever sees it.
     renderActionableError(
       workspaceCanvasRoot,
-      error instanceof Error ? error.message : "Unable to load integrated workspaces.",
+      workspaceLoadError instanceof Error ? workspaceLoadError.message : "Unable to load integrated workspaces.",
       "Retry Workspaces",
       () => void refreshIntegratedWorkspace(),
     );
   }
-  await openWorkspace(workspaceRoute(), { scroll: false, history: false });
 }
 
 async function refreshIntegratedWorkspace(): Promise<void> {

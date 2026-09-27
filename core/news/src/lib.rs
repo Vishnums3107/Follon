@@ -140,7 +140,7 @@ pub fn replay_availability_time_from_unix_ns(
         ));
     }
     let seconds = availability_time_ns / 1_000_000_000;
-    let rounded_seconds = if availability_time_ns % 1_000_000_000 == 0 {
+    let rounded_seconds = if availability_time_ns.is_multiple_of(1_000_000_000) {
         seconds
     } else {
         seconds.checked_add(1).ok_or_else(|| {

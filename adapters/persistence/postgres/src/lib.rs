@@ -9,10 +9,21 @@ use std::path::Path;
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp};
 use native_tls::{Certificate, TlsConnector};
+use postgres::error::SqlState;
 use postgres::{Client, NoTls, Transaction};
 use postgres_native_tls::MakeTlsConnector;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+/// Name PostgreSQL assigns (its default `<table>_<col>..._key` convention) to
+/// the unnamed `UNIQUE (tenant_id, idempotency_key)` constraint on
+/// `domain_events` declared in `migrations/0001_operating_system.sql`. Two
+/// transactions that both miss the pre-insert idempotency check (the classic
+/// "client retried while the original request was still in-flight" race) will
+/// serialize on the aggregate's advisory lock and then race this constraint;
+/// the loser's `INSERT` fails here rather than on the aggregate-sequence
+/// constraint, so this is the specific violation `append_event` recovers from.
+const IDEMPOTENCY_KEY_CONSTRAINT: &str = "domain_events_tenant_id_idempotency_key_key";
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_operating_system.sql")),
@@ -211,6 +222,16 @@ impl PostgresStore {
     /// Atomically appends one event and its outbox message. Aggregate sequence
     /// assignment is serialized with an advisory transaction lock. A repeated
     /// idempotency key succeeds only when its payload fingerprint is identical.
+    ///
+    /// The idempotency pre-check and the insert are necessarily separate
+    /// statements, so two concurrent callers that submit the same
+    /// `idempotency_key` can both miss the pre-check, both take the
+    /// aggregate's advisory lock in turn, and then race the
+    /// `UNIQUE (tenant_id, idempotency_key)` constraint on insert. Rather than
+    /// surface that race as a raw constraint-violation error to whichever
+    /// caller loses it, the loser re-reads the row the winner just committed
+    /// and returns the same fingerprint-checked idempotent outcome the
+    /// pre-check path would have returned had it observed the row in time.
     pub fn append_event(&mut self, event: &EventAppend) -> Result<AppendOutcome, PersistenceError> {
         validate_event(event)?;
         let canonical_payload = serde_json::to_vec(&event.payload)
@@ -219,28 +240,8 @@ impl PostgresStore {
         let mut transaction = self.client.transaction()?;
         set_tenant(&mut transaction, &event.tenant_id)?;
 
-        if let Some(row) = transaction.query_opt(
-            "SELECT aggregate_sequence, payload_sha256, event_type, aggregate_type, aggregate_id \
-             FROM domain_events WHERE tenant_id = $1 AND idempotency_key = $2",
-            &[&event.tenant_id, &event.idempotency_key],
-        )? {
-            let existing_hash: Vec<u8> = row.get(1);
-            let existing_event_type: String = row.get(2);
-            let existing_aggregate_type: String = row.get(3);
-            let existing_aggregate_id: String = row.get(4);
-            if existing_hash != payload_hash
-                || existing_event_type != event.event_type
-                || existing_aggregate_type != event.aggregate_type
-                || existing_aggregate_id != event.aggregate_id
-            {
-                return Err(PersistenceError(
-                    "idempotency key was reused with different event content".to_owned(),
-                ));
-            }
-            return Ok(AppendOutcome {
-                aggregate_sequence: row.get(0),
-                inserted: false,
-            });
+        if let Some(outcome) = idempotent_outcome(&mut transaction, event, &payload_hash)? {
+            return Ok(outcome);
         }
 
         transaction.query_one(
@@ -257,27 +258,70 @@ impl PostgresStore {
             &[&event.tenant_id, &event.aggregate_type, &event.aggregate_id],
         )?;
         let aggregate_sequence: i64 = row.get(0);
-        transaction.execute(
-            "INSERT INTO domain_events (\
-               event_id, tenant_id, aggregate_type, aggregate_id, aggregate_sequence,\
-               event_type, payload, occurred_at, correlation_id, causation_id,\
-               idempotency_key, payload_sha256\
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9,$10,$11,$12)",
-            &[
-                &event.event_id,
-                &event.tenant_id,
-                &event.aggregate_type,
-                &event.aggregate_id,
-                &aggregate_sequence,
-                &event.event_type,
-                &event.payload,
-                &event.occurred_at,
-                &event.correlation_id,
-                &event.causation_id,
-                &event.idempotency_key,
-                &payload_hash,
-            ],
-        )?;
+
+        // Insert inside a savepoint: on a unique-violation race we need to
+        // roll back just this statement (PostgreSQL otherwise aborts the
+        // whole transaction on any error) and keep using `transaction` to
+        // re-read the winning row and finish the advisory-locked commit path
+        // cleanly rather than starting over on a fresh connection.
+        let insert_conflict = {
+            let mut savepoint = transaction.savepoint("domain_event_insert")?;
+            // `$8::text::timestamptz` (not a bare `::timestamptz`): PostgreSQL
+            // infers a directly-cast parameter's wire type as the cast's
+            // target type, so a bare `$8::timestamptz` would demand a
+            // TIMESTAMPTZ-typed argument — but `occurred_at` is carried as an
+            // already-validated ISO-8601 `String`, whose `ToSql` impl only
+            // accepts text-like types. Casting through `text` first keeps the
+            // inferred parameter type TEXT so the `String` binds, then lets
+            // PostgreSQL parse it into `timestamptz` server-side.
+            let inserted = savepoint.execute(
+                "INSERT INTO domain_events (\
+                   event_id, tenant_id, aggregate_type, aggregate_id, aggregate_sequence,\
+                   event_type, payload, occurred_at, correlation_id, causation_id,\
+                   idempotency_key, payload_sha256\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::text::timestamptz,$9,$10,$11,$12)",
+                &[
+                    &event.event_id,
+                    &event.tenant_id,
+                    &event.aggregate_type,
+                    &event.aggregate_id,
+                    &aggregate_sequence,
+                    &event.event_type,
+                    &event.payload,
+                    &event.occurred_at,
+                    &event.correlation_id,
+                    &event.causation_id,
+                    &event.idempotency_key,
+                    &payload_hash,
+                ],
+            );
+            match inserted {
+                Ok(_) => {
+                    savepoint.commit()?;
+                    None
+                }
+                // Dropping `savepoint` here rolls back to it, clearing the
+                // aborted-transaction state so `transaction` stays usable.
+                Err(error) => Some(error),
+            }
+        };
+
+        if let Some(error) = insert_conflict {
+            if !is_idempotency_key_conflict(&error) {
+                return Err(error.into());
+            }
+            // A concurrent transaction won the race and committed the same
+            // idempotency key first. Recover exactly as the pre-check above
+            // would have if it had observed that row in time.
+            return idempotent_outcome(&mut transaction, event, &payload_hash)?.ok_or_else(|| {
+                PersistenceError(
+                    "idempotency key unique-violation was reported but the concurrent row \
+                     could not be re-read"
+                        .to_owned(),
+                )
+            });
+        }
+
         let message_id = format!("outbox.{}", event.event_id);
         transaction.execute(
             "INSERT INTO outbox_messages \
@@ -370,6 +414,62 @@ fn set_tenant(transaction: &mut Transaction<'_>, tenant_id: &str) -> Result<(), 
         &[&tenant_id],
     )?;
     Ok(())
+}
+
+/// Looks up any existing row for `event`'s idempotency key and reconciles it
+/// against `payload_hash`. Returns:
+/// - `Ok(None)` when no row exists yet for this key,
+/// - `Ok(Some(outcome))` with `inserted: false` when a row exists and its
+///   fingerprint (payload hash, event type, aggregate type/id) matches, or
+/// - `Err` when a row exists under this key with a different fingerprint.
+///
+/// Used both as `append_event`'s upfront idempotency check and, unchanged, as
+/// the race-recovery path after a unique-violation on the same constraint —
+/// the two callers must agree on what counts as "the same request replayed"
+/// versus "a genuinely different payload reusing this key".
+fn idempotent_outcome(
+    transaction: &mut Transaction<'_>,
+    event: &EventAppend,
+    payload_hash: &[u8],
+) -> Result<Option<AppendOutcome>, PersistenceError> {
+    let Some(row) = transaction.query_opt(
+        "SELECT aggregate_sequence, payload_sha256, event_type, aggregate_type, aggregate_id \
+         FROM domain_events WHERE tenant_id = $1 AND idempotency_key = $2",
+        &[&event.tenant_id, &event.idempotency_key],
+    )?
+    else {
+        return Ok(None);
+    };
+    let existing_hash: Vec<u8> = row.get(1);
+    let existing_event_type: String = row.get(2);
+    let existing_aggregate_type: String = row.get(3);
+    let existing_aggregate_id: String = row.get(4);
+    if existing_hash != payload_hash
+        || existing_event_type != event.event_type
+        || existing_aggregate_type != event.aggregate_type
+        || existing_aggregate_id != event.aggregate_id
+    {
+        return Err(PersistenceError(
+            "idempotency key was reused with different event content".to_owned(),
+        ));
+    }
+    Ok(Some(AppendOutcome {
+        aggregate_sequence: row.get(0),
+        inserted: false,
+    }))
+}
+
+/// True when `error` is a unique-violation on exactly the
+/// `(tenant_id, idempotency_key)` constraint, as opposed to some other
+/// constraint (e.g. the `event_id` primary key or the
+/// `(tenant_id, aggregate_type, aggregate_id, aggregate_sequence)` constraint)
+/// whose violation indicates a different, unrelated problem that must still
+/// surface as a hard error.
+fn is_idempotency_key_conflict(error: &postgres::Error) -> bool {
+    error.as_db_error().is_some_and(|database_error| {
+        *database_error.code() == SqlState::UNIQUE_VIOLATION
+            && database_error.constraint() == Some(IDEMPOTENCY_KEY_CONSTRAINT)
+    })
 }
 
 fn validate_id(name: &str, value: &str) -> Result<(), PersistenceError> {
@@ -484,5 +584,163 @@ mod tests {
         assert!(first.inserted);
         assert!(!second.inserted);
         assert_eq!(first.aggregate_sequence, second.aggregate_sequence);
+    }
+
+    /// Builds a `sample_event`-shaped event whose IDs are all namespaced by
+    /// `tag`, so each regression test below owns a disjoint tenant/aggregate
+    /// and cannot collide with `sample_event()` or with each other when the
+    /// `#[ignore]`d PostgreSQL tests run in parallel against one database.
+    fn sample_event_for(tag: &str) -> EventAppend {
+        EventAppend {
+            event_id: format!("event.{tag}-1"),
+            tenant_id: format!("tenant.{tag}"),
+            aggregate_type: "order".to_owned(),
+            aggregate_id: format!("order.{tag}"),
+            event_type: "order.accepted".to_owned(),
+            payload: serde_json::json!({"quantity": "1.00000000"}),
+            occurred_at: "2026-08-24T10:00:00Z".to_owned(),
+            correlation_id: format!("trace.{tag}"),
+            causation_id: Some(format!("command.{tag}")),
+            idempotency_key: format!("idem.{tag}"),
+            outbox_topic: "orders.events".to_owned(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn append_event_recovers_idempotent_outcome_after_losing_the_insert_race() {
+        // This reproduces the *end state* of the race described in
+        // `append_event`'s doc comment, not the exact interleaving: a
+        // concurrent transaction commits a row for this idempotency key
+        // strictly between our pre-check SELECT and our INSERT. There is no
+        // internal hook to force that interleaving deterministically, so
+        // instead we pre-insert the "winner" row exactly as the concurrent
+        // transaction would have, bypassing `append_event` entirely, and then
+        // call `append_event` and confirm it reconciles against that row via
+        // `idempotent_outcome` (the same fingerprint-comparison contract the
+        // non-racing pre-check path already used) rather than surfacing the
+        // raw unique-violation error. See
+        // `append_event_reconciles_concurrent_duplicate_submissions_of_the_same_idempotency_key`
+        // below for a best-effort test that drives the actual race.
+        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
+        let mut store = PostgresStore::connect_development(&uri).unwrap();
+        store.migrate().unwrap();
+        let event = sample_event_for("race-recovery");
+        store.provision_tenant(&event.tenant_id, "ACME").unwrap();
+
+        let canonical_payload = serde_json::to_vec(&event.payload).unwrap();
+        let payload_hash = Sha256::digest(&canonical_payload).to_vec();
+        {
+            let mut winner = store.client.transaction().unwrap();
+            set_tenant(&mut winner, &event.tenant_id).unwrap();
+            winner
+                .execute(
+                    "INSERT INTO domain_events (\
+                       event_id, tenant_id, aggregate_type, aggregate_id, aggregate_sequence,\
+                       event_type, payload, occurred_at, correlation_id, causation_id,\
+                       idempotency_key, payload_sha256\
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::text::timestamptz,$9,$10,$11,$12)",
+                    &[
+                        &event.event_id,
+                        &event.tenant_id,
+                        &event.aggregate_type,
+                        &event.aggregate_id,
+                        &1i64,
+                        &event.event_type,
+                        &event.payload,
+                        &event.occurred_at,
+                        &event.correlation_id,
+                        &event.causation_id,
+                        &event.idempotency_key,
+                        &payload_hash,
+                    ],
+                )
+                .unwrap();
+            winner.commit().unwrap();
+        }
+
+        // Same idempotency key, identical payload: must succeed exactly as
+        // the "winner" would report, not raise a constraint-violation error.
+        let recovered = store.append_event(&event).unwrap();
+        assert!(!recovered.inserted);
+        assert_eq!(recovered.aggregate_sequence, 1);
+
+        // Same idempotency key, different payload: must still be rejected,
+        // exactly as the existing non-racing pre-check already rejects it.
+        let mut conflicting = event.clone();
+        conflicting.event_id = format!("event.{}-2", "race-recovery");
+        conflicting.payload = serde_json::json!({"quantity": "2.00000000"});
+        let error = store.append_event(&conflicting).unwrap_err();
+        assert!(error
+            .0
+            .contains("idempotency key was reused with different event content"));
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn append_event_reconciles_concurrent_duplicate_submissions_of_the_same_idempotency_key() {
+        // Best-effort direct reproduction of the race itself, using two
+        // independent connections released from a shared barrier at the same
+        // instant so both are very likely to run their pre-check SELECT
+        // before either commits its INSERT. The exact interleaving isn't
+        // guaranteed (there's no internal hook to force it), but regardless
+        // of which caller's INSERT wins, neither may ever observe a raw
+        // constraint-violation error, and both must agree on the same
+        // aggregate_sequence.
+        //
+        // Each concurrent attempt gets its own `event_id`: a client retry
+        // shares the same `idempotency_key` (and the same aggregate/payload)
+        // across attempts, but `event_id` identifies this particular append
+        // attempt, so two in-flight attempts for one retried command are not
+        // expected to collide on it. Reusing one `event_id` for both would
+        // instead race the unrelated `domain_events` primary key and never
+        // exercise the idempotency-key recovery path this test targets.
+        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
+        let mut setup_store = PostgresStore::connect_development(&uri).unwrap();
+        setup_store.migrate().unwrap();
+        let event = sample_event_for("concurrent-race");
+        setup_store
+            .provision_tenant(&event.tenant_id, "ACME")
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results: Vec<Result<AppendOutcome, PersistenceError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|attempt| {
+                    let uri = uri.clone();
+                    let mut event = event.clone();
+                    event.event_id = format!("{}-attempt-{attempt}", event.event_id);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let mut store = PostgresStore::connect_development(&uri).unwrap();
+                        barrier.wait();
+                        store.append_event(&event)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for result in &results {
+            assert!(
+                result.is_ok(),
+                "concurrent duplicate submission surfaced an error instead of an \
+                 idempotent outcome: {result:?}"
+            );
+        }
+        let outcomes: Vec<AppendOutcome> =
+            results.into_iter().map(|result| result.unwrap()).collect();
+        assert_eq!(
+            outcomes[0].aggregate_sequence,
+            outcomes[1].aggregate_sequence
+        );
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.inserted).count(),
+            1,
+            "exactly one concurrent caller should report having performed the insert"
+        );
     }
 }

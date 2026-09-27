@@ -30,6 +30,20 @@ const CDF_A4: Decimal = Decimal::from_scaled(-182_125_598);
 const CDF_A5: Decimal = Decimal::from_scaled(133_027_442);
 const MIN_VOLATILITY: Decimal = Decimal::from_scaled(10_000);
 const MAX_VOLATILITY: Decimal = Decimal::from_scaled(500_000_000);
+// Guards only the `volatility * sqrt(time_to_expiry)` product used as the d1/d2
+// denominator against genuine fixed-point degeneracy (this Decimal has 8
+// fractional digits, so any product whose true value is below roughly 1e-8
+// rounds to exactly zero and would divide by zero downstream). This is
+// deliberately far smaller than MIN_VOLATILITY: MIN_VOLATILITY floors
+// volatility itself (the solver's search range and the news-shock clamp), a
+// completely different quantity with a different unit. Reusing MIN_VOLATILITY
+// here previously made the *effective* minimum accepted volatility rise as
+// expiry shrank (sqrt(time_to_expiry) < 1 for anything under a year), which
+// wrongly rejected economically ordinary short-dated, low-vol inputs (e.g.
+// 2% annualized vol at 5 minutes to expiry). This floor only trips when both
+// volatility and time-to-expiry are simultaneously close to their own
+// individual floors, which is the actual numerically-degenerate case.
+const MIN_VOLATILITY_TIME_PRODUCT: Decimal = Decimal::from_scaled(100);
 const MAX_ABSOLUTE_RATE: Decimal = Decimal::from_scaled(100_000_000);
 const MAX_YEARS: Decimal = Decimal::from_scaled(1_000_000_000);
 
@@ -403,9 +417,10 @@ pub fn european_greeks(input: &EuropeanModelInput) -> Result<OptionGreeks, Optio
     }
     let sqrt_time = sqrt(input.time_to_expiry_years)?;
     let volatility_sqrt_time = input.volatility.checked_mul(sqrt_time)?;
-    if volatility_sqrt_time < MIN_VOLATILITY {
+    if volatility_sqrt_time < MIN_VOLATILITY_TIME_PRODUCT {
         return Err(OptionError(
-            "option model volatility-time product is too small".to_owned(),
+            "option model volatility and time to expiry are jointly too small to price safely"
+                .to_owned(),
         ));
     }
     let variance_half = input
@@ -2099,5 +2114,93 @@ mod tests {
         assert!(shock_res.post_shock_model_value > shock_res.pre_shock_model_value);
         assert!(shock_res.vega_pnl > Decimal::ZERO);
         assert!(shock_res.mean_post_shock_iv > shock_res.mean_pre_shock_iv);
+    }
+
+    #[test]
+    fn european_greeks_accepts_realistic_short_dated_low_volatility_input() {
+        // ~5 minutes to expiry (300 seconds / 31_536_000 seconds-per-year) at a
+        // perfectly ordinary 2% annualized volatility. Both inputs are
+        // individually well within their documented valid ranges, so this must
+        // price rather than fail closed. Before the fix, MIN_VOLATILITY (a
+        // floor on volatility itself) was wrongly reused as the floor for the
+        // volatility * sqrt(time) product, which made the effective minimum
+        // accepted volatility rise to ~3.2% at this same expiry and rejected
+        // this exact input with "option model volatility-time product is too
+        // small".
+        let input = EuropeanModelInput {
+            underlying_price: decimal("100"),
+            strike: decimal("100"),
+            risk_free_rate: decimal("0.02"),
+            volatility: decimal("0.02"),
+            time_to_expiry_years: decimal("0.00000951"),
+            right: OptionRight::Call,
+        };
+        let greeks =
+            european_greeks(&input).expect("realistic short-dated low-vol input must price");
+        assert!(greeks.model_price >= Decimal::ZERO);
+        assert!(greeks.model_price < decimal("1"));
+        assert!(greeks.delta > Decimal::ZERO);
+        assert!(greeks.delta <= ONE);
+        assert!(greeks.vega >= Decimal::ZERO);
+
+        // The put leg of the same short-dated, low-vol input must also price.
+        let put_greeks = european_greeks(&EuropeanModelInput {
+            right: OptionRight::Put,
+            ..input
+        })
+        .expect("realistic short-dated low-vol put input must price");
+        assert!(put_greeks.model_price >= Decimal::ZERO);
+    }
+
+    #[test]
+    fn implied_volatility_solves_realistic_short_dated_low_volatility_input() {
+        let priced_input = EuropeanModelInput {
+            underlying_price: decimal("100"),
+            strike: decimal("100"),
+            risk_free_rate: decimal("0.02"),
+            volatility: decimal("0.02"),
+            time_to_expiry_years: decimal("0.00000951"),
+            right: OptionRight::Call,
+        };
+        let market_premium = european_greeks(&priced_input)
+            .expect("reference model price")
+            .model_price;
+
+        let solved = implied_volatility(
+            EuropeanModelInput {
+                volatility: decimal("0.25"),
+                ..priced_input
+            },
+            market_premium,
+        )
+        .expect("short-dated implied-volatility solve must not hit the denominator floor");
+
+        // Fixed-point pricing makes a range assertion more honest than exact
+        // equality: multiple adjacent volatility ticks can map to one premium.
+        assert!(solved >= decimal("0.019"));
+        assert!(solved <= decimal("0.021"));
+    }
+
+    #[test]
+    fn european_greeks_rejects_genuinely_degenerate_volatility_time_product() {
+        // Both volatility and time-to-expiry are simultaneously at/near their
+        // own individual floors (MIN_VOLATILITY, and roughly a third of a
+        // second to expiry). Their product is far below any level the fixed
+        // 8-decimal-place Decimal representation can carry meaningful
+        // precision through d1/d2, so this remains a correct rejection.
+        let input = EuropeanModelInput {
+            underlying_price: decimal("100"),
+            strike: decimal("100"),
+            risk_free_rate: decimal("0.02"),
+            volatility: MIN_VOLATILITY,
+            time_to_expiry_years: decimal("0.00000001"),
+            right: OptionRight::Call,
+        };
+        let error =
+            european_greeks(&input).expect_err("genuinely degenerate input must fail closed");
+        assert_eq!(
+            error.0,
+            "option model volatility and time to expiry are jointly too small to price safely"
+        );
     }
 }

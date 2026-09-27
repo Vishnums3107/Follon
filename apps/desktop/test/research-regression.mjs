@@ -210,6 +210,30 @@ const mockSnapshot = {
       report: {},
       artifact_fingerprint: "1".repeat(64),
     },
+    {
+      artifact: "backtest-run-002.json",
+      specification: { strategy_version: "strat.trend.v2", dataset: { dataset_id: "ds.sp500.bars.v1" } },
+      performance: { trade_count: "3", net_pnl: "-40.00", return_bps: "-4.00", max_drawdown_bps: "12.00" },
+      report: {},
+      artifact_fingerprint: "4".repeat(64),
+      advanced_account: {
+        advanced_report_schema_version: 1,
+        execution_charges: "1.00000000",
+        financing_charges: "4.50000000",
+        realized_pnl: "100.00000000",
+        unrealized_pnl: "0E-8",
+        margin: {
+          base_currency: "USD",
+          cash_value: "11194.50000000",
+          excess_liquidity: "11194.50000000",
+          initial_margin: "225.00000000",
+          maintenance_margin: "112.50000000",
+          margin_call: false,
+          net_liquidation_value: "11194.50000000",
+          position_market_value: "0E-8",
+        },
+      },
+    },
   ],
   experiments: [
     {
@@ -328,6 +352,23 @@ renderWorkspace(backtestSummary, backtestCanvas, "backtest-explorer", mockSnapsh
 
 const failedIdeaPanel = backtestCanvas.children.find((c) => c.id === "failed-idea-memory");
 assert.ok(failedIdeaPanel !== undefined, "Failed-idea memory panel must exist in Backtest Explorer");
+
+// Schema-3 artifacts carry the complete economics into the explorer; a run
+// without them is left out rather than shown with invented figures.
+const allText = (node) => [node.textContent ?? "", ...(node.children ?? []).map(allText)].join(" ");
+const economicsPanel = backtestCanvas.children.find((c) => c.id === "advanced-account-economics");
+assert.ok(economicsPanel !== undefined, "Advanced-account economics panel must exist in Backtest Explorer");
+const economicsText = allText(economicsPanel);
+assert.ok(economicsText.includes("backtest-run-002.json"), "the schema-3 run must be listed");
+assert.ok(economicsText.includes("11194.50000000"), "net liquidation value must render");
+assert.ok(economicsText.includes("225.00000000"), "initial margin must render");
+assert.ok(economicsText.includes("4.50000000"), "financing charges must render");
+assert.ok(!economicsText.includes("backtest-run-001.json"), "a run without advanced economics must not be listed");
+
+const emptyCanvas = new MockElement("div");
+renderWorkspace(new MockElement("div"), emptyCanvas, "backtest-explorer", { ...mockSnapshot, backtests: [mockSnapshot.backtests[0]] }, mockContext);
+const emptyEconomics = emptyCanvas.children.find((c) => c.id === "advanced-account-economics");
+assert.ok(allText(emptyEconomics).includes("No indexed run carries advanced-account economics"), "the empty state must say why the table is empty");
 
 // Test Replay & Incidents additions (RES-03)
 const replaySummary = new MockElement("div");

@@ -1,0 +1,113 @@
+"""Every checked-in configuration fixture conforms to its published schema.
+
+A reader and its JSON Schema can drift apart unnoticed: nothing else loads a
+schema next to the configuration it describes. The version-2 PAPER schema
+stopped describing what `follon-paper-status` reads when items 61 and 70
+added the tick and lot tables to the reader and to the version-1 schema only,
+so both version-2 fixtures failed validation (audit item 77).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+SCHEMA_ROOT = REPOSITORY_ROOT / "contracts" / "json-schema"
+FIXTURE_ROOT = REPOSITORY_ROOT / "tests" / "fixtures" / "config"
+
+# Each configuration fixture a CLI or service reads, and the schema of the
+# input contract that reader implements.
+CONFIGURATION_CONTRACTS = {
+    "backtest-v1.json": "v1/backtest-configuration.schema.json",
+    "backtest-advanced-v1.json": "v1/backtest-configuration.schema.json",
+    "backtest-probe-v1.json": "v1/backtest-configuration.schema.json",
+    "paper-v1.json": "v1/paper-configuration.schema.json",
+    "paper-v2.json": "v2/paper-configuration.schema.json",
+    "paper-v2-portfolio-risk.json": "v2/paper-configuration.schema.json",
+    "live-v1.json": "v1/live-configuration.schema.json",
+    "live-v1-portfolio-risk.json": "v1/live-configuration.schema.json",
+    "paper-command-route-v1.json": "v1/paper-command-route.schema.json",
+    "operations-v1.json": "v1/operations-configuration.schema.json",
+    "options-v1.json": "v1/options-configuration.schema.json",
+    "commercial-data-inventory-v1.json": "v1/commercial-data-inventory.schema.json",
+    "commercial-privacy-erasure-v1.json": "v1/commercial-privacy-request.schema.json",
+    "commercial-provisioning-v1.json": "v1/commercial-provisioning.schema.json",
+    "commercial-self-host-provisioning-v1.json": "v1/commercial-provisioning.schema.json",
+    "commercial-subscription-v1.json": "v1/commercial-subscription.schema.json",
+    "commercial-self-host-subscription-v1.json": "v1/commercial-subscription.schema.json",
+}
+
+
+def load(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def resolve(schema: dict, node: dict) -> dict:
+    """Follows a local `#/$defs/...` reference; other nodes are returned as is."""
+    reference = node.get("$ref", "")
+    if reference.startswith("#/$defs/"):
+        return schema["$defs"][reference.removeprefix("#/$defs/")]
+    return node
+
+
+class ConfigurationContractTests(unittest.TestCase):
+    def test_each_fixture_declares_exactly_what_its_schema_allows(self) -> None:
+        # Needs no third-party package, so CI's security job runs it too. It
+        # checks the top level and every object property one level down,
+        # which is where each configuration keeps its risk policy.
+        for fixture_name, schema_name in CONFIGURATION_CONTRACTS.items():
+            with self.subTest(fixture=fixture_name):
+                schema = load(SCHEMA_ROOT / schema_name)
+                fixture = load(FIXTURE_ROOT / fixture_name)
+                levels = [("", schema, fixture)]
+                for key, value in fixture.items():
+                    declared = schema.get("properties", {}).get(key)
+                    if isinstance(value, dict) and declared is not None:
+                        levels.append((f"{key}.", resolve(schema, declared), value))
+                for prefix, node, document in levels:
+                    undeclared = set(document) - set(node.get("properties", {}))
+                    if node.get("additionalProperties") is False:
+                        self.assertEqual(sorted(prefix + key for key in undeclared), [])
+                    missing = set(node.get("required", [])) - set(document)
+                    self.assertEqual(sorted(prefix + key for key in missing), [])
+
+    def test_version_2_paper_risk_extends_version_1(self) -> None:
+        # `follon-paper-status` reads both versions through one risk document,
+        # so version 2 may add to version 1's risk policy but never drop,
+        # loosen or stop requiring any of it.
+        version_1 = load(SCHEMA_ROOT / "v1" / "paper-configuration.schema.json")
+        version_2 = load(SCHEMA_ROOT / "v2" / "paper-configuration.schema.json")
+        risk_1 = resolve(version_1, version_1["properties"]["risk"])
+        risk_2 = resolve(version_2, version_2["properties"]["risk"])
+        self.assertEqual(sorted(set(risk_1["required"]) - set(risk_2["required"])), [])
+        for name, definition in risk_1["properties"].items():
+            with self.subTest(property=name):
+                self.assertEqual(risk_2["properties"].get(name), definition)
+        # Those definitions refer to shared ones by name, so the shared ones
+        # must mean the same in both versions.
+        for name, definition in version_1["$defs"].items():
+            if name != "risk":
+                with self.subTest(definition=name):
+                    self.assertEqual(version_2["$defs"].get(name), definition)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jsonschema"), "full validation needs jsonschema"
+    )
+    def test_each_fixture_validates_against_its_schema(self) -> None:
+        import jsonschema
+
+        for fixture_name, schema_name in CONFIGURATION_CONTRACTS.items():
+            with self.subTest(fixture=fixture_name):
+                schema = load(SCHEMA_ROOT / schema_name)
+                validator = jsonschema.validators.validator_for(schema)(schema)
+                fixture = load(FIXTURE_ROOT / fixture_name)
+                errors = [error.message for error in validator.iter_errors(fixture)]
+                self.assertEqual(errors, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

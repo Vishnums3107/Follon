@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 19992c2240c173814e2519aee32fa0e09ad4c5c067a7d02671a279113f6ef3ce # shrinks to legs = [GeneratedLeg { buy: false, ratio: 1, price_cents: 100, fee_cents: 0 }, GeneratedLeg { buy: false, ratio: 1, price_cents: 100, fee_cents: 100 }], units = 1, steps = [Fill(1)]

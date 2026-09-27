@@ -1,0 +1,14 @@
+# Every text file is checked out with LF line endings on every platform.
+#
+# Follon hashes checked-in inputs byte for byte: a backtest configuration's
+# content hash, a Python strategy bundle's files, and the built-in strategy's
+# own source. With the platform's line endings on checkout, one commit
+# published different evidence hashes on Windows and on Linux (audit item 75).
+# `eol=lf` overrides a local `core.autocrlf`.
+* text=auto eol=lf
+
+# Binary files are never converted.
+*.png binary
+*.ico binary
+*.icns binary
+*.pdf binary

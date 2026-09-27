@@ -11,12 +11,12 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 
 use follon_domain::{
-    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar, Decimal,
-    DecimalError, DomainError, EventEnvelope, EventPayload, Fill, NewsHeadline, OrderIntent,
-    OrderState, OrderStateChange, OrderType, PnlSnapshot, PositionSnapshot, RiskDecision,
-    SentimentVector, Side, TimeInForce,
+    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, AuditTrail, Bar,
+    ComboIntent, Decimal, DecimalError, DomainError, EventEnvelope, EventPayload, Fill,
+    NewsHeadline, OrderIntent, OrderState, OrderStateChange, OrderType, PnlSnapshot,
+    PositionSnapshot, RiskDecision, SentimentVector, Side, TimeInForce,
 };
-use follon_instrument::{InstrumentRegistry, TradingCalendar};
+use follon_instrument::{Instrument, InstrumentRegistry, TradingCalendar};
 use follon_news::{
     replay_availability_time_from_unix_ns, replay_time_from_unix_ns, NlpSentimentEngine,
 };
@@ -25,10 +25,16 @@ use sha2::{Digest, Sha256};
 pub mod capsule;
 pub mod provenance;
 
-pub use capsule::{CapsuleExportDisposition, StrategyCapsuleManifest, StrategyCapsuleVerifier};
+pub use capsule::{
+    build_strategy_bundle, extract_strategy_bundle, open_strategy_bundle, read_strategy_capsule,
+    sign_strategy_capsule, verify_capsule_signature, write_capsule_signature, BundleEntryPoint,
+    BundleNamespace, BundleSource, CapsuleContents, CapsuleExportDisposition, CapsuleSignature,
+    ExtractedStrategyBundle, LockedFile, SealedStrategyCapsule, StrategyBundleLock,
+    StrategyCapsuleManifest,
+};
 pub use provenance::{
     CausalEdge, CausalNode, DecisionProvenanceGraphBuilder, DecisionReconstruction,
-    ProvenanceIntegrityStatus,
+    ProvenanceIntegrityStatus, ProvenanceRecord,
 };
 
 /// Error returned by the deterministic trading kernel.
@@ -188,8 +194,9 @@ pub struct MarketPreconditions<'a> {
     pub calendar: &'a dyn TradingCalendar,
 }
 
-impl MarketPreconditions<'_> {
-    fn validate(&self, bar: &Bar, event_time: &str) -> Result<(), EngineError> {
+impl<'a> MarketPreconditions<'a> {
+    /// Returns the bar's effective reference data once its session resolves.
+    fn validate(&self, bar: &Bar, event_time: &str) -> Result<&'a Instrument, EngineError> {
         let version = self
             .instruments
             .resolve(&bar.instrument_id, event_time)
@@ -210,7 +217,7 @@ impl MarketPreconditions<'_> {
                     .to_owned(),
             ));
         }
-        Ok(())
+        Ok(&version.instrument)
     }
 }
 
@@ -551,6 +558,16 @@ impl StrategyWorkerIdentity {
     }
 }
 
+/// Process confinement for a worker whose source comes from a sealed capsule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyWorkerSandbox {
+    /// The child's only `PYTHONPATH` entry, replacing `FOLLON_STRATEGY_SDK_PATH`.
+    pub python_path: std::path::PathBuf,
+    /// The child's working directory, keeping the caller's directory off its
+    /// import path (`python -m` puts the working directory first).
+    pub working_directory: std::path::PathBuf,
+}
+
 /// Explicit single-currency starting balance for bounded worker services.
 ///
 /// It is intentionally limited to the deterministic replay account. A worker
@@ -830,7 +847,7 @@ impl ProcessStrategyWorker {
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
     ) -> Result<Self, EngineError> {
-        Self::spawn_inner(program, arguments, identity, None)
+        Self::spawn_inner(program, arguments, identity, None, None)
     }
 
     /// Starts a worker with bounded point-in-time data, portfolio, state, and
@@ -846,6 +863,28 @@ impl ProcessStrategyWorker {
             arguments,
             identity,
             Some(WorkerRuntimeServices::new(services)?),
+            None,
+        )
+    }
+
+    /// Starts a services-enabled worker confined to an explicit import root
+    /// and working directory, as a capsule replay requires.
+    ///
+    /// The caller's `FOLLON_STRATEGY_SDK_PATH` and current directory are never
+    /// visible to the child, so its code can come only from `sandbox`.
+    pub fn spawn_sandboxed_with_services(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+        services: StrategyWorkerServicesConfig,
+        sandbox: &StrategyWorkerSandbox,
+    ) -> Result<Self, EngineError> {
+        Self::spawn_inner(
+            program,
+            arguments,
+            identity,
+            Some(WorkerRuntimeServices::new(services)?),
+            Some(sandbox),
         )
     }
 
@@ -854,6 +893,7 @@ impl ProcessStrategyWorker {
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
         services: Option<WorkerRuntimeServices>,
+        sandbox: Option<&StrategyWorkerSandbox>,
     ) -> Result<Self, EngineError> {
         identity.validate()?;
         let mut command = Command::new(program);
@@ -861,7 +901,11 @@ impl ProcessStrategyWorker {
             .args(arguments)
             .env_clear()
             .env("PYTHONIOENCODING", "utf-8");
-        if let Some(sdk_path) = std::env::var_os("FOLLON_STRATEGY_SDK_PATH") {
+        if let Some(sandbox) = sandbox {
+            command
+                .env("PYTHONPATH", &sandbox.python_path)
+                .current_dir(&sandbox.working_directory);
+        } else if let Some(sdk_path) = std::env::var_os("FOLLON_STRATEGY_SDK_PATH") {
             command.env("PYTHONPATH", sdk_path);
         }
         let mut child = command
@@ -1461,6 +1505,12 @@ impl RiskPolicy {
     }
 
     /// Evaluates every executable request before an order exists.
+    ///
+    /// `bar` is the mark every price limit is judged against, so it must be
+    /// the intent's own instrument. Another instrument's close would price
+    /// the notional and the collar on the wrong asset. A decision against
+    /// that mark is not a decision at all, so it is an error rather than a
+    /// rejection, as PAPER treats a mismatched market observation.
     pub fn evaluate(
         &self,
         intent: &OrderIntent,
@@ -1468,6 +1518,11 @@ impl RiskPolicy {
         replay_time: &str,
     ) -> Result<RiskDecision, EngineError> {
         intent.validate()?;
+        if intent.instrument_id != bar.instrument_id {
+            return Err(EngineError(
+                "risk mark instrument does not match the intent".to_owned(),
+            ));
+        }
         let estimated_notional = intent.quantity.checked_mul(bar.close)?;
         let requested_price_deviation_bps = intent
             .limit_price
@@ -1516,16 +1571,68 @@ impl RiskPolicy {
         })
     }
 
-    /// Applies the ordinary pre-trade policy plus explicit news shock collars.
+    /// Applies [`Self::evaluate`] plus the rules PAPER and controlled LIVE
+    /// apply to the instrument's own trading increments (E3.6d), so a replay
+    /// cannot approve an order either environment would refuse. A limit price
+    /// must sit on the tick grid (`LIMIT_PRICE_OFF_TICK_GRID`) and the quantity
+    /// must be a whole number of lots (`ORDER_QUANTITY_OFF_LOT_SIZE`).
+    ///
+    /// `reference` is the instrument's effective-dated reference data at the
+    /// replay time, where PAPER reads an operator-configured table. A replay
+    /// already carries versioned reference data, bound into its dataset
+    /// manifest, so it has no second table to drift out of step with.
+    pub fn evaluate_with_reference(
+        &self,
+        intent: &OrderIntent,
+        bar: &Bar,
+        reference: &Instrument,
+        replay_time: &str,
+    ) -> Result<RiskDecision, EngineError> {
+        let mut decision = self.evaluate(intent, bar, replay_time)?;
+        if reference.instrument_id != intent.instrument_id {
+            return Err(EngineError(
+                "risk reference data instrument does not match the intent".to_owned(),
+            ));
+        }
+        if reference.tick_size <= Decimal::ZERO || reference.lot_size <= Decimal::ZERO {
+            return Err(EngineError(
+                "instrument reference data has a non-positive tick or lot size".to_owned(),
+            ));
+        }
+        let mut reasons = std::mem::take(&mut decision.reason_codes);
+        reasons.retain(|reason| reason != "APPROVED");
+        if intent
+            .limit_price
+            .is_some_and(|price| !is_whole_multiple(price, reference.tick_size))
+        {
+            reasons.push("LIMIT_PRICE_OFF_TICK_GRID".to_owned());
+        }
+        if !is_whole_multiple(intent.quantity, reference.lot_size) {
+            reasons.push("ORDER_QUANTITY_OFF_LOT_SIZE".to_owned());
+        }
+        decision.approved = reasons.is_empty();
+        if decision.approved {
+            reasons.push("APPROVED".to_owned());
+        }
+        decision.reason_codes = reasons;
+        decision.evaluated_limits.push_str(&format!(
+            ",instrument_tick_size={},instrument_lot_size={}",
+            reference.tick_size, reference.lot_size,
+        ));
+        Ok(decision)
+    }
+
+    /// Applies [`Self::evaluate_with_reference`] plus explicit news shock collars.
     pub fn evaluate_news(
         &self,
         intent: &OrderIntent,
         bar: &Bar,
+        reference: &Instrument,
         replay_time: &str,
         shock: &NewsShockContext,
     ) -> Result<RiskDecision, EngineError> {
         shock.validate()?;
-        let mut decision = self.evaluate(intent, bar, replay_time)?;
+        let mut decision = self.evaluate_with_reference(intent, bar, reference, replay_time)?;
         let requested_price = intent.limit_price.unwrap_or(bar.close);
         let news_slippage_bps =
             price_deviation_bps(shock.pre_headline_reference_price, requested_price)?;
@@ -1569,6 +1676,39 @@ impl RiskPolicy {
         ));
         Ok(decision)
     }
+}
+
+/// Whether `value` is an exact whole multiple of a positive `increment`.
+///
+/// Both are fixed-point with the same scale, so their scaled integers divide
+/// exactly when the decimals do. A non-positive increment has no multiples.
+fn is_whole_multiple(value: Decimal, increment: Decimal) -> bool {
+    increment > Decimal::ZERO && value.scaled() % increment.scaled() == 0
+}
+
+/// Rounds a simulated fill price onto a positive tick grid against the
+/// trader: a buy rounds up and a sell rounds down. A price already on the grid
+/// is unchanged (E3.6e).
+fn round_to_tick_against_trader(
+    price: Decimal,
+    side: Side,
+    tick: Decimal,
+) -> Result<Decimal, EngineError> {
+    if tick <= Decimal::ZERO {
+        return Err(EngineError(
+            "a fill price cannot be rounded to a non-positive tick".to_owned(),
+        ));
+    }
+    let scaled = price.scaled();
+    let step = tick.scaled();
+    let floor = scaled - scaled.rem_euclid(step);
+    let rounded = match side {
+        Side::Buy if floor != scaled => floor
+            .checked_add(step)
+            .ok_or_else(|| EngineError("rounded fill price overflow".to_owned()))?,
+        _ => floor,
+    };
+    Ok(Decimal::from_scaled(rounded))
 }
 
 /// OMS order whose legal transitions are enforced independently of a broker.
@@ -1633,6 +1773,106 @@ impl OmsOrder {
         if !is_valid_transition(self.state, next) {
             return Err(EngineError(format!(
                 "invalid OMS transition {} -> {}",
+                self.state.as_str(),
+                next.as_str()
+            )));
+        }
+        let change = OrderStateChange {
+            order_id: self.order_id.clone(),
+            previous_state: Some(self.state),
+            new_state: next,
+            reason: reason.into(),
+        };
+        self.state = next;
+        Ok(change)
+    }
+}
+
+/// A durable OMS order for one atomic multi-leg combination.
+///
+/// Deliberately a sibling of [`OmsOrder`] rather than a variant inside it. The
+/// two carry different intents but share one lifecycle, and that lifecycle is
+/// `is_valid_transition` **unchanged**: a combination is approved, submitted,
+/// acknowledged, partially filled, cancelled, rejected, expired or `UNKNOWN`
+/// exactly as a plain order is, because those states describe the broker
+/// conversation, not the instrument. Reusing the same state machine means the
+/// combination path inherits the property test that already covers it rather
+/// than needing a second, separately-verified copy.
+///
+/// One combination is **one** order with **one** state. It is never modelled as
+/// several orders that happen to be submitted together: an atomic group either
+/// executes in full or not at all, so a per-leg state would be able to express
+/// outcomes the broker cannot produce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OmsComboOrder {
+    /// Client-generated idempotency identity.
+    pub order_id: String,
+    /// Original approved combination intent.
+    pub intent: ComboIntent,
+    /// Current lifecycle state, shared with the single-order state machine.
+    pub state: OrderState,
+}
+
+impl OmsComboOrder {
+    /// The durable order identity a combination intent produces.
+    ///
+    /// A distinct prefix from `order-`, so a combination and a plain order can
+    /// never collide even if an operator reuses one identity for both.
+    pub fn order_id_for(intent_id: &str) -> String {
+        format!("combo-order-{intent_id}")
+    }
+
+    /// Creates an OMS combination order after, and only after, a risk approval.
+    pub fn from_approved_intent(
+        intent: ComboIntent,
+        decision: &RiskDecision,
+    ) -> Result<Self, EngineError> {
+        if !decision.approved || decision.intent_id != intent.intent_id {
+            return Err(EngineError(
+                "an OMS combination order requires a matching risk approval".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id: Self::order_id_for(&intent.intent_id),
+            intent,
+            state: OrderState::Created,
+        })
+    }
+
+    /// Rebuilds a previously persisted combination order.
+    ///
+    /// Recovery is explicit for the same reason it is on [`OmsOrder`]: a
+    /// restart may restore an order, but it must never invent a new client
+    /// identity or silently change a state.
+    pub fn recover(
+        order_id: impl Into<String>,
+        intent: ComboIntent,
+        state: OrderState,
+    ) -> Result<Self, EngineError> {
+        intent.validate()?;
+        let order_id = order_id.into();
+        validate_canonical_id("combo order_id", &order_id)?;
+        if order_id != Self::order_id_for(&intent.intent_id) {
+            return Err(EngineError(
+                "persisted OMS combination order ID does not match its intent identity".to_owned(),
+            ));
+        }
+        Ok(Self {
+            order_id,
+            intent,
+            state,
+        })
+    }
+
+    /// Applies a legal lifecycle transition and returns the corresponding evidence.
+    pub fn transition(
+        &mut self,
+        next: OrderState,
+        reason: impl Into<String>,
+    ) -> Result<OrderStateChange, EngineError> {
+        if !is_valid_transition(self.state, next) {
+            return Err(EngineError(format!(
+                "invalid OMS combination transition {} -> {}",
                 self.state.as_str(),
                 next.as_str()
             )));
@@ -1729,6 +1969,11 @@ fn is_valid_transition(from: OrderState, to: OrderState) -> bool {
 }
 
 /// Deterministic fill model used exclusively for non-live replay/simulation.
+///
+/// In a replay with reference data, the modelled price is then rounded onto
+/// the instrument's tick grid against the trader (E3.6e): a venue prints only
+/// grid prices, and the spread and slippage are estimates, so the grid price
+/// is never better than the estimate.
 #[derive(Clone, Debug)]
 pub struct DeterministicFillModel {
     /// Full quoted bid/ask spread in basis points. A fill pays half the spread.
@@ -1737,7 +1982,12 @@ pub struct DeterministicFillModel {
     pub slippage_bps: Decimal,
     /// Exact flat fee per fill.
     pub flat_fee: Decimal,
-    /// Number of complete market bars to wait before the first fill attempt.
+    /// Number of complete market bars to wait before the first fill attempt,
+    /// counted from the bar after the one that produced the order. `0` and `1`
+    /// are equivalent: a newly created order is never eligible on the very
+    /// bar that produced it, since the strategy already observed that bar's
+    /// complete OHLC before deciding, and filling against its own low/high
+    /// would be look-ahead no live order could realize.
     pub latency_bars: u32,
     /// Optional maximum quantity executable on each eligible market bar.
     pub max_fill_quantity: Option<Decimal>,
@@ -1770,6 +2020,9 @@ impl DeterministicFillModel {
     }
 
     /// Produces a fill if the current bar can satisfy the order model.
+    ///
+    /// This prices the model alone, off any tick grid. A replay with reference
+    /// data also rounds the price onto the instrument's grid.
     pub fn fill(
         &self,
         order: &OmsOrder,
@@ -1782,6 +2035,7 @@ impl DeterministicFillModel {
             replay_time,
             order.intent.quantity,
             format!("exec-{}", order.intent.intent_id),
+            None,
         )
     }
 
@@ -1792,6 +2046,7 @@ impl DeterministicFillModel {
         replay_time: &str,
         quantity: Decimal,
         execution_id: String,
+        tick_size: Option<Decimal>,
     ) -> Result<Option<Fill>, EngineError> {
         if quantity <= Decimal::ZERO || quantity > order.intent.quantity {
             return Err(EngineError(
@@ -1825,6 +2080,10 @@ impl DeterministicFillModel {
         let price = match order.intent.side {
             Side::Buy => base_price.checked_add(adverse_adjustment)?,
             Side::Sell => base_price.checked_sub(adverse_adjustment)?,
+        };
+        let price = match tick_size {
+            Some(tick) => round_to_tick_against_trader(price, order.intent.side, tick)?,
+            None => price,
         };
         if price <= Decimal::ZERO {
             return Err(EngineError(
@@ -1883,12 +2142,35 @@ impl Portfolio {
         average_cost: Decimal,
         realized_pnl: Decimal,
     ) -> Result<Self, EngineError> {
+        if quantity < Decimal::ZERO {
+            return Err(EngineError(
+                "persisted long-only portfolio is short".to_owned(),
+            ));
+        }
+        Self::recover_signed(
+            account_id,
+            instrument_id,
+            quantity,
+            average_cost,
+            realized_pnl,
+        )
+    }
+
+    /// Restores a signed position for a caller with an explicit short-exposure policy.
+    pub fn recover_signed(
+        account_id: impl Into<String>,
+        instrument_id: impl Into<String>,
+        quantity: Decimal,
+        average_cost: Decimal,
+        realized_pnl: Decimal,
+    ) -> Result<Self, EngineError> {
         let account_id = account_id.into();
         let instrument_id = instrument_id.into();
         validate_canonical_id("portfolio account_id", &account_id)?;
         validate_canonical_id("portfolio instrument_id", &instrument_id)?;
-        if quantity < Decimal::ZERO
-            || average_cost < Decimal::ZERO
+        // Negative only for a short, where it is net opening proceeds per unit
+        // (see `apply_signed_fill`).
+        if (quantity >= Decimal::ZERO && average_cost < Decimal::ZERO)
             || quantity == Decimal::ZERO && average_cost != Decimal::ZERO
         {
             return Err(EngineError("persisted portfolio is invalid".to_owned()));
@@ -1941,6 +2223,87 @@ impl Portfolio {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Applies authoritative signed execution evidence; authorization belongs to risk.
+    /// Existing long-only callers continue to use `apply_fill`.
+    pub fn apply_signed_fill(&mut self, fill: &Fill) -> Result<(), EngineError> {
+        if fill.instrument_id != self.instrument_id
+            || fill.quantity <= Decimal::ZERO
+            || fill.price <= Decimal::ZERO
+            || fill.fee < Decimal::ZERO
+        {
+            return Err(EngineError("invalid signed portfolio fill".to_owned()));
+        }
+        let signed = match fill.side {
+            Side::Buy => fill.quantity,
+            Side::Sell => Decimal::ZERO.checked_sub(fill.quantity)?,
+        };
+        let held = if self.quantity < Decimal::ZERO {
+            Decimal::ZERO.checked_sub(self.quantity)?
+        } else {
+            self.quantity
+        };
+        let closing = (self.quantity > Decimal::ZERO && signed < Decimal::ZERO)
+            || (self.quantity < Decimal::ZERO && signed > Decimal::ZERO);
+        let next = self.quantity.checked_add(signed)?;
+        let (average_cost, realized_pnl) = if closing {
+            let closed = held.min(fill.quantity);
+            let close_fee = if closed == fill.quantity {
+                fill.fee
+            } else {
+                fill.fee.checked_mul(closed)?.checked_div(fill.quantity)?
+            };
+            let gain = if self.quantity > Decimal::ZERO {
+                fill.price.checked_sub(self.average_cost)?
+            } else {
+                self.average_cost.checked_sub(fill.price)?
+            };
+            let realized = self
+                .realized_pnl
+                .checked_add(gain.checked_mul(closed)?.checked_sub(close_fee)?)?;
+            let cost = if fill.quantity < held {
+                self.average_cost
+            } else if fill.quantity == held {
+                Decimal::ZERO
+            } else {
+                let opening_fee = fill
+                    .fee
+                    .checked_sub(close_fee)?
+                    .checked_div(fill.quantity.checked_sub(closed)?)?;
+                match fill.side {
+                    Side::Buy => fill.price.checked_add(opening_fee)?,
+                    Side::Sell => fill.price.checked_sub(opening_fee)?,
+                }
+            };
+            (cost, realized)
+        } else {
+            let gross = fill.price.checked_mul(fill.quantity)?;
+            let value = match fill.side {
+                Side::Buy => gross.checked_add(fill.fee)?,
+                Side::Sell => gross.checked_sub(fill.fee)?,
+            };
+            (
+                self.average_cost
+                    .checked_mul(held)?
+                    .checked_add(value)?
+                    .checked_div(held.checked_add(fill.quantity)?)?,
+                self.realized_pnl,
+            )
+        };
+        // A long position's cost (price plus fee) can never be negative. A
+        // short position's average is its net opening proceeds per unit, which
+        // is negative when the commission exceeded the premium -- a real,
+        // broker-executed trade (a 1-lot, one-cent option with a one-dollar
+        // minimum commission) that the OMS must be able to record rather than
+        // reject as an execution anomaly.
+        if next > Decimal::ZERO && average_cost < Decimal::ZERO {
+            return Err(EngineError("signed portfolio cost is negative".to_owned()));
+        }
+        self.quantity = next;
+        self.average_cost = average_cost;
+        self.realized_pnl = realized_pnl;
         Ok(())
     }
 
@@ -2049,14 +2412,35 @@ impl ReplayEngine {
         })
     }
 
-    /// Processes one historical bar through strategy, risk, OMS, simulation, and portfolio.
-    pub fn process_bar(
+    /// Replays a bar with no reference data or calendar, for this crate's
+    /// unit tests of the engine itself.
+    ///
+    /// It applies no session, halt, tick or lot rule, so it is not public:
+    /// every other replay goes through
+    /// [`Self::process_bar_with_market_preconditions`] (E3.6d).
+    #[cfg(test)]
+    fn process_bar(
         &mut self,
         sink: &mut impl EventSink,
         strategy: &mut impl Strategy,
         account_id: &str,
         event_time: &str,
         bar: Bar,
+    ) -> Result<ReplayResult, EngineError> {
+        self.replay_bar(sink, strategy, account_id, event_time, bar, None)
+    }
+
+    /// Processes one historical bar through strategy, risk, OMS, simulation,
+    /// and portfolio. `reference` is the bar's effective reference data; it is
+    /// absent only for [`Self::process_bar`]'s unit tests.
+    fn replay_bar(
+        &mut self,
+        sink: &mut impl EventSink,
+        strategy: &mut impl Strategy,
+        account_id: &str,
+        event_time: &str,
+        bar: Bar,
+        reference: Option<&Instrument>,
     ) -> Result<ReplayResult, EngineError> {
         bar.validate()?;
         self.clock.advance_to(event_time)?;
@@ -2105,6 +2489,7 @@ impl ReplayEngine {
                 account_id,
                 &bar,
                 &mut working,
+                reference,
             )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
@@ -2128,6 +2513,18 @@ impl ReplayEngine {
             return Err(EngineError(
                 "strategy intent does not match replay account or configuration".to_owned(),
             ));
+        }
+        // This bar is the only mark the risk decision has. Refuse here, before
+        // the intent is recorded, so the stream never holds an intent with no
+        // decision. A strategy trades an instrument on that instrument's bar.
+        if intent.instrument_id != bar.instrument_id {
+            return Err(EngineError(
+                "strategy intent instrument does not match the market bar that produced it"
+                    .to_owned(),
+            ));
+        }
+        if let Some(reference) = reference {
+            self.require_whole_lot_fill_cap(reference)?;
         }
         if self
             .working_orders
@@ -2154,7 +2551,13 @@ impl ReplayEngine {
         let intent_event_id = intent_event.event_id.clone();
         events.push(intent_event);
 
-        let decision = self.policy.evaluate(&intent, &bar, self.clock.now())?;
+        let decision = match reference {
+            Some(reference) => {
+                self.policy
+                    .evaluate_with_reference(&intent, &bar, reference, self.clock.now())?
+            }
+            None => self.policy.evaluate(&intent, &bar, self.clock.now())?,
+        };
         let current_time = self.clock.now().to_owned();
         let decision_event = self.emit(
             sink,
@@ -2210,9 +2613,19 @@ impl ReplayEngine {
             let change = order.transition(state, reason)?;
             self.emit_order_change(sink, &mut events, &intent, &decision_event_id, change)?;
         }
+        // A newly created order can never be eligible on the same bar that
+        // produced it, even at `latency_bars == 0`. `strategy.on_bar` above
+        // already received this bar's complete OHLC (including `low`/`high`),
+        // so evaluating a fill for a brand-new limit order against this same
+        // bar's own extremes would let the strategy trade on a range it could
+        // only have known once the bar had already closed -- a look-ahead bias
+        // no live order could ever realize. Flooring eligibility at the next
+        // bar closes that gap while leaving already-working orders (whose
+        // `eligible_on_bar` was computed on an earlier bar) and any configured
+        // `latency_bars >= 1` completely unchanged.
         let eligible_on_bar = self
             .bar_sequence
-            .checked_add(u64::from(self.fill_model.latency_bars))
+            .checked_add(u64::from(self.fill_model.latency_bars).max(1))
             .ok_or_else(|| EngineError("simulated order latency overflow".to_owned()))?;
         let mut working = SimulatedWorkingOrder {
             remaining_quantity: intent.quantity,
@@ -2233,6 +2646,7 @@ impl ReplayEngine {
                 account_id,
                 &bar,
                 &mut working,
+                reference,
             )? {
                 latest_position = Some(position);
                 latest_pnl = Some(pnl);
@@ -2324,6 +2738,11 @@ impl ReplayEngine {
 
     /// Replays one causally linked sentiment vector through strategy, risk,
     /// OMS, deterministic simulation, portfolio, and audit evidence.
+    ///
+    /// `instruments` supplies the market snapshot's effective reference data,
+    /// so a news-driven order meets the same tick and lot rules as a bar-driven
+    /// one (E3.6d). No calendar is consulted here.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_news_sentiment(
         &mut self,
         sink: &mut impl EventSink,
@@ -2332,6 +2751,7 @@ impl ReplayEngine {
         sentiment: SentimentVector,
         market: Bar,
         shock: NewsShockContext,
+        instruments: &InstrumentRegistry,
     ) -> Result<ReplayResult, EngineError> {
         sentiment.validate()?;
         market.validate()?;
@@ -2370,6 +2790,16 @@ impl ReplayEngine {
                     error.0
                 ))
             })?;
+        // Resolved at the decision time, and before anything is recorded.
+        let reference = &instruments
+            .resolve(&market.instrument_id, &availability_time)
+            .ok_or_else(|| {
+                EngineError(
+                    "no effective instrument reference data for the news market snapshot"
+                        .to_owned(),
+                )
+            })?
+            .instrument;
         self.clock.advance_to(&availability_time)?;
         let correlation_id = format!("corr-news-{}", sentiment.causation_news_id);
         let sentiment_event = self.emit(
@@ -2402,6 +2832,7 @@ impl ReplayEngine {
             strategy,
             account_id,
             &market,
+            reference,
             &shock,
             &sentiment_event_id,
             intent,
@@ -2423,6 +2854,7 @@ impl ReplayEngine {
         strategy: &mut impl Strategy,
         account_id: &str,
         market: &Bar,
+        reference: &Instrument,
         shock: &NewsShockContext,
         causation_id: &str,
         intent: OrderIntent,
@@ -2438,6 +2870,13 @@ impl ReplayEngine {
                 "strategy intent does not match replay account or configuration".to_owned(),
             ));
         }
+        // The market snapshot is the news decision's only mark; see `process_bar`.
+        if intent.instrument_id != market.instrument_id {
+            return Err(EngineError(
+                "news intent instrument does not match its market snapshot".to_owned(),
+            ));
+        }
+        self.require_whole_lot_fill_cap(reference)?;
         if self
             .working_orders
             .contains_key(&format!("order-{}", intent.intent_id))
@@ -2461,9 +2900,9 @@ impl ReplayEngine {
         )?;
         let intent_event_id = intent_event.event_id.clone();
         events.push(intent_event);
-        let decision = self
-            .policy
-            .evaluate_news(&intent, market, self.clock.now(), shock)?;
+        let decision =
+            self.policy
+                .evaluate_news(&intent, market, reference, self.clock.now(), shock)?;
         let current_time = self.clock.now().to_owned();
         let decision_event = self.emit(
             sink,
@@ -2538,6 +2977,7 @@ impl ReplayEngine {
                 account_id,
                 market,
                 &mut working,
+                Some(reference),
             )? {
                 *latest_position = Some(position);
                 *latest_pnl = Some(pnl);
@@ -2560,6 +3000,27 @@ impl ReplayEngine {
         Ok(())
     }
 
+    /// A per-bar fill cap must be a whole number of the traded instrument's
+    /// lots. Risk makes the order whole lots, so every partial fill and every
+    /// remainder is then whole lots too. It is a configuration fault, not a
+    /// decision, so it is an error raised before the intent is recorded.
+    fn require_whole_lot_fill_cap(&self, reference: &Instrument) -> Result<(), EngineError> {
+        if self
+            .fill_model
+            .max_fill_quantity
+            .is_some_and(|cap| !is_whole_multiple(cap, reference.lot_size))
+        {
+            return Err(EngineError(format!(
+                "simulated fill cap is not a whole number of {}'s lots",
+                reference.instrument_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// `reference` is the bar's instrument's reference data, in force when the
+    /// order fills. It is absent only for [`Self::process_bar`]'s unit tests.
+    #[allow(clippy::too_many_arguments)]
     fn attempt_simulated_fill(
         &mut self,
         sink: &mut impl EventSink,
@@ -2568,6 +3029,7 @@ impl ReplayEngine {
         account_id: &str,
         bar: &Bar,
         working: &mut SimulatedWorkingOrder,
+        reference: Option<&Instrument>,
     ) -> Result<Option<(PositionSnapshot, PnlSnapshot)>, EngineError> {
         let intent = working.order.intent.clone();
         let quantity = self
@@ -2576,6 +3038,32 @@ impl ReplayEngine {
             .map_or(working.remaining_quantity, |limit| {
                 std::cmp::min(working.remaining_quantity, limit)
             });
+        // Risk made the order whole lots under the reference data in force
+        // when it was decided. An effective-dated lot change while it works
+        // can leave this fill off the new lot, which no venue executes. The
+        // replay does not model the venue's response, so it refuses, before
+        // anything about the attempt is recorded (E3.6g).
+        // The tick analogue, under the same decision: risk put a limit on the
+        // grid in force when it was decided, and a later tick change can
+        // leave it off the new grid, at a price no venue holds (E3.6h).
+        if let Some(reference) = reference {
+            if !is_whole_multiple(quantity, reference.lot_size) {
+                return Err(EngineError(format!(
+                    "working order {} cannot fill {} after {}'s lot size changed to {}",
+                    working.order.order_id, quantity, reference.instrument_id, reference.lot_size
+                )));
+            }
+            if let Some(limit) = intent
+                .limit_price
+                .filter(|limit| !is_whole_multiple(*limit, reference.tick_size))
+            {
+                return Err(EngineError(format!(
+                    "working order {} cannot rest at {} after {}'s tick size changed to {}",
+                    working.order.order_id, limit, reference.instrument_id, reference.tick_size
+                )));
+            }
+        }
+        let tick_size = reference.map(|reference| reference.tick_size);
         let next_fill_sequence = working
             .fill_sequence
             .checked_add(1)
@@ -2594,6 +3082,7 @@ impl ReplayEngine {
             self.clock.now(),
             quantity,
             execution_id,
+            tick_size,
         )?
         else {
             let audit = self.audit_event(
@@ -2708,7 +3197,9 @@ impl ReplayEngine {
         Ok(Some((position, pnl)))
     }
 
-    /// Processes a bar only after its reference data and trading session resolve.
+    /// Processes a bar only after its reference data and trading session
+    /// resolve. That reference data then prices the decision's tick and lot
+    /// rules and bounds the fill cap (E3.6d).
     pub fn process_bar_with_market_preconditions(
         &mut self,
         sink: &mut impl EventSink,
@@ -2718,8 +3209,8 @@ impl ReplayEngine {
         bar: Bar,
         market: &MarketPreconditions<'_>,
     ) -> Result<ReplayResult, EngineError> {
-        market.validate(&bar, event_time)?;
-        self.process_bar(sink, strategy, account_id, event_time, bar)
+        let reference = market.validate(&bar, event_time)?;
+        self.replay_bar(sink, strategy, account_id, event_time, bar, Some(reference))
     }
 
     fn emit_order_change(
@@ -2900,7 +3391,28 @@ mod tests {
     }
 
     fn market_dependencies() -> (InstrumentRegistry, StaticTradingCalendar) {
-        let calendar = StaticTradingCalendar::new(
+        market_dependencies_with("0.01", 1)
+    }
+
+    /// SPY's session and reference data at an explicit tick and lot size.
+    fn market_dependencies_with(
+        tick_size: &str,
+        lot_size: i64,
+    ) -> (InstrumentRegistry, StaticTradingCalendar) {
+        let mut instruments = InstrumentRegistry::default();
+        instruments
+            .register(spy_version(
+                tick_size,
+                lot_size,
+                "2026-01-01T00:00:00Z",
+                None,
+            ))
+            .unwrap();
+        (instruments, spy_calendar())
+    }
+
+    fn spy_calendar() -> StaticTradingCalendar {
+        StaticTradingCalendar::new(
             "cal.us_equities.nyse",
             vec![TradingSession {
                 exchange_date: "2026-01-02".to_owned(),
@@ -2908,29 +3420,34 @@ mod tests {
                 closes_at: "2026-01-02T21:00:00Z".to_owned(),
             }],
         )
-        .unwrap();
-        let mut instruments = InstrumentRegistry::default();
-        instruments
-            .register(InstrumentVersion {
-                instrument: Instrument {
-                    instrument_id: "inst.us_equity.spy".to_owned(),
-                    symbol: "SPY".to_owned(),
-                    exchange_symbol: "SPY".to_owned(),
-                    asset_class: AssetClass::Etf,
-                    venue: "venue.nyse_arca".to_owned(),
-                    currency: "USD".to_owned(),
-                    broker_ids: BTreeMap::new(),
-                    tick_size: Decimal::from_str("0.01").unwrap(),
-                    lot_size: Decimal::from_integer(1).unwrap(),
-                    multiplier: Decimal::from_integer(1).unwrap(),
-                    trading_calendar_id: "cal.us_equities.nyse".to_owned(),
-                },
-                effective_from: "2026-01-01T00:00:00Z".to_owned(),
-                effective_to: None,
-                reference_version: "reference-test-1".to_owned(),
-            })
-            .unwrap();
-        (instruments, calendar)
+        .unwrap()
+    }
+
+    /// One effective-dated version of SPY's reference data.
+    fn spy_version(
+        tick_size: &str,
+        lot_size: i64,
+        effective_from: &str,
+        effective_to: Option<&str>,
+    ) -> InstrumentVersion {
+        InstrumentVersion {
+            instrument: Instrument {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                symbol: "SPY".to_owned(),
+                exchange_symbol: "SPY".to_owned(),
+                asset_class: AssetClass::Etf,
+                venue: "venue.nyse_arca".to_owned(),
+                currency: "USD".to_owned(),
+                broker_ids: BTreeMap::new(),
+                tick_size: Decimal::from_str(tick_size).unwrap(),
+                lot_size: Decimal::from_integer(lot_size).unwrap(),
+                multiplier: Decimal::from_integer(1).unwrap(),
+                trading_calendar_id: "cal.us_equities.nyse".to_owned(),
+            },
+            effective_from: effective_from.to_owned(),
+            effective_to: effective_to.map(str::to_owned),
+            reference_version: "reference-test-1".to_owned(),
+        }
     }
 
     #[test]
@@ -3064,7 +3581,22 @@ mod tests {
                 &market,
             )
             .unwrap();
-        assert!(resumed.position.is_some());
+        // The strategy's one-time buy order is created on this first bar it
+        // actually observes, but a newly created order is never eligible
+        // until the following bar (see `process_bar`'s `eligible_on_bar`
+        // comment) -- so no fill has happened yet.
+        assert!(resumed.position.is_none());
+        let filled = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut example_strategy,
+                "acct-paper-001",
+                "2026-01-02T14:33:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap();
+        assert!(filled.position.is_some());
     }
 
     #[test]
@@ -3168,6 +3700,521 @@ mod tests {
             .contains("requested_price_deviation_bps=500.00000000"));
     }
 
+    /// Emits one market order for an instrument other than the one it observed.
+    struct TradesAnotherInstrument;
+
+    impl TradesAnotherInstrument {
+        fn intent(intent_id: &str, replay_time: &str) -> Result<OrderIntent, EngineError> {
+            Ok(OrderIntent {
+                intent_id: intent_id.to_owned(),
+                account_id: "acct-paper-001".to_owned(),
+                strategy_id: "strategy-cross-001".to_owned(),
+                instrument_id: "inst.us_equity.qqq".to_owned(),
+                correlation_id: "corr-cross-001".to_owned(),
+                side: Side::Buy,
+                quantity: Decimal::from_integer(5)?,
+                order_type: OrderType::Market,
+                limit_price: None,
+                time_in_force: TimeInForce::Day,
+                rationale: "trades one instrument off another's observation".to_owned(),
+                created_at: replay_time.to_owned(),
+                strategy_version: "strategy-cross-v1".to_owned(),
+                configuration_version: "cfg-example-1".to_owned(),
+                environment: "SIMULATION".to_owned(),
+            })
+        }
+    }
+
+    impl Strategy for TradesAnotherInstrument {
+        fn on_bar(
+            &mut self,
+            _bar: &Bar,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Self::intent("intent-cross-bar-001", replay_time).map(Some)
+        }
+
+        fn on_news_sentiment(
+            &mut self,
+            _sentiment: &SentimentVector,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            Self::intent("intent-cross-news-001", replay_time).map(Some)
+        }
+    }
+
+    fn event_types(store: &InMemoryEventStore) -> Vec<&str> {
+        store
+            .events()
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn risk_evaluation_refuses_a_mark_for_another_instrument() {
+        // SPY's close would price this QQQ order's notional and collar, and
+        // says nothing about QQQ's own price. There is no decision to make.
+        let policy = engine().policy;
+        let intent =
+            TradesAnotherInstrument::intent("intent-cross-risk-001", "2026-01-02T14:31:00Z")
+                .unwrap();
+        let error = policy
+            .evaluate(&intent, &bar(), "2026-01-02T14:31:00Z")
+            .unwrap_err();
+        assert_eq!(error.0, "risk mark instrument does not match the intent");
+
+        let mut own_mark = bar();
+        own_mark.instrument_id = intent.instrument_id.clone();
+        assert!(
+            policy
+                .evaluate(&intent, &own_mark, "2026-01-02T14:31:00Z")
+                .unwrap()
+                .approved
+        );
+    }
+
+    #[test]
+    fn replay_refuses_an_intent_for_another_instrument_before_recording_it() {
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let error = replay
+            .process_bar(
+                &mut store,
+                &mut TradesAnotherInstrument,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap_err();
+        // The bar was observed; nothing the strategy asked for was recorded.
+        assert_eq!(event_types(&store), vec!["market.bar.v1"]);
+        assert!(replay.working_orders.is_empty());
+        assert_eq!(
+            error.0,
+            "strategy intent instrument does not match the market bar that produced it"
+        );
+    }
+
+    #[test]
+    fn news_intent_for_another_instrument_is_refused_before_recording_it() {
+        let mut replay = news_engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = TradesAnotherInstrument;
+        replay
+            .process_news_headline(&mut store, &mut strategy, news_headline())
+            .unwrap();
+        let error = replay
+            .process_news_sentiment(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                news_sentiment(),
+                bar(),
+                NewsShockContext {
+                    pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+                    current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                    baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+                },
+                &news_reference_data(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            event_types(&store),
+            vec!["news.headline.v1", "news.sentiment.v1"]
+        );
+        assert!(replay.working_orders.is_empty());
+        assert_eq!(
+            error.0,
+            "news intent instrument does not match its market snapshot"
+        );
+    }
+
+    /// Submits one order on the first bar or sentiment it sees, on that
+    /// observation's own instrument.
+    struct SubmitsOnce {
+        quantity: Decimal,
+        limit_price: Option<Decimal>,
+        submitted: bool,
+    }
+
+    impl SubmitsOnce {
+        fn new(quantity: i64, limit_price: Option<&str>) -> Self {
+            Self {
+                quantity: Decimal::from_integer(quantity).unwrap(),
+                limit_price: limit_price.map(|price| Decimal::from_str(price).unwrap()),
+                submitted: false,
+            }
+        }
+
+        fn submit(
+            &mut self,
+            instrument_id: &str,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            if self.submitted {
+                return Ok(None);
+            }
+            self.submitted = true;
+            Ok(Some(OrderIntent {
+                intent_id: "intent-increments-001".to_owned(),
+                account_id: "acct-paper-001".to_owned(),
+                strategy_id: "strategy-increments-001".to_owned(),
+                instrument_id: instrument_id.to_owned(),
+                correlation_id: "corr-increments-001".to_owned(),
+                side: Side::Buy,
+                quantity: self.quantity,
+                order_type: if self.limit_price.is_some() {
+                    OrderType::Limit
+                } else {
+                    OrderType::Market
+                },
+                limit_price: self.limit_price,
+                time_in_force: TimeInForce::Day,
+                rationale: "reference-data increment regression".to_owned(),
+                created_at: replay_time.to_owned(),
+                strategy_version: "strategy-increments-v1".to_owned(),
+                configuration_version: "cfg-example-1".to_owned(),
+                environment: "SIMULATION".to_owned(),
+            }))
+        }
+    }
+
+    impl Strategy for SubmitsOnce {
+        fn on_bar(
+            &mut self,
+            bar: &Bar,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            self.submit(&bar.instrument_id, replay_time)
+        }
+
+        fn on_news_sentiment(
+            &mut self,
+            sentiment: &SentimentVector,
+            replay_time: &str,
+        ) -> Result<Option<OrderIntent>, EngineError> {
+            self.submit(&sentiment.instrument_id, replay_time)
+        }
+    }
+
+    fn only_decision(events: &[EventEnvelope]) -> RiskDecision {
+        let decisions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::RiskDecision(decision) => Some(decision.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        decisions.into_iter().next().unwrap()
+    }
+
+    fn fill_quantities(events: &[EventEnvelope]) -> Vec<Decimal> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::Fill(fill) => Some(fill.quantity),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fill_prices(events: &[EventEnvelope]) -> Vec<Decimal> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::Fill(fill) => Some(fill.price),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reference_data_tick_and_lot_rules_match_paper() {
+        // SPY trading at a nickel tick in five-share lots. The engine policy
+        // allows ten shares and a 500 bps collar around the 100 close.
+        let (instruments, _) = market_dependencies_with("0.05", 5);
+        let reference = &instruments
+            .resolve("inst.us_equity.spy", "2026-01-02T14:31:00Z")
+            .unwrap()
+            .instrument;
+        let policy = engine().policy;
+        let decide = |quantity: i64, limit: Option<&str>| {
+            let intent = SubmitsOnce::new(quantity, limit)
+                .submit("inst.us_equity.spy", "2026-01-02T14:31:00Z")
+                .unwrap()
+                .unwrap();
+            policy
+                .evaluate_with_reference(&intent, &bar(), reference, "2026-01-02T14:31:00Z")
+                .unwrap()
+        };
+
+        let on_grid = decide(10, Some("100.05"));
+        assert_eq!(on_grid.reason_codes, vec!["APPROVED".to_owned()]);
+        assert!(on_grid
+            .evaluated_limits
+            .ends_with(",instrument_tick_size=0.05000000,instrument_lot_size=5.00000000"));
+        // Three shares is a whole number of ticks, but not of lots.
+        assert_eq!(
+            decide(3, None).reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert_eq!(
+            decide(5, Some("100.02")).reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        assert_eq!(
+            decide(3, Some("100.02")).reason_codes,
+            vec![
+                "LIMIT_PRICE_OFF_TICK_GRID".to_owned(),
+                "ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()
+            ]
+        );
+        // A market order has no price to put on the grid.
+        assert!(decide(5, None).approved);
+        // The ordinary limits still apply alongside the increments.
+        assert_eq!(
+            decide(13, None).reason_codes,
+            vec![
+                "MAX_QUANTITY_EXCEEDED".to_owned(),
+                "ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()
+            ]
+        );
+
+        let mut other = reference.clone();
+        other.instrument_id = "inst.us_equity.qqq".to_owned();
+        let intent = SubmitsOnce::new(5, None)
+            .submit("inst.us_equity.spy", "2026-01-02T14:31:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy
+                .evaluate_with_reference(&intent, &bar(), &other, "2026-01-02T14:31:00Z")
+                .unwrap_err()
+                .0,
+            "risk reference data instrument does not match the intent"
+        );
+
+        // Unvalidated reference data with no lot is an error, not a "no".
+        let mut no_lot = reference.clone();
+        no_lot.lot_size = Decimal::ZERO;
+        assert_eq!(
+            policy
+                .evaluate_with_reference(&intent, &bar(), &no_lot, "2026-01-02T14:31:00Z")
+                .unwrap_err()
+                .0,
+            "instrument reference data has a non-positive tick or lot size"
+        );
+    }
+
+    #[test]
+    fn replay_applies_reference_data_increments_before_an_order_exists() {
+        let (instruments, calendar) = market_dependencies_with("0.05", 5);
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let replay_once = |strategy: &mut SubmitsOnce| {
+            let mut replay = engine();
+            let mut store = InMemoryEventStore::default();
+            let mut events = Vec::new();
+            for event_time in ["2026-01-02T14:31:00Z", "2026-01-02T14:32:00Z"] {
+                events.extend(
+                    replay
+                        .process_bar_with_market_preconditions(
+                            &mut store,
+                            strategy,
+                            "acct-paper-001",
+                            event_time,
+                            bar(),
+                            &market,
+                        )
+                        .unwrap()
+                        .events,
+                );
+            }
+            events
+        };
+
+        // Three shares of a five-share lot is refused, and no order exists.
+        let refused = replay_once(&mut SubmitsOnce::new(3, None));
+        let decision = only_decision(&refused);
+        assert_eq!(
+            decision.reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(decision
+            .evaluated_limits
+            .contains("instrument_lot_size=5.00000000"));
+        assert!(!refused
+            .iter()
+            .any(|event| event.event_type == "order.state_changed.v1"));
+        assert!(fill_quantities(&refused).is_empty());
+
+        // An off-grid limit is refused the same way.
+        let off_grid = replay_once(&mut SubmitsOnce::new(5, Some("100.02")));
+        assert_eq!(
+            only_decision(&off_grid).reason_codes,
+            vec!["LIMIT_PRICE_OFF_TICK_GRID".to_owned()]
+        );
+        assert!(fill_quantities(&off_grid).is_empty());
+
+        // Two whole lots are approved and fill on the next bar.
+        let approved = replay_once(&mut SubmitsOnce::new(10, None));
+        assert!(only_decision(&approved).approved);
+        assert_eq!(
+            fill_quantities(&approved),
+            vec![Decimal::from_integer(10).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_fill_cap_must_be_a_whole_number_of_lots() {
+        let (instruments, calendar) = market_dependencies_with("0.01", 5);
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+
+        // A three-share cap would split a ten-share order into partials of
+        // three, which no five-share-lot venue executes.
+        let mut replay = engine();
+        replay.fill_model.max_fill_quantity = Some(Decimal::from_integer(3).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let error = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut SubmitsOnce::new(10, None),
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap_err();
+        assert_eq!(event_types(&store), vec!["market.bar.v1"]);
+        assert_eq!(
+            error.0,
+            "simulated fill cap is not a whole number of inst.us_equity.spy's lots"
+        );
+
+        // A one-lot cap fills the same order in two whole lots.
+        let mut replay = engine();
+        replay.fill_model.max_fill_quantity = Some(Decimal::from_integer(5).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = SubmitsOnce::new(10, None);
+        let mut fills = Vec::new();
+        for event_time in [
+            "2026-01-02T14:31:00Z",
+            "2026-01-02T14:32:00Z",
+            "2026-01-02T14:33:00Z",
+        ] {
+            fills.extend(fill_quantities(
+                &replay
+                    .process_bar_with_market_preconditions(
+                        &mut store,
+                        &mut strategy,
+                        "acct-paper-001",
+                        event_time,
+                        bar(),
+                        &market,
+                    )
+                    .unwrap()
+                    .events,
+            ));
+        }
+        let lot = Decimal::from_integer(5).unwrap();
+        assert_eq!(fills, vec![lot, lot]);
+        assert!(replay.working_orders.is_empty());
+    }
+
+    fn replay_news_order(
+        strategy: &mut SubmitsOnce,
+        fill_cap: Option<i64>,
+        instruments: &InstrumentRegistry,
+    ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
+        let mut replay = news_engine();
+        replay.fill_model.max_fill_quantity =
+            fill_cap.map(|cap| Decimal::from_integer(cap).unwrap());
+        replay_news_order_on(replay, strategy, instruments)
+    }
+
+    fn replay_news_order_on(
+        mut replay: ReplayEngine,
+        strategy: &mut SubmitsOnce,
+        instruments: &InstrumentRegistry,
+    ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
+        let mut store = InMemoryEventStore::default();
+        replay
+            .process_news_headline(&mut store, strategy, news_headline())
+            .unwrap();
+        let result = replay.process_news_sentiment(
+            &mut store,
+            strategy,
+            "acct-paper-001",
+            news_sentiment(),
+            bar(),
+            NewsShockContext {
+                pre_headline_reference_price: Decimal::from_integer(100).unwrap(),
+                current_spread: Some(Decimal::from_str("0.02").unwrap()),
+                baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
+            },
+            instruments,
+        );
+        let recorded = event_types(&store).into_iter().map(str::to_owned).collect();
+        (result, recorded)
+    }
+
+    #[test]
+    fn news_orders_meet_the_same_reference_data_increments() {
+        let (round_lots, _) = market_dependencies_with("0.01", 5);
+
+        let (result, _) = replay_news_order(&mut SubmitsOnce::new(3, None), None, &round_lots);
+        let events = result.unwrap().events;
+        assert_eq!(
+            only_decision(&events).reason_codes,
+            vec!["ORDER_QUANTITY_OFF_LOT_SIZE".to_owned()]
+        );
+        assert!(fill_quantities(&events).is_empty());
+
+        // The same order at a one-share lot is approved and fills, and its
+        // evidence names the increments it was judged against.
+        let (result, _) =
+            replay_news_order(&mut SubmitsOnce::new(3, None), None, &news_reference_data());
+        let events = result.unwrap().events;
+        let decision = only_decision(&events);
+        assert!(decision.approved);
+        assert!(decision
+            .evaluated_limits
+            .contains(",instrument_tick_size=0.01000000,instrument_lot_size=1.00000000,"));
+        assert_eq!(
+            fill_quantities(&events),
+            vec![Decimal::from_integer(3).unwrap()]
+        );
+
+        // An off-lot fill cap is refused before the news intent is recorded.
+        let (result, recorded) =
+            replay_news_order(&mut SubmitsOnce::new(10, None), Some(3), &round_lots);
+        assert_eq!(recorded, vec!["news.headline.v1", "news.sentiment.v1"]);
+        assert_eq!(
+            result.unwrap_err().0,
+            "simulated fill cap is not a whole number of inst.us_equity.spy's lots"
+        );
+    }
+
+    #[test]
+    fn news_without_reference_data_is_refused_before_recording_it() {
+        let mut strategy = SubmitsOnce::new(1, None);
+        let (result, recorded) =
+            replay_news_order(&mut strategy, None, &InstrumentRegistry::default());
+        assert_eq!(recorded, vec!["news.headline.v1"]);
+        assert!(!strategy.submitted);
+        assert_eq!(
+            result.unwrap_err().0,
+            "no effective instrument reference data for the news market snapshot"
+        );
+    }
+
     #[test]
     fn deterministic_fill_model_applies_half_spread_and_slippage_unfavourably() {
         let model = DeterministicFillModel {
@@ -3265,6 +4312,335 @@ mod tests {
         assert!(negative_spread.validate().is_err());
         assert!(excessive_combined_cost.validate().is_err());
         assert!(zero_fill_cap.validate().is_err());
+    }
+
+    #[test]
+    fn a_fill_price_rounds_onto_the_tick_grid_against_the_trader() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+        let round = |value: &str, side: Side, tick: &str| {
+            round_to_tick_against_trader(price(value), side, price(tick)).unwrap()
+        };
+
+        // The probe corpus's base-cost estimate: a buy pays the next cent up,
+        // and a sell at the same estimate concedes the cent below it.
+        assert_eq!(round("100.28016", Side::Buy, "0.01"), price("100.29"));
+        assert_eq!(round("100.28016", Side::Sell, "0.01"), price("100.28"));
+        // Against the trader, not to the nearest tick.
+        assert_eq!(round("100.01", Side::Buy, "0.05"), price("100.05"));
+        assert_eq!(round("100.04", Side::Sell, "0.05"), price("100.00"));
+        // A price already on the grid is unchanged on either side.
+        for side in [Side::Buy, Side::Sell] {
+            assert_eq!(round("100.25", side, "0.05"), price("100.25"));
+        }
+        // A grid at the decimal's own resolution changes nothing.
+        assert_eq!(
+            round("100.28016", Side::Buy, "0.00000001"),
+            price("100.28016")
+        );
+
+        for tick in ["0", "-0.01"] {
+            assert_eq!(
+                round_to_tick_against_trader(price("100.28016"), Side::Buy, price(tick))
+                    .unwrap_err()
+                    .0,
+                "a fill price cannot be rounded to a non-positive tick"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fill_model_rounds_onto_the_grid_before_checking_the_limit() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+        // 20 bps of spread and 5 of slippage estimate a buy at 100.15 and a
+        // sell at 99.85 against the 100.00 close.
+        let model = DeterministicFillModel {
+            spread_bps: price("20"),
+            slippage_bps: price("5"),
+            flat_fee: Decimal::ZERO,
+            latency_bars: 0,
+            max_fill_quantity: None,
+        };
+        let fill_price = |side: Side,
+                          order_type: OrderType,
+                          limit: Option<&str>,
+                          tick: Option<&str>,
+                          bar: &Bar| {
+            model
+                .fill_quantity(
+                    &simulated_order(side, order_type, limit.map(price)),
+                    bar,
+                    "2026-01-02T14:31:00Z",
+                    Decimal::from_integer(1).unwrap(),
+                    "exec-grid-001".to_owned(),
+                    tick.map(price),
+                )
+                .map(|fill| fill.map(|fill| fill.price))
+        };
+        let market = |side, tick| fill_price(side, OrderType::Market, None, tick, &bar());
+        let limit = |side, limit, tick| fill_price(side, OrderType::Limit, limit, tick, &bar());
+
+        // A dime grid moves both estimates against the trader.
+        assert_eq!(
+            market(Side::Buy, Some("0.10")).unwrap(),
+            Some(price("100.20"))
+        );
+        assert_eq!(
+            market(Side::Sell, Some("0.10")).unwrap(),
+            Some(price("99.80"))
+        );
+        // Both estimates already sit on a nickel grid.
+        assert_eq!(
+            market(Side::Buy, Some("0.05")).unwrap(),
+            Some(price("100.15"))
+        );
+        assert_eq!(
+            market(Side::Sell, Some("0.05")).unwrap(),
+            Some(price("99.85"))
+        );
+
+        // Rounding cannot breach an on-grid limit: the next grid price above
+        // an estimate inside the limit is at most the limit itself.
+        assert_eq!(
+            limit(Side::Buy, Some("100.20"), Some("0.10")).unwrap(),
+            Some(price("100.20"))
+        );
+        assert_eq!(
+            limit(Side::Sell, Some("99.80"), Some("0.10")).unwrap(),
+            Some(price("99.80"))
+        );
+        // The limit is checked against the grid price, not the estimate. Risk
+        // refuses an off-grid limit before any order exists, so only a direct
+        // call reaches this: 100.15 is inside 100.17, and 100.20 is not.
+        assert_eq!(
+            limit(Side::Buy, Some("100.17"), None).unwrap(),
+            Some(price("100.15"))
+        );
+        assert_eq!(
+            limit(Side::Buy, Some("100.17"), Some("0.10")).unwrap(),
+            None
+        );
+
+        // A sell estimated under one tick rounds to zero, which no venue
+        // prints, so it is an error rather than a fill for nothing.
+        let mut sub_tick = bar();
+        for value in [
+            &mut sub_tick.open,
+            &mut sub_tick.high,
+            &mut sub_tick.low,
+            &mut sub_tick.close,
+        ] {
+            *value = price("0.05");
+        }
+        assert_eq!(
+            fill_price(Side::Sell, OrderType::Market, None, Some("0.10"), &sub_tick)
+                .unwrap_err()
+                .0,
+            "deterministic fill model produced a non-positive price"
+        );
+    }
+
+    /// Replays `SubmitsOnce`'s one-share market buy at 25 bps of slippage, an
+    /// estimate of 100.25 against the fill bar's 100.00 close, and returns
+    /// the fill prices and the resulting position.
+    fn replay_slipped_buy(instruments: &InstrumentRegistry) -> (Vec<Decimal>, PositionSnapshot) {
+        let calendar = spy_calendar();
+        let market = MarketPreconditions {
+            instruments,
+            calendar: &calendar,
+        };
+        let mut replay = engine();
+        replay.fill_model.slippage_bps = Decimal::from_integer(25).unwrap();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = SubmitsOnce::new(1, None);
+        let mut events = Vec::new();
+        let mut position = None;
+        for event_time in ["2026-01-02T14:31:00Z", "2026-01-02T14:32:00Z"] {
+            let result = replay
+                .process_bar_with_market_preconditions(
+                    &mut store,
+                    &mut strategy,
+                    "acct-paper-001",
+                    event_time,
+                    bar(),
+                    &market,
+                )
+                .unwrap();
+            position = result.position.or(position);
+            events.extend(result.events);
+        }
+        (fill_prices(&events), position.unwrap())
+    }
+
+    #[test]
+    fn replay_fills_print_on_the_instruments_tick_grid() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+
+        let (dime_grid, _) = market_dependencies_with("0.10", 1);
+        let (prices, position) = replay_slipped_buy(&dime_grid);
+        assert_eq!(prices, vec![price("100.30")]);
+        // The ledger is charged the grid price plus the 0.10 fee.
+        assert_eq!(position.average_cost, price("100.40"));
+
+        // On a nickel grid the estimate is already a price the venue prints.
+        let (nickel_grid, _) = market_dependencies_with("0.05", 1);
+        let (prices, position) = replay_slipped_buy(&nickel_grid);
+        assert_eq!(prices, vec![price("100.25")]);
+        assert_eq!(position.average_cost, price("100.35"));
+
+        // A working order prints on the grid in force when it fills, not the
+        // one in force when it was decided: a cent grid at 14:31 and a dime
+        // grid from 14:32, the fill bar.
+        let mut regridded = InstrumentRegistry::default();
+        for version in [
+            spy_version(
+                "0.01",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-02T14:32:00Z"),
+            ),
+            spy_version("0.10", 1, "2026-01-02T14:32:00Z", None),
+        ] {
+            regridded.register(version).unwrap();
+        }
+        let (prices, _) = replay_slipped_buy(&regridded);
+        assert_eq!(prices, vec![price("100.30")]);
+    }
+
+    /// Decides `strategy`'s buy on the 14:31 bar under a cent tick and a
+    /// one-share lot, then replays the 14:32 bar, from which SPY trades on a
+    /// `new_tick` grid in `new_lot`-share lots. Returns the 14:32 bar's
+    /// result and every recorded event type.
+    fn replay_across_a_reference_change(
+        mut strategy: SubmitsOnce,
+        fill_cap: Option<i64>,
+        new_tick: &str,
+        new_lot: i64,
+    ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
+        let mut instruments = InstrumentRegistry::default();
+        for version in [
+            spy_version(
+                "0.01",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-02T14:32:00Z"),
+            ),
+            spy_version(new_tick, new_lot, "2026-01-02T14:32:00Z", None),
+        ] {
+            instruments.register(version).unwrap();
+        }
+        let calendar = spy_calendar();
+        let market = MarketPreconditions {
+            instruments: &instruments,
+            calendar: &calendar,
+        };
+        let mut replay = engine();
+        replay.fill_model.max_fill_quantity =
+            fill_cap.map(|cap| Decimal::from_integer(cap).unwrap());
+        let mut store = InMemoryEventStore::default();
+        let decided = replay
+            .process_bar_with_market_preconditions(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+                &market,
+            )
+            .unwrap();
+        assert!(only_decision(&decided.events).approved);
+        let result = replay.process_bar_with_market_preconditions(
+            &mut store,
+            &mut strategy,
+            "acct-paper-001",
+            "2026-01-02T14:32:00Z",
+            bar(),
+            &market,
+        );
+        let recorded = event_types(&store).into_iter().map(str::to_owned).collect();
+        (result, recorded)
+    }
+
+    #[test]
+    fn a_lot_change_under_a_working_order_refuses_the_replay() {
+        // Three shares were whole lots when decided. From the fill bar SPY
+        // trades in fives, so no venue would execute this fill.
+        let (result, recorded) =
+            replay_across_a_reference_change(SubmitsOnce::new(3, None), None, "0.01", 5);
+        assert_eq!(
+            result.unwrap_err().0,
+            "working order order-intent-increments-001 cannot fill 3.00000000 after inst.us_equity.spy's lot size changed to 5.00000000"
+        );
+        // The fill bar is the last thing recorded: nothing about the attempt.
+        assert_eq!(recorded.last().map(String::as_str), Some("market.bar.v1"));
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|kind| *kind == "market.bar.v1")
+                .count(),
+            2
+        );
+        assert!(!recorded.iter().any(|kind| kind == "execution.fill.v1"));
+
+        // A fill cap can leave a whole-lot order's partial off the new lot:
+        // four shares are one lot of four, but a cap of two is not.
+        let (result, recorded) =
+            replay_across_a_reference_change(SubmitsOnce::new(4, None), Some(2), "0.01", 4);
+        assert_eq!(
+            result.unwrap_err().0,
+            "working order order-intent-increments-001 cannot fill 2.00000000 after inst.us_equity.spy's lot size changed to 4.00000000"
+        );
+        assert_eq!(recorded.last().map(String::as_str), Some("market.bar.v1"));
+
+        // A change the order still fits is not refused: six shares are two
+        // lots of three, and fill as usual.
+        let (result, _) =
+            replay_across_a_reference_change(SubmitsOnce::new(6, None), None, "0.01", 3);
+        assert_eq!(
+            fill_quantities(&result.unwrap().events),
+            vec![Decimal::from_integer(6).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_tick_change_under_a_working_limit_refuses_the_replay() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+
+        // A buy limited at 100.05 sat on the cent grid when it was decided.
+        // From the fill bar SPY trades in dimes, so no venue holds the order
+        // at that price, although the bar would fill it.
+        let (result, recorded) =
+            replay_across_a_reference_change(SubmitsOnce::new(1, Some("100.05")), None, "0.10", 1);
+        assert_eq!(
+            result.unwrap_err().0,
+            "working order order-intent-increments-001 cannot rest at 100.05000000 after inst.us_equity.spy's tick size changed to 0.10000000"
+        );
+        // The fill bar is the last thing recorded: nothing about the attempt.
+        assert_eq!(recorded.last().map(String::as_str), Some("market.bar.v1"));
+        assert!(!recorded.iter().any(|kind| kind == "execution.fill.v1"));
+
+        // A limit the new grid still holds fills as usual, on that grid.
+        let (result, _) =
+            replay_across_a_reference_change(SubmitsOnce::new(1, Some("100.10")), None, "0.10", 1);
+        assert_eq!(fill_prices(&result.unwrap().events), vec![price("100.00")]);
+
+        // A market order has no limit to leave the grid. It fills, rounded
+        // onto the new grid against the trader (E3.6e).
+        let (result, _) =
+            replay_across_a_reference_change(SubmitsOnce::new(1, None), None, "0.10", 1);
+        assert_eq!(fill_prices(&result.unwrap().events), vec![price("100.00")]);
+    }
+
+    #[test]
+    fn news_fills_print_on_the_instruments_tick_grid() {
+        let (dime_grid, _) = market_dependencies_with("0.10", 1);
+        let mut replay = news_engine();
+        replay.fill_model.slippage_bps = Decimal::from_integer(25).unwrap();
+        let (result, _) = replay_news_order_on(replay, &mut SubmitsOnce::new(1, None), &dime_grid);
+        // The same 100.25 estimate, filled at once on the news snapshot.
+        assert_eq!(
+            fill_prices(&result.unwrap().events),
+            vec![Decimal::from_str("100.30").unwrap()]
+        );
     }
 
     #[test]
@@ -3604,6 +4980,9 @@ mod tests {
                 bar(),
             )
             .unwrap();
+        // Bar 1's order (intent-cumulative-001) is never eligible until bar 2,
+        // so bar 2 both fills it and creates bar 2's own order
+        // (intent-cumulative-002), which is in turn only eligible on bar 3.
         let second = replay
             .process_bar(
                 &mut store,
@@ -3615,8 +4994,96 @@ mod tests {
             .unwrap();
         assert_eq!(
             second.position.unwrap().quantity,
+            Decimal::from_integer(1).unwrap()
+        );
+        let third = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:32:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert_eq!(
+            third.position.unwrap().quantity,
             Decimal::from_integer(2).unwrap()
         );
+    }
+
+    #[test]
+    fn a_new_limit_order_cannot_fill_against_the_same_bar_that_produced_it() {
+        // `bar()` is high=101/low=99/close=100. A strategy that only ever sees
+        // a bar *after* it has fully closed could never have known that low
+        // beforehand; setting a limit exactly at it and filling within that
+        // same bar would be look-ahead no live order could realize.
+        struct BuyAtThisBarsOwnLow {
+            submitted: bool,
+        }
+
+        impl Strategy for BuyAtThisBarsOwnLow {
+            fn on_bar(
+                &mut self,
+                bar: &Bar,
+                replay_time: &str,
+            ) -> Result<Option<OrderIntent>, EngineError> {
+                if self.submitted {
+                    return Ok(None);
+                }
+                self.submitted = true;
+                Ok(Some(OrderIntent {
+                    intent_id: "intent-lookahead-001".to_owned(),
+                    account_id: "acct-paper-001".to_owned(),
+                    strategy_id: "strategy-lookahead-001".to_owned(),
+                    instrument_id: bar.instrument_id.clone(),
+                    correlation_id: "corr-lookahead-001".to_owned(),
+                    side: Side::Buy,
+                    quantity: Decimal::from_integer(1)?,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(bar.low),
+                    time_in_force: TimeInForce::Day,
+                    rationale: "look-ahead regression".to_owned(),
+                    created_at: replay_time.to_owned(),
+                    strategy_version: "strategy-lookahead-v1".to_owned(),
+                    configuration_version: "cfg-example-1".to_owned(),
+                    environment: "SIMULATION".to_owned(),
+                }))
+            }
+        }
+
+        let mut replay = engine();
+        let mut store = InMemoryEventStore::default();
+        let mut strategy = BuyAtThisBarsOwnLow { submitted: false };
+
+        let first = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:31:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert!(first.position.is_none());
+        assert!(!first
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::Fill(_))));
+
+        let second = replay
+            .process_bar(
+                &mut store,
+                &mut strategy,
+                "acct-paper-001",
+                "2026-01-02T14:32:00Z",
+                bar(),
+            )
+            .unwrap();
+        assert!(second.position.is_some());
+        assert!(second
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::Fill(_))));
     }
 
     struct NewsIntentStrategy;
@@ -3716,6 +5183,11 @@ mod tests {
         }
     }
 
+    /// The news fixtures' reference data: SPY at a 0.01 tick and a 1-share lot.
+    fn news_reference_data() -> InstrumentRegistry {
+        market_dependencies().0
+    }
+
     fn news_engine() -> ReplayEngine {
         ReplayEngine::new(
             "2026-09-01T10:59:59Z",
@@ -3760,6 +5232,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .unwrap();
         headline
@@ -3833,6 +5306,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .expect("causally linked sentiment should be accepted");
         let sentiment_event = &sentiment.events[0];
@@ -3877,6 +5351,7 @@ mod tests {
                     current_spread: Some(Decimal::from_str("0.02").unwrap()),
                     baseline_spread: Some(Decimal::from_str("0.01").unwrap()),
                 },
+                &news_reference_data(),
             )
             .is_err());
         assert_eq!(store.events().len(), event_count_before);
@@ -3926,6 +5401,7 @@ mod tests {
                 news_sentiment(),
                 bar(),
                 shock.clone(),
+                &news_reference_data(),
             )
             .unwrap();
         let counts_before = [
@@ -3955,6 +5431,7 @@ mod tests {
             news_sentiment(),
             bar(),
             shock,
+            &news_reference_data(),
         );
         assert!(duplicate.is_err());
         assert_eq!(store.events().len(), event_count_before);

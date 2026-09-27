@@ -637,7 +637,7 @@ FIXTURES: dict[str, tuple[str, dict]] = {
     "model-evaluation-benchmark.json": (
         "model-evaluation-benchmark.schema.json",
         {
-            "benchmark_schema_version": 1,
+            "model_evaluation_schema_version": 1,
             "benchmark_id": "eval.model.gemini-pro",
             "model_identifier": "gemini-1.5-pro",
             "evaluation_dataset_id": "ds.eval.research-ops.v1",
@@ -915,9 +915,11 @@ def validate_and_write() -> None:
         jsonschema.validate(instance=data, schema=schema)
         # Write canonical sorted JSON
         target_path = TARGET_DIR / filename
+        # LF on every platform: these are checked-in fixtures (audit item 75).
         target_path.write_text(
             json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         print(f"  [OK] {filename:<40} (validated against {schema_name})")
     print(f"\nAll {len(FIXTURES)} advanced fixtures successfully validated and published to {TARGET_DIR}.")

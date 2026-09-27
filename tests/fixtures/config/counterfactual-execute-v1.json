@@ -1,0 +1,18 @@
+{
+  "baseline_run_id": "run.probe-corpus.baseline",
+  "seed": 11,
+  "divergence_event_id": "evt.max-notional-reject",
+  "created_at": "2026-09-16T00:00:00Z",
+  "interventions": [
+    {
+      "intervention_type": "RISK_COLLAR_ADJUSTMENT",
+      "parameter_name": "max_notional",
+      "baseline_value": "10000",
+      "counterfactual_value": "50"
+    }
+  ],
+  "execute": {
+    "backtest_configuration": "backtest-probe-v1.json",
+    "historical_bars": "../historical-bars/probe-corpus-one-minute.csv"
+  }
+}

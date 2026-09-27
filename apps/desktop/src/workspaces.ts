@@ -57,6 +57,7 @@ import { FeatureDefinition, SystemStatus } from "./catalog.js";
 import { createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { OrderTicket } from "./OrderTicket.js";
+import { ComboTicket } from "./ComboTicket.js";
 
 export type EvidenceArtifact = Readonly<{
   name: string;
@@ -135,6 +136,8 @@ type BacktestSummary = Readonly<{
   report: Readonly<Record<string, unknown>>;
   specification: Readonly<Record<string, unknown>>;
   specification_fingerprint: unknown;
+  /** Complete advanced-account economics carried by a schema-3 artifact. */
+  advanced_account?: Readonly<Record<string, unknown>> | null;
 }>;
 
 type SnapshotDashboard = Readonly<{
@@ -186,6 +189,7 @@ export type WorkspaceContext = Readonly<{
 type Metric = readonly [label: string, value: string, detail: string, state?: "good" | "warn" | "bad", isSignature?: boolean];
 
 let mountedTicket: ReturnType<typeof createRoot> | undefined;
+let mountedComboTicket: ReturnType<typeof createRoot> | undefined;
 const tableFilterValues = new Map<string, string>();
 
 const OMS_LIFECYCLE_COVERAGE: ReadonlyArray<readonly [string, string, string]> = [
@@ -249,6 +253,8 @@ export function renderWorkspace(
 ): void {
   mountedTicket?.unmount();
   mountedTicket = undefined;
+  mountedComboTicket?.unmount();
+  mountedComboTicket = undefined;
   summaryRoot.replaceChildren();
   canvasRoot.replaceChildren();
   switch (workspaceId) {
@@ -680,8 +686,8 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
   root.append(inputCorrectionPanel);
 
   const counterfactualPanel = createPanel(
-    "Counterfactual scenario replay and intervention lab",
-    "Simulate parameter, latency, data corruption, and volatility interventions on frozen baseline runs without mutating production history (DUR-02)."
+    "Operator-attested counterfactual result comparison",
+    "Compare caller-supplied baseline and intervention results without mutating production history; this view does not execute or prove a replay (DUR-02)."
   );
   counterfactualPanel.id = "counterfactual-panel";
   appendAdvancedEvidenceRows(
@@ -701,7 +707,7 @@ function renderResearchLab(summaryRoot: HTMLElement, root: HTMLElement, snapshot
       `${scenario.delta_metrics.max_drawdown_delta_bps} bps`,
       String(scenario.delta_metrics.risk_rejection_count_delta),
     ]],
-    "No typed counterfactual replay scenario is published."
+    "No typed operator-attested counterfactual result is published."
   );
   root.append(counterfactualPanel);
   const payoffVisualizer = renderOptionsPayoffVisualizer(options);
@@ -1059,17 +1065,17 @@ function renderStrategyStudio(summaryRoot: HTMLElement, root: HTMLElement, snaps
     context,
     "adversarial_evaluation",
     parseAdversarialEvaluation,
-    ["Evaluation ID", "Strategy", "Probes Passed", "Composite Robustness", "Gate Status", "Blocking Failure Reasons", "Evaluated At"],
+    ["Evaluation ID", "Strategy", "Attested Probes Passed", "Composite Robustness", "Certification Status", "Blocking Failure Reasons", "Evaluated At"],
     (evaluation) => [[
       evaluation.evaluation_id,
       evaluation.strategy_version,
       `${evaluation.probes.filter((p) => p.passed).length}/${evaluation.probes.length} probes`,
       `${evaluation.composite_robustness_score_bps} bps`,
-      evaluation.gate_passed ? "PASSED" : "FAILED_GATE",
+      evaluation.gate_passed ? "INPUTS_PASS" : "INPUTS_FAIL",
       evaluation.blocking_failure_reasons.join(" | ") || "None",
       evaluation.evaluated_at,
     ]],
-    "No typed adversarial research evaluation is published."
+    "No typed operator-attested adversarial evaluation is published."
   );
   root.append(strategyInvalidationPanel);
 
@@ -1126,6 +1132,23 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
   }), "No backtest result artifacts are available.", (index) => context.onOpenArtifact(snapshot.backtests[index]?.artifact ?? ""));
   root.append(runs);
 
+  // Schema-3 artifacts carry the complete economics; older runs are not
+  // back-filled, so they are simply absent from this table.
+  const advancedRuns = snapshot.backtests.filter((run) => isRecord(run.advanced_account));
+  const economics = createPanel(
+    "Advanced-account economics",
+    "Multi-currency cash, long and short positions, margin, financing, and attributed charges, carried inside each schema-3 artifact. These supersede the single-currency run comparison figures.",
+  );
+  economics.id = "advanced-account-economics";
+  appendTableOrEmpty(economics, ["Artifact", "Base currency", "Net liquidation", "Initial margin", "Maintenance margin", "Excess liquidity", "Margin call", "Realized P&L", "Unrealized P&L", "Execution charges", "Financing charges"], advancedRuns.map((run) => {
+    const advanced = record(run.advanced_account);
+    const margin = record(advanced.margin);
+    return [run.artifact, field(margin, "base_currency"), field(margin, "net_liquidation_value"), field(margin, "initial_margin"),
+      field(margin, "maintenance_margin"), field(margin, "excess_liquidity"), field(margin, "margin_call"), field(advanced, "realized_pnl"),
+      field(advanced, "unrealized_pnl"), field(advanced, "execution_charges"), field(advanced, "financing_charges")];
+  }), "No indexed run carries advanced-account economics; they appear in artifact schema 3.", (index) => context.onOpenArtifact(advancedRuns[index]?.artifact ?? ""));
+  root.append(economics);
+
   const trades = createPanel("Trade evidence", "Inspect each canonical simulated execution rather than relying only on aggregate trade counts.");
   appendTableOrEmpty(trades, ["Time", "Execution", "Order", "Instrument", "Side", "Quantity", "Price", "Fee", "Source"], fills.map((item) => {
     const payload = record(item.data.payload);
@@ -1166,7 +1189,9 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
   appendDefinition(executionModel, [
     ["Quoted spread", "Buys pay and sells concede half of the configured full spread"],
     ["Slippage", "Configured basis points are applied unfavourably after half-spread"],
-    ["Limit protection", "The final spread-and-slippage price can never violate the order limit"],
+    ["Tick grid", "The spread-and-slippage price is rounded onto the instrument's tick grid against the trader: buys up, sells down"],
+    ["Limit protection", "The final grid price can never violate the order limit"],
+    ["Increment changes", "A lot or tick change that leaves a working order off the new increments stops the replay rather than filling it"],
     ["Latency", "A configured number of complete market bars must pass before fill eligibility"],
     ["Partial fills", "An optional per-bar quantity cap persists remaining quantity as a working order"],
     ["Trading halts", "Version-controlled venue or instrument halt windows block strategy evaluation"],
@@ -1298,6 +1323,22 @@ function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLElement, sna
     mountedTicket.render(createElement(OrderTicket, {
       defaultAccountId: paper?.account_id ?? "",
       defaultEnvironment: "PAPER",
+    }));
+  } catch {
+    // Non-browser or mock DOM testing environment
+  }
+
+  const comboTicket = createPanel(
+    "Combination ticket",
+    "Submit one atomic multi-leg PAPER combination to the configured Risk/OMS route as a single order. Controlled-LIVE is not exposed by this ticket.",
+  );
+  const comboTicketRoot = document.createElement("div");
+  comboTicket.append(comboTicketRoot);
+  root.append(comboTicket);
+  try {
+    mountedComboTicket = createRoot(comboTicketRoot);
+    mountedComboTicket.render(createElement(ComboTicket, {
+      defaultAccountId: paper?.account_id ?? "",
     }));
   } catch {
     // Non-browser or mock DOM testing environment
@@ -3098,7 +3139,8 @@ function isBacktestSummary(value: unknown): value is BacktestSummary {
   return isRecord(value) && typeof value.artifact === "string" && typeof value.modified_at === "string" &&
     typeof value.artifact_fingerprint === "string" && typeof value.event_output_hash === "string" &&
     typeof value.specification_fingerprint === "string" && isRecord(value.performance) &&
-    isRecord(value.report) && isRecord(value.specification);
+    isRecord(value.report) && isRecord(value.specification) &&
+    (value.advanced_account === undefined || value.advanced_account === null || isRecord(value.advanced_account));
 }
 
 function isEvidenceArtifact(value: unknown): value is EvidenceArtifact {

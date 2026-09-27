@@ -7,8 +7,13 @@ use follon_domain::{validate_canonical_id, validate_utc_timestamp, Bar, Decimal,
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+pub mod gap_repair;
 pub mod rights;
 
+pub use gap_repair::{
+    detect_quote_gaps, import_quotes, quotes_to_csv, repair_quote_gaps, QuoteGapRepair,
+    SequenceRange, QUOTE_CSV_HEADER,
+};
 pub use rights::{
     CorporateActionPolicy, DataRightsAndSemanticsReceipt, DataRightsLedger, LicenseTier,
 };

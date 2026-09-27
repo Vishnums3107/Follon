@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.dev/contracts/v1/operator-directory.schema.json",
+  "title": "Follon Operator Directory v1",
+  "description": "One tenant's provisioned operators, loaded by follon-trading-api from FOLLON_TRADING_API_OPERATOR_DIRECTORY to authorize write RPCs. It holds TOTP secrets and is secret material. Write it with follon-admin operator-add.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["directory_schema_version", "tenant_id", "operators"],
+  "properties": {
+    "directory_schema_version": { "const": 1 },
+    "tenant_id": { "$ref": "#/$defs/canonicalId" },
+    "operators": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["user_id", "email", "password_hash", "totp_secret_base32", "roles"],
+        "properties": {
+          "user_id": { "$ref": "#/$defs/canonicalId" },
+          "email": { "type": "string", "minLength": 3, "maxLength": 254 },
+          "password_hash": { "type": "string", "pattern": "^\\$argon2id\\$" },
+          "totp_secret_base32": { "type": "string", "pattern": "^[A-Z2-7]{32,}$" },
+          "roles": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "enum": ["organization_admin", "risk_manager", "trader", "read_only", "auditor"] }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 }
+  }
+}

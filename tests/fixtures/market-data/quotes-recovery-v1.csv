@@ -1,0 +1,5 @@
+event_time,received_at,instrument_id,quote_id,source_sequence,bid_price,bid_quantity,ask_price,ask_quantity
+2026-01-02T14:30:03Z,2026-01-02T14:30:03Z,inst.us_equity.spy,quote.spy.3,3,470.11,100,470.14,200
+2026-01-02T14:30:04Z,2026-01-02T14:30:04Z,inst.us_equity.spy,quote.spy.4,4,470.12,100,470.14,200
+2026-01-02T14:30:05Z,2026-01-02T14:30:05Z,inst.us_equity.spy,quote.spy.5,5,470.13,100,470.15,200
+2026-01-02T14:30:02Z,2026-01-02T14:30:02Z,inst.us_equity.qqq,quote.qqq.2,2,410.01,100,410.03,200

@@ -89,87 +89,172 @@ pub struct DecisionReconstruction {
 }
 
 impl DecisionReconstruction {
-    /// Formats the reconstruction as canonical JSON matching the v1 schema.
+    /// Formats the reconstruction as JSON matching the v1 schema.
+    ///
+    /// Serialized through `serde_json`, so every string is escaped. A value
+    /// taken from a journal -- an actor or summary containing a quote, say --
+    /// must never be able to produce an invalid or differently-shaped document.
     pub fn to_json(&self) -> String {
-        let mut json = String::from("{");
-        json.push_str("\"reconstruction_schema_version\":1,");
-        json.push_str(&format!(
-            "\"reconstruction_id\":\"{}\",",
-            self.reconstruction_id
-        ));
-        json.push_str(&format!(
-            "\"target_event_id\":\"{}\",",
-            self.target_event_id
-        ));
-        json.push_str(&format!(
-            "\"target_entity_type\":\"{}\",",
-            self.target_entity_type
-        ));
+        let causal_chain: Vec<serde_json::Value> = self
+            .causal_chain
+            .iter()
+            .map(|node| {
+                serde_json::json!({
+                    "node_id": node.node_id,
+                    "event_type": node.event_type,
+                    "actor": node.actor,
+                    "event_time": node.event_time,
+                    "available_at": node.available_at,
+                    "causation_id": node.causation_id,
+                    "content_hash": node.content_hash,
+                    "summary": node.summary,
+                })
+            })
+            .collect();
+        let edges: Vec<serde_json::Value> = self
+            .edges
+            .iter()
+            .map(|edge| {
+                serde_json::json!({
+                    "from_node_id": edge.from_node_id,
+                    "to_node_id": edge.to_node_id,
+                    "relation": edge.relation,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "reconstruction_schema_version": 1,
+            "reconstruction_id": self.reconstruction_id,
+            "target_event_id": self.target_event_id,
+            "target_entity_type": self.target_entity_type,
+            "causal_chain": causal_chain,
+            "edges": edges,
+            "configuration_hash": self.configuration_hash,
+            "integrity_status": self.integrity_status.as_str(),
+            "verified_at": self.verified_at,
+        })
+        .to_string()
+    }
+}
 
-        // causal_chain
-        json.push_str("\"causal_chain\":[");
-        for (index, node) in self.causal_chain.iter().enumerate() {
-            if index > 0 {
-                json.push(',');
-            }
-            let causation_json = match &node.causation_id {
-                Some(id) => format!("\"{}\"", id),
-                None => "null".to_owned(),
-            };
-            json.push_str(&format!(
-                "{{\"node_id\":\"{}\",\"event_type\":\"{}\",\"actor\":\"{}\",\"event_time\":\"{}\",\"available_at\":\"{}\",\"causation_id\":{},\"content_hash\":\"{}\",\"summary\":\"{}\"}}",
-                node.node_id,
-                node.event_type,
-                node.actor,
-                node.event_time,
-                node.available_at,
-                causation_json,
-                node.content_hash,
-                node.summary
+/// The envelope metadata provenance needs, plus a hash of the exact record.
+///
+/// Reconstruction never reads a payload, so it does not need a full
+/// [`EventEnvelope`]. This lets it work from a persisted journal line without
+/// a payload decoder, while hashing the exact bytes that were persisted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvenanceRecord {
+    /// Globally unique event identifier.
+    pub event_id: String,
+    /// Canonical event type name.
+    pub event_type: String,
+    /// Subsystem or model actor that emitted the event.
+    pub actor: String,
+    /// Source event timestamp.
+    pub event_time: String,
+    /// Availability timestamp.
+    pub receive_time: String,
+    /// Direct parent event identifier if causally linked.
+    pub causation_id: Option<String>,
+    /// SHA-256 hex digest of the record's canonical JSON.
+    pub content_hash: String,
+}
+
+impl ProvenanceRecord {
+    /// Builds the record for an in-memory envelope.
+    pub fn from_envelope(event: &EventEnvelope) -> Self {
+        Self {
+            event_id: event.event_id.clone(),
+            event_type: event.event_type.clone(),
+            actor: event.actor.clone(),
+            event_time: event.event_time.clone(),
+            receive_time: event.receive_time.clone(),
+            causation_id: event.causation_id.clone(),
+            content_hash: format!("{:x}", Sha256::digest(event.canonical_json().as_bytes())),
+        }
+    }
+
+    /// Builds the record for one persisted journal line.
+    ///
+    /// The line must already be canonical -- compact, sorted-key JSON, the
+    /// form [`EventEnvelope::canonical_json`] writes -- so that its hash is the
+    /// same hash [`Self::from_envelope`] computes for the event it encodes. A
+    /// line in any other form is refused rather than re-canonicalized: a
+    /// provenance hash over bytes nobody persisted would bind nothing.
+    pub fn from_canonical_line(line: &str) -> Result<Self, EngineError> {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| EngineError(format!("journal record is not JSON: {error}")))?;
+        if serde_json::to_string(&value)
+            .map_err(|error| EngineError(format!("journal record cannot be re-encoded: {error}")))?
+            != line
+        {
+            return Err(EngineError(
+                "journal record is not canonical sorted-key JSON".to_owned(),
             ));
         }
-        json.push_str("],");
-
-        // edges
-        json.push_str("\"edges\":[");
-        for (index, edge) in self.edges.iter().enumerate() {
-            if index > 0 {
-                json.push(',');
+        let text = |name: &str| -> Result<String, EngineError> {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| EngineError(format!("journal record is missing {name}")))
+        };
+        let causation_id = match value.get("causation_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+            Some(_) => {
+                return Err(EngineError(
+                    "journal record causation_id must be a string or null".to_owned(),
+                ))
             }
-            json.push_str(&format!(
-                "{{\"from_node_id\":\"{}\",\"to_node_id\":\"{}\",\"relation\":\"{}\"}}",
-                edge.from_node_id, edge.to_node_id, edge.relation
-            ));
-        }
-        json.push_str("],");
-
-        json.push_str(&format!(
-            "\"configuration_hash\":\"{}\",",
-            self.configuration_hash
-        ));
-        json.push_str(&format!(
-            "\"integrity_status\":\"{}\",",
-            self.integrity_status.as_str()
-        ));
-        json.push_str(&format!("\"verified_at\":\"{}\"", self.verified_at));
-        json.push('}');
-        json
+        };
+        Ok(Self {
+            event_id: text("event_id")?,
+            event_type: text("event_type")?,
+            actor: text("actor")?,
+            event_time: text("event_time")?,
+            receive_time: text("receive_time")?,
+            causation_id,
+            content_hash: format!("{:x}", Sha256::digest(line.as_bytes())),
+        })
     }
 }
 
 /// Builder for reconstructing decision provenance graphs from immutable event logs.
-pub struct DecisionProvenanceGraphBuilder<'a> {
-    events_by_id: HashMap<&'a str, &'a EventEnvelope>,
+pub struct DecisionProvenanceGraphBuilder {
+    events_by_id: HashMap<String, ProvenanceRecord>,
 }
 
-impl<'a> DecisionProvenanceGraphBuilder<'a> {
+impl DecisionProvenanceGraphBuilder {
     /// Creates a builder indexing a slice of event envelopes.
-    pub fn new(events: &'a [EventEnvelope]) -> Self {
+    pub fn new(events: &[EventEnvelope]) -> Self {
         let mut events_by_id = HashMap::with_capacity(events.len());
         for event in events {
-            events_by_id.insert(event.event_id.as_str(), event);
+            events_by_id.insert(
+                event.event_id.clone(),
+                ProvenanceRecord::from_envelope(event),
+            );
         }
         Self { events_by_id }
+    }
+
+    /// Creates a builder from persisted journal records.
+    ///
+    /// A repeated event identity is refused: in an append-only journal it
+    /// means two different records claim to be the same event, and choosing
+    /// either one would make the reconstruction depend on which was read last.
+    pub fn from_records(records: Vec<ProvenanceRecord>) -> Result<Self, EngineError> {
+        let mut events_by_id = HashMap::with_capacity(records.len());
+        for record in records {
+            let event_id = record.event_id.clone();
+            if events_by_id.insert(event_id.clone(), record).is_some() {
+                return Err(EngineError(format!(
+                    "journal contains event {event_id} more than once"
+                )));
+            }
+        }
+        Ok(Self { events_by_id })
     }
 
     /// Reconstructs the complete causal graph for a chosen target event.
@@ -211,9 +296,6 @@ impl<'a> DecisionProvenanceGraphBuilder<'a> {
 
             match self.events_by_id.get(node_id) {
                 Some(event) => {
-                    let canonical = event.canonical_json();
-                    let hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
-
                     // Timestamp sanity: receive_time must not precede event_time
                     if event.receive_time < event.event_time {
                         integrity_status = ProvenanceIntegrityStatus::TimestampAnomaly;
@@ -227,7 +309,7 @@ impl<'a> DecisionProvenanceGraphBuilder<'a> {
                         event_time: event.event_time.clone(),
                         available_at: event.receive_time.clone(),
                         causation_id: event.causation_id.clone(),
-                        content_hash: hash,
+                        content_hash: event.content_hash.clone(),
                         summary,
                     });
 
@@ -336,6 +418,84 @@ mod tests {
         let json = recon.to_json();
         assert!(json.contains("\"integrity_status\":\"VERIFIED\""));
         assert!(json.contains("\"target_event_id\":\"evt.3\""));
+    }
+
+    fn chain() -> Vec<EventEnvelope> {
+        vec![
+            dummy_bar_envelope("evt.1", "2026-09-01T10:00:00Z", None),
+            dummy_bar_envelope("evt.2", "2026-09-01T10:00:01Z", Some("evt.1")),
+            dummy_bar_envelope("evt.3", "2026-09-01T10:00:02Z", Some("evt.2")),
+        ]
+    }
+
+    #[test]
+    fn a_persisted_line_hashes_exactly_like_its_envelope() {
+        for event in chain() {
+            let from_line = ProvenanceRecord::from_canonical_line(&event.canonical_json()).unwrap();
+            assert_eq!(from_line, ProvenanceRecord::from_envelope(&event));
+        }
+    }
+
+    #[test]
+    fn reconstruction_from_journal_lines_matches_reconstruction_from_envelopes() {
+        let events = chain();
+        let records = events
+            .iter()
+            .map(|event| ProvenanceRecord::from_canonical_line(&event.canonical_json()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let from_lines = DecisionProvenanceGraphBuilder::from_records(records)
+            .unwrap()
+            .reconstruct("evt.3", "cfg_hash_abc", "2026-09-01T10:05:00Z")
+            .unwrap();
+        let from_envelopes = DecisionProvenanceGraphBuilder::new(&events)
+            .reconstruct("evt.3", "cfg_hash_abc", "2026-09-01T10:05:00Z")
+            .unwrap();
+        assert_eq!(from_lines, from_envelopes);
+    }
+
+    #[test]
+    fn a_non_canonical_line_is_refused_rather_than_rehashed() {
+        let line = chain()[0].canonical_json();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        assert!(ProvenanceRecord::from_canonical_line(&pretty).is_err());
+        let reordered = line.replacen("{\"account_id\":null,", "{", 1).replacen(
+            "\"strategy_id\":null}",
+            "\"strategy_id\":null,\"account_id\":null}",
+            1,
+        );
+        assert_ne!(reordered, line);
+        assert!(ProvenanceRecord::from_canonical_line(&reordered).is_err());
+    }
+
+    #[test]
+    fn a_repeated_event_identity_is_refused() {
+        let events = chain();
+        let mut records: Vec<_> = events.iter().map(ProvenanceRecord::from_envelope).collect();
+        let mut forged = records[1].clone();
+        forged.actor = "someone_else".to_owned();
+        records.push(forged);
+        assert!(DecisionProvenanceGraphBuilder::from_records(records).is_err());
+    }
+
+    #[test]
+    fn journal_strings_are_escaped_in_the_published_document() {
+        let mut event = dummy_bar_envelope("evt.1", "2026-09-01T10:00:00Z", None);
+        event.actor = "desk \"alpha\" \\ ops".to_owned();
+        let events = vec![event];
+        let json = DecisionProvenanceGraphBuilder::new(&events)
+            .reconstruct("evt.1", "cfg_hash_abc", "2026-09-01T10:05:00Z")
+            .unwrap()
+            .to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("the document must remain valid JSON");
+        assert_eq!(parsed["causal_chain"][0]["actor"], "desk \"alpha\" \\ ops");
+        assert_eq!(
+            parsed["causal_chain"][0]["causation_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(parsed.as_object().unwrap().len(), 9);
     }
 
     #[test]

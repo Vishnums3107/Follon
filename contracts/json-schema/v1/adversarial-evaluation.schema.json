@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "AdversarialEvaluation",
-  "description": "Adversarial research gate challenging strategy candidates with 5 automated stress probes (DUR-06).",
+  "description": "Deterministic certification of 5 standardized adversarial stress-probe results (DUR-06). The `follon-backtest adversarial` CLI's 'execute' input mode actually drives all 5 probes as genuine perturbed replays of the built-in strategy and computes `passed`/`degradation_bps` from their real output; its 'probes'-only mode instead certifies operator-attested figures. This artifact records only the resulting evaluation either way and does not itself prove which mode produced it.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -60,7 +60,10 @@
       "minimum": 0,
       "maximum": 10000
     },
-    "gate_passed": { "type": "boolean" },
+    "gate_passed": {
+      "type": "boolean",
+      "description": "Deterministic aggregate of the probe outcomes above; this field alone does not indicate whether they were computed from a real execute-mode replay or supplied by the caller."
+    },
     "blocking_failure_reasons": {
       "type": "array",
       "items": { "type": "string" }

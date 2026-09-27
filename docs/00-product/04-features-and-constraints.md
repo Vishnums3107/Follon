@@ -12,7 +12,7 @@ Follon is a risk-first, multi-asset trading operating system designed for advanc
 
 ### Desktop Trading Terminal
 - **Architecture:** Built with React/TypeScript and packaged with Vite and Tauri v2 for a privileged native boundary.
-- **Capabilities:** Active PAPER and LIVE order-entry controls, cancel, and position-close controls alongside monitoring, operations, portfolio, identity, platform, and acceptance-gate views.
+- **Capabilities:** Active PAPER order-entry, cancel, and position-close controls alongside monitoring, operations, portfolio, identity, platform, and acceptance-gate views. Controlled-LIVE activation and submission are not exposed by the desktop.
 - **IPC Boundaries:** The desktop uses privileged IPC commands to submit declarative order intents to the Risk/OMS route, meaning it never contacts a broker directly.
 
 ### Integrations and Services

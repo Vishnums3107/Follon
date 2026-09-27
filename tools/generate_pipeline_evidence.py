@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -25,7 +26,12 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def run_step(description: str, cmd: list[str], targets: list[Path] | None = None) -> None:
+def run_step(
+    description: str,
+    cmd: list[str],
+    targets: list[Path] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     if targets:
         for target in targets:
             try:
@@ -34,7 +40,13 @@ def run_step(description: str, cmd: list[str], targets: list[Path] | None = None
                 pass
     print(f"\n[+] {description}")
     print(f"    Command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=str(REPOSITORY_ROOT), capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        cwd=str(REPOSITORY_ROOT),
+        capture_output=True,
+        text=True,
+        env=None if env is None else {**os.environ, **env},
+    )
     if result.returncode != 0:
         print(f"[-] FAILED (exit code {result.returncode})")
         if result.stdout:
@@ -48,6 +60,7 @@ def run_step(description: str, cmd: list[str], targets: list[Path] | None = None
         for line in result.stdout.strip().splitlines()[:5]:
             print(f"    {line}")
     print("    [OK]")
+    return result
 
 
 def main() -> None:
@@ -76,9 +89,11 @@ def main() -> None:
         VAR_DIR / "follon-backtest-artifact.events.ndjson",
         VAR_DIR / "follon-backtest-artifact.report.md",
         VAR_DIR / "follon-backtest-artifact.manifest.json",
-        VAR_DIR / "follon-backtest-artifact.advanced-account.json",
-        VAR_DIR / "follon-backtest-artifact.advanced-report.md",
     ]
+    # Schema-3 artifacts carry the advanced-account economics themselves, so
+    # remove the sidecars earlier runs published rather than leave them orphaned.
+    for retired in ("advanced-account.json", "advanced-report.md"):
+        (VAR_DIR / f"follon-backtest-artifact.{retired}").unlink(missing_ok=True)
     run_step(
         "Step 2: Executing deterministic replay backtest & advanced margin projection",
         [
@@ -311,12 +326,26 @@ def main() -> None:
     )
 
     # 15. Controlled Live Status Dashboard
+    #
+    # `follon-live-status` durably appends a `live.service.restarted.v1` audit
+    # event to whatever journal it opens -- intentional for a real LIVE
+    # journal (every open must be recorded), but this pipeline's input is a
+    # checked-in, immutable test fixture, not a live journal. Opening it
+    # in place silently mutated `tests/fixtures/live/journal-v1.ndjson` by
+    # two lines on every pipeline run (found and fixed 2026-09-20, see
+    # docs/06-delivery/14-master-plan-conformance-audit.md item 45). Copy it
+    # into var/ first, matching every other step's write-to-var/-only
+    # discipline, so the fixture stays a frozen input.
+    live_journal_copy = VAR_DIR / "follon-live-journal.ndjson"
+    live_journal_copy.write_bytes(
+        (REPOSITORY_ROOT / "tests" / "fixtures" / "live" / "journal-v1.ndjson").read_bytes()
+    )
     live_dash = VAR_DIR / "follon-live-dashboard.json"
     run_step(
         "Step 15: Projecting Controlled-Live Monitoring Snapshot",
         [
             "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-live-status", "--",
-            "tests/fixtures/live/journal-v1.ndjson",
+            str(live_journal_copy),
             str(live_dash),
             "--opened-at", "2026-08-11T13:30:00Z",
             "--config", "tests/fixtures/config/live-v1.json",
@@ -446,17 +475,148 @@ def main() -> None:
         targets=[privacy_receipt],
     )
 
-    # 16g. Advanced Evidence Verification and Workspace Synchronization (DUR-01 through DUR-12)
+    # 16g. Advanced Evidence Contract Validation (DUR-01 through DUR-12)
+    #
+    # `build_advanced_evidence_fixtures.py` validates 32 hand-authored example
+    # documents against their JSON schemas -- a legitimate contract test. It
+    # does NOT compute real evidence: no domain crate or CLI backs 29 of the
+    # 32 categories at all. Of the 3 that do, `decision-reconstruction` is
+    # computed in step 16h from the real step-2 journal and
+    # `strategy-capsule-manifest` in step 16i from a real Python-worker
+    # evaluation; `data-rights-and-semantics-receipt` is not invoked, because
+    # nothing measures its parity score. These are schema-validation fixtures, not evidence,
+    # so they stay in tests/fixtures/ and are deliberately not copied into
+    # var/, which the desktop dashboard reads as real, dated evidence. Doing
+    # so previously violated the dashboard's own zero-synthetic-data invariant
+    # (see docs/06-delivery/14-master-plan-conformance-audit.md item 45) the
+    # same way items 23-24 already found and fixed once before.
     run_step(
-        "Step 16g: Validating and Publishing Advanced Evidence Fixtures",
+        "Step 16g: Validating Advanced Evidence Fixture Contracts",
         [
             sys.executable, "tools/build_advanced_evidence_fixtures.py",
         ],
     )
-    adv_fixtures_dir = REPOSITORY_ROOT / "tests" / "fixtures" / "config" / "advanced"
-    for fixture_file in sorted(adv_fixtures_dir.glob("*.json")):
-        target_in_var = VAR_DIR / fixture_file.name
-        target_in_var.write_bytes(fixture_file.read_bytes())
+
+    # 16h. Decision provenance reconstruction (DUR-01), computed, not typed.
+    #
+    # Walks the causal chain of the latest fill in the real step-2 backtest
+    # journal. The CLI refuses a journal that does not hash to its manifest's
+    # `events_sha256`, binds the manifest's own `configuration_hash`, and
+    # hashes each node's exact persisted line. `--verified-at` is explicit so
+    # a re-run over the same journal reproduces the same document.
+    reconstruction_target = VAR_DIR / "decision-reconstruction.json"
+    run_step(
+        "Step 16h: Reconstructing Decision Provenance from the Backtest Journal",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-operations", "--",
+            "decision-reconstruction",
+            str(VAR_DIR / "follon-backtest-artifact.events.ndjson"),
+            str(VAR_DIR / "follon-backtest-artifact.manifest.json"),
+            str(reconstruction_target),
+            "--verified-at", "2026-09-07T12:00:00Z",
+        ],
+        targets=[reconstruction_target],
+    )
+
+    # 16i. Portable strategy capsule (DUR-07, ASSET-04), sealed only after a
+    # sandboxed replay of its own contents reproduces a real evaluation.
+    #
+    # (i) The SDK locks the example worker strategy bundle. (ii) The Python
+    # worker is evaluated through the real backtest runner, which verifies the
+    # worker's announced bundle hash and records it in the artifact. (iii)
+    # `capsule-package` rebuilds the archive from the trees, checks it against
+    # the lock and the evaluation, replays the capsule's own copies with no
+    # site packages or inherited import path, and seals the manifest only if
+    # the replay reproduces the completion manifest byte for byte. (iv)
+    # `capsule-verify` re-checks the sealed capsule from disk and replays it
+    # again. `--packaged-at` is explicit so a re-run reproduces the manifest;
+    # the signature changes each run because the key is regenerated.
+    python = str(Path(sys.executable).resolve())
+    sdk_source = REPOSITORY_ROOT / "python" / "strategy-sdk" / "src"
+    evaluation_dir = VAR_DIR / "strategy-evaluation"
+    capsule_dir = VAR_DIR / "strategy-capsule"
+    for stale in (evaluation_dir, capsule_dir):
+        shutil.rmtree(stale, ignore_errors=True)
+    evaluation_dir.mkdir(parents=True)
+    capsule_lock = evaluation_dir / "dependency.lock"
+    locked = run_step(
+        "Step 16i(i): Locking the Python worker strategy bundle",
+        [
+            python, "-m", "follon_strategy_sdk.bundle_lock",
+            "--bundle-root", "python/examples",
+            "--strategy-file", "python/examples/worker_buy_once_strategy.py",
+            "--class-name", "WorkerBuyOnceStrategy",
+            "--output", str(capsule_lock),
+        ],
+        env={"PYTHONPATH": str(sdk_source)},
+    )
+    bundle_hash = locked.stdout.strip()
+    evaluation_artifact = evaluation_dir / "python-worker-backtest.json"
+    run_step(
+        "Step 16i(ii): Evaluating the locked strategy through the isolated Python worker",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "tests/fixtures/historical-bars/spy-one-minute.csv",
+            str(evaluation_artifact),
+            "--python-worker", python,
+            "python/examples/worker_buy_once_strategy.py", "WorkerBuyOnceStrategy",
+            "python/examples", "strategy-example-001", "strategy-example-v1", bundle_hash,
+        ],
+        env={"FOLLON_STRATEGY_SDK_PATH": str(sdk_source)},
+    )
+    run_step(
+        "Step 16i(iii): Sealing the portable strategy capsule after a sandboxed replay",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "capsule-package",
+            "--bundle-root", "python/examples",
+            "--sdk-root", str(sdk_source / "follon_strategy_sdk"),
+            "--lock", str(capsule_lock),
+            "--config", "tests/fixtures/config/backtest-v1.json",
+            "--evaluation", str(evaluation_artifact),
+            "--bars", "tests/fixtures/historical-bars/spy-one-minute.csv",
+            "--python", python,
+            "--packaged-at", "2026-09-07T12:00:00Z",
+            "--output", str(capsule_dir),
+        ],
+    )
+    # (iv) A locally generated key signs the sealed manifest. It demonstrates
+    # the mechanism only: this key is not an independent or custodied signer.
+    capsule_private_key = VAR_DIR / "strategy-capsule-signing.pk8"
+    capsule_trusted_key = VAR_DIR / "trusted-capsule-key.json"
+    run_step(
+        "Step 16i(iv): Generating the capsule signing keypair",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-admin", "--",
+            "release-keygen",
+            "--key-id", "capsule.key.follon.001",
+            "--private-key", str(capsule_private_key),
+            "--trusted-key", str(capsule_trusted_key),
+        ],
+        targets=[capsule_private_key, capsule_trusted_key],
+    )
+    run_step(
+        "Step 16i(v): Signing the sealed capsule manifest",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "capsule-sign", str(capsule_dir),
+            "--private-key", str(capsule_private_key),
+            "--key-id", "capsule.key.follon.001",
+            "--signed-at", "2026-09-07T12:05:00Z",
+        ],
+    )
+    # (vi) Independent re-verification: every digest, the signature under the
+    # trusted key, and a fresh sandboxed replay.
+    run_step(
+        "Step 16i(vi): Independently re-verifying, signature-checking and replaying the capsule",
+        [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-backtest", "--",
+            "capsule-verify", str(capsule_dir),
+            "--bars", "tests/fixtures/historical-bars/spy-one-minute.csv",
+            "--python", python,
+            "--trusted-key", str(capsule_trusted_key),
+        ],
+    )
 
 
     # 17. News Sentiment NLP Stream
@@ -606,6 +766,16 @@ def main() -> None:
         targets=[acceptance_target],
     )
 
+    # 23b. Repository-authored dynamic scan (E3.4). Starts the real dashboard
+    # and trading API on loopback and probes them over the network. It is not
+    # an independent DAST run or a penetration test and moves no gate.
+    dast_dir = VAR_DIR / "dast"
+    run_step(
+        "Step 23b: Dynamically scanning a local loopback deployment",
+        [sys.executable, "tools/dast_scan.py", "--output-dir", str(dast_dir)],
+        targets=[dast_dir / "dast-report.json", dast_dir / "dast-report.md"],
+    )
+
     # 24. Summary of Populated Evidence
     print("\n=================================================================")
     print("                    EVIDENCE INVENTORY SUMMARY                    ")
@@ -618,7 +788,11 @@ def main() -> None:
             print(f"  * {art.name:<45} | {size_kb:7.2f} KB | SHA256: {digest}...")
 
     print(f"\nSuccessfully populated {len([a for a in artifacts if a.is_file()])} immutable evidence artifacts in {VAR_DIR}.")
-    print("All 12 Enduring Capabilities (DUR-01 through DUR-12) & Release Readiness fully demonstrated.")
+    # Deliberately not a capability claim: most advanced-evidence categories
+    # still have no computation behind them (see step 16g), and no step here
+    # moves an external gate. Report only what was measured.
+    print("Every pipeline step exited 0. This is local engineering evidence; it closes no external gate "
+          "(see docs/06-delivery/16-delivery-state.md).")
 
 
 if __name__ == "__main__":

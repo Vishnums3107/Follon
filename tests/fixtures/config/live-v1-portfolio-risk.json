@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "configuration_id": "config.live.portfolio-risk.001",
+  "configuration_version": "live-config-v1",
+  "account": {
+    "account_id": "acct.live.001",
+    "currency": "USD",
+    "initial_cash": "1000",
+    "max_deployed_capital": "100",
+    "environment": "LIVE",
+    "credential_reference": "secret.broker.test.acct-live-001"
+  },
+  "risk": {
+    "policy_version": "live-risk-v1",
+    "trading_calendar_id": "calendar.nyse.v1",
+    "max_order_quantity": "10",
+    "max_order_notional": "100",
+    "max_price_deviation_bps": "100",
+    "canary_max_order_notional": "50",
+    "canary_max_orders": 2,
+    "max_open_orders": 2,
+    "max_position_quantity": "10",
+    "max_realized_loss": "100",
+    "max_market_data_age_seconds": 60,
+    "max_order_rate": 20,
+    "order_rate_window_seconds": 60,
+    "instrument_tick_sizes": {
+      "inst.us_equity.spy": "0.01"
+    },
+    "instrument_lot_sizes": {
+      "inst.us_equity.spy": "1"
+    },
+    "portfolio_risk": {
+      "policy_version": "portfolio-risk-v1",
+      "max_gross_exposure": "5000",
+      "max_abs_net_exposure": "5000",
+      "max_leverage_bps": "20000",
+      "max_concentration_bps": "6000",
+      "max_drawdown_bps": "3000",
+      "max_daily_loss": "500",
+      "max_margin_utilization_bps": "4000",
+      "allowed_instruments": [],
+      "restricted_instruments": [],
+      "sector_limits": {
+        "index": "2500"
+      },
+      "asset_class_limits": {
+        "equity": "5000"
+      },
+      "currency_limits": {
+        "USD": "5000"
+      },
+      "strategy_limits": {
+        "strategy.live.001": "3000"
+      },
+      "instrument_buckets": {
+        "inst.us_equity.spy": {
+          "asset_class": "equity",
+          "currency": "USD",
+          "sector": "index"
+        }
+      },
+      "margin_rates": {
+        "equity": {
+          "initial_bps": 5000,
+          "maintenance_bps": 2500
+        }
+      }
+    }
+  },
+  "kill_switch_version": "live-kills-v1",
+  "activation": {
+    "activation_id": "activation.live.001",
+    "mode": "SHADOW",
+    "requested_by": "operator.requester.001",
+    "approved_by": "operator.approver.001",
+    "activated_at": "2026-01-02T14:00:00Z",
+    "expires_at": "2026-12-31T23:59:59Z"
+  }
+}

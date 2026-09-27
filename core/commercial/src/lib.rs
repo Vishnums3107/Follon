@@ -2246,18 +2246,17 @@ struct CommercialLedgerRecordDocument {
     record_hash: String,
 }
 
+/// `symlink_metadata` never follows a link, so a dangling one is refused too.
+/// The `exists()` check this replaced followed it and found nothing, so a
+/// ledger was created at the link's target, or read as empty (E3.11).
 fn reject_symlink_path(label: &str, path: &Path) -> Result<(), CommercialError> {
-    if path.exists()
-        && fs::symlink_metadata(path)
-            .map_err(io_error)?
-            .file_type()
-            .is_symlink()
-    {
-        return Err(CommercialError(format!(
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CommercialError(format!(
             "{label} path must not be a symbolic link"
-        )));
+        ))),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_error(error)),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn validate_sha256(name: &str, value: &str) -> Result<(), CommercialError> {
@@ -2301,7 +2300,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(label: &str, value: &str) -> Result<Vec<u8>, CommercialError> {
-    if value.len() % 2 != 0
+    if !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte <= b'f'))
@@ -2391,6 +2390,51 @@ mod tests {
         assert_eq!(first.maximum_members, 1);
         drop(ledger);
         assert_eq!(CommercialLedger::read_verified(&path).unwrap().len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Links `link` to `target`, which need not exist. Returns false where
+    /// this account cannot create a symbolic link, such as Windows without
+    /// Developer Mode, after saying so.
+    fn symlink_to(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(target, link);
+        if let Err(error) = &linked {
+            eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+        }
+        linked.is_ok()
+    }
+
+    #[test]
+    fn a_commercial_ledger_refuses_a_symbolic_link_even_a_dangling_one() {
+        let directory = temp_directory("link");
+        let target = directory.join("elsewhere.ndjson");
+        let link = directory.join("commercial.ndjson");
+        if !symlink_to(&target, &link) {
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+        let refusal = "commercial ledger path must not be a symbolic link";
+
+        // Nothing exists at the target, so following the link finds nothing.
+        // Opening must not create the ledger there, and a verified read must
+        // not report an empty ledger.
+        assert_eq!(CommercialLedger::open(&link).err().unwrap().0, refusal);
+        assert!(!target.exists(), "the ledger was created through the link");
+        assert_eq!(
+            CommercialLedger::read_verified(&link).unwrap_err().0,
+            refusal
+        );
+
+        // A link to a real ledger is refused too.
+        drop(CommercialLedger::open(&target).unwrap());
+        assert_eq!(CommercialLedger::open(&link).err().unwrap().0, refusal);
+        assert_eq!(
+            CommercialLedger::read_verified(&link).unwrap_err().0,
+            refusal
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

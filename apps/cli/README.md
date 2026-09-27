@@ -81,6 +81,37 @@ Trade IDs and per-instrument source sequences must be unique. The builder sorts
 by source time/sequence, emits canonical `(event_time, instrument_id)` order,
 uses exact decimals, and atomically publishes an immutable output file.
 
+## Quote-stream gap repair
+
+`follon-repair-quotes` fills sequence gaps in a recorded v1 quote stream, using
+only a recovery batch you supply, such as a vendor replay of the gap window:
+
+```powershell
+cargo run -p follon-cli --bin follon-repair-quotes -- --recorded tests/fixtures/market-data/quotes-recorded-v1.csv --recovery tests/fixtures/market-data/quotes-recovery-v1.csv --output-dir var/quote-repair
+```
+
+A gap is a missing sequence strictly between two recorded sequences of one
+instrument. The command never interpolates, and it never changes or drops a
+recorded quote. A recovery record identical to a recorded quote corroborates
+it. The whole repair is refused, and nothing is written, when a recovery
+record:
+
+- differs from the recorded quote at its sequence;
+- reuses a recorded quote identity;
+- lies outside every gap;
+- contradicts its neighbours' event-time order.
+
+On success the command writes two immutable files:
+
+- `repaired-quotes.csv`, in instrument-then-sequence order;
+- `gap-repair.json`, which holds the input and output SHA-256 hashes, the
+  gaps, the recovered runs, and the residual gaps.
+
+A gap the batch does not fill stays declared in `residual`.
+`--require-complete` makes a residual gap a failing exit, after both files are
+written. The command repairs files; nothing in the repository records a live
+quote stream or requests a replay from a vendor.
+
 ## Python strategy worker
 
 Install `python/strategy-sdk` into a dedicated virtual environment first, or
@@ -101,6 +132,60 @@ dependencies must be vendored under the declared bundle root. The control plane
 verifies the worker's bundle hash, strategy identity, and version before
 accepting a callback. Any protocol error, changed hash, or context-mismatched
 intent fails the backtest before it can be treated as a decision artifact.
+
+## Portable strategy capsules
+
+A capsule packages one real Python-worker evaluation so it can be re-run and
+checked elsewhere. First lock the bundle (the lock records the runtime, the
+entry point, and every strategy and SDK source file's size and digest, and
+prints the bundle hash), then evaluate with that hash exactly as above:
+
+```powershell
+$env:FOLLON_STRATEGY_SDK_PATH = (Resolve-Path python/strategy-sdk/src)
+$env:PYTHONPATH = $env:FOLLON_STRATEGY_SDK_PATH # only for the lock command
+$bundleHash = python -m follon_strategy_sdk.bundle_lock --bundle-root python/examples --strategy-file python/examples/worker_buy_once_strategy.py --class-name WorkerBuyOnceStrategy --output var/dependency.lock
+cargo run -p follon-cli --bin follon-backtest -- tests/fixtures/historical-bars/spy-one-minute.csv var/python-backtest.json --python-worker C:\path\to\python.exe python/examples/worker_buy_once_strategy.py WorkerBuyOnceStrategy python/examples strategy-example-001 strategy-example-v1 $bundleHash
+cargo run -p follon-cli --bin follon-backtest -- capsule-package --bundle-root python/examples --sdk-root python/strategy-sdk/src/follon_strategy_sdk --lock var/dependency.lock --config tests/fixtures/config/backtest-v1.json --evaluation var/python-backtest.json --bars tests/fixtures/historical-bars/spy-one-minute.csv --python C:\path\to\python.exe --packaged-at 2026-09-07T12:00:00Z --output var/strategy-capsule
+cargo run -p follon-cli --bin follon-backtest -- capsule-verify var/strategy-capsule --bars tests/fixtures/historical-bars/spy-one-minute.csv --python C:\path\to\python.exe
+```
+
+`capsule-package` rebuilds the strategy archive from the two trees and refuses
+it unless it opens exactly as the lock describes, hashes to the bundle hash the
+evaluation recorded, and was evaluated with the given configuration. It then
+extracts the archive to a fresh temporary directory and replays it with the
+interpreter's `-S` flag, the extracted SDK as the only import root, and that
+directory as the working directory. `FOLLON_STRATEGY_SDK_PATH`, the caller's
+directory, and installed site packages are all out of reach. The capsule is
+written, with the `VERIFIED_PORTABLE` disposition, only if that replay
+reproduces the evaluation's completion manifest byte for byte. A strategy that
+imports anything it did not vendor therefore fails here, with the interpreter's
+own error naming the missing module. `capsule-verify` re-checks every digest
+from the capsule's files and replays it again.
+
+The capsule directory holds `strategy-bundle.bin` (the exact byte stream the
+bundle hash is computed over), `dependency.lock`, `configuration.json`,
+`evaluation-receipt.json` (the completion manifest), and
+`capsule-manifest.json`. Market data is referenced by content hash and never
+carried. `VERIFIED_PORTABLE` covers only the recorded runtime target, and no
+capsule has yet been verified on a second machine.
+
+A sealed capsule can carry one detached Ed25519 signature over its manifest
+bytes. The manifest hash-binds every other member, so the signature covers the
+whole capsule. Keys use the `follon-admin release-keygen` format:
+
+```powershell
+cargo run -p follon-cli --bin follon-admin -- release-keygen --key-id capsule.key.author --private-key capsule-signing.pk8 --trusted-key trusted-capsule-key.json
+cargo run -p follon-cli --bin follon-backtest -- capsule-sign var/strategy-capsule --private-key capsule-signing.pk8 --key-id capsule.key.author --signed-at 2026-09-07T12:05:00Z
+cargo run -p follon-cli --bin follon-backtest -- capsule-verify var/strategy-capsule --bars tests/fixtures/historical-bars/spy-one-minute.csv --python C:\path\to\python.exe --trusted-key trusted-capsule-key.json
+```
+
+The signature is written as `capsule-signature.json` inside the capsule, and a
+capsule can be signed only once. The signed message is domain-separated from
+release signatures, so neither can be replayed as the other. With
+`--trusted-key`, verification fails unless the capsule is signed by exactly that
+key. Without it, a signature's bindings are still checked, and the output says
+the signer was not checked. A signature attests who sealed the capsule, not
+that its strategy is sound.
 
 ## PAPER operations status and kill switch
 
@@ -131,7 +216,8 @@ exists.
 Configuration v2 is the default and explicitly binds the current reviewed
 `adapter.ibkr.paper.*` / `venue.ibkr.paper` route into the journal fingerprint.
 V1 is accepted only to reopen an existing unchanged legacy IBKR PAPER journal;
-it cannot initialize a journal or describe a new route. After a clean final
+it cannot initialize a journal or describe a new route, and a refused v1 start
+creates neither a journal file nor its directory. After a clean final
 reconciliation with no working or `UNKNOWN` order, retain the v1 journal as
 immutable evidence and begin a separately named v2 journal.
 
@@ -208,3 +294,34 @@ boundary and must never be placed in this repository, a container image, or a
 self-host deployment. The [commercial/self-hosting runbook](../../docs/operations/04-commercial-self-hosting-runbook.md)
 and [privacy/retention runbook](../../docs/operations/05-privacy-retention-runbook.md)
 contain the required operating procedure and boundaries.
+
+## Trading API operators
+
+`follon-trading-api` accepts its write RPCs only from an operator in the
+directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`. They are
+`SubmitPaperCombo`, the PAPER kill-switch RPCs and the controlled-LIVE
+kill-switch RPCs. A configured PAPER or controlled-LIVE route refuses to start
+without that directory. `follon-admin operator-add` provisions each operator:
+
+```powershell
+cargo run -p follon-cli --bin follon-admin -- operator-add --directory operators.json --tenant-id tenant.alpha --user-id user.trader --email trader@example.com --roles trader --password-file password.txt
+```
+
+- The password is read from a file, never the command line, and only its
+  Argon2id hash is stored.
+- A fresh TOTP secret is generated and printed once as an `otpauth://` URI, for
+  enrolment in an authenticator. Every operator must pass this second factor.
+- One directory serves one tenant. Roles are `organization_admin`,
+  `risk_manager`, `trader`, `read_only` and `auditor`; only `trader` grants
+  PAPER trading, and only `risk_manager` grants kill-switch operation, PAPER
+  or controlled LIVE.
+- A refused addition leaves the directory unchanged, and a successful one
+  replaces it atomically.
+- The directory holds TOTP secrets, so it is secret material: keep it readable
+  only by the service account, as with the PostgreSQL URL file.
+
+A client logs in with `BeginOperatorLogin` (password) and then
+`CompleteOperatorLogin` (TOTP). It sends the returned session as
+`authorization: Bearer <token>`. The PAPER journal records the operator as the
+combination's `submitted_by`. Sessions last 15 minutes, live only in the
+server's memory, and end on restart.

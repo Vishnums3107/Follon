@@ -1,7 +1,7 @@
 //! End-to-end checks for commercial evidence, privacy retention, and signed self-host readiness.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -23,6 +23,70 @@ fn run(command: &mut Command) -> String {
 
 fn sha256(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
+}
+
+/// Links `link` to `target`, which need not exist. Returns false where this
+/// account cannot create a symbolic link, such as Windows without Developer
+/// Mode, after saying so.
+fn symlink_to(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(target, link);
+    if let Err(error) = &linked {
+        eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+    }
+    linked.is_ok()
+}
+
+#[test]
+fn an_admin_output_refuses_a_dangling_symbolic_link() {
+    let workspace =
+        std::env::temp_dir().join(format!("follon-admin-output-link-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).unwrap();
+    let target = workspace.join("elsewhere");
+    let link = workspace.join("link");
+    if !symlink_to(&target, &link) {
+        fs::remove_dir_all(&workspace).unwrap();
+        return;
+    }
+    let keygen = |private_key: &Path, trusted_key: &Path| {
+        command()
+            .arg("release-keygen")
+            .arg("--key-id")
+            .arg("release.key.link.001")
+            .arg("--private-key")
+            .arg(private_key)
+            .arg("--trusted-key")
+            .arg(trusted_key)
+            .output()
+            .expect("admin command should start")
+    };
+    let staged = || {
+        fs::read_dir(&workspace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect::<Vec<_>>()
+    };
+
+    // Each output is refused as a link, with nothing written at its target
+    // and nothing staged beside it.
+    for output in [
+        keygen(&link, &workspace.join("trusted.json")),
+        keygen(&workspace.join("release.pk8"), &link),
+    ] {
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refusing to write through a symbolic link"),
+            "refused for another reason: {stderr}"
+        );
+        assert!(!target.exists(), "an output was written through the link");
+        assert_eq!(staged(), Vec::<String>::new());
+    }
+    fs::remove_dir_all(&workspace).unwrap();
 }
 
 #[test]

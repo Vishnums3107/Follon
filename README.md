@@ -3,9 +3,11 @@
 Follon is a risk-first, multi-asset trading operating system for advanced independent traders and small professional teams. Its defining requirement is **research-to-live parity**: a strategy must behave equivalently in research, deterministic replay, simulation, paper trading, and controlled live execution.
 
 The complete capability set is a reference architecture, not a fixed 24-month
-solo-founder commitment. The active scope includes US-equities Replay, PAPER,
-and controlled-LIVE order entry; the current operational status is recorded in
-the [roadmap](docs/06-delivery/03-roadmap-and-gates.md).
+solo-founder commitment. The active executable scope is US-equities Replay and
+locally configured PAPER order entry. Controlled-LIVE remains safety-kernel and
+adapter-boundary engineering without a configured broker transport; the current
+operational status is recorded in the
+[roadmap](docs/06-delivery/03-roadmap-and-gates.md).
 
 This repository is an **active trading platform**.
 It contains the decomposed product plan, versioned contracts, deterministic
@@ -16,7 +18,8 @@ operating workspaces are packaged with React/Vite and a Tauri v2 host. The
 desktop uses privileged IPC commands to submit declarative order intents and
 order-management requests to the application routing boundary.
 
-The desktop provides active PAPER and LIVE order-entry controls. An IPC command
+The desktop provides active PAPER order-entry, cancel, and position-close
+controls. It does not expose controlled-LIVE activation or submission. An IPC command
 does not contact a broker itself: it creates a validated request for the
 Risk/OMS route, which remains the sole authority allowed to submit through a
 broker adapter. See the [master-plan conformance audit](docs/06-delivery/14-master-plan-conformance-audit.md)
@@ -49,7 +52,7 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   reservation, durable evidence/restart recovery, reconciliation, kill
   switches, reconnect handling, deterministic broker fault injection, and a
   bounded process transport for the official IBKR Python TWS API bridge.
-- A React/TypeScript desktop trading terminal, including active PAPER and LIVE
+- A React/TypeScript desktop trading terminal, including active PAPER
   order-entry, cancel, and position-close controls alongside monitoring,
   operations, portfolio, identity, platform, and acceptance-gate views. Vite
   creates the web bundle and Tauri v2 supplies the privileged native package
@@ -60,7 +63,9 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   content-addressed execution-plan evidence (`ExecutionPlanEvidence`),
   portfolio-wide risk, and balanced multi-currency/margin accounting. Scheduled,
   passive, combination, risk, and
-  margin planning are exposed through the versioned gRPC API.
+  margin planning are exposed through the versioned gRPC API. A separately
+  configured PAPER command route also exposes atomic combination submission
+  through the real PAPER risk/OMS/journal path; it fails closed when absent.
 - Customer IAM primitives with Argon2id, TOTP MFA, lockout, short opaque
   sessions, revocation, tenant isolation, and explicit RBAC permissions.
 - Transactional PostgreSQL migrations and adapter behavior for tenant-isolated

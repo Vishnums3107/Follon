@@ -16,6 +16,9 @@ use follon_accounting::{
     Currency, JournalLine, JournalTransaction, MarginPosition, MultiCurrencyLedger,
 };
 use follon_cli::{sha256_text, write_immutable};
+use follon_control_plane::{
+    DecisionProvenanceGraphBuilder, DecisionReconstruction, ProvenanceRecord,
+};
 use follon_domain::compatibility::{CompatibilityRegistry, SchemaMigrationStatus};
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
 use follon_news::ingest_local_headlines_ndjson;
@@ -204,6 +207,7 @@ enum Command {
     RecoveryDrill(RecoveryDrillArguments),
     AttentionBudget(AttentionBudgetArguments),
     CompatibilityMatrix(CompatibilityMatrixArguments),
+    DecisionReconstruction(DecisionReconstructionArguments),
 }
 
 #[derive(Deserialize)]
@@ -239,6 +243,14 @@ struct RecoveryDrillArguments {
 struct AttentionBudgetArguments {
     budget_config_path: PathBuf,
     output_path: PathBuf,
+}
+
+struct DecisionReconstructionArguments {
+    events_path: PathBuf,
+    manifest_path: PathBuf,
+    output_path: PathBuf,
+    target_event_id: Option<String>,
+    verified_at: String,
 }
 
 struct CompatibilityMatrixArguments {
@@ -732,8 +744,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 golden_corpus_size
             );
         }
+        Command::DecisionReconstruction(arguments) => {
+            let events = fs::read_to_string(&arguments.events_path).map_err(|error| {
+                format!(
+                    "failed to read event journal {}: {error}",
+                    arguments.events_path.display()
+                )
+            })?;
+            let manifest = fs::read_to_string(&arguments.manifest_path).map_err(|error| {
+                format!(
+                    "failed to read manifest {}: {error}",
+                    arguments.manifest_path.display()
+                )
+            })?;
+            let reconstruction = reconstruct_decision(
+                &events,
+                &manifest,
+                arguments.target_event_id.as_deref(),
+                &arguments.verified_at,
+            )?;
+            let value: serde_json::Value = serde_json::from_str(&reconstruction.to_json())?;
+            let json = serde_json::to_string_pretty(&value)?;
+            publish(&arguments.output_path, &json)?;
+            println!("{json}");
+            eprintln!(
+                "decision reconstruction: {} ({})",
+                arguments.output_path.display(),
+                reconstruction.integrity_status.as_str()
+            );
+        }
     }
     Ok(())
+}
+
+/// The event type a reconstruction targets when none is named.
+const DEFAULT_RECONSTRUCTION_TARGET_TYPE: &str = "execution.fill.v1";
+
+/// Reconstructs one decision from a persisted event journal and its manifest.
+///
+/// Every input is real, retained evidence: the journal must hash to the
+/// manifest's `events_sha256`, so the reconstruction is bound to exactly the
+/// run that produced it, and `configuration_hash` is the manifest's own. Each
+/// node's content hash is over the exact persisted line. Nothing is inferred
+/// or filled in; a missing ancestor is reported as `INCOMPLETE_CHAIN`.
+fn reconstruct_decision(
+    events: &str,
+    manifest: &str,
+    target_event_id: Option<&str>,
+    verified_at: &str,
+) -> Result<DecisionReconstruction, Box<dyn std::error::Error>> {
+    validate_utc_timestamp("--verified-at", verified_at)?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(manifest).map_err(|error| format!("manifest is not JSON: {error}"))?;
+    let manifest_hash = |name: &str| -> Result<String, String> {
+        manifest
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| format!("manifest {name} must be a lowercase SHA-256 hex digest"))
+    };
+    if sha256_text(events) != manifest_hash("events_sha256")? {
+        return Err("event journal does not match its manifest's events_sha256".into());
+    }
+    let configuration_hash = manifest_hash("configuration_hash")?;
+    let records = events
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(ProvenanceRecord::from_canonical_line)
+        .collect::<Result<Vec<_>, _>>()?;
+    let target = match target_event_id {
+        Some(target) => target.to_owned(),
+        None => records
+            .iter()
+            .rev()
+            .find(|record| record.event_type == DEFAULT_RECONSTRUCTION_TARGET_TYPE)
+            .map(|record| record.event_id.clone())
+            .ok_or_else(|| {
+                format!(
+                    "event journal contains no {DEFAULT_RECONSTRUCTION_TARGET_TYPE} event to reconstruct"
+                )
+            })?,
+    };
+    Ok(
+        DecisionProvenanceGraphBuilder::from_records(records)?.reconstruct(
+            &target,
+            &configuration_hash,
+            verified_at,
+        )?,
+    )
 }
 
 fn parse_command(arguments: Vec<String>) -> Result<Command, Box<dyn std::error::Error>> {
@@ -797,6 +901,9 @@ fn parse_command(arguments: Vec<String>) -> Result<Command, Box<dyn std::error::
         )?)),
         "compatibility-matrix" => Ok(Command::CompatibilityMatrix(
             parse_compatibility_matrix_arguments(remainder)?,
+        )),
+        "decision-reconstruction" => Ok(Command::DecisionReconstruction(
+            parse_decision_reconstruction_arguments(remainder)?,
         )),
         _ => Err(usage().into()),
     }
@@ -1423,6 +1530,56 @@ fn parse_attention_budget_arguments(
     })
 }
 
+fn parse_decision_reconstruction_arguments(
+    arguments: &[String],
+) -> Result<DecisionReconstructionArguments, Box<dyn std::error::Error>> {
+    const USAGE: &str = "usage: follon-operations decision-reconstruction <events.ndjson> <manifest.json> [output.json] --verified-at <UTC> [--target <event-id>]";
+    let mut positional = Vec::new();
+    let mut target_event_id = None;
+    let mut verified_at = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--target" => {
+                if target_event_id.is_some() {
+                    return Err("--target may be specified only once".into());
+                }
+                index += 1;
+                target_event_id = Some(required(arguments, index, "--target")?.to_owned());
+            }
+            "--verified-at" => {
+                if verified_at.is_some() {
+                    return Err("--verified-at may be specified only once".into());
+                }
+                index += 1;
+                verified_at = Some(required(arguments, index, "--verified-at")?.to_owned());
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unsupported argument: {argument}").into());
+            }
+            argument => positional.push(PathBuf::from(argument)),
+        }
+        index += 1;
+    }
+    if !(2..=3).contains(&positional.len()) {
+        return Err(USAGE.into());
+    }
+    // Explicit, never a wall-clock reading, so a pipeline re-run over the same
+    // journal reproduces the same document.
+    let verified_at = verified_at.ok_or(USAGE)?;
+    validate_utc_timestamp("--verified-at", &verified_at)?;
+    Ok(DecisionReconstructionArguments {
+        events_path: positional[0].clone(),
+        manifest_path: positional[1].clone(),
+        output_path: positional
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("var/decision-reconstruction.json")),
+        target_event_id,
+        verified_at,
+    })
+}
+
 fn parse_compatibility_matrix_arguments(
     arguments: &[String],
 ) -> Result<CompatibilityMatrixArguments, Box<dyn std::error::Error>> {
@@ -1858,7 +2015,7 @@ fn optional_json_string(value: Option<&str>) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  follon-operations validate-config [operations.json]\n  follon-operations config-diff <previous operations.json> <target operations.json> [changes.json]\n  follon-operations dashboard [operations.json] [dashboard.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations report [operations.json] [report.md] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations schedule [operations.json] [schedule.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations complete-schedule [operations.json] --schedule-id <id> --entry-id <id> --actor <id> --occurred-at <UTC> [--journal journal.ndjson]\n  follon-operations model-risk-record --record-id <id> --actor <id> --occurred-at <UTC> --strategy-id <id> --strategy-version <version> --strategy-bundle-hash <sha256> --backtest-artifact-hash <sha256> --decision <PROMOTE|DEMOTE|HOLD> --change-summary <text> --reason <text> [--journal journal.ndjson]\n  follon-operations model-risk-register [journal.ndjson] [register.json]\n  follon-operations game-day-record --record-id <id> --actor <id> --occurred-at <UTC> --scenario-id <id> --result <PASS|FAIL> --fault-plan-hash <sha256> --evidence-hash <sha256> --reconciliation-hash <sha256> --postmortem-summary <text> [--journal journal.ndjson]\n  follon-operations game-day-register [journal.ndjson] [register.json]\n  follon-operations reconcile-statement <operations.json> <statement.csv> [reconciliation.json] [--as-of <UTC>]\n  follon-operations recovery-drill <drill-config.json> [output.json]\n  follon-operations attention-budget <budget-config.json> [output.json]\n  follon-operations compatibility-matrix [output.json] [--engine-version <version>] [--verified-at <UTC>] [--golden-corpus <path.ndjson>]\n  follon-operations journal --entry-id <id> --event-type <type> --actor <id> --occurred-at <UTC> [--journal journal.ndjson] [--detail key=value]"
+    "usage:\n  follon-operations validate-config [operations.json]\n  follon-operations config-diff <previous operations.json> <target operations.json> [changes.json]\n  follon-operations dashboard [operations.json] [dashboard.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations report [operations.json] [report.md] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations schedule [operations.json] [schedule.json] --as-of <UTC> [--journal journal.ndjson]\n  follon-operations complete-schedule [operations.json] --schedule-id <id> --entry-id <id> --actor <id> --occurred-at <UTC> [--journal journal.ndjson]\n  follon-operations model-risk-record --record-id <id> --actor <id> --occurred-at <UTC> --strategy-id <id> --strategy-version <version> --strategy-bundle-hash <sha256> --backtest-artifact-hash <sha256> --decision <PROMOTE|DEMOTE|HOLD> --change-summary <text> --reason <text> [--journal journal.ndjson]\n  follon-operations model-risk-register [journal.ndjson] [register.json]\n  follon-operations game-day-record --record-id <id> --actor <id> --occurred-at <UTC> --scenario-id <id> --result <PASS|FAIL> --fault-plan-hash <sha256> --evidence-hash <sha256> --reconciliation-hash <sha256> --postmortem-summary <text> [--journal journal.ndjson]\n  follon-operations game-day-register [journal.ndjson] [register.json]\n  follon-operations reconcile-statement <operations.json> <statement.csv> [reconciliation.json] [--as-of <UTC>]\n  follon-operations recovery-drill <drill-config.json> [output.json]\n  follon-operations attention-budget <budget-config.json> [output.json]\n  follon-operations compatibility-matrix [output.json] [--engine-version <version>] [--verified-at <UTC>] [--golden-corpus <path.ndjson>]\n  follon-operations decision-reconstruction <events.ndjson> <manifest.json> [output.json] --verified-at <UTC> [--target <event-id>]\n  follon-operations journal --entry-id <id> --event-type <type> --actor <id> --occurred-at <UTC> [--journal journal.ndjson] [--detail key=value]"
 }
 
 #[cfg(test)]
@@ -2186,6 +2343,175 @@ mod tests {
                 assert!(!budget.budget_exhausted);
             }
             _ => panic!("expected AttentionBudget command"),
+        }
+    }
+
+    /// One canonical (compact, sorted-key) journal line.
+    fn journal_line(
+        event_id: &str,
+        event_type: &str,
+        time: &str,
+        causation_id: Option<&str>,
+    ) -> String {
+        serde_json::json!({
+            "account_id": null,
+            "actor": "test",
+            "causation_id": causation_id,
+            "configuration_version": "v1",
+            "correlation_id": "corr.1",
+            "event_id": event_id,
+            "event_time": time,
+            "event_type": event_type,
+            "instrument_id": null,
+            "payload": { "kind": "test" },
+            "receive_time": time,
+            "schema_version": 1,
+            "software_version": "0.1.0",
+            "source": "test",
+            "strategy_id": null
+        })
+        .to_string()
+    }
+
+    fn fill_journal() -> String {
+        [
+            journal_line("evt-1", "market.bar.v1", "2026-01-02T14:31:00Z", None),
+            journal_line(
+                "evt-2",
+                "intent.created.v1",
+                "2026-01-02T14:31:00Z",
+                Some("evt-1"),
+            ),
+            journal_line(
+                "evt-3",
+                "execution.fill.v1",
+                "2026-01-02T14:32:00Z",
+                Some("evt-2"),
+            ),
+            journal_line(
+                "evt-4",
+                "intent.created.v1",
+                "2026-01-02T14:33:00Z",
+                Some("evt-1"),
+            ),
+            journal_line(
+                "evt-5",
+                "execution.fill.v1",
+                "2026-01-02T14:34:00Z",
+                Some("evt-4"),
+            ),
+            journal_line("evt-6", "audit.trail.v1", "2026-01-02T14:35:00Z", None),
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    fn manifest_for(events: &str) -> String {
+        serde_json::json!({
+            "events_sha256": sha256_text(events),
+            "configuration_hash": "e".repeat(64),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn decision_reconstruction_binds_the_latest_fill_to_its_manifest() {
+        let events = fill_journal();
+        let recon = reconstruct_decision(
+            &events,
+            &manifest_for(&events),
+            None,
+            "2026-09-07T12:00:00Z",
+        )
+        .unwrap();
+
+        // The latest fill in journal order, not the first.
+        assert_eq!(recon.target_event_id, "evt-5");
+        assert_eq!(recon.target_entity_type, "fill");
+        assert_eq!(recon.integrity_status.as_str(), "VERIFIED");
+        assert_eq!(recon.configuration_hash, "e".repeat(64));
+        let chain: Vec<&str> = recon
+            .causal_chain
+            .iter()
+            .map(|node| node.node_id.as_str())
+            .collect();
+        assert_eq!(chain, ["evt-1", "evt-4", "evt-5"]);
+        // Each node is bound to the exact persisted bytes of its line.
+        let fill_line = events.lines().nth(4).unwrap();
+        assert_eq!(recon.causal_chain[2].content_hash, sha256_text(fill_line));
+    }
+
+    #[test]
+    fn decision_reconstruction_refuses_a_journal_its_manifest_does_not_describe() {
+        let events = fill_journal();
+        let manifest = manifest_for(&events);
+        let altered = events.replace("2026-01-02T14:32:00Z", "2026-01-02T14:32:01Z");
+        let error = reconstruct_decision(&altered, &manifest, None, "2026-09-07T12:00:00Z")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match its manifest"), "{error}");
+    }
+
+    #[test]
+    fn decision_reconstruction_reports_a_missing_ancestor_rather_than_inventing_one() {
+        let events = [
+            journal_line(
+                "evt-2",
+                "intent.created.v1",
+                "2026-01-02T14:31:00Z",
+                Some("evt-1"),
+            ),
+            journal_line(
+                "evt-3",
+                "execution.fill.v1",
+                "2026-01-02T14:32:00Z",
+                Some("evt-2"),
+            ),
+        ]
+        .join("\n");
+        let recon = reconstruct_decision(
+            &events,
+            &manifest_for(&events),
+            None,
+            "2026-09-07T12:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(recon.integrity_status.as_str(), "INCOMPLETE_CHAIN");
+        assert_eq!(recon.causal_chain.len(), 2);
+    }
+
+    #[test]
+    fn decision_reconstruction_without_a_fill_requires_an_explicit_target() {
+        let events = journal_line("evt-1", "market.bar.v1", "2026-01-02T14:31:00Z", None);
+        let manifest = manifest_for(&events);
+        assert!(reconstruct_decision(&events, &manifest, None, "2026-09-07T12:00:00Z").is_err());
+        let recon = reconstruct_decision(&events, &manifest, Some("evt-1"), "2026-09-07T12:00:00Z")
+            .unwrap();
+        assert_eq!(recon.target_entity_type, "alert");
+    }
+
+    #[test]
+    fn decision_reconstruction_requires_an_explicit_verification_time() {
+        let arguments = vec![
+            "decision-reconstruction".to_owned(),
+            "events.ndjson".to_owned(),
+            "manifest.json".to_owned(),
+        ];
+        assert!(parse_command(arguments.clone()).is_err());
+        let mut with_time = arguments;
+        with_time.extend([
+            "--verified-at".to_owned(),
+            "2026-09-07T12:00:00Z".to_owned(),
+        ]);
+        match parse_command(with_time).unwrap() {
+            Command::DecisionReconstruction(parsed) => {
+                assert_eq!(
+                    parsed.output_path,
+                    PathBuf::from("var/decision-reconstruction.json")
+                );
+                assert!(parsed.target_event_id.is_none());
+            }
+            _ => panic!("expected DecisionReconstruction command"),
         }
     }
 

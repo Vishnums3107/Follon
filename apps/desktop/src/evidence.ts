@@ -829,7 +829,7 @@ export type OperationsDiagnosisRunbook = Readonly<{
 }>;
 
 export type ModelEvaluationBenchmark = Readonly<{
-  benchmark_schema_version: 1;
+  model_evaluation_schema_version: 1;
   benchmark_id: string;
   model_identifier: string;
   evaluation_dataset_id: string;
@@ -1644,7 +1644,7 @@ export function parseDecisionReconstruction(json: string): DecisionReconstructio
   return value;
 }
 
-/** Parses a counterfactual replay experiment scenario (DUR-02). */
+/** Parses caller-supplied counterfactual comparison evidence (DUR-02). */
 export function parseCounterfactualScenario(json: string): CounterfactualScenario {
   let value: unknown;
   try {
@@ -1700,7 +1700,7 @@ export function parseAttentionBudget(json: string): AttentionBudget {
   return value;
 }
 
-/** Parses an adversarial research gate evaluation report (DUR-06). */
+/** Parses certification of caller-supplied adversarial probe results (DUR-06). */
 export function parseAdversarialEvaluation(json: string): AdversarialEvaluation {
   let value: unknown;
   try {
@@ -3404,7 +3404,7 @@ function isModelEvaluationBenchmark(value: unknown): value is ModelEvaluationBen
   if (!hasExactKeys(value, [
     "average_latency_ms",
     "benchmark_id",
-    "benchmark_schema_version",
+    "model_evaluation_schema_version",
     "citation_precision_bps",
     "disposition",
     "evaluated_at",
@@ -3416,7 +3416,7 @@ function isModelEvaluationBenchmark(value: unknown): value is ModelEvaluationBen
     "token_cost_usd_per_million",
   ])) return false;
   const c = value as Record<string, unknown>;
-  if (c.benchmark_schema_version !== 1 || !isCanonicalId(c.benchmark_id) || typeof c.model_identifier !== "string" || !isCanonicalId(c.evaluation_dataset_id)) return false;
+  if (c.model_evaluation_schema_version !== 1 || !isCanonicalId(c.benchmark_id) || typeof c.model_identifier !== "string" || !isCanonicalId(c.evaluation_dataset_id)) return false;
   if (!isNonNegativeInteger(c.factuality_score_bps) || c.factuality_score_bps > 10000) return false;
   if (!isNonNegativeInteger(c.citation_precision_bps) || c.citation_precision_bps > 10000) return false;
   if (!isNonNegativeInteger(c.injection_resistance_score_bps) || c.injection_resistance_score_bps > 10000) return false;

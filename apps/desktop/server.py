@@ -25,8 +25,26 @@ from time import monotonic
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import urlopen
 
+def _ancestor(path: Path, levels: int) -> Path:
+    """Returns the ``levels``-th ancestor of ``path``, or the root-most
+    ancestor available if ``path`` is not nested that deeply.
+
+    In the real repository layout (``apps/desktop/server.py``), two levels up
+    from this file is the repository root. The dashboard's Docker image,
+    however, copies this file directly to ``/app/server.py`` -- a flattened
+    layout with no such ancestor -- and this value is only ever used as a
+    fallback default for ``FOLLON_EVIDENCE_ROOT``/``FOLLON_DASHBOARD_STATIC_ROOT``,
+    which the image always sets explicitly. Indexing ``.parents[levels]``
+    directly would raise ``IndexError`` and crash the server before that
+    override is even consulted, in an environment that was never going to use
+    the fallback value anyway.
+    """
+    parents = path.parents
+    return parents[levels] if levels < len(parents) else parents[-1]
+
+
 _DEFAULT_STATIC = Path(__file__).resolve().parent / "web-dist"
-_DEFAULT_EVIDENCE = Path(__file__).resolve().parents[2] / "var"
+_DEFAULT_EVIDENCE = _ancestor(Path(__file__).resolve(), 2) / "var"
 STATIC_ROOT = Path(
     os.environ.get(
         "FOLLON_DASHBOARD_STATIC_ROOT",
@@ -102,6 +120,15 @@ _AUTH_FAILURES_LOCK = Lock()
 # one of the reviewed v1 schemas.  The browser validates the complete contract
 # again before rendering it; this lightweight registry keeps the read-only
 # projection bounded without treating arbitrary JSON as operational evidence.
+#
+# Every discriminator field here must be unique across this table AND across
+# every other schema_version-style field checked elsewhere in this file (see
+# the `classify_artifact`/`benchmark_schema_version`+`p99_micros` check
+# below): a real `follon-risk-benchmark.json` artifact was previously
+# misclassified as `model_evaluation_benchmark` because both once used the
+# bare field name `benchmark_schema_version`, silently dropping the real
+# risk-latency evidence from the dashboard (found and fixed 2026-09-20, see
+# docs/06-delivery/14-master-plan-conformance-audit.md item 45).
 ADVANCED_EVIDENCE_SCHEMAS: tuple[tuple[str, str, str], ...] = (
     ("hypothesis_schema_version", "research_hypothesis", "research"),
     ("lineage_schema_version", "experiment_lineage", "research"),
@@ -126,7 +153,7 @@ ADVANCED_EVIDENCE_SCHEMAS: tuple[tuple[str, str, str], ...] = (
     ("champion_challenger_schema_version", "champion_challenger_evaluation", "research"),
     ("planner_schema_version", "capability_execution_planner", "execution-risk"),
     ("diagnosis_schema_version", "operations_diagnosis_runbook", "operations"),
-    ("benchmark_schema_version", "model_evaluation_benchmark", "operations"),
+    ("model_evaluation_schema_version", "model_evaluation_benchmark", "operations"),
     ("capsule_schema_version", "strategy_capsule_manifest", "research"),
     ("expansion_schema_version", "multi_asset_expansion_plan", "execution-risk"),
     ("reconstruction_schema_version", "decision_reconstruction", "execution-risk"),
@@ -875,7 +902,7 @@ def workspace_snapshot(as_of: str | None = None) -> dict[str, object]:
                 execution_evidence.append(
                     {"artifact": name, "modified_at": metadata["modified_at"], "data": payload}
                 )
-            elif payload.get("artifact_schema_version") in {1, 2} and isinstance(payload.get("report"), dict):
+            elif payload.get("artifact_schema_version") in {1, 2, 3} and isinstance(payload.get("report"), dict):
                 backtests.append(
                     {
                         "artifact": name,
@@ -886,6 +913,12 @@ def workspace_snapshot(as_of: str | None = None) -> dict[str, object]:
                         "report": payload.get("report", {}),
                         "specification": payload.get("specification", {}),
                         "specification_fingerprint": payload.get("specification_fingerprint"),
+                        # Schema 3 carries the complete advanced-account economics.
+                        "advanced_account": (
+                            payload.get("advanced_account")
+                            if isinstance(payload.get("advanced_account"), dict)
+                            else None
+                        ),
                     }
                 )
             elif "manifest_schema_version" in payload:
@@ -1246,7 +1279,13 @@ def system_status() -> dict[str, object]:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "FollonEvidenceDashboard/2.0"
+    server_version = "FollonEvidenceDashboard"
+
+    def version_string(self) -> str:
+        # The stdlib default appends the exact Python version to every
+        # response's Server header, which hands a scanner the runtime to
+        # target. Report the product name only (found by tools/dast_scan.py).
+        return self.server_version
 
     TAURI_READ_ONLY_ORIGINS = frozenset({
         "http://tauri.localhost",

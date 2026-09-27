@@ -7,15 +7,20 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+follon-accounting = { path = "../accounting" }
 follon-control-plane = { path = "../control-plane" }
 follon-domain = { path = "../domain" }
 follon-instrument = { path = "../instrument" }
+follon-risk = { path = "../risk" }
 follon-secrets = { path = "../secrets" }
 fs2 = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 time = { version = "0.3.44", features = ["parsing"] }
+
+[dev-dependencies]
+proptest = "1.11.0"
 
 [lib]
 path = "src/lib.rs"

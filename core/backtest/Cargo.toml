@@ -16,6 +16,7 @@ sha2 = "0.10.9"
 
 [dev-dependencies]
 follon-instrument = { path = "../instrument" }
+proptest = "1.11.0"
 
 [lib]
 path = "src/lib.rs"
