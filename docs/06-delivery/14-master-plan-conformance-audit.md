@@ -2298,6 +2298,9 @@ These are mandatory master-plan acceptance conditions and are currently open:
       configuration fixtures, the PAPER and LIVE CLI loaders, the versioned gRPC command route, and the
       desktop `FOLLON_DESKTOP_PAPER_CONFIG` gateway, whose README now documents the table. Fixtures list
       `inst.us_equity.spy` at 0.01, the instrument the portfolio-risk fixtures already use.
+      **Corrected in place 2026-09-27 (item 77).** "Every configuration boundary" was false. The
+      `paper-configuration` contract also has a version-2 schema, which `follon-paper-status` reads, and it
+      was not changed. From this item until item 77, both version-2 fixtures failed validation against it.
     - **Journal fixtures regenerated, not edited.** The fingerprint change correctly made both checked-in
       journals refuse their configurations, and pipeline step 14a failed exactly as intended. Both were
       regenerated with the current `follon-paper-status` and `follon-live-status` binaries against their
@@ -2707,6 +2710,8 @@ These are mandatory master-plan acceptance conditions and are currently open:
       the scanner's route. Both checked-in journals were regenerated with the real status binaries; only the
       configuration fingerprint and entry hash changed. `checked_in_journal_configuration.rs` failed for both
       journals before the regeneration and passes after it.
+      **Corrected in place 2026-09-27 (item 77).** As a list of every boundary this was incomplete. The
+      version-2 `paper-configuration` schema, which `follon-paper-status` reads, gained neither table.
     - **Tests.**
       - PAPER and controlled-LIVE each cover an off-lot plain order, an instrument with no lot, the table's
         validation and fingerprint binding, and a ratio-2 combination: whole leg lots approved, an off-lot
@@ -3106,6 +3111,47 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** The tables remain the operator's configuration, and nothing checks them
       against a venue's own reference data. A venue's odd-lot handling is not modelled. No external gate
       moved.
+
+77. The version-2 PAPER configuration schema describes what its reader reads, and every configuration
+    fixture is held to its schema (2026-09-27, Architecture row and contract conformance; E3.9).
+    - **The gap.** `follon-paper-status` reads versions 1 and 2 of the PAPER configuration through one
+      document type, which since items 61 and 70 requires `instrument_tick_sizes` and
+      `instrument_lot_sizes`. Those items added both tables to the version-1 schema only. The version-2
+      schema's `risk` object declares neither table and forbids additional properties. So it rejected
+      both version-2 fixtures, including `paper-v2.json`, which pipeline step 14a feeds to the CLI.
+      Nothing loaded a schema next to the configuration it describes, so nothing failed. Items 61 and 70
+      are corrected in place.
+    - **The fix.** The version-2 `risk` object declares and requires both tables, with the version-1
+      definitions byte for byte, including item 76's pairing rule. Every shared `$defs` entry was already
+      identical in both versions.
+    - **Tests.** `tests/security/test_configuration_contracts.py` pins 17 configuration fixtures to the
+      input-contract schema their reader implements: three backtest, three PAPER, two controlled-LIVE, the
+      PAPER command route, operations, options, and six commercial configurations.
+      - Without any third-party package, so CI's security job runs it: each fixture declares nothing its
+        schema forbids and omits nothing the schema requires, at the top level and one level down, where
+        each configuration keeps its risk policy.
+      - Also without a package: the version-2 PAPER `risk` object declares and requires everything the
+        version-1 one does, with identical definitions, and every shared definition is identical.
+      - Where `jsonschema` is installed, full validation of every fixture. CI's security job does not
+        install it, so there this one is skipped with that reason.
+      - Surveying every fixture against every similarly named schema also turned up six evidence
+        schemas: adversarial evaluation, counterfactual scenario, attention budget, recovery drill,
+        capital allocation and gateway qualification. Each describes a command's output, not the
+        configuration it reads. Those were my pairings, not drift, and they are not in the table.
+    - **Rule 5.** All three tests failed before the fix, and only on the two version-2 fixtures. 6 of 6
+      injected defects were then caught:
+      - the version-2 lot table misnamed, caught by all three tests;
+      - the tables declared but no longer required, the lot table's `minProperties` loosened to 0, and
+        `positiveDecimal` loosened to admit a sign. Each of these was caught only by the version-extension
+        test, which is why it exists;
+      - a fixture carrying an undeclared field, and a fixture missing a required one.
+    - **Measured result.** The Python suite rose from 52 to 55 passed; the Rust workspace is unchanged at
+      507 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all seven
+      suites green, and the full evidence pipeline exited 0, including step 23b's scan (76 probes, 0
+      failed).
+    - **Bounded remainder.** Output and evidence documents are outside this test; only some pipeline
+      steps validate what they publish. JSON Schema cannot express item 76's pairing rule, so the services
+      enforce it. No external gate moved.
 
 ## Business-readiness decision
 

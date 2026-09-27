@@ -43,7 +43,7 @@
     "risk": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["policy_version", "trading_calendar_id", "max_order_quantity", "max_order_notional", "max_price_deviation_bps", "max_open_orders", "max_position_quantity", "max_realized_loss", "max_market_data_age_seconds", "max_order_rate", "order_rate_window_seconds"],
+      "required": ["policy_version", "trading_calendar_id", "max_order_quantity", "max_order_notional", "max_price_deviation_bps", "max_open_orders", "max_position_quantity", "max_realized_loss", "max_market_data_age_seconds", "max_order_rate", "order_rate_window_seconds", "instrument_tick_sizes", "instrument_lot_sizes"],
       "properties": {
         "policy_version": { "type": "string", "minLength": 1 },
         "trading_calendar_id": { "$ref": "#/$defs/canonicalId" },
@@ -56,7 +56,9 @@
         "max_market_data_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
         "max_order_rate": { "type": "integer", "minimum": 1 },
         "order_rate_window_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
-        "portfolio_risk": { "$ref": "#/$defs/portfolioRisk" }
+        "portfolio_risk": { "$ref": "#/$defs/portfolioRisk" },
+        "instrument_tick_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue tick size per tradable instrument. An order for an unlisted instrument, or a limit price off its instrument's grid, is refused before it can reach the broker." },
+        "instrument_lot_sizes": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/canonicalId" }, "additionalProperties": { "$ref": "#/$defs/positiveDecimal" }, "description": "Venue lot size per tradable instrument: the exact quantity increment. An order for an unlisted instrument, or a quantity (for a combination, each leg's contract quantity) that is not a whole number of lots, is refused before it can reach the broker. It must list exactly the instruments instrument_tick_sizes lists; a configuration that lists an instrument in only one of the two tables is refused at startup." }
       }
     },
     "portfolioRisk": {

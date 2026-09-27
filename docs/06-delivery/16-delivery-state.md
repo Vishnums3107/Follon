@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T13:02:36Z  
+**Measured at:** 2026-09-27T13:08:01Z  
 **Branch:** `main`  
-**HEAD:** `47375a0` -- fix(repo): one commit publishes one set of hashes on every platform -- E3.8 (2026-09-27T18:21:41+05:30)  
-**Uncommitted paths:** 9
+**HEAD:** `c6f0c55` -- feat(risk): refuse tick and lot tables that list different instruments -- E3.6f (2026-09-27T18:34:13+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -67,7 +67,7 @@ already produced a real defect here.
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 52 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 55 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -451,6 +451,7 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 | E3.7 | **Done 2026-09-26 (audit item 72).** Replay risk priced an intent from the bar that produced it, whatever that bar's instrument, so a QQQ order raised on SPY's bar was judged at SPY's price. `RiskPolicy::evaluate` now refuses a mark for another instrument, and the bar and news paths refuse such an intent before recording it, as PAPER does. Remainder: the engine holds no mark except the current bar, so one instrument cannot be traded on another's bar. | 5.4 |
 | E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
+| E3.9 | **Done 2026-09-27 (audit item 77).** The version-2 PAPER configuration schema declared neither the tick nor the lot table, so it rejected both version-2 fixtures that `follon-paper-status` reads. It now matches version 1, and `tests/security/test_configuration_contracts.py` holds 17 configuration fixtures to their schemas. Remainder: output and evidence documents are outside that test. | Architecture |
 
 ## The backlog that code cannot close
 
@@ -554,6 +555,15 @@ short — detail belongs in the conformance audit.
   Found while documenting it: the version-2 PAPER configuration schema
   rejects both version-2 fixtures (E3.9).
 - Rust workspace **505 → 507 passed**; the final
+  `python tools/session_status.py` measurement recorded all seven suites
+  green, and the full pipeline exited 0.
+- Landed **E3.9**. The version-2 PAPER schema now declares and requires
+  both tables, exactly as version 1 does. A new contract test pins 17
+  configuration fixtures to their schemas, and pins version 2's risk policy
+  to version 1's. Most of it runs in CI without `jsonschema`. Items 61 and
+  70 are corrected in place, because they had claimed every boundary
+  changed. 6/6 injected defects were caught (audit item 77).
+- Python **52 → 55 passed**; Rust unchanged at 507. The final
   `python tools/session_status.py` measurement recorded all seven suites
   green, and the full pipeline exited 0.
 
