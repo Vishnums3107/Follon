@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T15:19:38Z  
-**Branch:** `main`  
-**HEAD:** `37caa63` -- fix(security): journal, ledger and admin paths refuse a dangling symbolic link -- E3.11 (2026-09-27T20:45:24+05:30)  
-**Uncommitted paths:** 5
+**Measured at:** 2026-09-27T16:22:10Z  
+**Branch:** `feat/risk-evidence-and-replay-hardening`  
+**HEAD:** `a0f750a` -- feat(replay): refuse to fill a working limit off a changed tick grid -- E3.6h (2026-09-27T20:51:20+05:30)  
+**Uncommitted paths:** 0
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
