@@ -1191,6 +1191,7 @@ function renderBacktestExplorer(summaryRoot: HTMLElement, root: HTMLElement, sna
     ["Slippage", "Configured basis points are applied unfavourably after half-spread"],
     ["Tick grid", "The spread-and-slippage price is rounded onto the instrument's tick grid against the trader: buys up, sells down"],
     ["Limit protection", "The final grid price can never violate the order limit"],
+    ["Increment changes", "A lot or tick change that leaves a working order off the new increments stops the replay rather than filling it"],
     ["Latency", "A configured number of complete market bars must pass before fill eligibility"],
     ["Partial fills", "An optional per-bar quantity cap persists remaining quantity as a working order"],
     ["Trading halts", "Version-controlled venue or instrument halt windows block strategy evaluation"],

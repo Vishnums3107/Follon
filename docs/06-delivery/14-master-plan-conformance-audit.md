@@ -3401,6 +3401,53 @@ These are mandatory master-plan acceptance conditions and are currently open:
       on Windows, which the repository does not use. Other file writers in the repository do not claim to
       refuse links and are unchanged. No external gate moved.
 
+84. A replay refuses to fill a working limit order off a tick grid that changed while it worked
+    (2026-09-27, row 5.4 and research-to-live parity; E3.6h). This closes the remainder item 79 recorded.
+    - **The gap.** Item 73's risk rule puts a limit on the tick grid in force when the order is decided.
+      If an instrument's tick size then changed while the order worked, its limit could be off the new
+      grid, a price no venue holds an order at. The replay kept it eligible and filled it on the new grid
+      (item 74). Measured with the guard removed: a buy limited at 100.05, decided on a cent grid, filled
+      at 100.00 on a dime grid.
+    - **The rule.** It applies the operator's E3.6g decision to the tick. That decision was to refuse
+      rather than model a venue's response, which varies by venue. A venue may cancel a non-conforming
+      resting order or reprice it, and neither is modelled.
+      - At each fill attempt, a limit must sit on the fill bar's tick grid. Otherwise the replay stops with
+        an error naming the order, its limit, the instrument and its new tick.
+      - The check runs beside item 79's lot check, before anything about the attempt is recorded, whether
+        or not the bar would fill the order. A lot violation is reported first.
+      - A limit the new grid still holds is not refused, and a market order has no limit to check. It
+        fills on the new grid against the trader, as before.
+      - On the news path, the reference data that judged the order is the one it fills under, so the
+        check never fires there. It still applies.
+      - PAPER and controlled LIVE read a configured tick table that cannot change under a journal, since
+        a journal opens only under the fingerprint it was written with. They need no analogue.
+    - **Tests.** Across a change from a cent to a dime grid at the fill bar:
+      - a buy limited at 100.05 is refused with nothing after the fill bar on the stream, and no fill;
+      - a buy limited at 100.10 fills at 100.00;
+      - a market buy fills at 100.00.
+
+      Item 79's helper now takes the strategy and both new increments. Its three lot cases are
+      unchanged.
+    - **Rule 5.** 4 of 4 injected defects were caught:
+      - the guard removed, after which the off-grid limit filled;
+      - the limit checked against the lot size instead;
+      - the check inverted;
+      - the guard moved to after the fill is recorded. This was caught on the stream, not the error text,
+        which is identical.
+    - **Documentation.** The operations guide's replay capability list, and the desktop's "Execution
+      realism model" panel, now state that a lot or tick change which leaves a working order off the new
+      increments stops the replay. The panel described neither this guard nor item 79's.
+    - **Measured result.** The Rust workspace rose from 520 to 521 passed / 0 failed / 3 ignored. The final
+      `python tools/session_status.py` run measured all seven suites green, and the full evidence pipeline
+      exited 0, including step 23b's scan (85 probes, 0 failed). Against the previous run's `var/`, both
+      backtests' event streams are byte-identical. The main backtest's `strategy_bundle_hash` and the two
+      fingerprints built on it changed only because that hash covers `core/control-plane/src/lib.rs`,
+      which this slice edits. The other changed files carry per-run values: fresh signing keys and
+      signatures, and benchmark timings.
+    - **Bounded remainder.** A venue's own handling of a tick or lot change, whether it cancels, reprices
+      or accepts odd lots, is not modelled. Price improvement and midpoint prints are not modelled either.
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

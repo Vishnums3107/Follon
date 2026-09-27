@@ -56,6 +56,9 @@ instrument's effective end and supports venue/instrument halts,
 full-spread/half-spread pricing, adverse slippage, bar latency, and per-bar
 partial fills. A simulated fill price is rounded onto the instrument's tick
 grid against the trader (a buy up, a sell down) before its limit is checked.
+If an effective-dated lot or tick change leaves a working order off the new
+increments, its fill off the new lots or its limit off the new grid, the
+replay stops with an error rather than fill it.
 
 The advanced account is separately implemented and tested for point-in-time
 universe membership, long/short crossings, explicit borrow availability and

@@ -3043,11 +3043,23 @@ impl ReplayEngine {
         // can leave this fill off the new lot, which no venue executes. The
         // replay does not model the venue's response, so it refuses, before
         // anything about the attempt is recorded (E3.6g).
+        // The tick analogue, under the same decision: risk put a limit on the
+        // grid in force when it was decided, and a later tick change can
+        // leave it off the new grid, at a price no venue holds (E3.6h).
         if let Some(reference) = reference {
             if !is_whole_multiple(quantity, reference.lot_size) {
                 return Err(EngineError(format!(
                     "working order {} cannot fill {} after {}'s lot size changed to {}",
                     working.order.order_id, quantity, reference.instrument_id, reference.lot_size
+                )));
+            }
+            if let Some(limit) = intent
+                .limit_price
+                .filter(|limit| !is_whole_multiple(*limit, reference.tick_size))
+            {
+                return Err(EngineError(format!(
+                    "working order {} cannot rest at {} after {}'s tick size changed to {}",
+                    working.order.order_id, limit, reference.instrument_id, reference.tick_size
                 )));
             }
         }
@@ -4494,12 +4506,14 @@ mod tests {
         assert_eq!(prices, vec![price("100.30")]);
     }
 
-    /// Decides a market buy on the 14:31 bar under a one-share lot, then
-    /// replays the 14:32 bar, from which SPY trades in `new_lot`-share lots.
-    /// Returns the 14:32 bar's result and every recorded event type.
-    fn replay_across_a_lot_change(
-        quantity: i64,
+    /// Decides `strategy`'s buy on the 14:31 bar under a cent tick and a
+    /// one-share lot, then replays the 14:32 bar, from which SPY trades on a
+    /// `new_tick` grid in `new_lot`-share lots. Returns the 14:32 bar's
+    /// result and every recorded event type.
+    fn replay_across_a_reference_change(
+        mut strategy: SubmitsOnce,
         fill_cap: Option<i64>,
+        new_tick: &str,
         new_lot: i64,
     ) -> (Result<ReplayResult, EngineError>, Vec<String>) {
         let mut instruments = InstrumentRegistry::default();
@@ -4510,7 +4524,7 @@ mod tests {
                 "2026-01-01T00:00:00Z",
                 Some("2026-01-02T14:32:00Z"),
             ),
-            spy_version("0.01", new_lot, "2026-01-02T14:32:00Z", None),
+            spy_version(new_tick, new_lot, "2026-01-02T14:32:00Z", None),
         ] {
             instruments.register(version).unwrap();
         }
@@ -4523,7 +4537,6 @@ mod tests {
         replay.fill_model.max_fill_quantity =
             fill_cap.map(|cap| Decimal::from_integer(cap).unwrap());
         let mut store = InMemoryEventStore::default();
-        let mut strategy = SubmitsOnce::new(quantity, None);
         let decided = replay
             .process_bar_with_market_preconditions(
                 &mut store,
@@ -4551,7 +4564,8 @@ mod tests {
     fn a_lot_change_under_a_working_order_refuses_the_replay() {
         // Three shares were whole lots when decided. From the fill bar SPY
         // trades in fives, so no venue would execute this fill.
-        let (result, recorded) = replay_across_a_lot_change(3, None, 5);
+        let (result, recorded) =
+            replay_across_a_reference_change(SubmitsOnce::new(3, None), None, "0.01", 5);
         assert_eq!(
             result.unwrap_err().0,
             "working order order-intent-increments-001 cannot fill 3.00000000 after inst.us_equity.spy's lot size changed to 5.00000000"
@@ -4569,7 +4583,8 @@ mod tests {
 
         // A fill cap can leave a whole-lot order's partial off the new lot:
         // four shares are one lot of four, but a cap of two is not.
-        let (result, recorded) = replay_across_a_lot_change(4, Some(2), 4);
+        let (result, recorded) =
+            replay_across_a_reference_change(SubmitsOnce::new(4, None), Some(2), "0.01", 4);
         assert_eq!(
             result.unwrap_err().0,
             "working order order-intent-increments-001 cannot fill 2.00000000 after inst.us_equity.spy's lot size changed to 4.00000000"
@@ -4578,11 +4593,41 @@ mod tests {
 
         // A change the order still fits is not refused: six shares are two
         // lots of three, and fill as usual.
-        let (result, _) = replay_across_a_lot_change(6, None, 3);
+        let (result, _) =
+            replay_across_a_reference_change(SubmitsOnce::new(6, None), None, "0.01", 3);
         assert_eq!(
             fill_quantities(&result.unwrap().events),
             vec![Decimal::from_integer(6).unwrap()]
         );
+    }
+
+    #[test]
+    fn a_tick_change_under_a_working_limit_refuses_the_replay() {
+        let price = |value: &str| Decimal::from_str(value).unwrap();
+
+        // A buy limited at 100.05 sat on the cent grid when it was decided.
+        // From the fill bar SPY trades in dimes, so no venue holds the order
+        // at that price, although the bar would fill it.
+        let (result, recorded) =
+            replay_across_a_reference_change(SubmitsOnce::new(1, Some("100.05")), None, "0.10", 1);
+        assert_eq!(
+            result.unwrap_err().0,
+            "working order order-intent-increments-001 cannot rest at 100.05000000 after inst.us_equity.spy's tick size changed to 0.10000000"
+        );
+        // The fill bar is the last thing recorded: nothing about the attempt.
+        assert_eq!(recorded.last().map(String::as_str), Some("market.bar.v1"));
+        assert!(!recorded.iter().any(|kind| kind == "execution.fill.v1"));
+
+        // A limit the new grid still holds fills as usual, on that grid.
+        let (result, _) =
+            replay_across_a_reference_change(SubmitsOnce::new(1, Some("100.10")), None, "0.10", 1);
+        assert_eq!(fill_prices(&result.unwrap().events), vec![price("100.00")]);
+
+        // A market order has no limit to leave the grid. It fills, rounded
+        // onto the new grid against the trader (E3.6e).
+        let (result, _) =
+            replay_across_a_reference_change(SubmitsOnce::new(1, None), None, "0.10", 1);
+        assert_eq!(fill_prices(&result.unwrap().events), vec![price("100.00")]);
     }
 
     #[test]
