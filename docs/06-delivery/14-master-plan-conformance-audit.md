@@ -3686,6 +3686,59 @@ These are mandatory master-plan acceptance conditions and are currently open:
       that ties it to the ledger files it counted, and the promotion gate still trusts a supplied status
       (E6.3). Nothing authenticates a reviewer (E6.4). No external gate moved.
 
+90. Promotion recomputes acceptance from the ledgers, and its receipt binds what it counted (2026-09-28,
+    Security row "Immutable audit and signed release" and External and operational gates; delivery state
+    E6.3). Reported by the revised assessment.
+    - **The gap.** `tools/release_promotion_gate.py` read a caller-supplied status document through
+      `--acceptance-status` and trusted its `all_gates_eligible`. A two-field document,
+      `{"acceptance_status_schema_version": 1, "all_gates_eligible": true}`, passed it for production. The
+      status itself carried nothing tying it to the ledgers it came from, so even a genuine one could not
+      show which ledger state it counted. A status that was not a JSON object also escaped the gate's
+      error handling as a traceback; the gate now parses only its own tool's output, which is always
+      an object, so that path is closed by construction rather than by a test.
+    - **The fix.**
+      - The gate takes `--acceptance-ledger-root` instead. It runs `tools/acceptance_evidence.py` over that
+        root itself and trusts only what the tool prints. A tool failure blocks promotion to every
+        environment, and production still needs every gate eligible.
+      - The status is schema 2 and lists, for each ledger file counted, its path relative to the root, its
+        SHA-256, its record count and its chain head, all taken from the bytes the tool validated.
+      - The receipt is schema 2. It hashes the exact bytes the tool emitted and carries every ledger
+        binding.
+      - The production runbook's command and description are updated.
+    - **Tests.** In `tests/security/test_release_promotion_gate.py`, which covered only the approval rule:
+      - production is refused over an empty ledger root;
+      - a status document is not an input: two documents declaring every gate eligible, placed in the
+        ledger root itself, change nothing, and the parser refuses `--acceptance-status`;
+      - production becomes eligible only when the ledgers meet every gate, and one missing PAPER session
+        blocks it;
+      - a tampered ledger blocks staging and production alike;
+      - staging needs verifiable ledgers but not eligibility;
+      - the receipt's status hash is of the tool's exact bytes, and it binds each ledger file's SHA-256.
+
+      In the acceptance tests, the status binds two ledgers, one in a subdirectory, by relative path,
+      SHA-256, record count and head.
+    - **Rule 5.** 8 of 8 injected defects were caught:
+      - production no longer refused on open gates;
+      - the acceptance tool's failure ignored;
+      - `--acceptance-status` accepted again;
+      - the status dropping its bindings, one hashing the path instead of the bytes, and one recording the
+        genesis hash as its head;
+      - the receipt omitting the ledgers, or hashing a re-serialized status instead of the tool's bytes.
+
+      One injection was first refused by the runner as ambiguous, because its text appears twice in the
+      gate. It was re-anchored and caught. An early version of the `--acceptance-status` assertion would
+      have passed on missing required arguments alone. It now supplies every argument, so only the
+      unrecognized one can end the parse.
+    - **Measured result.** Python rose from 64 to 71 passed; the Rust workspace is unchanged
+      at 529 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+      The published status is schema 2 with zero verified records, every gate ineligible, and an empty
+      `ledgers` list, because no operational ledger has been retained.
+    - **Bounded remainder.** The gate still authenticates no reviewer, and it neither re-hashes the source
+      artifact a record names nor binds a release to the environment it was accepted in (E6.4). The
+      trusted release key is still whatever file the caller passes. Requester and approver are still two
+      distinct strings rather than two authenticated people. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

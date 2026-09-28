@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from tools import generate_pipeline_evidence
-from tools.acceptance_evidence import ZERO_HASH, EvidenceError, load_ledgers, record_hash, status
+from tools.acceptance_evidence import (
+    ZERO_HASH,
+    EvidenceError,
+    load_ledger_files,
+    load_ledgers,
+    record_hash,
+    status,
+)
 
 
 def make_record(
@@ -61,7 +69,42 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_ledger(root / "paper.acceptance.ndjson", records)
-            return status(load_ledgers(root))
+            return status(*load_ledger_files(root))
+
+    def test_the_status_binds_every_ledger_file_it_counted(self) -> None:
+        # Without this a status could not be tied to the ledger state it was
+        # computed from, so a receipt could not show what it trusted (E6.3).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "partners").mkdir()
+            paper = make_chain(("evidence.paper.1", "session.paper.1", {}), ("evidence.paper.2", "session.paper.2", {}))
+            partner = make_chain(("evidence.partner.1", "partner.1", {"evidence_type": "design_partner"}))
+            write_ledger(root / "paper.acceptance.ndjson", paper)
+            write_ledger(root / "partners" / "partner.acceptance.ndjson", partner)
+
+            report = status(*load_ledger_files(root))
+
+            self.assertEqual(report["acceptance_status_schema_version"], 2)
+            self.assertEqual(
+                report["ledgers"],
+                [
+                    {
+                        "path": "paper.acceptance.ndjson",
+                        "sha256": hashlib.sha256((root / "paper.acceptance.ndjson").read_bytes()).hexdigest(),
+                        "records": 2,
+                        "head": paper[-1]["record_hash"],
+                    },
+                    {
+                        "path": "partners/partner.acceptance.ndjson",
+                        "sha256": hashlib.sha256(
+                            (root / "partners" / "partner.acceptance.ndjson").read_bytes()
+                        ).hexdigest(),
+                        "records": 1,
+                        "head": partner[-1]["record_hash"],
+                    },
+                ],
+            )
+            self.assertEqual(len(load_ledgers(root)), 3)
 
     def refused(self, record: dict[str, object]) -> str:
         with tempfile.TemporaryDirectory() as directory:

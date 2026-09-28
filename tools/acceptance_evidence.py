@@ -99,11 +99,15 @@ def validate_record(record: object, expected_previous: str) -> dict[str, Any]:
     return record
 
 
-def load_ledgers(root: Path) -> list[dict[str, Any]]:
+def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Returns every verified record and, for each ledger file, what binds a
+    status to exactly the bytes it counted: the file's path relative to the
+    root, its SHA-256, its record count, and its chain head (E6.3)."""
     root = root.resolve(strict=True)
     if not root.is_dir():
         raise EvidenceError("evidence root must be a directory")
     records: list[dict[str, Any]] = []
+    ledgers: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     paths = sorted(root.rglob("*.acceptance.ndjson"))
     for path in paths:
@@ -113,6 +117,7 @@ def load_ledgers(root: Path) -> list[dict[str, Any]]:
         data = path.read_bytes()
         if data and not data.endswith(b"\n"):
             raise EvidenceError(f"ledger must end with a complete newline: {path.name}")
+        count = 0
         for line_number, line in enumerate(data.splitlines(), start=1):
             if not line or len(line) > MAX_LINE_BYTES:
                 raise EvidenceError(f"invalid evidence line {path.name}:{line_number}")
@@ -126,10 +131,21 @@ def load_ledgers(root: Path) -> list[dict[str, Any]]:
             seen_ids.add(record["evidence_id"])
             previous = record["record_hash"]
             records.append(record)
-    return records
+            count += 1
+        ledgers.append({
+            "path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "records": count,
+            "head": previous,
+        })
+    return records, ledgers
 
 
-def status(records: list[dict[str, Any]]) -> dict[str, Any]:
+def load_ledgers(root: Path) -> list[dict[str, Any]]:
+    return load_ledger_files(root)[0]
+
+
+def status(records: list[dict[str, Any]], ledgers: list[dict[str, Any]]) -> dict[str, Any]:
     accepted_subjects: dict[str, set[str]] = defaultdict(set)
     rejected_subjects: dict[str, set[str]] = defaultdict(set)
     rejected = defaultdict(int)
@@ -155,11 +171,14 @@ def status(records: list[dict[str, Any]]) -> dict[str, Any]:
             "rejected_records": rejected[evidence_type],
             "disqualified_subjects": len(disqualified),
         }
+    # Version 2 adds `ledgers`, so a status can be tied to the ledger state it
+    # was computed from (E6.3).
     return {
-        "acceptance_status_schema_version": 1,
+        "acceptance_status_schema_version": 2,
         "verified_records": len(records),
         "all_gates_eligible": all(gate["eligible"] for gate in gates.values()),
         "gates": gates,
+        "ledgers": ledgers,
     }
 
 
@@ -169,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args(argv)
     try:
-        report = status(load_ledgers(arguments.evidence_root))
+        report = status(*load_ledger_files(arguments.evidence_root))
     except (EvidenceError, OSError) as error:
         print(f"acceptance evidence verification failed: {error}", file=sys.stderr)
         return 2
