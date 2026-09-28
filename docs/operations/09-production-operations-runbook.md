@@ -31,7 +31,10 @@ evidence.
 Never generate fictional sessions or customer facts. Each
 `*.acceptance.ndjson` line is strict schema v1, binds a retained source artifact
 by SHA-256, uses a distinct observer/reviewer, and chains to the prior record.
-The validator counts unique accepted subjects and preserves rejected records.
+The validator counts unique accepted subjects that carry no rejected record in
+the same gate. A rejection disqualifies its subject whether it was recorded
+before or after an acceptance, because the ledger has no correction record;
+rejected records are preserved and counted separately.
 The required gates are 30 PAPER sessions, 60 controlled-LIVE sessions, five
 design partners, one broker-backed options acceptance, and one paying-customer
 acceptance record. Commercial roadmap targets above one customer remain in the

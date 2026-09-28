@@ -9,7 +9,7 @@ import json
 import re
 import sys
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,8 @@ MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 CANONICAL_ID = re.compile(r"^[a-z0-9._-]+$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
+# ASCII digits only: `\d` also matches other scripts' digits.
+CANONICAL_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 EVIDENCE_TARGETS = {
     "paper_session": 30,
     "live_session": 60,
@@ -56,20 +58,23 @@ def record_hash(record: dict[str, Any]) -> str:
 
 
 def validate_timestamp(value: object) -> None:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise EvidenceError("occurred_at must be canonical UTC ending in Z")
-    try:
-        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
-    except ValueError as error:
-        raise EvidenceError("occurred_at is invalid") from error
-    if parsed.tzinfo != UTC or parsed.microsecond != 0 or len(value) != 20:
+    # Exactly YYYY-MM-DDTHH:MM:SSZ. `fromisoformat` alone also accepted a
+    # space for the `T` and ISO week dates, both the same length (E6.2).
+    if not isinstance(value, str) or CANONICAL_UTC.fullmatch(value) is None:
         raise EvidenceError("occurred_at must use second-precision YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise EvidenceError("occurred_at is not a real UTC time") from error
 
 
 def validate_record(record: object, expected_previous: str) -> dict[str, Any]:
     if not isinstance(record, dict) or set(record) != REQUIRED_KEYS:
         raise EvidenceError("record keys do not match the v1 evidence contract")
-    if record["acceptance_evidence_schema_version"] != SCHEMA_VERSION:
+    version = record["acceptance_evidence_schema_version"]
+    # `type` rather than `isinstance`: JSON `true` is a `bool`, which is an
+    # `int` equal to 1, and passed an equality check (E6.2).
+    if type(version) is not int or version != SCHEMA_VERSION:
         raise EvidenceError("unsupported evidence schema version")
     for key in ("evidence_id", "subject_id", "observed_by", "reviewed_by"):
         value = record[key]
@@ -126,21 +131,29 @@ def load_ledgers(root: Path) -> list[dict[str, Any]]:
 
 def status(records: list[dict[str, Any]]) -> dict[str, Any]:
     accepted_subjects: dict[str, set[str]] = defaultdict(set)
+    rejected_subjects: dict[str, set[str]] = defaultdict(set)
     rejected = defaultdict(int)
     for record in records:
         if record["outcome"] == "accepted":
             accepted_subjects[record["evidence_type"]].add(record["subject_id"])
         else:
+            rejected_subjects[record["evidence_type"]].add(record["subject_id"])
             rejected[record["evidence_type"]] += 1
     gates = {}
     for evidence_type, required in EVIDENCE_TARGETS.items():
-        observed = len(accepted_subjects[evidence_type])
+        # A rejection disqualifies its subject within its gate, whichever
+        # record came first. The ledger has no correction record, so an
+        # acceptance can neither outlive a later rejection nor overturn an
+        # earlier one (E6.2).
+        disqualified = accepted_subjects[evidence_type] & rejected_subjects[evidence_type]
+        observed = len(accepted_subjects[evidence_type] - rejected_subjects[evidence_type])
         gates[evidence_type] = {
             "observed": observed,
             "required": required,
             "remaining": max(0, required - observed),
             "eligible": observed >= required,
             "rejected_records": rejected[evidence_type],
+            "disqualified_subjects": len(disqualified),
         }
     return {
         "acceptance_status_schema_version": 1,

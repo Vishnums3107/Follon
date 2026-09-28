@@ -3648,6 +3648,44 @@ These are mandatory master-plan acceptance conditions and are currently open:
       client may take to receive a large evidence download: at most 15 seconds, where there was no limit.
       No external gate moved.
 
+89. A rejection disqualifies its subject, and acceptance records are held to their exact contract
+    (2026-09-28, External and operational gates; delivery state E6.2). Reported by the revised assessment,
+    whose synthetic experiment showed a later rejection leaving a customer gate eligible.
+    - **The gaps.**
+      - A rejected record only incremented a per-gate counter; its `subject_id` was ignored. A subject
+        accepted and then rejected still counted toward its gate, and so did one rejected and then
+        accepted.
+      - `acceptance_evidence_schema_version` was compared with `!=`, so JSON `true`, which Python treats
+        as 1, passed, and so did 1.0.
+      - `occurred_at` was checked by `fromisoformat` plus its length and trailing `Z`. A space in place of
+        the `T`, and an ISO week date such as `2026-W35-1T10:00:00Z`, have the same length and passed.
+      - A test was named for refusing duplicate evidence IDs but only ever tampered with a record.
+    - **The fix.**
+      - Within each gate, any subject with a rejected record is subtracted from the accepted subjects,
+        whichever record came first. The ledger has no correction record, so an acceptance can neither
+        outlive a later rejection nor overturn an earlier one. Each gate reports `disqualified_subjects`.
+        A rejection in one gate does not touch another.
+      - The schema version must be the integer 1: `type`, not `isinstance`, because `bool` is an `int`.
+      - `occurred_at` must match `YYYY-MM-DDTHH:MM:SSZ` in ASCII digits, then parse as a real UTC time.
+      - The production runbook states the counting rule.
+    - **Tests.** Six new cases, on top of the tampering test, now named for what it does: rejection after
+      acceptance, rejection before acceptance, a rejection confined to its own subject and gate, a boolean
+      or float schema version, six non-canonical timestamps including February 30 and Arabic-Indic
+      digits, and a real duplicate evidence ID.
+    - **Rule 5.** 6 of 6 injected defects were caught, each by the test written for it: the subtraction
+      removed, the latest record allowed to win, a rejection disqualifying the subject in every gate, the
+      version compared by equality only, the old timestamp parser restored, and the duplicate check
+      removed.
+    - **Measured result.** Python rose from 58 to 64 passed; the Rust workspace is unchanged
+      at 529 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+      The published status reports zero verified records, every gate ineligible, and
+      `disqualified_subjects` in each gate.
+    - **Bounded remainder.** A mistaken rejection cannot be withdrawn: a correction record, and who may
+      write one, is a policy decision with the session criteria (E6.5). The status still carries nothing
+      that ties it to the ledger files it counted, and the promotion gate still trusts a supplied status
+      (E6.3). Nothing authenticates a reviewer (E6.4). No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
