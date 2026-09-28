@@ -210,7 +210,7 @@ flagged a LIVE fixture's `credential_reference`.
 
 | Slice | Scope | State |
 | --- | --- | --- |
-| E4.1 | The three failures with an obvious fix. Semgrep excludes the audit as a path, keeping the nginx rules on the real configuration. Gitleaks allowlists a `credential_reference` line holding a canonical secret reference, and nothing broader. The desktop job installs Tauri's documented Linux libraries. The bridge README's stale "without `ibapi`" instruction is corrected. | open |
+| E4.1 | The three failures with an obvious fix. Semgrep excludes the audit as a path, keeping the nginx rules on the real configuration. Gitleaks allowlists a `credential_reference` line holding a canonical secret reference, and nothing broader. The desktop job installs Tauri's documented Linux libraries. The bridge README's stale "without `ibapi`" instruction is corrected. Semgrep and gitleaks were verified both ways at CI's versions; the desktop fix is unverified until CI runs (audit item 85). | **done** 2026-09-28 |
 | E4.2 | An approved IBKR API distribution for the bridge's six official-backend tests. The only version they have run against is `ibapi` 9.81.1.post1 from PyPI, the one this machine has, published under IBKR's API licence. Current TWS API releases are 10.x, which reportedly rename `commission_report`, an import the bridge uses. | **decision** |
 | E4.3 | A green GitHub run of all six jobs on the reviewed commit. It needs a push, which waits for the operator, and E4.1's desktop fix is unverified until then. | open |
 

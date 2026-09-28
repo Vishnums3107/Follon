@@ -48,12 +48,22 @@ Do not copy the placeholder contract into an operational deployment. Resolve
 and independently verify the exact `con_id`, venue, primary exchange, currency,
 lot/tick rules, account, client ID, TWS time zone, and PAPER port first.
 
-Run the bridge-only contract suite without TWS or `ibapi`:
+Run the bridge contract suite:
 
 ```text
 PYTHONPATH=python/ibkr-gateway/src python -m unittest discover -s python/ibkr-gateway/tests -v
 ```
 
-This suite verifies the private protocol and fail-closed PAPER configuration.
-It is not a substitute for a controlled integration test against the exact
-operator-managed PAPER session and pinned official API build.
+Eight of its fourteen tests need neither TWS nor `ibapi`: they verify the
+private protocol and the fail-closed PAPER configuration. The other six (the
+four `OfficialBackendSubmitRetryTests` and two of the
+`OfficialBackendExecutionTimeTests`) exercise the official backend and import
+the official Python API, so without it they error with
+`No module named 'ibapi'`. They pass against `ibapi` 9.81.1.post1, the only
+version they have been run against. No distribution or version is pinned for
+deployment or CI yet (delivery state, E4.2). On Windows, which has no system
+time-zone database, `zoneinfo` also needs the `tzdata` package; without it
+eight tests error with `No module named 'tzdata'`.
+
+The suite is not a substitute for a controlled integration test against the
+exact operator-managed PAPER session and pinned official API build.

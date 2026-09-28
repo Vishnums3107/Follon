@@ -446,7 +446,7 @@ does not expose privileged mutations through the read-only evidence server.
 | Secret ingress | Implemented interfaces; deployment gate | Managed-command/password/connection-string file boundaries and zeroizing broker material exist. Production mode refuses a direct database URL and requires a TLS connection string. A production vault/keychain, rotation operation, and custody evidence remain external. |
 | Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
-| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. |
+| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. As of item 85 (2026-09-28), that Semgrep job and the gitleaks check had not passed on any run visible on GitHub: Semgrep blocked on this audit's own quotation of item 41's fixed defect, and gitleaks on a fixture's secret reference. Both are fixed and verified locally at CI's pinned versions; a green GitHub run is still open (delivery state E4.3). |
 | Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. |
 | MFA, short sessions, revocation, customer RBAC and tenant isolation | Implemented kernel/schema; deployment gate | Argon2id, password policy/rotation, TOTP with bounded challenges, hashed one-time recovery codes, lockout, opaque hashed 15-minute sessions, security-version revocation, five roles, tenant authorization, and PostgreSQL RLS schema are tested. Production enrollment, out-of-band delivery, support, and customer acceptance remain external. |
 | TLS and encryption at rest | TLS topology implemented; custody gate | Production Compose requires gRPC mTLS and a client-certificate dashboard proxy, pinned reviewed images, certificate secret files, and PostgreSQL `sslmode=require`. Certificate issuance/rotation, encrypted volume/KMS ownership, and deployed proof remain external. |
@@ -3451,6 +3451,59 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** A venue's own handling of a tick or lot change, whether it cancels, reprices
       or accepts odd lots, is not modelled. Price improvement and midpoint prints are not modelled either.
       No external gate moved.
+
+85. Foundation CI's failures with an obvious fix (2026-09-28, Security and Reliability; delivery state
+    E4.1). Reported by the revised assessment and reproduced here from GitHub's logs.
+    - **The gaps.** GitHub's `Verify foundation` workflow has not passed on any run visible there, back to
+      at least 2026-09-05. Main run 36334101143 failed three jobs, and PR run 36333055826 a fourth:
+      - `sast`: the one blocking finding was `generic.nginx.security.request-host-used` on line 1516 of
+        this audit, which quotes item 41's fixed defect. The nginx rules select their targets by a `conf`
+        path glob, which this file's name matches. Measured with Semgrep 1.177.0, the version CI pins: the
+        same text is flagged in a file named `conformance-notes.md` and not in one named `plain-notes.md`.
+      - `security`, on the PR run: gitleaks 8.24.3's `generic-api-key` flagged the `credential_reference`
+        field of two LIVE configuration fixtures, whose value is a canonical ID beginning `secret.broker.`.
+        That value names a managed secret; `core/secrets` documents `SecretReference` as
+        "the non-sensitive reference used for audit and access policy". A push to main scans only its own
+        commits, which is why the main run passed. A full-history scan found three findings, all this one.
+      - `desktop`: clippy stopped in `glib-sys`'s build script, "Package glib-2.0 was not found in the
+        pkg-config search path", because the runner lacks Tauri's Linux libraries. The native tests after
+        it were skipped.
+      - `python-and-contracts`: six IBKR bridge tests import `ibapi`, which the runner lacks. Which IBKR
+        API distribution CI may install is a decision (E4.2), so that job is unchanged here. The bridge
+        README said its suite runs "without TWS or `ibapi`", false since those six tests were added.
+    - **The fixes.**
+      - Semgrep excludes this audit as a path. Excluding the rule instead would stop scanning
+        `infra/nginx.dashboard.conf`. The audit's secrets remain covered by gitleaks.
+      - `.gitleaks.toml` extends the default rules with one allowlist: a line, anchored at both ends,
+        holding only `credential_reference` with a `secret.`-prefixed canonical ID. It has no `paths`
+        condition, because gitleaks 8.24.3 ignores `condition = "AND"` in the global allowlist, so a path
+        would allowlist every finding beneath it. That was measured before this file was written: with a
+        path and the condition, a real-looking key under the fixture directory, the same reference
+        elsewhere, and a token-shaped value in the field were all allowlisted.
+      - The desktop job installs Tauri v2's documented Ubuntu prerequisites before its native steps.
+      - The bridge README states what its suite needs. Eight tests need neither TWS nor `ibapi`. Six need
+        `ibapi`, and pass against 9.81.1.post1, the only version they have run against. On Windows,
+        `zoneinfo` also needs the `tzdata` package.
+      - The security job's test step was named "Verify deterministic SBOM generation" but runs every test
+        under `tests/security`. It is renamed.
+    - **Verification.** Each configuration change was checked in both directions, the rule-5 method
+      applied to configuration:
+      - Semgrep, the exact CI command plus the exclusion: 0 findings on 329 files, exit 0. With
+        `proxy_set_header Host $host;` re-injected into `infra/nginx.dashboard.conf`, the same command
+        blocked it, exit 1. The file was restored byte for byte.
+      - Gitleaks over the whole history, 100 commits, with the configuration: no findings, exit 0. In a
+        probe repository the canonical reference was allowed, and three leaks were still reported: a
+        real-looking key in the fixture directory, a token-shaped value in the allowlisted field, and a
+        real-looking key sharing a line with a canonical reference. A control run without the
+        configuration reported every probe file.
+      - The bridge suite as CI runs it, without `ibapi` but with `tzdata`: 14 run, the same 6 errors,
+        8 passed. With `ibapi` 9.81.1.post1: 14 passed.
+      - Not verified: the desktop fix. Docker's daemon was not running and this machine has no other
+        Linux environment, so it stays unverified until the workflow runs on GitHub (E4.3).
+    - **Measured result.** Configuration and documentation only. The final `python tools/session_status.py`
+      run, over this exact tree, measured all seven suites green with the Rust workspace unchanged at 521
+      passed / 0 failed / 3 ignored. The evidence pipeline was not run: its acceptance step would publish
+      the assessment's synthetic record, which E6.1 fixes next. No external gate moved.
 
 ## Business-readiness decision
 
