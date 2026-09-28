@@ -1764,7 +1764,11 @@ These are mandatory master-plan acceptance conditions and are currently open:
       repeat of the same identity. A transport failure leaves the combination `UNKNOWN` rather than guessing.
       `IbkrPaperAdapter` now accepts native combinations, because the real paper bridge it models
       (`adapters/brokers/ibkr::submit_paper_combo`) does; a model that refused what the thing it models
-      accepts would leave the path testable only against a rejection. **The part that matters most for safety
+      accepts would leave the path testable only against a rejection. **Corrected in place 2026-09-28: the
+      premise was false.** `submit_paper_combo` only forwards a `submit_combo` request to the Python bridge,
+      whose dispatch has no such operation and answers `unsupported bridge operation`; nothing in the
+      repository builds an IBKR BAG contract. The model's combination support is a model capability, not
+      parity with the real bridge (delivery state E5.1). **The part that matters most for safety
       is integration, not submission**: open orders, the rate window, reserved cash, the `UNKNOWN` guard and
       self-trade all now read both order maps through shared helpers, because a combination invisible to the
       single-order gate would be a hole in exactly the limits it is subject to. Its legs are individually
@@ -3455,6 +3459,9 @@ repository mechanisms and packages are deployable candidates after automated
 verification, but the open external gates above are material. The next
 master-plan action remains to configure and independently review the real IBKR
 PAPER environment, retain 30 clean sessions, complete security/legal/deployment
-approvals, and record them through the tamper-evident acceptance ledger. Broad
+approvals, and record them through the tamper-evident acceptance ledger. As of
+2026-09-28 a configured environment is not enough on its own: no application
+composes the real IBKR PAPER bridge yet (delivery state E5), so that
+composition comes first. Broad
 LIVE or commercial promotion before those gates would violate the plan's own
 evidence-gated sequence.

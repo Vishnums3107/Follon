@@ -890,13 +890,15 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
     }
 
-    /// Accepts an atomic combination, mirroring the real paper bridge.
+    /// Accepts an atomic combination. This is a model capability only.
     ///
-    /// The genuine IBKR paper transport does support native BAG combinations
-    /// (`adapters/brokers/ibkr::submit_paper_combo`), so this deterministic
-    /// model of that same bridge supports them too. A model that refused what
-    /// the thing it models accepts would make the combination path untestable
-    /// against anything but a rejection.
+    /// It was added on the belief that the genuine IBKR paper transport
+    /// supports native BAG combinations. It does not: its
+    /// `submit_paper_combo` forwards a `submit_combo` request that the Python
+    /// bridge's dispatch does not implement, and nothing in the repository
+    /// builds a BAG contract (delivery state E5.1, corrected 2026-09-28). The
+    /// model keeps combinations so the OMS combination path stays testable end
+    /// to end; that is not evidence the real bridge can execute one.
     fn submit_combo(
         &mut self,
         request: &BrokerComboRequest,
