@@ -1,5 +1,20 @@
 # Dashboard feature integration and remaining-work status
 
+## Current boundary clarification as of 27 September 2026
+
+The historical integration record below describes evidence views. Browser REST
+projections remain read-only, but the native desktop now exposes single/combo
+submission, cancellation, position close, and route status through its PAPER
+Risk/OMS gateway. That gateway uses a local fill model and operator-attested
+price/time; it is not connected to IBKR. Native writes lack separate operator
+authentication and omit optional aggregate portfolio-risk composition.
+
+The current pipeline publishes computed artifacts for two of the 32 advanced
+schema categories: decision reconstruction and strategy capsule manifest.
+It validates fixtures but does not publish computed artifacts for the remaining
+30. A view or example contract is not an implemented operating capability.
+See the [revised repository assessment](../analysis/project-status-2026-09-27.md).
+
 **Implementation snapshot: 2026-09-07; fabricated-evidence remediation: 2026-09-10; second
 fabricated-evidence remediation: 2026-09-20.** The desktop dashboard provides twelve (12) functional,
 workspace-specific read-only views over every capability across all 12 Enduring Capabilities (DUR-01

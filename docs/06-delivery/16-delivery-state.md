@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T16:22:10Z  
-**Branch:** `feat/risk-evidence-and-replay-hardening`  
-**HEAD:** `a0f750a` -- feat(replay): refuse to fill a working limit off a changed tick grid -- E3.6h (2026-09-27T20:51:20+05:30)  
-**Uncommitted paths:** 0
+**Measured at:** 2026-09-28T07:35:15Z  
+**Branch:** `docs/project-status-assessment-2026-09-27`  
+**HEAD:** `4adb090` -- Merge pull request #30 from Vishnums3107/feat/risk-evidence-and-replay-hardening (2026-09-27T22:10:20+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -74,6 +74,52 @@ already produced a real defect here.
 **All 7 executed suite(s) green.**
 
 <!-- END GENERATED STATUS -- tools/session_status.py -->
+
+## Current repository assessment as of 27 September 2026
+
+The examined GitHub `main` snapshot is `4adb0909430d723c800fb1a2fd4bddb8aaddd792`,
+which merged [PR 30](https://github.com/Vishnums3107/Follon/pull/30). The local
+measurement above passes every suite; that does **not** mean GitHub CI is green.
+The [main foundation run](https://github.com/Vishnums3107/Follon/actions/runs/36334101143)
+passed Rust, PostgreSQL integration, and security, but failed three jobs:
+
+- Python/IBKR tests: six tests could not import `ibapi` on the clean runner.
+- Linux desktop Clippy: the runner could not find `glib-2.0` through pkg-config.
+- SAST: one rule matched the historical vulnerable Nginx Host example in the
+  conformance document; the actual deployment configuration uses a fixed Host.
+
+A fresh `tools/dast_scan.py` run at `2026-09-27T16:49:11Z` passed 85 probes with
+zero failures. It remains a repository-authored local scan, not an independent
+security assessment. Two fresh SPY fixture backtests reproduced all four output
+types byte for byte. Root and native dependency audits exited 0; the native
+lockfile retains seven allowed warnings. No external acceptance gate moved:
+the inspected acceptance artifact has zero verified records.
+
+The [revised project assessment](../analysis/project-status-2026-09-27.md)
+supersedes the first report after deeper source review. The desktop, gRPC PAPER
+route, and PAPER CLI compose local models; the real IBKR PAPER process bridge
+requires application integration. Its Python dispatch lacks combination
+submission, and the real adapter lacks replacement. Native/API PAPER routes
+omit optional aggregate portfolio risk. The primary backtest runner is funded
+and long-only; advanced account models do not widen that executable route.
+
+The Python worker does not supply broker secrets through its protocol but is
+not an operating-system sandbox. Operations journals lack the PAPER/LIVE
+symlink guard. Acceptance tooling checks declared IDs, internal hashes, and
+subject counts without authenticating reviewers or verifying source artifacts;
+later rejections do not retract prior accepted subjects. The promotion tool's
+acceptance subcheck trusts caller-supplied status. These limits remain open.
+
+The deeper pass ran 56 control-plane, 17 backtest, and 15 security/tool tests,
+all passing. These 88 invocations overlap the earlier suites and are not added
+to their totals. An isolated synthetic experiment reproduced the acceptance
+and promotion-subcheck limits; no full promotion or actual acceptance ran.
+
+The earlier monetary range relied on unvalidated staffing effort and is
+withdrawn as a project-specific estimate. Realizable market value and company
+valuation remain undetermined. Engineering priorities are clean-runner CI,
+one integrated broker-PAPER workflow, and trustworthy acceptance evidence.
+External progress still requires 30 independently reviewed clean PAPER sessions.
 
 ## The backlog that code can actually close
 
