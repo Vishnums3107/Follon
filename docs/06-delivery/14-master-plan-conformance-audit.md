@@ -447,7 +447,7 @@ does not expose privileged mutations through the read-only evidence server.
 | Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
 | Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. As of item 85 (2026-09-28), that Semgrep job and the gitleaks check had not passed on any run visible on GitHub: Semgrep blocked on this audit's own quotation of item 41's fixed defect, and gitleaks on a fixture's secret reference. Both are fixed and verified locally at CI's pinned versions; a green GitHub run is still open (delivery state E4.3). |
-| Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. |
+| Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. As of item 88 (2026-09-28), it reads and discards a request's declared body, up to 64 KiB, before answering, and a 15-second socket timeout bounds every read. |
 | MFA, short sessions, revocation, customer RBAC and tenant isolation | Implemented kernel/schema; deployment gate | Argon2id, password policy/rotation, TOTP with bounded challenges, hashed one-time recovery codes, lockout, opaque hashed 15-minute sessions, security-version revocation, five roles, tenant authorization, and PostgreSQL RLS schema are tested. Production enrollment, out-of-band delivery, support, and customer acceptance remain external. |
 | TLS and encryption at rest | TLS topology implemented; custody gate | Production Compose requires gRPC mTLS and a client-certificate dashboard proxy, pinned reviewed images, certificate secret files, and PostgreSQL `sslmode=require`. Certificate issuance/rotation, encrypted volume/KMS ownership, and deployed proof remain external. |
 | Request idempotency | Implemented for durable event boundary | Orders/releases/artifacts remain idempotent; PostgreSQL event append binds tenant key to content and atomically creates outbox state. Production gateway/load evidence remains external. |
@@ -3608,6 +3608,45 @@ These are mandatory master-plan acceptance conditions and are currently open:
       refusing `submit_combo`, and `core/live` records that refusal as a transport failure that keeps the
       approval and a canary slot consumed (E5.7, latent). A refusal from the bridge itself, such as an
       unmapped instrument, still becomes `UNKNOWN` (E5.4). No external gate moved.
+
+88. The dashboard reads a request's declared body before it answers (2026-09-28, Security row "Dashboard
+    authentication"; delivery state E7.13). Found when scan probe H32 failed during item 87's first
+    pipeline run.
+    - **The gap.** The dashboard serves `GET`, and answers any other method with the standard library's
+      501, without reading a declared request body. Closing a connection with input unread resets it, and
+      the reset can reach the client before the client reads the response, which destroys it. Probe H32
+      sends `DELETE` with a two-byte body, recorded no response, and rightly treats that as a failure.
+      - Measured with the probe's own client against the real handler: 19 of 1,000 responses were lost.
+      - With the body sent just after the headers, every response was lost.
+      - Behind the production nginx proxy the same race would surface as a 502.
+    - **The fix.**
+      - `parse_request` runs once per request, after its headers and before any dispatch, including the
+        standard library's 501. It now reads and discards a declared body of at most 64 KiB.
+      - A larger or malformed declaration is never read, and the connection closes after the response.
+      - Every read now has a 15-second socket timeout. Before, no read had one, and a client that declared
+        a body and never sent it would have held its handler thread indefinitely once bodies were read.
+    - **Tests.** Four contract tests run against a real server, each sending the body one byte at a time
+      just after the headers:
+      - POST, PUT, DELETE and PATCH each keep their 501;
+      - a GET keeps its 200;
+      - a declared body that never arrives cannot hold the server: with the timeout shortened, the client
+        gets its 501 instead of timing out, and the default timeout is finite;
+      - a declared 10 MiB body is never read: with a handler timeout longer than the client's, the 501
+        still arrives.
+
+      The suite ran 15 times without a failure.
+    - **Rule 5.** 4 of 4 injected defects were caught: the discard removed, one byte of the body left
+      unread, the 64 KiB bound removed, and the timeout removed. The second was missed at first, because the
+      buffered reader pulled both bytes off the socket anyway, so the injection changed nothing observable.
+      The test now sends the body in pieces, so a short read leaves input unread, and is caught.
+    - **Measured result.** The dashboard contract suite rose from 20 to 24 tests; the Rust
+      workspaces are unchanged at 529 and 31. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with step 23b's scan at 85 probes, 0
+      failed. H32's own request against the real handler lost 19 responses in 1,000 before the fix and
+      none after.
+    - **Bounded remainder.** A chunked request body is not read. The timeout also bounds how long a slow
+      client may take to receive a large evidence download: at most 15 seconds, where there was no limit.
+      No external gate moved.
 
 ## Business-readiness decision
 

@@ -1280,6 +1280,44 @@ def system_status() -> dict[str, object]:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "FollonEvidenceDashboard"
+    # Seconds a client may take over any read or write on its connection. A
+    # client that declares a body and never sends it would otherwise hold its
+    # handler thread indefinitely once that body is read (E7.13).
+    timeout = 15
+    # The most of a declared request body that is read, and discarded, before
+    # the response. No path accepts a body. It is read only because closing a
+    # connection with unread input resets it, which can destroy the response
+    # before the client reads it (E7.13).
+    MAX_DISCARDED_BODY_BYTES = 64 * 1024
+
+    def parse_request(self) -> bool:
+        # Runs once per request, after its headers and before any dispatch,
+        # including the standard library's own 501 for an unsupported method.
+        if not super().parse_request():
+            return False
+        self.discard_request_body()
+        return True
+
+    def discard_request_body(self) -> None:
+        declared = self.headers.get("Content-Length")
+        if declared is None:
+            return
+        try:
+            length = int(declared)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length == 0:
+            return
+        if length < 0 or length > self.MAX_DISCARDED_BODY_BYTES:
+            # Never read an unbounded or malformed body; the connection closes
+            # after this response, reset or not.
+            self.close_connection = True
+            return
+        try:
+            self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
 
     def version_string(self) -> str:
         # The stdlib default appends the exact Python version to every

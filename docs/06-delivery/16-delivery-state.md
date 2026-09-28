@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-28T08:47:34Z  
+**Measured at:** 2026-09-28T09:02:24Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `a149a29` -- fix(acceptance): the pipeline counts only the operational ledger root -- E6.1 (2026-09-28T13:51:23+05:30)  
-**Uncommitted paths:** 7
+**HEAD:** `48a6ffc` -- feat(paper): a route declares what it can carry; the OMS refuses the rest first -- E5.1 (2026-09-28T14:23:57+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -273,7 +273,7 @@ passes it for production.
 | E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. | **decision** |
 | E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open. | open |
-| E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. | open |
+| E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
 
 ### E8 — Accounting and state parity (assessment priority 5)
 
