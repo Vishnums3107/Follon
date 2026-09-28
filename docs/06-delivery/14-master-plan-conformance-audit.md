@@ -3538,6 +3538,77 @@ These are mandatory master-plan acceptance conditions and are currently open:
       (E6.3), and nothing authenticates a reviewer or re-hashes a source artifact (E6.4). No external gate
       moved.
 
+87. A PAPER route declares what it can carry, and the OMS refuses the rest before an order exists
+    (2026-09-28, row 5.6 and Architecture; delivery state E5.1). Found while verifying the revised
+    assessment.
+    - **The gap.** The real IBKR PAPER adapter could not execute three things the OMS would send it, and
+      each left the order worse off than a refusal:
+      - A combination. `IbkrPaperBridgeProcessTransport::submit_paper_combo` forwarded a `submit_combo`
+        request, whose payload carried neither leg quantities nor the debit or credit sign, to a Python
+        bridge whose dispatch has no such operation. The bridge answers `unsupported bridge operation`.
+        The OMS records any adapter error as a transport failure, so the combination became `UNKNOWN`,
+        the session disconnected, and every later order was refused with
+        `UNKNOWN_ORDER_REQUIRES_RECONCILIATION`. Leaving `UNKNOWN` needs broker evidence, which the bridge
+        could never send for an order it never placed.
+      - A GTC intent. `BrokerOrderRequest` has no time in force and the bridge places every order DAY,
+        so a GTC intent would have been placed DAY with nothing recording the change.
+      - A replacement. The adapter inherits the trait's refusal, which the OMS meets after moving the
+        order to `PENDING_REPLACE`, so it too became `UNKNOWN` with the session disconnected.
+
+      No application composes the real adapter yet (E5.2), so none of this could happen in a shipped
+      application. It would have been the first thing an integration met.
+    - **The fix.** `PaperBrokerCapabilities` declares, per adapter and account, whether a route executes
+      combinations, carries GTC, and replaces orders. Its default is the narrowest set, single DAY
+      orders, so an adapter that declares nothing is never handed more.
+      - The service asks before it evaluates risk, because evaluation itself caches the request's mark
+        and moves the equity baselines. Anything the route cannot carry is refused with nothing
+        recorded, nothing transmitted, and the session still connected. Replacement is asked before the
+        order moves.
+      - The model declares all three, as model capabilities. The registry answers for its route's
+        adapter. The desktop's `ManualFillAdapter` declares everything but replacement, which it never
+        forwarded.
+      - The real adapter declares the default, and its transport no longer sends `submit_combo`; the
+        trait's default refuses without transmitting.
+    - **A test that passed for the wrong reason.** `FaultInjectingBroker` never forwarded `submit_combo`.
+      So `combo_transport_failure_leaves_the_group_unknown_and_disconnects` passed on the trait's
+      refusal: its scheduled Disconnect fault was never consumed, and every combination through the
+      wrapper became `UNKNOWN` whether or not a fault was scheduled. A first version of this slice gave
+      the wrapper no combinations, that test failed, and the reason was found. The wrapper now forwards
+      combinations under the same fault schedule as single orders. A new test shows that an unfaulted
+      combination through it is acknowledged, so the old test can no longer pass on a refusal.
+    - **Tests.**
+      - A narrow route refuses a GTC intent, a combination and a replacement. After each refusal no
+        order and no risk evidence exist, the broker was not called, the durable journal's sequence is
+        unchanged, the session is connected, and no order is `UNKNOWN`. The same route then carries a
+        DAY order.
+      - The refused GTC intent is on an instrument nothing else in its test touches, and so are the
+        refused combination's legs. After the next DAY order is journaled, neither appears anywhere in
+        the journal, so each refusal came before risk evaluation cached its mark.
+      - Each adapter's declaration: the default, the model, the fault wrapper over the model and over a
+        narrow route, and a registry holding a narrow route beside a model route.
+      - The real adapter declares the default and refuses a combination without calling its transport.
+        Its process transport, run against the fake bridge fixture, sends nothing for a combination: the
+        fixture exits on any operation it does not implement, and it still answers a poll afterwards.
+      - The desktop adapter declares everything but replacement.
+    - **Rule 5.** 14 of 14 injected defects were caught, each by a failing assertion rather than a compile
+      error:
+      - each of the three checks removed;
+      - each submission check moved after risk evaluation, caught only by the journal assertion;
+      - the model declaring no combinations, and the registry answering the default;
+      - the fault wrapper stripping combinations, ignoring its schedule, or not forwarding them at all;
+      - the real adapter declaring combinations or GTC, and its transport sending `submit_combo` again;
+      - the desktop adapter declaring replacement.
+    - **Measured result.** The Rust workspace rose from 521 to 529 passed / 0 failed / 3 ignored,
+      and the Tauri host from 30 to 31. The final `python tools/session_status.py` run measured all seven
+      suites green. The first full pipeline run failed one probe of step 23b's scan: H32, a DELETE with a
+      two-byte body sent to the dashboard, got no response. That is a flake which predates this slice and
+      lies outside it. In isolation it lost 12 responses in 1,000 with a body and none without, and the
+      next slice fixes it (E7.13). The rerun exited 0, with the scan at 85 probes and 0 failed.
+    - **Bounded remainder.** Controlled LIVE has the same shape: `IbkrControlledLiveAdapter` inherits a
+      refusing `submit_combo`, and `core/live` records that refusal as a transport failure that keeps the
+      approval and a canary slot consumed (E5.7, latent). A refusal from the bridge itself, such as an
+      unmapped instrument, still becomes `UNKNOWN` (E5.4). No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

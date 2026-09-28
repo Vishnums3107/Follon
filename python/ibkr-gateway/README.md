@@ -12,6 +12,16 @@ only through `IbkrPaperBridgeProcessTransport`; stdout is reserved for protocol
 messages. The current official setup and API reference are maintained in the
 [IBKR TWS API documentation](https://ibkrcampus.com/campus/ibkr-api-page/twsapi-doc/).
 
+## What the bridge executes
+
+Single market and limit orders, placed DAY, plus cancellation, execution
+polling, account snapshots and reconnect. It has no combination (BAG)
+operation, no replacement, no time in force other than DAY, and no market-data
+request. The Rust adapter, `IbkrPaperGatewayAdapter`, declares exactly this
+set, so the PAPER OMS refuses a combination, a GTC intent or a replacement
+before any order exists, rather than leaving it `UNKNOWN` (delivery state
+E5.1). No application composes the adapter yet (E5.2).
+
 The fixed process arguments have this shape (values are illustrative):
 
 ```text

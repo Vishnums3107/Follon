@@ -478,8 +478,39 @@ pub struct BrokerAccountSnapshot {
     pub cash: Decimal,
 }
 
+/// What one PAPER broker route can carry to its venue.
+///
+/// The service consults this before it evaluates risk or creates an order,
+/// so a request the route cannot carry is refused with nothing recorded,
+/// nothing transmitted and no `UNKNOWN` order left behind. Without it, a
+/// route whose adapter cannot execute a request reported the refusal as a
+/// transport failure: the order became `UNKNOWN`, the session disconnected,
+/// and nothing could ever clear it (delivery state E5.1).
+///
+/// The derived default is the narrowest set, single DAY orders. An adapter
+/// declares anything more.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaperBrokerCapabilities {
+    /// Executes an atomic multi-leg combination as one order.
+    pub combinations: bool,
+    /// Carries a good-til-cancelled time in force to the venue as such,
+    /// rather than dropping or rewriting it.
+    pub good_til_cancelled: bool,
+    /// Replaces a working order's limit price.
+    pub replacement: bool,
+}
+
 /// Paper-only broker boundary. It has no live environment parameter.
 pub trait PaperBrokerAdapter {
+    /// Declares what this adapter can carry for one account.
+    ///
+    /// The default is [`PaperBrokerCapabilities::default`], single DAY
+    /// orders, so an adapter that declares nothing is never handed a
+    /// combination, a GTC order or a replacement it would refuse, drop or
+    /// rewrite.
+    fn capabilities(&self, _account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        Ok(PaperBrokerCapabilities::default())
+    }
     /// Returns a stable non-secret fingerprint of this adapter implementation
     /// and its account-specific transport configuration.
     ///
@@ -656,6 +687,18 @@ impl PaperBrokerRegistry {
 }
 
 impl PaperBrokerAdapter for PaperBrokerRegistry {
+    /// A route carries exactly what its adapter declares.
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        validate_canonical_id("paper broker route account_id", account_id)?;
+        let route = self.routes.get(account_id).ok_or_else(|| {
+            PaperError("paper broker route is not configured for account".to_owned())
+        })?;
+        self.adapters
+            .get(&route.adapter_id)
+            .ok_or_else(|| PaperError("paper broker route adapter is unavailable".to_owned()))?
+            .capabilities(account_id)
+    }
+
     fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         validate_canonical_id("paper broker route account_id", account_id)?;
         let route = self.routes.get(account_id).ok_or_else(|| {
@@ -841,6 +884,22 @@ impl IbkrPaperAdapter {
 }
 
 impl PaperBrokerAdapter for IbkrPaperAdapter {
+    /// The model executes combinations and replacements, and never drops or
+    /// rewrites a time in force. These are model capabilities: the real
+    /// official-API bridge declares none of them (delivery state E5.1).
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        if account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match adapter configuration".to_owned(),
+            ));
+        }
+        Ok(PaperBrokerCapabilities {
+            combinations: true,
+            good_til_cancelled: true,
+            replacement: true,
+        })
+    }
+
     fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         if account_id != self.account_id {
             return Err(PaperError(
@@ -1142,6 +1201,12 @@ impl<B> FaultInjectingBroker<B> {
 }
 
 impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
+    /// Exactly the inner adapter's set: every operation it declares is
+    /// forwarded, under this wrapper's fault schedule.
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        self.inner.capabilities(account_id)
+    }
+
     fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         self.inner.adapter_configuration_fingerprint(account_id)
     }
@@ -1166,6 +1231,29 @@ impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
                 ))
             }
             Some(BrokerFault::DuplicateFirstEvent) | None => self.inner.submit(request),
+        }
+    }
+
+    /// Combinations follow the same submission fault schedule as single
+    /// orders. Before E5.1 this wrapper did not forward them, so every
+    /// combination met the trait's refusal, which the OMS recorded as
+    /// `UNKNOWN` whether or not a fault was scheduled.
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        match self.next_fault(BrokerOperation::Submit) {
+            Some(BrokerFault::Disconnect) => Err(PaperError(
+                "fault injection disconnected before paper combination submission".to_owned(),
+            )),
+            Some(BrokerFault::AmbiguousAfterSubmit) => {
+                let _ = self.inner.submit_combo(request)?;
+                Err(PaperError(
+                    "fault injection made paper combination submission outcome ambiguous"
+                        .to_owned(),
+                ))
+            }
+            Some(BrokerFault::DuplicateFirstEvent) | None => self.inner.submit_combo(request),
         }
     }
 
@@ -2892,6 +2980,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             });
         }
 
+        self.ensure_route_carries(intent.time_in_force, false)?;
         let decision = self.evaluate_risk(&intent, &market, decided_at)?;
         let evidence = PaperRiskEvidence {
             intent: intent.clone(),
@@ -3078,6 +3167,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             });
         }
 
+        self.ensure_route_carries(intent.time_in_force, true)?;
         // `evaluate_combo_risk` performs its own staleness check and updates
         // the mark cache, peak equity and daily baseline, exactly as the
         // single-order path relies on `evaluate_risk` to do.
@@ -3268,6 +3358,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if !self.broker_connected {
             return Err(PaperError(
                 "paper broker session is disconnected; reconnect and reconcile before replacement"
+                    .to_owned(),
+            ));
+        }
+        // Before the order moves to `PENDING_REPLACE`: a route that cannot
+        // replace would otherwise leave it `UNKNOWN` and the session
+        // disconnected (delivery state E5.1).
+        if !self
+            .broker
+            .capabilities(&self.account.account_id)?
+            .replacement
+        {
+            return Err(PaperError(
+                "the configured paper broker route cannot replace orders; the order was left unchanged"
                     .to_owned(),
             ));
         }
@@ -5141,6 +5244,31 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 "paper OMS is fail-closed after a durable journal write failure".to_owned(),
             ))
         }
+    }
+
+    /// Refuses a new order the configured broker route cannot carry. Callers
+    /// run it before risk is evaluated, because evaluation itself updates the
+    /// mark cache and equity baselines, so a refusal records, moves and
+    /// transmits nothing (delivery state E5.1).
+    fn ensure_route_carries(
+        &self,
+        time_in_force: TimeInForce,
+        combination: bool,
+    ) -> Result<(), PaperError> {
+        let capabilities = self.broker.capabilities(&self.account.account_id)?;
+        if combination && !capabilities.combinations {
+            return Err(PaperError(
+                "the configured paper broker route cannot execute combinations; nothing was recorded or transmitted"
+                    .to_owned(),
+            ));
+        }
+        if time_in_force == TimeInForce::GoodTilCancelled && !capabilities.good_til_cancelled {
+            return Err(PaperError(
+                "the configured paper broker route carries only DAY orders; the GTC intent was refused before anything was recorded or transmitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn persistent_state(&self) -> PersistentPaperState {
@@ -7343,6 +7471,310 @@ mod tests {
         fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// The model behind a route that declares only the trait default, single
+    /// DAY orders, as the real IBKR bridge adapter does. It forwards every
+    /// call to the model, which could execute all of them, so only the
+    /// service's capability check stands between a request and the broker.
+    struct NarrowRouteBroker {
+        inner: IbkrPaperAdapter,
+        broker_calls: u32,
+    }
+
+    impl NarrowRouteBroker {
+        fn new() -> Self {
+            Self {
+                inner: IbkrPaperAdapter::new(&account()).unwrap(),
+                broker_calls: 0,
+            }
+        }
+    }
+
+    impl PaperBrokerAdapter for NarrowRouteBroker {
+        fn adapter_configuration_fingerprint(
+            &self,
+            account_id: &str,
+        ) -> Result<String, PaperError> {
+            self.inner.adapter_configuration_fingerprint(account_id)
+        }
+
+        fn submit(
+            &mut self,
+            request: &BrokerOrderRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.broker_calls += 1;
+            self.inner.submit(request)
+        }
+
+        fn submit_combo(
+            &mut self,
+            request: &BrokerComboRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.broker_calls += 1;
+            self.inner.submit_combo(request)
+        }
+
+        fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+            self.inner.cancel(request)
+        }
+
+        fn replace(&mut self, request: &BrokerReplaceRequest) -> Result<(), PaperError> {
+            self.broker_calls += 1;
+            self.inner.replace(request)
+        }
+
+        fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+            self.inner.poll(account_id)
+        }
+
+        fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+            self.inner.snapshot(account_id)
+        }
+
+        fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+            self.inner.reconnect(account_id)
+        }
+    }
+
+    /// A durable service over a narrow route, in a fresh directory, so a test
+    /// can prove a refusal journaled nothing.
+    fn narrow_route_service(name: &str) -> (PathBuf, PaperTradingService<NarrowRouteBroker>) {
+        let directory = std::env::temp_dir().join(format!(
+            "follon-paper-narrow-route-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let service = PaperTradingService::open_durable(
+            account(),
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            NarrowRouteBroker::new(),
+            directory.join("journal.ndjson"),
+        )
+        .unwrap();
+        (directory, service)
+    }
+
+    #[test]
+    fn a_route_without_gtc_refuses_a_gtc_intent_before_anything_is_recorded() {
+        let (directory, mut service) = narrow_route_service("gtc");
+        let at = "2026-01-02T14:31:00Z";
+        let sequence = service.dashboard().audit_sequence;
+        // On an instrument nothing else in this test touches, so any trace of
+        // it in the journal can only have come from the refused request.
+        let gtc = OrderIntent {
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            time_in_force: TimeInForce::GoodTilCancelled,
+            ..intent("intent-narrow-gtc-001", at)
+        };
+        let qqq = PaperMarketData {
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            mark_price: decimal("mark", "250").unwrap(),
+            observed_at: at.to_owned(),
+        };
+
+        let error = service.submit_intent(gtc, qqq, at).unwrap_err();
+
+        assert!(error.0.contains("carries only DAY orders"), "{}", error.0);
+        assert!(service.order("order-intent-narrow-gtc-001").is_none());
+        assert!(service
+            .risk_evidence("paper-risk-intent-narrow-gtc-001")
+            .is_none());
+        assert_eq!(service.broker_mut().broker_calls, 0);
+        let dashboard = service.dashboard();
+        assert_eq!(
+            dashboard.audit_sequence, sequence,
+            "the refusal was journaled"
+        );
+        assert!(dashboard.broker_connected);
+        assert_eq!(dashboard.unknown_orders, 0);
+
+        // The same route still carries a DAY order, and journaling it must
+        // not carry anything the refused request left behind: risk
+        // evaluation caches the request's mark, and the next record persists
+        // that cache, so a refusal after evaluation would leak it here.
+        let day = service
+            .submit_intent(intent("intent-narrow-day-001", at), market(at), at)
+            .unwrap();
+        assert!(day.decision.approved, "{:?}", day.decision.reason_codes);
+        assert_eq!(service.broker_mut().broker_calls, 1);
+        drop(service);
+        let journal = fs::read_to_string(directory.join("journal.ndjson")).unwrap();
+        assert!(
+            !journal.contains("inst.us_equity.qqq"),
+            "the refused request reached the journal"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_route_without_combinations_refuses_one_before_anything_is_recorded() {
+        // Before the capability check, the real bridge adapter answered a
+        // combination with an error the OMS records as a transport failure:
+        // the combination became UNKNOWN, the session disconnected, and every
+        // later order was refused until evidence that could never arrive.
+        let (directory, mut service) = narrow_route_service("combo");
+        let at = "2026-01-02T14:31:00Z";
+        let sequence = service.dashboard().audit_sequence;
+
+        let error = service
+            .submit_combo_intent(
+                combo_intent("intent-narrow-combo-001", at),
+                combo_market(at),
+                at,
+            )
+            .unwrap_err();
+
+        assert!(
+            error.0.contains("cannot execute combinations"),
+            "{}",
+            error.0
+        );
+        assert!(service
+            .combo_order(&OmsComboOrder::order_id_for("intent-narrow-combo-001"))
+            .is_none());
+        assert!(service
+            .combo_risk_evidence("paper-combo-risk-intent-narrow-combo-001")
+            .is_none());
+        assert_eq!(service.broker_mut().broker_calls, 0);
+        let dashboard = service.dashboard();
+        assert_eq!(
+            dashboard.audit_sequence, sequence,
+            "the refusal was journaled"
+        );
+        assert!(dashboard.broker_connected);
+        assert_eq!(dashboard.working_orders, 0);
+
+        // Nothing blocks the next single order, and journaling it carries no
+        // leg mark the refused request's risk evaluation would have cached.
+        let day = service
+            .submit_intent(intent("intent-narrow-day-002", at), market(at), at)
+            .unwrap();
+        assert!(day.decision.approved, "{:?}", day.decision.reason_codes);
+        drop(service);
+        let journal = fs::read_to_string(directory.join("journal.ndjson")).unwrap();
+        assert!(
+            !journal.contains("inst.us_option.spy.near"),
+            "the refused request reached the journal"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_route_without_replacement_refuses_one_and_leaves_the_order_unchanged() {
+        let (directory, mut service) = narrow_route_service("replace");
+        let at = "2026-01-02T14:31:00Z";
+        let resting = service
+            .submit_intent(
+                OrderIntent {
+                    order_type: OrderType::Limit,
+                    limit_price: Some(decimal("limit", "99.50").unwrap()),
+                    ..intent("intent-narrow-replace-001", at)
+                },
+                market(at),
+                at,
+            )
+            .unwrap();
+        let order_id = resting.order_id.unwrap();
+        assert_eq!(resting.state, Some(OrderState::Acknowledged));
+        let sequence = service.dashboard().audit_sequence;
+        let calls = service.broker_mut().broker_calls;
+
+        let error = service
+            .replace_order(&order_id, decimal("limit", "99").unwrap())
+            .unwrap_err();
+
+        assert!(error.0.contains("cannot replace orders"), "{}", error.0);
+        assert_eq!(
+            service.order(&order_id).unwrap().oms.state,
+            OrderState::Acknowledged
+        );
+        assert_eq!(service.broker_mut().broker_calls, calls);
+        let dashboard = service.dashboard();
+        assert_eq!(
+            dashboard.audit_sequence, sequence,
+            "the refusal was journaled"
+        );
+        assert!(dashboard.broker_connected);
+        assert_eq!(dashboard.unknown_orders, 0);
+        drop(service);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_route_declares_what_its_adapter_can_carry() {
+        let everything = PaperBrokerCapabilities {
+            combinations: true,
+            good_til_cancelled: true,
+            replacement: true,
+        };
+        assert_eq!(
+            PaperBrokerCapabilities::default(),
+            PaperBrokerCapabilities {
+                combinations: false,
+                good_til_cancelled: false,
+                replacement: false,
+            }
+        );
+        let model = IbkrPaperAdapter::new(&account()).unwrap();
+        assert_eq!(model.capabilities("acct.paper.001").unwrap(), everything);
+        assert!(model.capabilities("acct.paper.002").is_err());
+        assert_eq!(
+            NarrowRouteBroker::new()
+                .capabilities("acct.paper.001")
+                .unwrap(),
+            PaperBrokerCapabilities::default()
+        );
+        assert_eq!(
+            FaultInjectingBroker::new(IbkrPaperAdapter::new(&account()).unwrap())
+                .capabilities("acct.paper.001")
+                .unwrap(),
+            everything
+        );
+        assert_eq!(
+            FaultInjectingBroker::new(NarrowRouteBroker::new())
+                .capabilities("acct.paper.001")
+                .unwrap(),
+            PaperBrokerCapabilities::default()
+        );
+
+        // A registry route carries exactly what its own adapter declares:
+        // a narrow route and a model route side by side.
+        let second_account = PaperAccount {
+            account_id: "acct.paper.002".to_owned(),
+            ..account()
+        };
+        let mut registry = PaperBrokerRegistry::new();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: "acct.paper.001".to_owned(),
+                    adapter_id: "adapter.ibkr.paper.narrow".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(NarrowRouteBroker::new()),
+            )
+            .unwrap();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: "acct.paper.002".to_owned(),
+                    adapter_id: "adapter.ibkr.paper.model".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(IbkrPaperAdapter::new(&second_account).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.capabilities("acct.paper.001").unwrap(),
+            PaperBrokerCapabilities::default()
+        );
+        assert_eq!(registry.capabilities("acct.paper.002").unwrap(), everything);
+        assert!(registry.capabilities("acct.paper.unrouted").is_err());
+    }
+
     #[test]
     fn a_lot_size_table_must_be_nonempty_positive_and_canonical() {
         for broken in [
@@ -7549,6 +7981,10 @@ mod tests {
 
     #[test]
     fn combo_transport_failure_leaves_the_group_unknown_and_disconnects() {
+        // Until E5.1 the fault wrapper did not forward combinations, so this
+        // passed on the trait's refusal and the scheduled fault was never
+        // consumed. It now exercises the fault itself; the test below shows
+        // an unfaulted combination reaches the model.
         let account = account();
         let adapter = IbkrPaperAdapter::new(&account).unwrap();
         let mut faulted = FaultInjectingBroker::new(adapter);
@@ -7573,6 +8009,28 @@ mod tests {
         // And an UNKNOWN combination blocks the next decision of either kind,
         // exactly as an UNKNOWN plain order does.
         assert!(service.has_unknown_order());
+    }
+
+    #[test]
+    fn the_fault_wrapper_forwards_a_combination_when_no_fault_is_scheduled() {
+        let account = account();
+        let faulted = FaultInjectingBroker::new(IbkrPaperAdapter::new(&account).unwrap());
+        let mut service = PaperTradingService::new(
+            account,
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            faulted,
+        )
+        .unwrap();
+        let outcome = service
+            .submit_combo_intent(
+                combo_intent("combo-000025", "2026-01-02T14:30:00Z"),
+                combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert_eq!(outcome.state, Some(OrderState::Acknowledged));
+        assert!(!service.has_unknown_order());
     }
 
     #[test]

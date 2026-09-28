@@ -121,9 +121,10 @@ for the deployment and evidence sequence.
 - The desktop, gRPC PAPER route, and PAPER status CLI currently compose local
   model adapters. The official IBKR PAPER process bridge is implemented as a
   library component but is not wired into those application compositions.
-  Its checked-in Python backend submits single market/limit DAY orders; it
-  does not dispatch the Rust transport's combination command, and the real
-  PAPER adapter does not implement replacement.
+  Its checked-in Python backend submits single market/limit DAY orders only.
+  The real adapter declares exactly that, so the PAPER OMS refuses a
+  combination, a GTC intent or a replacement on that route before any order
+  exists.
 - The primary strategy backtest route is funded and long-only. Advanced
   margin, financing, and short accounting are separate model calculations;
   their presence does not enable those strategies in the primary runner.
