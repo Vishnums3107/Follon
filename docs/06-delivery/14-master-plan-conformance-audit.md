@@ -3505,6 +3505,39 @@ These are mandatory master-plan acceptance conditions and are currently open:
       passed / 0 failed / 3 ignored. The evidence pipeline was not run: its acceptance step would publish
       the assessment's synthetic record, which E6.1 fixes next. No external gate moved.
 
+86. The evidence pipeline counts only the operational acceptance ledgers (2026-09-28, External and
+    operational gates; delivery state E6.1). Found while verifying the revised assessment.
+    - **The gap.** Pipeline step 23 ran `tools/acceptance_evidence.py` over `var/` itself, and the tool
+      counts every `*.acceptance.ndjson` beneath its root. The 2026-09-27 assessment retained a synthetic
+      boundary-experiment ledger under `var/reports/`: one structurally valid `paying_customer` record,
+      invented to probe the tool's limits and labelled as such in its notes. An in-memory run of the tool
+      over this machine's `var/` counted it as one verified record, with the paying-customer gate
+      eligible. The pipeline had not run since that ledger was written, so nothing false was published;
+      its next run would have published it.
+    - **The fix.** Step 23 is now `publish_acceptance_status(var_dir)`, which audits only `var/acceptance/`,
+      the operational ledger root, and creates it empty when absent. The tool refuses a missing root rather
+      than reporting zero, and an empty root is the truth when no ledger has been retained. The production
+      runbook names the root and says to keep review and synthetic ledgers out of it. The assessment's
+      ledger is left where it was: it is the assessment's retained evidence, and it is now outside what
+      counts.
+    - **Tests.** `PipelineAcceptanceRootTests` runs the pipeline's own step against a temporary `var/`:
+      - a valid synthetic customer ledger under `reports/` is not counted, and the gate stays ineligible;
+      - a ledger under the operational root is counted;
+      - an absent root is created empty and reports zero records.
+    - **Rule 5.** 3 of 3 injected defects were caught:
+      - the root reverted to `var/` itself, the original defect. Only the first test failed, on the count;
+      - the root no longer created, after which the tool refused the missing directory;
+      - the root moved to a directory that counts nothing, caught by the second test.
+    - **Measured result.** Python rose from 55 to 58 passed; the Rust workspace is unchanged at 521 passed /
+      0 failed / 3 ignored. The final `python tools/session_status.py` run measured all seven suites green,
+      and the full evidence pipeline exited 0, including step 23b's scan (85 probes, 0 failed). The
+      published `var/follon-acceptance-status.json` reports zero verified records and every gate
+      ineligible, with the synthetic ledger still present under `var/reports/`.
+    - **Bounded remainder.** The tool still trusts whatever sits under its root. A subject rejected after it
+      was accepted still counts (E6.2), the promotion gate still trusts a caller-supplied status document
+      (E6.3), and nothing authenticates a reviewer or re-hashes a source artifact (E6.4). No external gate
+      moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -37,6 +37,11 @@ design partners, one broker-backed options acceptance, and one paying-customer
 acceptance record. Commercial roadmap targets above one customer remain in the
 master-plan audit and cannot be inferred from this minimum technical gate.
 
+The evidence pipeline (step 23) audits only `var/acceptance/`, the operational
+ledger root, and every `*.acceptance.ndjson` beneath it counts. Keep review,
+experiment, and synthetic ledgers out of that directory. A ledger anywhere else
+under `var/` is never counted.
+
 ## Monitoring and on-call
 
 Combine `infra/compose.production.yml` and `infra/compose.monitoring.yml` only

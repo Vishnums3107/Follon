@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-28T08:08:37Z  
+**Measured at:** 2026-09-28T08:18:32Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `0e1eee6` -- docs(assessment): retain the revised capability and readiness assessment (2026-09-28T13:28:54+05:30)  
-**Uncommitted paths:** 6
+**HEAD:** `5f8e5c6` -- ci: fix the foundation failures that have an obvious fix -- E4.1 (2026-09-28T13:43:57+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -67,7 +67,7 @@ already produced a real defect here.
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 55 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 58 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -250,7 +250,7 @@ passes it for production.
 
 | Slice | Scope | State |
 | --- | --- | --- |
-| E6.1 | Pipeline step 23 audits only the operational ledger root, `var/acceptance/`, so no ledger elsewhere under `var/` is ever counted. | open |
+| E6.1 | Pipeline step 23 audits only the operational ledger root, `var/acceptance/`, so no ledger elsewhere under `var/` is ever counted. The assessment's synthetic ledger under `var/reports/` is no longer counted (audit item 86). | **done** 2026-09-28 |
 | E6.2 | A subject with any rejected record does not count toward its gate. The schema version must be the integer 1, not JSON `true`. `occurred_at` must be exactly `YYYY-MM-DDTHH:MM:SSZ`, not also a space-separated time or a week date, which both pass today. | open |
 | E6.3 | The promotion gate recomputes eligibility from the ledger root rather than trusting a status document, and its receipt binds the ledger files it counted. | open |
 | E6.4 | Reviewer authentication, with records signed against a trusted reviewer key set; each record's source artifact re-hashed against a retained artifact root; and release and environment binding. | open, design first |
