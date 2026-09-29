@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T08:12:58Z  
-**Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `7306f8c` -- feat(trading-api): authenticated PAPER single-order and cancel RPCs -- E5.2b-2 (2026-09-29T13:35:25+05:30)  
-**Uncommitted paths:** 7
+**Measured at:** 2026-09-29T10:48:13Z  
+**Branch:** `refactor/module-decomposition`  
+**HEAD:** `8eb8798` -- docs(ibkr): add the Rust adapter README and cross-link the Python bridge (2026-09-29T16:16:17+05:30)  
+**Uncommitted paths:** 0
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -780,6 +780,51 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-29 — session 12
+
+- Structure refactor only; no behaviour changed. Branch
+  `refactor/module-decomposition` (unpushed). Split the monolithic `lib.rs` of
+  `core/domain`, `core/risk`, `core/execution` and `core/paper` into modules
+  (paper in three slices: top-level types, the `service/` impl chunks, and the
+  4,700-line inline test module into `tests/` by topic), moved each crate's
+  inline tests to `tests.rs`, and organised `apps/desktop/src` into
+  `evidence/`, `workspaces/` and `orders/`. Every `lib.rs` is now 24-55 lines;
+  the largest desktop source file is now 41 KB (was 168 KB).
+- Every split is a pure move. A whitespace-insensitive comparison of each
+  file's lines against its previous commit differs only by imports, `mod` /
+  `pub use` wiring, `pub(crate)` on items that now cross modules, and a few
+  rustfmt re-wraps. Test names were listed before and after (paper 95, domain
+  17, risk 8, execution 37) and are identical. Items private to the old
+  single-file crate roots were already crate-visible, so `pub(crate)` keeps the
+  access surface unchanged; `PaperTradingService` fields that only its own
+  `service/` chunks touch stay private.
+- The one edit that is not a move: the desktop's two module-level
+  `mountedTicket` / `mountedComboTicket` variables, reassigned by three
+  renderers, became one `mountedTickets` holder object, because an imported
+  binding cannot be reassigned. The desktop contract tests (`test/*.mjs`,
+  `server_contract.py`) follow the folder layout; the module-graph test now
+  resolves imports relative to the importing file, so `../` imports are checked
+  where the flat resolver skipped them.
+- Measured: the generated block above (562 Rust tests, 31 Tauri host, 75
+  Python, both desktop suites; 24 server-contract tests) and a full
+  `tools/generate_pipeline_evidence.py` run, every step exit 0 (45 artifacts).
+  No injection run: nothing here changes behaviour.
+- Not split, on purpose: `apps/desktop/src/main.ts` (script-style, shared
+  mutable state; a redesign, not a move) and `core/control-plane/src/lib.rs`
+  (its bytes are hashed into the built-in strategy bundle hash). Still large
+  and untouched: `core/live/src/lib.rs` (about 9,400 lines),
+  `services/trading-api/src/main.rs`, `core/backtest`, `core/operations`,
+  `core/commercial`, `core/options`, `core/accounting`.
+- The structure review's cache and `.env` items needed no change: no cache
+  directory or `infra/.env` is tracked, and `.gitignore` covers them.
+- Observation, not changed: `CLAUDE.md` describes `adapters/brokers/ibkr` as
+  hard-locked to paper ports and loopback. The crate also holds controlled-LIVE
+  adapter types (loopback, ports 7496 / 4001) that no non-test transport
+  implements; the new `adapters/brokers/ibkr/README.md` says so.
+- **Next action:** the operator's call whether to push this branch and open a
+  PR (public repository: run gitleaks over the history and the CI Semgrep
+  command first). The E5.3 / E5.5 direction from session 11 is unchanged.
 
 ### 2026-09-29 — session 11
 
