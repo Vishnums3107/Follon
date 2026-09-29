@@ -914,7 +914,13 @@ impl ProcessStrategyWorker {
         command
             .args(arguments)
             .env_clear()
-            .env("PYTHONIOENCODING", "utf-8");
+            .env("PYTHONIOENCODING", "utf-8")
+            // A fixed string-hash seed. Python otherwise seeds `hash()` of
+            // `str` and `bytes` randomly per process, so iterating a set of
+            // symbols, or anything keyed by such hashes, could order a
+            // strategy's decisions differently between two runs of the same
+            // replay (delivery state E7.3).
+            .env("PYTHONHASHSEED", "0");
         if let Some(sandbox) = sandbox {
             command
                 .env("PYTHONPATH", &sandbox.python_path)
@@ -3473,6 +3479,72 @@ mod tests {
         .unwrap();
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].bar.close, Decimal::from_integer(100).unwrap());
+    }
+
+    /// An absolute interpreter path, because the worker receives no PATH.
+    fn python_executable() -> Option<std::path::PathBuf> {
+        ["python", "python3"].into_iter().find_map(|candidate| {
+            std::process::Command::new(candidate)
+                .args([
+                    "-c",
+                    "import pathlib,sys;print(pathlib.Path(sys.executable).resolve())",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|output| std::path::PathBuf::from(output.trim()))
+                .filter(|path| path.is_absolute() && path.is_file())
+        })
+    }
+
+    #[test]
+    fn two_runs_of_a_worker_hash_strings_identically() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the worker hash-seed fixture was skipped");
+            return;
+        };
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/worker/hash-seed-worker.py")
+            .canonicalize()
+            .expect("fixture path");
+        let identity = StrategyWorkerIdentity {
+            account_id: "acct.paper.001".to_owned(),
+            strategy_id: "strategy-worker-001".to_owned(),
+            strategy_version: "v1".to_owned(),
+            configuration_version: "cfg-v1".to_owned(),
+            strategy_bundle_hash: "a".repeat(64),
+            environment: "SIMULATION".to_owned(),
+        };
+        // The fixture answers every callback with an error whose code is the
+        // hash of a fixed string, so the error text exposes each process's
+        // string-hash seed.
+        let reported_hash = || {
+            let mut worker = ProcessStrategyWorker::spawn(
+                python.as_os_str(),
+                [
+                    fixture.clone().into_os_string(),
+                    identity.strategy_bundle_hash.clone().into(),
+                    identity.strategy_id.clone().into(),
+                    identity.strategy_version.clone().into(),
+                ],
+                identity.clone(),
+            )
+            .expect("worker starts");
+            worker
+                .request_intent(&bar(), "2026-01-02T14:31:00Z")
+                .expect_err("the fixture rejects every callback")
+                .0
+        };
+        let first = reported_hash();
+        assert!(first.contains("hash."), "{first}");
+        for _ in 0..3 {
+            assert_eq!(
+                reported_hash(),
+                first,
+                "string hashing differed between runs"
+            );
+        }
     }
 
     #[test]

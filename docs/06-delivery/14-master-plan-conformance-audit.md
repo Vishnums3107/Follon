@@ -3777,6 +3777,30 @@ These are mandatory master-plan acceptance conditions and are currently open:
     - **Bounded remainder.** Every guard still runs before its open, so a link swapped in between them is
       not refused (E7.12). The penetration-test runbook lists the new paths. No external gate moved.
 
+92. Every strategy worker hashes strings identically in every run (2026-09-28, research-to-live parity
+    and Reliability; delivery state E7.3). Found by the source review behind the revised assessment.
+    - **The gap.** The parent clears the worker's environment and sets only `PYTHONIOENCODING` and an
+      import path. With `PYTHONHASHSEED` unset, Python seeds `hash()` of `str` and `bytes` randomly per
+      process. A strategy that iterates a set of symbols, or anything ordered by such hashes, could
+      therefore decide in a different order in two runs of one replay. A capsule's byte-for-byte replay
+      check would then fail at random rather than report a real change.
+    - **The fix.** `spawn_inner`, behind every worker constructor including the capsule's sandboxed one,
+      sets `PYTHONHASHSEED=0`. The CLI README states the worker's full environment and that the worker is
+      a same-user process for trusted code only.
+    - **Test.** A fixture worker, `tests/fixtures/worker/hash-seed-worker.py`, speaks protocol v1 and
+      answers every callback with an error whose code is the hash of a fixed string. The test starts it
+      four times through `ProcessStrategyWorker::spawn` and requires the same code each time.
+    - **Rule 5.** 2 of 2 injected defects were caught, before and after formatting: the seed removed, and
+      the seed set to `random`.
+    - **Measured result.** The Rust workspace rose from 534 to 535 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed. Its strategy capsule, replayed by a
+      seeded worker, still sealed `VERIFIED_PORTABLE`.
+    - **Bounded remainder.** The backtest configuration's `seed` is still provenance only. It does not seed
+      a strategy's own `random`, as the E7.3 row records, and a strategy may still read the clock, files or
+      the network, which only running trusted code controls. Hashes are identical for one Python version,
+      not across versions. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
