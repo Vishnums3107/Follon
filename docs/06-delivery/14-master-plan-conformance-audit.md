@@ -4397,6 +4397,52 @@ These are mandatory master-plan acceptance conditions and are currently open:
        and one instrument, the case the doc states; FX conversion and multipliers are
        covered by the advanced account's own tests. No external gate moved.
 
+109. The release SBOM covers the desktop's Cargo workspace and records first-party
+     licences (2026-09-29, Release supply chain; E7.8). Found by the source review behind
+     the revised assessment, and unblocked by E7.11's decision on the licence.
+     - **Gap.** `tools/generate_sbom.py` read the root `Cargo.lock`, the desktop's npm
+       lockfile and the Python `pyproject.toml` files. The desktop host is a separate Cargo
+       workspace with its own lockfile, so Tauri and its whole dependency tree were absent
+       from the bill of a build that ships them. No component recorded a first-party
+       licence, and the desktop npm package, a first-party component, had none to record.
+     - **Behavior.**
+       - The desktop host's `Cargo.lock` is read and hashed as an input, and each
+         component names the lockfile that declares it: Tauri only the desktop's, a shared
+         crate such as `follon-domain` both.
+       - First-party Cargo licences come from each workspace member's manifest and the
+         desktop's, resolving `license.workspace = true`. A package with no registry or git
+         source is first-party. Its licence is recorded, as `follon:license` and as
+         CycloneDX's native `licenses`, and it carries `follon:first-party`.
+       - Python packages carry their PEP 639 licence expression, and the desktop npm
+         package is now a first-party component. The bill's own component carries the
+         repository's licence. A licence that is an SPDX expression is written as an
+         expression, not as an identifier.
+       - Every manifest read is hashed into the bill's inputs, so a licence change changes
+         the bill's own evidence.
+       - The generator refuses a first-party crate that declares no licence, a path package
+         it has no manifest for, a Python package without a licence, and an npm package
+         without a name, version and licence.
+       - `apps/desktop/package.json` and the lockfile's root entry declare MIT, and the
+         licence-declaration test now covers them.
+     - **Tests.** Nine SBOM tests and one licence test were added. Tauri is present, and
+       only under the desktop lockfile. A crate in both workspaces names both. Every
+       first-party component is exactly the set the manifests declare, each with its licence,
+       and no registry component claims to be first-party. The refusals are each held with a
+       synthetic tree, and inheritance resolves.
+     - **Rule 5.** 15 of 15 injected defects were caught: the desktop lock left out, not
+       hashed, or mis-attributed; a wrong licence; no path package treated as first-party,
+       or a registry crate claiming to be; the bill naming no licence for itself; every
+       licence written as an identifier; each refusal removed; and the desktop package losing
+       its licence.
+     - **Measured result.** The Python suite rose from 95 to 105 passed. The final
+       `python tools/session_status.py` run measured all seven suites green. The full
+       evidence pipeline exited 0, and the SBOM it publishes now has 639 components.
+     - **Boundary.** Third-party Cargo licences are still not recorded: a lockfile does not
+       carry them, and reading them needs each crate's registry metadata. That remains a
+       part of the SBOM review the deployment runbook already requires. The bill is a
+       machine-readable record, not a licence-compatibility clearance. No external gate
+       moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

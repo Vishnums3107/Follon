@@ -146,6 +146,13 @@ proxy rate limits, MFA, centralized identity, alerts, or source-IP controls.
   python tools/generate_sbom.py --source-revision <immutable-revision> --output build/follon-sbom.cdx.json
   ```
 
+  The bill covers both Cargo workspaces (the root one and the desktop host's, with
+  its own lockfile), the npm lockfile and the Python packages. It records the
+  declared licence of every first-party component, read from that component's own
+  manifest, and refuses to publish if one declares none. Third-party licences are
+  recorded only where the npm lockfile carries them: `Cargo.lock` has none, so a Cargo
+  dependency's licence needs its registry metadata and is part of the SBOM review.
+
   A release candidate still requires SBOM review, vulnerability disposition,
   signature, and `follon-admin self-host-readiness` evidence.
 

@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T14:03:22Z  
+**Measured at:** 2026-09-29T14:09:24Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `277ec06` -- feat(risk): an account with no positive equity may only reduce risk -- E7.4b (2026-09-29T19:29:13+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `b342593` -- test(backtest): state and hold the two P&L conventions -- E8.5 (2026-09-29T19:34:21+05:30)  
+**Uncommitted paths:** 8
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -67,7 +67,7 @@ already produced a real defect here.
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 95 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 105 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -276,7 +276,7 @@ passes it for production.
 | E7.5 | Aggregate portfolio risk in the order-submitting routes, the desktop gateway and the gRPC PAPER route. Only the read-only `follon-paper-status` composes it today. | open |
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
-| E7.8 | The SBOM covers the desktop's Cargo workspace and records first-party licences; E7.11, on which the licences depended, is decided (MIT). | open |
+| E7.8 | The SBOM covered only the root Cargo lockfile and recorded no first-party licence. **Now** it also covers the desktop host's Cargo workspace and lockfile, and each first-party crate, Python package and the desktop npm package carries its declared licence, read from its own manifest, natively as CycloneDX `licenses`. The bill's own component names the repository's licence. A first-party package that declares none, or a path package this repository has no manifest for, is refused rather than left out. `apps/desktop/package.json` declares MIT. Third-party Cargo licences are still not recorded, since a lockfile does not carry them. Audit item 109. | **done** 2026-09-29 |
 | E7.9 | The risk benchmark records when it was measured; its `observed_at` was the fixture's scenario time. **Now** the artifact is schema 2: `measured_at` is the wall-clock UTC second the run began, `scenario_observed_at` is the fixture's own as-of time, and no field named `observed_at` remains. The desktop's benchmark table shows both. Audit item 106. | **done** 2026-09-29 |
 | E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |

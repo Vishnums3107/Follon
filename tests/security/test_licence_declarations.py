@@ -7,6 +7,7 @@ state E7.11); this keeps the declarations from drifting apart again.
 
 from __future__ import annotations
 
+import json
 import tomllib
 import unittest
 from pathlib import Path
@@ -41,6 +42,14 @@ class LicenceDeclarationTests(unittest.TestCase):
             with self.subTest(path=path):
                 # An SPDX expression, as PEP 639 and setuptools 77+ expect.
                 self.assertEqual(manifest(path)["project"].get("license"), LICENCE)
+
+    def test_the_desktop_npm_package_declares_it(self) -> None:
+        # Recorded in the SBOM as a first-party component (delivery state E7.8),
+        # so an undeclared licence would be refused there as well.
+        package = json.loads((ROOT / "apps/desktop/package.json").read_text(encoding="utf-8"))
+        lock = json.loads((ROOT / "apps/desktop/package-lock.json").read_text(encoding="utf-8"))
+        self.assertEqual(package.get("license"), LICENCE)
+        self.assertEqual(lock["packages"][""].get("license"), LICENCE)
 
 
 if __name__ == "__main__":

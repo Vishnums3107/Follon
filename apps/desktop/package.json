@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "React and Tauri operations desktop for the Follon trading operating system",
+  "license": "MIT",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
