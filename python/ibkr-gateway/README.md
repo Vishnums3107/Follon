@@ -70,8 +70,15 @@ four `OfficialBackendSubmitRetryTests` and two of the
 `OfficialBackendExecutionTimeTests`) exercise the official backend and import
 the official Python API, so without it they error with
 `No module named 'ibapi'`. They pass against `ibapi` 9.81.1.post1, the only
-version they have been run against. No distribution or version is pinned for
-deployment or CI yet (delivery state, E4.2). On Windows, which has no system
+version they have been run against. CI installs exactly that release,
+hash-pinned in `requirements-ci.txt`, as the operator approved on 2026-09-29
+(delivery state E4.2):
+
+```text
+python -m pip install --require-hashes -r python/ibkr-gateway/requirements-ci.txt
+```
+
+A deployment must still record and review its own distribution. On Windows, which has no system
 time-zone database, `zoneinfo` also needs the `tzdata` package; without it
 eight tests error with `No module named 'tzdata'`.
 

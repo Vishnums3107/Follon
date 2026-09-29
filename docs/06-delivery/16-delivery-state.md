@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T04:51:38Z  
+**Measured at:** 2026-09-29T05:03:29Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `302406f` -- fix(worker): every strategy worker hashes strings identically in every run -- E7.3 (2026-09-29T10:16:14+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `b16e955` -- fix(accounting): tax lots follow a split, as the position always did -- E8.1 (2026-09-29T10:28:49+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -211,8 +211,8 @@ flagged a LIVE fixture's `credential_reference`.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E4.1 | The three failures with an obvious fix. Semgrep excludes the audit as a path, keeping the nginx rules on the real configuration. Gitleaks allowlists a `credential_reference` line holding a canonical secret reference, and nothing broader. The desktop job installs Tauri's documented Linux libraries. The bridge README's stale "without `ibapi`" instruction is corrected. Semgrep and gitleaks were verified both ways at CI's versions; the desktop fix is unverified until CI runs (audit item 85). | **done** 2026-09-28 |
-| E4.2 | An approved IBKR API distribution for the bridge's six official-backend tests. The only version they have run against is `ibapi` 9.81.1.post1 from PyPI, the one this machine has, published under IBKR's API licence. Current TWS API releases are 10.x, which reportedly rename `commission_report`, an import the bridge uses. | **decision** |
-| E4.3 | A green GitHub run of all six jobs on the reviewed commit. It needs a push, which waits for the operator, and E4.1's desktop fix is unverified until then. | open |
+| E4.2 | An approved IBKR API distribution for the bridge's six official-backend tests. The only version they have run against is `ibapi` 9.81.1.post1 from PyPI, the one this machine has, published under IBKR's API licence. Current TWS API releases are 10.x, which reportedly rename `commission_report`, an import the bridge uses. **Decided 2026-09-29: pin 9.81.1.post1.** CI installs it from a hash-pinned `python/ibkr-gateway/requirements-ci.txt`, whose hash is PyPI's published digest; in a fresh environment it installs and all 14 bridge tests pass, and a wrong hash is refused (audit item 94). | **done** 2026-09-29 |
+| E4.3 | A green GitHub run of all six jobs on the reviewed commit. It needs a push, which the operator approved on 2026-09-29, and E4.1's desktop fix is unverified until it runs. | open |
 
 ### E5 — One integrated broker-PAPER workflow (assessment priority 2)
 
@@ -233,7 +233,7 @@ desktop wraps the model in `ManualFillAdapter`, the gRPC route accepts only
 | Slice | Scope | State |
 | --- | --- | --- |
 | E5.1 | The real adapter refuses, before transmitting and as a clean rejection, what its bridge cannot execute. That covers combinations: the Python dispatch has no `submit_combo`, and the Rust payload drops each leg's quantity and the debit or credit sign. It also covers any time in force other than DAY. Replacement is already refused by the trait default, but `core/paper` records that refusal as `UNKNOWN`. **Landed as `PaperBrokerCapabilities`**: every adapter declares what it carries, defaulting to single DAY orders, and the service refuses anything more before risk is evaluated or an order exists. The real adapter declares the default, and its transport no longer emits `submit_combo` (audit item 87). | **done** 2026-09-28 |
-| E5.2 | One order-submitting route composes the real bridge, selected by configuration, with the model as the default. Which route comes first is the decision: the authenticated gRPC PAPER route, the desktop gateway, or a CLI. | **decision** |
+| E5.2 | One order-submitting route composes the real bridge, selected by configuration, with the model as the default. Which route comes first was the decision: the authenticated gRPC PAPER route, the desktop gateway, or a CLI. **Decided 2026-09-29: the gRPC PAPER route.** That route's only order RPC is `SubmitPaperCombo`, which the real bridge cannot carry, so composing the bridge alone would give an operator nothing usable. The slice is therefore three: **E5.2a**, the route composes the bridge by configuration, with the model the default and the adapter bound into the journal fingerprint; **E5.2b**, an authenticated single-order submit and a cancel, journaled by operator; **E5.2c**, synchronize and reconcile, so fills arrive and discrepancies surface. | open |
 | E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
 | E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR (`REJECTED`), from transport ambiguity (`UNKNOWN`). Today every `ok: false` reply strands the order `UNKNOWN` and disconnects the session. IBKR error codes that are not rejections, such as 202 (order cancelled), need checking against a real TWS. | open |
 | E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
@@ -271,7 +271,7 @@ passes it for production.
 | E7.8 | The SBOM covers the desktop's Cargo workspace and records first-party licences, which depend on E7.11. | open |
 | E7.9 | The risk benchmark records when it was measured; its `observed_at` is the fixture's scenario time. | open |
 | E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
-| E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. | **decision** |
+| E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** | open |
 | E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open. | open |
 | E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
 
@@ -751,6 +751,14 @@ the reversal here with its date.
    what makes it reachable. It reverses nothing item 3 keeps warm.
    Authenticated Tauri IPC writes (E7.10) stay a decision, although the
    assessment lists native authentication under its priority 4.
+5. **2026-09-29 — four decisions, asked after the E4 to E8 re-plan.**
+   - The real IBKR PAPER bridge goes first into the authenticated gRPC PAPER
+     route (E5.2).
+   - CI installs `ibapi` 9.81.1.post1 from PyPI, hash-pinned (E4.2).
+   - The repository's licence is MIT. The Cargo and SDK metadata that said
+     Apache-2.0 follow the root `LICENSE` (E7.11).
+   - The branch is pushed and a pull request opened, so GitHub CI can verify
+     E4 (E4.3).
 
 ### Still unanswered
 

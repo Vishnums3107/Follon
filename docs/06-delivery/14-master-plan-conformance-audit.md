@@ -3833,6 +3833,28 @@ These are mandatory master-plan acceptance conditions and are currently open:
       split can leave fractional lot quantities, exactly as it leaves a fractional position; cash in lieu is
       not modelled. No external gate moved.
 
+94. CI installs the IBKR API the operator approved, pinned by hash (2026-09-29, Reliability; delivery state
+    E4.2). Item 85 left the Python job's `ibapi` failure for this decision.
+    - **The decision.** Asked which IBKR API distribution CI may install, the operator chose `ibapi`
+      9.81.1.post1 from PyPI (Settled direction item 5). It is IBKR's own upload (IBG LLC, 2020-12-06),
+      under the IB API Non-Commercial License or the IB API Commercial License, and it is the only version
+      the bridge's six official-backend tests have run against.
+    - **The change.** `python/ibkr-gateway/requirements-ci.txt` pins that release by version and by SHA-256,
+      and the `python-and-contracts` job installs it with `--require-hashes` before the bridge tests. The
+      hash, `49f6678b...9cd6`, is the one PyPI publishes for the release's only file, its source archive,
+      and it matched the file downloaded here. The bridge README states the pin and the command.
+    - **Verification.** In a freshly created environment, the pinned install succeeded and all 14 bridge
+      tests passed; `tzdata` was added only because Windows has no system time-zone database. With one
+      byte of the hash changed, pip refused the install ("THESE PACKAGES DO NOT MATCH THE HASHES").
+    - **Measured result.** Configuration and documentation only. The final
+      `python tools/session_status.py` run measured all seven suites green, unchanged at Rust 538 and
+      Python 71, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+    - **Bounded remainder.** 9.81 dates from 2020, and current TWS API releases are 10.x. Whether the bridge
+      runs against a current TWS or IB Gateway build is unverified until E5.6's real session. A deployment
+      must record and review its own distribution. The job's storage-adapter and server-contract steps
+      have never run on GitHub, because the bridge step failed before them; a green run is E4.3. No
+      external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

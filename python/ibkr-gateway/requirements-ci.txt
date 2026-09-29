@@ -1,0 +1,7 @@
+# The IBKR API distribution the operator approved for CI on 2026-09-29
+# (delivery state E4.2): ibapi 9.81.1.post1 from PyPI, IBKR's own upload
+# (IBG LLC, 2020-12-06), under the IB API Non-Commercial License or the IB API
+# Commercial License. It is the only version the bridge's six official-backend
+# tests have run against. The hash is PyPI's published SHA-256 of the
+# release's only file, its source archive.
+ibapi==9.81.1.post1 --hash=sha256:49f6678bf4cced996920f32ad4b48e6897749ac30ba14a661082285f4ec09cd6
