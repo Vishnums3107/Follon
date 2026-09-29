@@ -44,6 +44,16 @@ journal records the operator of every change. PostgreSQL identity rows are prote
 Compose requires database TLS, gRPC mutual TLS, and client-certificate TLS at
 the dashboard proxy.
 
+Since E7.7 the database also refuses to rewrite what it retains. Sixteen evidence
+tables (domain events, the journal, risk policy, strategy and configuration versions,
+broker commands and receipts, the audit index, news, FX pricing and the execution
+evidence) carry triggers that refuse UPDATE, DELETE and TRUNCATE, and two versioned
+reference tables may only be closed once. News is tenant-owned and under the same
+forced RLS. The triggers protect against the application's role and a careless
+statement. They do not protect against the database's owner, who can disable one with
+a DDL statement, so the owner role, its credentials and DDL logging remain
+deployment obligations.
+
 These mechanisms do not provide a production vault/keychain, certificate
 issuance/rotation, HSM/KMS signing custody, out-of-band MFA enrollment or
 delivery, support operations, an independent DAST product run, an independent
