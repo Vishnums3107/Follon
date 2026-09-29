@@ -1402,6 +1402,37 @@ pub struct KillSwitchOperation {
     pub operated_at: String,
 }
 
+/// What an operator asked of an order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderOperationAction {
+    /// The operator requested cancellation, and the order moved to
+    /// `PENDING_CANCEL`.
+    CancelRequested,
+}
+
+impl OrderOperationAction {
+    /// Stable journal identity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CancelRequested => "CANCEL_REQUESTED",
+        }
+    }
+}
+
+/// One operator-attributed order command, as the PAPER journal records it
+/// (delivery state E5.2b).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderOperation {
+    /// The single or combination order the command addressed.
+    pub order_id: String,
+    /// What the operator asked.
+    pub action: OrderOperationAction,
+    /// The authenticated operator who asked.
+    pub operator: String,
+    /// Canonical UTC time the command was applied.
+    pub operated_at: String,
+}
+
 /// Versioned independently-operable paper kill-switch registry.
 #[derive(Clone, Debug)]
 pub struct KillSwitchRegistry {
@@ -2015,6 +2046,9 @@ pub struct PaperRiskEvidence {
     pub decision: RiskDecision,
     /// The exact validated price observation evaluated by risk.
     pub market: PaperMarketData,
+    /// The authenticated operator who submitted the order, when it arrived
+    /// through an authenticated route; `None` for a direct caller (E5.2b).
+    pub submitted_by: Option<String>,
 }
 
 /// An authoritative exchange session that may count toward the paper gate.
@@ -2268,11 +2302,23 @@ struct PersistentPaperState {
     /// empty, so a journal without one re-serializes byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     kill_switch_operations: Vec<PersistentKillSwitchOperation>,
+    /// Operator-attributed order commands (E5.2b). Never written while empty,
+    /// so a journal without one re-serializes byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    order_operations: Vec<PersistentOrderOperation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistentKillSwitchOperation {
     scope: String,
+    action: String,
+    operator: String,
+    operated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentOrderOperation {
+    order_id: String,
     action: String,
     operator: String,
     operated_at: String,
@@ -2404,6 +2450,9 @@ struct PersistentRiskEvidence {
     actor: String,
     evaluated_limits: String,
     market: PersistentMarketData,
+    /// Versioned extension (E5.2b); absence retains the earlier serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submitted_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2660,6 +2709,9 @@ pub struct PaperTradingService<B> {
     /// Operator-attributed kill-switch changes, oldest first (E3.3b). A local
     /// change through [`Self::activate_kill_switch`] adds none, as before.
     kill_switch_operations: Vec<KillSwitchOperation>,
+    /// Operator-attributed order commands, oldest first (E5.2b). A direct
+    /// [`Self::cancel_order`] adds none.
+    order_operations: Vec<OrderOperation>,
     broker: B,
     broker_route_fingerprint: String,
     broker_connected: bool,
@@ -2742,6 +2794,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             risk_policy,
             kill_switches,
             kill_switch_operations: Vec::new(),
+            order_operations: Vec::new(),
             broker,
             broker_route_fingerprint,
             broker_connected: true,
@@ -2879,6 +2932,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         &self.kill_switch_operations
     }
 
+    /// Operator-attributed order commands, oldest first (E5.2b).
+    pub fn order_operations(&self) -> &[OrderOperation] {
+        &self.order_operations
+    }
+
     fn operate_kill_switch_as(
         &mut self,
         scope: KillSwitchScope,
@@ -2917,7 +2975,24 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         market: PaperMarketData,
         decided_at: &str,
     ) -> Result<PaperSubmitOutcome, PaperError> {
+        self.submit_intent_as(intent, market, decided_at, None)
+    }
+
+    /// Submits a single order on behalf of an authenticated operator, whose
+    /// identity is journaled with the risk evidence, as
+    /// [`Self::submit_combo_intent_as`] does for a combination. An idempotent
+    /// retry must come from the same submitter (delivery state E5.2b).
+    pub fn submit_intent_as(
+        &mut self,
+        intent: OrderIntent,
+        market: PaperMarketData,
+        decided_at: &str,
+        submitted_by: Option<&str>,
+    ) -> Result<PaperSubmitOutcome, PaperError> {
         self.ensure_persistence_healthy()?;
+        if let Some(operator) = submitted_by {
+            validate_canonical_id("paper order submitted_by", operator)?;
+        }
         intent.validate()?;
         validate_utc_timestamp("paper risk decision time", decided_at)?;
         market.validate()?;
@@ -2973,6 +3048,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                         .to_owned(),
                 ));
             }
+            if evidence.submitted_by.as_deref() != submitted_by {
+                return Err(PaperError(
+                    "paper order retry must come from the original submitter".to_owned(),
+                ));
+            }
             return Ok(PaperSubmitOutcome {
                 decision: evidence.decision.clone(),
                 order_id: Some(order_id),
@@ -2986,6 +3066,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             intent: intent.clone(),
             decision: decision.clone(),
             market: market.clone(),
+            submitted_by: submitted_by.map(str::to_owned),
         };
         if !decision.approved {
             self.risk_evidence
@@ -3295,9 +3376,42 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
 
     /// Requests cancellation. A transport failure leaves the order explicitly `UNKNOWN`.
     pub fn cancel_order(&mut self, order_id: &str) -> Result<(), PaperError> {
+        self.cancel_order_attributed(order_id, None)
+    }
+
+    /// Requests cancellation of a single or combination order for an
+    /// authenticated operator. The request is journaled with the operator and
+    /// time, together with the order's move to `PENDING_CANCEL` and before the
+    /// broker is asked. A retry of a cancellation already accepted changes
+    /// nothing and journals nothing, as a repeated kill-switch change does
+    /// (delivery state E5.2b).
+    pub fn cancel_order_as(
+        &mut self,
+        order_id: &str,
+        operator: &str,
+        operated_at: &str,
+    ) -> Result<(), PaperError> {
+        validate_canonical_id("order operator", operator)?;
+        validate_utc_timestamp("order operation time", operated_at)?;
+        self.cancel_order_attributed(
+            order_id,
+            Some(OrderOperation {
+                order_id: order_id.to_owned(),
+                action: OrderOperationAction::CancelRequested,
+                operator: operator.to_owned(),
+                operated_at: operated_at.to_owned(),
+            }),
+        )
+    }
+
+    fn cancel_order_attributed(
+        &mut self,
+        order_id: &str,
+        operation: Option<OrderOperation>,
+    ) -> Result<(), PaperError> {
         self.ensure_persistence_healthy()?;
         if self.combo_orders.contains_key(order_id) {
-            return self.cancel_combo_order(order_id);
+            return self.cancel_combo_order(order_id, operation);
         }
         if !self.broker_connected {
             return Err(PaperError(
@@ -3329,6 +3443,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.order_mut(order_id)?
             .oms
             .transition(OrderState::PendingCancel, "PAPER_CANCEL_REQUESTED")?;
+        if let Some(operation) = operation {
+            self.order_operations.push(operation);
+        }
+        // Durable before the external command, as submission and combination
+        // cancellation are: a crash after the broker accepts the cancellation
+        // cannot leave the journal saying the order still works, or losing
+        // who asked for it (E5.2b).
+        self.persist()?;
         let cancel = BrokerCancelRequest {
             account_id: self.account.account_id.clone(),
             client_order_id: order_id.to_owned(),
@@ -3341,7 +3463,6 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             self.persist()?;
             return Err(error);
         }
-        self.persist()?;
         Ok(())
     }
 
@@ -5466,6 +5587,16 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     operated_at: operation.operated_at.clone(),
                 })
                 .collect(),
+            order_operations: self
+                .order_operations
+                .iter()
+                .map(|operation| PersistentOrderOperation {
+                    order_id: operation.order_id.clone(),
+                    action: operation.action.as_str().to_owned(),
+                    operator: operation.operator.clone(),
+                    operated_at: operation.operated_at.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -5940,6 +6071,32 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 ));
             }
         }
+        let mut order_operations = Vec::with_capacity(state.order_operations.len());
+        for persisted in state.order_operations {
+            let action = match persisted.action.as_str() {
+                "CANCEL_REQUESTED" => OrderOperationAction::CancelRequested,
+                _ => {
+                    return Err(PaperError(
+                        "persisted order operation action is invalid".to_owned(),
+                    ))
+                }
+            };
+            if !orders.contains_key(&persisted.order_id)
+                && !combo_orders.contains_key(&persisted.order_id)
+            {
+                return Err(PaperError(
+                    "persisted order operation names an unknown order".to_owned(),
+                ));
+            }
+            validate_canonical_id("persisted order operator", &persisted.operator)?;
+            validate_utc_timestamp("persisted order operation time", &persisted.operated_at)?;
+            order_operations.push(OrderOperation {
+                order_id: persisted.order_id,
+                action,
+                operator: persisted.operator,
+                operated_at: persisted.operated_at,
+            });
+        }
         self.orders = orders;
         self.risk_evidence = risk_evidence;
         self.combo_orders = combo_orders;
@@ -5951,6 +6108,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.execution_ids = execution_ids;
         self.kill_switches = restored_switches;
         self.kill_switch_operations = kill_switch_operations;
+        self.order_operations = order_operations;
         self.incidents = incidents;
         self.last_reconciled_at = state.last_reconciled_at;
         self.last_reconciliation_clean = state.last_reconciliation_clean;
@@ -6326,6 +6484,7 @@ impl From<&PaperRiskEvidence> for PersistentRiskEvidence {
             actor: evidence.decision.actor.clone(),
             evaluated_limits: evidence.decision.evaluated_limits.clone(),
             market: PersistentMarketData::from(&evidence.market),
+            submitted_by: evidence.submitted_by.clone(),
         }
     }
 }
@@ -6350,6 +6509,9 @@ impl TryFrom<PersistentRiskEvidence> for PaperRiskEvidence {
                 "persisted risk correlation does not match its intent".to_owned(),
             ));
         }
+        if let Some(operator) = &evidence.submitted_by {
+            validate_canonical_id("persisted paper order submitted_by", operator)?;
+        }
         let decision = RiskDecision {
             decision_id: format!("paper-risk-{}", intent.intent_id),
             intent_id: intent.intent_id.clone(),
@@ -6365,6 +6527,7 @@ impl TryFrom<PersistentRiskEvidence> for PaperRiskEvidence {
             intent,
             decision,
             market: PaperMarketData::try_from(evidence.market)?,
+            submitted_by: evidence.submitted_by,
         })
     }
 }
@@ -8314,6 +8477,381 @@ mod tests {
         for corrupt in corruptions {
             let mut state = valid.clone();
             corrupt(&mut state.kill_switch_operations[0]);
+            assert!(service().restore(state).is_err());
+        }
+    }
+
+    fn scratch_journal(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-{label}.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// The journal's last recorded state, read once its service is dropped:
+    /// an open service holds the journal exclusively.
+    fn last_journal_state(path: &Path) -> serde_json::Value {
+        let journal = fs::read_to_string(path).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        record["state"].clone()
+    }
+
+    #[test]
+    fn an_authenticated_order_submitter_is_journaled_and_owns_the_retry() {
+        let journal_path = scratch_journal("order-submitted-by");
+        let account = account();
+        let open = || {
+            PaperTradingService::open_durable(
+                account.clone(),
+                policy(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account).unwrap(),
+                &journal_path,
+            )
+            .unwrap()
+        };
+        let mut service = open();
+        let order = intent("paper-000041", "2026-01-02T14:30:00Z");
+        let observation = market("2026-01-02T14:30:00Z");
+        let decided_at = "2026-01-02T14:30:02Z";
+        let outcome = service
+            .submit_intent_as(
+                order.clone(),
+                observation.clone(),
+                decided_at,
+                Some("user.trader"),
+            )
+            .unwrap();
+        assert!(outcome.decision.approved);
+        let decision_id = outcome.decision.decision_id.clone();
+        assert_eq!(
+            service
+                .risk_evidence(&decision_id)
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        // Neither another operator nor an unattributed caller may claim it.
+        for other in [Some("user.other"), None] {
+            assert!(service
+                .submit_intent_as(order.clone(), observation.clone(), decided_at, other)
+                .is_err());
+        }
+        // A malformed submitter is refused before risk sees the intent.
+        assert!(service
+            .submit_intent_as(
+                intent("paper-000042", "2026-01-02T14:30:00Z"),
+                observation.clone(),
+                decided_at,
+                Some("User Trader"),
+            )
+            .is_err());
+        assert!(service.risk_evidence("paper-risk-paper-000042").is_none());
+        // The original submitter's retry is the idempotent original.
+        let retry = service
+            .submit_intent_as(order, observation.clone(), decided_at, Some("user.trader"))
+            .unwrap();
+        assert_eq!(retry.order_id, outcome.order_id);
+        // A direct submission journals no `submitted_by` key at all, keeping
+        // the earlier serialization byte for byte.
+        service
+            .submit_intent(
+                intent("paper-000043", "2026-01-02T14:30:00Z"),
+                observation,
+                decided_at,
+            )
+            .unwrap();
+        drop(service);
+
+        let state = last_journal_state(&journal_path);
+        assert_eq!(
+            state["risk_evidence"]["paper-risk-paper-000041"]["submitted_by"],
+            "user.trader"
+        );
+        assert!(
+            state["risk_evidence"]["paper-risk-paper-000043"]
+                .get("submitted_by")
+                .is_none(),
+            "an unattributed decision must not carry submitted_by"
+        );
+        // The attribution survives a restart.
+        let reopened = open();
+        assert_eq!(
+            reopened
+                .risk_evidence(&decision_id)
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    /// The model, except that asking it to cancel stops the process, as a
+    /// crash just after the broker received the request would.
+    struct CrashOnCancelBroker(IbkrPaperAdapter);
+
+    impl PaperBrokerAdapter for CrashOnCancelBroker {
+        fn adapter_configuration_fingerprint(
+            &self,
+            account_id: &str,
+        ) -> Result<String, PaperError> {
+            self.0.adapter_configuration_fingerprint(account_id)
+        }
+
+        fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+            self.0.configuration_fingerprint(account_id)
+        }
+
+        fn permits_empty_journal(&self, account_id: &str) -> bool {
+            self.0.permits_empty_journal(account_id)
+        }
+
+        fn submit(
+            &mut self,
+            request: &BrokerOrderRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.0.submit(request)
+        }
+
+        fn cancel(&mut self, _request: &BrokerCancelRequest) -> Result<(), PaperError> {
+            panic!("the process stopped while the broker held the cancellation")
+        }
+
+        fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+            self.0.poll(account_id)
+        }
+
+        fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+            self.0.snapshot(account_id)
+        }
+
+        fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+            self.0.reconnect(account_id)
+        }
+    }
+
+    #[test]
+    fn an_operator_cancellation_is_durable_before_the_broker_is_asked() {
+        let journal_path = scratch_journal("order-cancel-crash");
+        let account = account();
+        let mut service = PaperTradingService::open_durable(
+            account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            CrashOnCancelBroker(IbkrPaperAdapter::new(&account).unwrap()),
+            &journal_path,
+        )
+        .unwrap();
+        let order_id = service
+            .submit_intent_as(
+                intent("paper-000051", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+                Some("user.trader"),
+            )
+            .unwrap()
+            .order_id
+            .unwrap();
+        assert_eq!(
+            service.order(&order_id).unwrap().oms.state,
+            OrderState::Acknowledged
+        );
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.cancel_order_as(&order_id, "user.risk", "2026-01-02T14:31:00Z")
+        }));
+        assert!(crashed.is_err(), "the broker was never asked to cancel");
+        drop(service);
+
+        // The restarted service knows the cancellation was requested, and by
+        // whom, although the process stopped before it heard back.
+        let reopened = PaperTradingService::open_durable(
+            account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.order(&order_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        assert_eq!(
+            reopened.order_operations(),
+            [OrderOperation {
+                order_id: order_id.clone(),
+                action: OrderOperationAction::CancelRequested,
+                operator: "user.risk".to_owned(),
+                operated_at: "2026-01-02T14:31:00Z".to_owned(),
+            }]
+            .as_slice()
+        );
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn an_operator_cancellation_is_journaled_once_for_a_single_order_or_a_combination() {
+        let account = account();
+        let open = |path: &Path| {
+            PaperTradingService::open_durable(
+                account.clone(),
+                policy_permitting_shorts(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account).unwrap(),
+                path,
+            )
+            .unwrap()
+        };
+
+        // A direct, unattributed cancellation journals no operation record at
+        // all, keeping the earlier serialization byte for byte.
+        let local_path = scratch_journal("order-operations-local");
+        let mut local = open(&local_path);
+        let local_id = local
+            .submit_intent(
+                intent("paper-000060", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap()
+            .order_id
+            .unwrap();
+        local.cancel_order(&local_id).unwrap();
+        drop(local);
+        let local_state = last_journal_state(&local_path);
+        assert_eq!(
+            local_state["orders"][local_id.as_str()]["state"],
+            "PENDING_CANCEL"
+        );
+        assert!(local_state.get("order_operations").is_none());
+        let _ = fs::remove_file(&local_path);
+
+        let journal_path = scratch_journal("order-operations");
+        let mut service = open(&journal_path);
+        let submit = |service: &mut PaperTradingService<IbkrPaperAdapter>, intent_id: &str| {
+            service
+                .submit_intent(
+                    intent(intent_id, "2026-01-02T14:30:00Z"),
+                    market("2026-01-02T14:30:00Z"),
+                    "2026-01-02T14:30:02Z",
+                )
+                .unwrap()
+                .order_id
+                .unwrap()
+        };
+        let order_id = submit(&mut service, "paper-000061");
+        let direct_id = submit(&mut service, "paper-000062");
+        let combo_id = submit_lifecycle_combo(&mut service, "operator-cancel");
+
+        // A malformed operator or time changes nothing.
+        assert!(service
+            .cancel_order_as(&order_id, "User Risk", "2026-01-02T14:31:00Z")
+            .is_err());
+        assert!(service
+            .cancel_order_as(&order_id, "user.risk", "yesterday")
+            .is_err());
+        assert_eq!(
+            service.order(&order_id).unwrap().oms.state,
+            OrderState::Acknowledged
+        );
+        assert!(service.order_operations().is_empty());
+
+        service
+            .cancel_order_as(&order_id, "user.risk", "2026-01-02T14:31:00Z")
+            .unwrap();
+        // A retry, even by another operator, changes nothing and journals nothing.
+        service
+            .cancel_order_as(&order_id, "user.risk.second", "2026-01-02T14:31:05Z")
+            .unwrap();
+        service
+            .cancel_order_as(&combo_id, "user.risk.second", "2026-01-02T14:31:10Z")
+            .unwrap();
+        // A direct cancellation is not attributed.
+        service.cancel_order(&direct_id).unwrap();
+        let operation = |order_id: &str, operator: &str, operated_at: &str| OrderOperation {
+            order_id: order_id.to_owned(),
+            action: OrderOperationAction::CancelRequested,
+            operator: operator.to_owned(),
+            operated_at: operated_at.to_owned(),
+        };
+        let expected = vec![
+            operation(&order_id, "user.risk", "2026-01-02T14:31:00Z"),
+            operation(&combo_id, "user.risk.second", "2026-01-02T14:31:10Z"),
+        ];
+        assert_eq!(service.order_operations(), expected.as_slice());
+        for id in [&order_id, &direct_id] {
+            assert_eq!(
+                service.order(id).unwrap().oms.state,
+                OrderState::PendingCancel
+            );
+        }
+        assert_eq!(
+            service.combo_order(&combo_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        drop(service);
+
+        let state = last_journal_state(&journal_path);
+        assert_eq!(state["order_operations"].as_array().unwrap().len(), 2);
+        assert_eq!(state["order_operations"][0]["action"], "CANCEL_REQUESTED");
+        assert_eq!(state["order_operations"][1]["operator"], "user.risk.second");
+        let reopened = open(&journal_path);
+        assert_eq!(reopened.order_operations(), expected.as_slice());
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn a_persisted_order_attribution_must_be_well_formed() {
+        let mut attributed = service();
+        let order_id = attributed
+            .submit_intent_as(
+                intent("paper-000071", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+                Some("user.trader"),
+            )
+            .unwrap()
+            .order_id
+            .unwrap();
+        attributed
+            .cancel_order_as(&order_id, "user.risk", "2026-01-02T14:31:00Z")
+            .unwrap();
+        let valid = attributed.persistent_state();
+        let mut restored = service();
+        restored.restore(valid.clone()).unwrap();
+        assert_eq!(restored.order_operations().len(), 1);
+        assert_eq!(
+            restored
+                .risk_evidence("paper-risk-paper-000071")
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        let corruptions: [fn(&mut PersistentPaperState); 5] = [
+            |state| state.order_operations[0].order_id = "order-paper-000099".to_owned(),
+            |state| state.order_operations[0].action = "CANCEL".to_owned(),
+            |state| state.order_operations[0].operator = "User Risk".to_owned(),
+            |state| state.order_operations[0].operated_at = "yesterday".to_owned(),
+            |state| {
+                state
+                    .risk_evidence
+                    .get_mut("paper-risk-paper-000071")
+                    .unwrap()
+                    .submitted_by = Some("User Trader".to_owned());
+            },
+        ];
+        for corrupt in corruptions {
+            let mut state = valid.clone();
+            corrupt(&mut state);
             assert!(service().restore(state).is_err());
         }
     }

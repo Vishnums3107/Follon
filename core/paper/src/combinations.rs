@@ -172,7 +172,11 @@ impl PaperComboOrder {
 }
 
 impl<B: PaperBrokerAdapter> PaperTradingService<B> {
-    pub(super) fn cancel_combo_order(&mut self, id: &str) -> Result<(), PaperError> {
+    pub(super) fn cancel_combo_order(
+        &mut self,
+        id: &str,
+        operation: Option<OrderOperation>,
+    ) -> Result<(), PaperError> {
         if !self.broker_connected {
             return Err(PaperError(
                 "reconnect and reconcile before combination cancellation".to_owned(),
@@ -198,6 +202,9 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         order
             .oms
             .transition(OrderState::PendingCancel, "PAPER_COMBO_CANCEL_REQUESTED")?;
+        if let Some(operation) = operation {
+            self.order_operations.push(operation);
+        }
         // Intent is durable before the external command, including crash/restart ambiguity.
         self.persist()?;
         let request = BrokerCancelRequest {

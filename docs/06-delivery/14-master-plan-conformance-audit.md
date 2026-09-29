@@ -4025,6 +4025,46 @@ These are mandatory master-plan acceptance conditions and are currently open:
       that surfaces at the first broker call. Nothing here was run against a real TWS or IB Gateway (E5.6).
       No external gate moved.
 
+100. An attributed single PAPER order records who submitted it; an attributed cancellation records who
+     requested it. Cancellation is durable before the broker is asked (2026-09-29, rows 5.5 and
+     5.10; delivery state E5.2b-1). This is the kernel half of E5.2b. The gRPC
+     route's single-order submit and cancel follow as E5.2b-2.
+     - **The gap.**
+       - `PaperTradingService` recorded who submitted a combination, and who moved a kill switch. For a
+         single order it recorded nobody, and a cancellation named nobody for either kind.
+       - A single-order cancellation also moved the order to `PENDING_CANCEL` and asked the broker before
+         journaling anything. A crash after the broker accepted it left the journal saying the order still
+         worked. Submission and combination cancellation had always journaled first, and controlled
+         LIVE journals every pending cancellation first, with its actor.
+     - **The fix.**
+       - `submit_intent_as` journals the operator with the order's risk evidence, as
+         `submit_combo_intent_as` does, and an idempotent retry must come from that operator.
+         `submit_intent` is the unattributed form, unchanged.
+       - `cancel_order_as` covers single orders and combinations. It records an `OrderOperation` (order,
+         `CANCEL_REQUESTED`, operator, time) in the same journal write as the move to `PENDING_CANCEL`. A
+         retry of an accepted cancellation changes nothing and journals nothing, as a repeated kill-switch
+         change does. `cancel_order` is the unattributed form.
+       - A single-order cancellation now journals `PENDING_CANCEL` before the broker is asked, and writes
+         no second, identical record after the broker accepts.
+       - Both additions are written only when present, so an existing journal re-serializes byte-for-byte.
+         A restore refuses an operation that names an unknown order, an unknown action, or a malformed
+         operator or time, and a malformed persisted submitter.
+     - **Tests.**
+       - An attributed order journals its submitter and survives a restart. Another operator's retry and an
+         unattributed retry are refused, and so is a malformed submitter, before risk sees the intent. An
+         unattributed order journals no `submitted_by` key.
+       - A broker stand-in that stops the process when asked to cancel. The restarted service finds the
+         order `PENDING_CANCEL` and the operator's request journaled.
+       - Operator cancellations of a single order and a combination are each journaled once. A malformed
+         operator or time changes nothing. A direct cancellation is not attributed, and the record
+         survives a restart.
+       - Each malformed persisted field is refused on restore.
+     - **Rule 5.** 19 of 19 injected defects were caught by the intended tests on the final files.
+     - **Measured result.** The Rust workspace rose from 548 to 552 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all seven suites green. The full evidence pipeline exited 0; its local DAST scan reported 85 probes, 0 failed.
+     - **Bounded remainder.** No route calls these yet (E5.2b-2). Replacement is not attributed; no route
+       offers it, and the IBKR bridge cannot carry it (E5.1). Controlled LIVE is unchanged, since it already
+       did both. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

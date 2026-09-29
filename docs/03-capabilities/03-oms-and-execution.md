@@ -137,6 +137,9 @@ configuration file, never in the UI.
 - An accepted intent has a terminal state or an explicitly unresolved `UNKNOWN` state.
 - Duplicate broker messages cannot create duplicate fills.
 - A restart cannot silently discard working orders.
+- A cancellation is journaled as `PENDING_CANCEL` before the broker is asked.
+  A cancellation requested by an operator records who asked and when. A single
+  order an operator submits records its submitter, as a combination does (E5.2b-1).
 - A network interruption never proves that submission failed.
 - Every state transition is validated, causal, and auditable.
 - Client order IDs are generated before adapter submission and are idempotency keys where the broker supports them.
