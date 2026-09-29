@@ -149,3 +149,9 @@ for the deployment and evidence sequence.
 No feature is represented as broker-approved, custody-capable, regulated,
 mobile-enabled, or operationally live until the relevant phase's contract,
 adapter evidence, reconciliation, and release gates are complete.
+
+## Licence
+
+Follon is released under the MIT License; see [`LICENSE`](LICENSE). Every Cargo
+manifest and Python package declares the same licence, and
+`tests/security/test_licence_declarations.py` keeps them in agreement.

@@ -3855,6 +3855,34 @@ These are mandatory master-plan acceptance conditions and are currently open:
       have never run on GitHub, because the bridge step failed before them; a green run is E4.3. No
       external gate moved.
 
+95. Every first-party licence declaration is MIT, as the root `LICENSE` is (2026-09-29, Architecture and
+    release supply chain; delivery state E7.11). Reported by the revised assessment.
+    - **The gap.** The root `LICENSE` is the MIT License, while the Cargo workspace, which all 21 member
+      crates inherit, the separate desktop host crate and the strategy SDK declared Apache-2.0, and the
+      storage adapter declared nothing. The assessment asked that this be resolved before any rights or
+      distribution claim.
+    - **The decision.** Asked which licence was intended, the operator chose MIT (Settled direction item 5).
+    - **The change.**
+      - `[workspace.package]` and the desktop host declare `license = "MIT"`.
+      - Both Python packages declare `license = "MIT"`, the PEP 639 SPDX form that setuptools 77 and later
+        expect. The table form is deprecated there, and its removal date has passed. The strategy SDK's
+        build requirement rises from setuptools 68 to 77, the first version that reads the string form.
+      - The README gains a licence section.
+      - `tests/security/test_licence_declarations.py` holds `LICENSE`, every Cargo manifest and both Python
+        packages to the one licence.
+    - **Verification.**
+      - `cargo metadata` reports MIT for all 21 root-workspace packages and for the desktop host.
+      - Both Python wheels built in isolation without a deprecation warning, and each records
+        `License-Expression: MIT`.
+      - The test failed before the change, on the Cargo and Python declarations.
+      - Rule 5: 4 of 4 injected defects were caught, each declaration reverted or dropped in turn.
+    - **Measured result.** Python rose from 71 to 74 passed; the Rust workspace is unchanged at
+      538 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+    - **Bounded remainder.** The SBOM still records no first-party licence (E7.8). Contributor provenance
+      and third-party notices, which the assessment also named, are a review for the owner, not a
+      metadata change. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
