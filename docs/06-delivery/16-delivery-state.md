@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T08:04:59Z  
+**Measured at:** 2026-09-29T08:12:58Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `9c3aea7` -- fix(paper): journal attributed order commands before cancellation -- E5.2b-1 (2026-09-29T11:44:39+05:30)  
-**Uncommitted paths:** 6
+**HEAD:** `7306f8c` -- feat(trading-api): authenticated PAPER single-order and cancel RPCs -- E5.2b-2 (2026-09-29T13:35:25+05:30)  
+**Uncommitted paths:** 7
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 558 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 562 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -228,8 +228,10 @@ application composed the real adapter, and `IbkrPaperGatewayAdapter` was
 constructed nowhere, not even in a test. E5.1's tests were the first to
 construct it. Since E5.2a (2026-09-29) the gRPC PAPER route composes it when
 its configuration says `adapter_kind: IBKR_PAPER_BRIDGE`. Since E5.2b-2 it
-submits supported single DAY orders and cancellations. Nothing synchronizes
-the bridge's fills or reconciles its account yet (E5.2c).
+submits supported single DAY orders and cancellations. Since E5.2c it can
+drain broker evidence and reconcile the account on an authenticated risk
+manager request. It does not poll in the background, and no real IBKR PAPER
+account has been reconciled through it (E5.5 and E5.6).
 
 The desktop wraps the model in `ManualFillAdapter`, and `follon-paper-status`
 always builds `IbkrPaperAdapter`. The 30-session gate cannot begin until this
@@ -238,7 +240,7 @@ epic lands (see the correction under the external gates).
 | Slice | Scope | State |
 | --- | --- | --- |
 | E5.1 | The real adapter refuses, before transmitting and as a clean rejection, what its bridge cannot execute. That covers combinations: the Python dispatch has no `submit_combo`, and the Rust payload drops each leg's quantity and the debit or credit sign. It also covers any time in force other than DAY. Replacement is already refused by the trait default, but `core/paper` records that refusal as `UNKNOWN`. **Landed as `PaperBrokerCapabilities`**: every adapter declares what it carries, defaulting to single DAY orders, and the service refuses anything more before risk is evaluated or an order exists. The real adapter declares the default, and its transport no longer emits `submit_combo` (audit item 87). | **done** 2026-09-28 |
-| E5.2 | The authenticated gRPC PAPER route composes the real bridge by configuration, with the model as the default. **E5.2a** binds the adapter and IBKR session to the journal fingerprint (audit item 99). **E5.2b-1** journals the submitter of a single order and the operator cancelling either order kind before a broker call (audit item 100). **E5.2b-2** adds `SubmitPaperOrder` and `CancelPaperOrder` RPCs, with tenant and role checks, an account-bound cancel, fixed-point request parsing, and operator-attributed durable outcomes (audit item 101). A fake bridge process accepted a single DAY order and cancel; a GTC request was refused before creating an order. **E5.2c** must synchronize broker events and reconcile the account. | E5.2a and E5.2b **done** 2026-09-29; E5.2c open |
+| E5.2 | The authenticated gRPC PAPER route composes the real bridge by configuration, with the model as the default. **E5.2a** binds the adapter and IBKR session to the journal fingerprint (audit item 99). **E5.2b** adds operator-attributed single-order submit and cancel over the journaled kernel (items 100–101). **E5.2c** adds a risk-manager `ReconcilePaperAccount` RPC: it drains broker events, compares the snapshot, returns its discrepancies and UNKNOWN count, and can explicitly reconnect. A stateful bridge protocol fixture applied a fill and reconciled its account; a model restart surfaced missing broker state rather than reporting clean (audit item 102). No background poller or real Gateway evidence is claimed. | E5.2a–c **done** 2026-09-29; E5.5 and E5.6 open |
 | E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
 | E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR (`REJECTED`), from transport ambiguity (`UNKNOWN`). Today every `ok: false` reply strands the order `UNKNOWN` and disconnects the session. IBKR error codes that are not rejections, such as 202 (order cancelled), need checking against a real TWS. | open |
 | E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
@@ -787,12 +789,16 @@ short — detail belongs in the conformance audit.
   A fake bridge accepted a DAY market order and cancellation; GTC was refused
   before risk evidence. These tests are protocol evidence, not TWS evidence.
 - An injected omission of the submitter failed the durable-operator regression
-  test, then was reverted. The full evidence pipeline exited 0.
-- Measured all seven suites green: Rust 558 passed / 0 failed / 3 ignored,
-  Tauri 31 passed, Python 75 passed (audit item 101).
-- **Next action:** E5.2c, synchronize broker events and reconcile the account
-  through the configured route, then retain Gateway evidence against a real
-  IBKR PAPER account. E5.3 through E5.5 and the external gates remain open.
+  test, then was reverted. E5.2c adds a risk-manager reconciliation RPC over
+  the configured route. A stateful bridge protocol fixture produced a fill
+  and matching snapshot; a model restart surfaced discrepancies. Omitting the
+  broker event drain failed the bridge regression, then was reverted (item 102).
+- The full evidence pipeline exited 0 after both slices. Final suite counts
+  for E5.2c are in the generated status block above.
+- **Next action:** define the real IBKR PAPER account scope and fresh market
+  input for this route (E5.3 and E5.5), then retain Gateway evidence for
+  restart, reconnect, cancellation races and reconciliation (E5.6). E5.4's
+  bridge refusal distinction and the other external gates remain open.
 
 ### 2026-09-28/29 — session 10
 

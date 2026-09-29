@@ -121,8 +121,9 @@ for the deployment and evidence sequence.
 - The desktop and PAPER status CLI compose local model adapters. The gRPC PAPER
   route selects the model by default or the official IBKR PAPER process bridge
   by configuration. Its checked-in Python backend submits single market/limit
-  DAY orders only; the route can submit and cancel those orders but does not
-  yet synchronize fills or reconcile the broker account.
+  DAY orders only; the route can submit and cancel those orders. An authenticated
+  risk manager can drain broker events and compare the account snapshot through
+  `ReconcilePaperAccount`.
   The real adapter declares exactly that, so the PAPER OMS refuses a
   combination, a GTC intent or a replacement on that route before any order
   exists.

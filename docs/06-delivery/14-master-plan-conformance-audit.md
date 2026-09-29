@@ -4097,6 +4097,41 @@ These are mandatory master-plan acceptance conditions and are currently open:
        is a protocol fixture, not TWS or IB Gateway evidence. No external gate
        moved.
 
+102. The gRPC PAPER route can now drain broker evidence and reconcile a
+     configured account on an authenticated risk-manager request (2026-09-29,
+     rows 5.5 and 5.10; E5.2c). It uses the existing durable PAPER kernel;
+     the route has no background poller.
+     - **Contract.** `ReconcilePaperAccount` requires a tenant and account, and
+       an explicit `reconnect` flag after an ambiguous disconnect or restart.
+       Only a session with `RiskPolicyManage` permission may call it. The
+       response carries the persisted reconciliation ID and time, every issue,
+       the UNKNOWN count, broker connection state, and audit sequence/head.
+       `snapshot_matches` means only that this snapshot comparison found no
+       issue; it is not a clean-session certificate.
+     - **Behavior.** A connected call synchronizes broker events before taking
+       the independent snapshot. A reconnect call uses the kernel's
+       `reconnect_and_reconcile`, which reconnects, drains delayed evidence,
+       then compares. The route refuses an absent route or another account,
+       and reports broker errors rather than returning a clean result.
+     - **Tests.** A model execution is applied before reconciliation; reopening
+       its journal against a fresh empty model produces cash and position
+       discrepancies. A disconnected model needs an explicit reconnect.
+       Missing session, trader role, wrong tenant/account and missing route are
+       refused. A stateful Python bridge protocol fixture submits a DAY order,
+       emits its execution on poll, and returns a matching account snapshot.
+       Removing the event drain made the bridge test fail with filled quantity,
+       order state, position and cash mismatches; it was restored.
+     - **Measured result.** The Rust workspace rose from 558 to 562 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run
+       measured all seven suites green. The full evidence pipeline exited 0;
+       its artifacts remain local engineering evidence.
+     - **Boundary.** The fixture is synthetic test input under `tests/fixtures/`,
+       not operating evidence. A real IBKR PAPER account still needs scoped
+       snapshot comparison, Gateway logs, restart/reconnect/cancel races, and
+       independent review (E5.5–E5.6). The reconciliation journal names the
+       account and time but does not retain which authenticated risk manager
+       requested it. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
@@ -4109,7 +4144,8 @@ approvals, and record them through the tamper-evident acceptance ledger. As of
 composes the real IBKR PAPER bridge yet (delivery state E5), so that
 composition comes first. As of 2026-09-29 the gRPC PAPER route composes it by
 configuration (item 99), and it can submit a single DAY order and cancel it
-(item 101), but it cannot yet synchronize or reconcile broker evidence
-(delivery state E5.2c). Broad
+(item 101), and a risk manager can invoke broker synchronization and
+reconciliation (item 102). These routes still lack real Gateway evidence,
+fresh market inputs, and reviewed account scope (delivery state E5.3–E5.6). Broad
 LIVE or commercial promotion before those gates would violate the plan's own
 evidence-gated sequence.

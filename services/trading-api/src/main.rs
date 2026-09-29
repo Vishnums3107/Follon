@@ -1,6 +1,6 @@
 //! Deployed gRPC topology for broker-neutral execution planning, portfolio
 //! risk, multi-currency margin valuation, and configured risk-gated PAPER
-//! order submission and cancellation.
+//! order submission, cancellation, and broker reconciliation.
 //!
 //! Every write RPC requires a bearer session from an operator in the
 //! configured operator directory: password plus a mandatory TOTP second
@@ -10,6 +10,10 @@
 //! directory serves one tenant, so a route is reachable only by that tenant's
 //! operators, and the PAPER journal records who submitted, cancelled, and
 //! moved a switch.
+//!
+//! `ReconcilePaperAccount` requires risk-policy management permission. It
+//! drains the broker event queue and compares the account snapshot; no
+//! background polling is implied.
 //!
 //! `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` need the same
 //! kill-switch permission, against a configured controlled-LIVE route. That
@@ -82,9 +86,10 @@ use api::{
     ExecutionAlgorithmKind, ExecutionPlanRequest, ExecutionPlanResponse, ExecutionSide,
     HealthRequest, HealthResponse, MarginAccountRequest, MarginAccountResponse, OmsOrderState,
     OptionComboRequest, OptionComboResponse, OrderTimeInForceKind, PaperComboMarketObservation,
-    PaperOrderKind, PassiveRepricingRequest, PassiveRepricingResponse, PortfolioRiskRequest,
-    PortfolioRiskResponse, RiskMetrics, SubmitPaperComboRequest, SubmitPaperComboResponse,
-    SubmitPaperOrderRequest, SubmitPaperOrderResponse,
+    PaperOrderKind, PaperReconciliationIssue, PaperReconciliationRequest,
+    PaperReconciliationResponse, PassiveRepricingRequest, PassiveRepricingResponse,
+    PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics, SubmitPaperComboRequest,
+    SubmitPaperComboResponse, SubmitPaperOrderRequest, SubmitPaperOrderResponse,
 };
 
 type PaperComboRoute = Arc<Mutex<PaperTradingService<PaperRouteAdapter>>>;
@@ -716,6 +721,68 @@ impl TradingOperatingSystem for OperatingSystemService {
             state: oms_order_state(state) as i32,
             operated_by: operator.user_id,
             operated_at,
+        }))
+    }
+
+    async fn reconcile_paper_account(
+        &self,
+        request: Request<PaperReconciliationRequest>,
+    ) -> Result<Response<PaperReconciliationResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        self.identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::RiskPolicyManage,
+                now,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        validate_canonical_id("account_id", &request.account_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER Risk/OMS route is not configured; no reconciliation ran",
+            )
+        })?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        if request.account_id != service.account_id() {
+            return Err(Status::permission_denied("access denied"));
+        }
+        let reconciled_at = utc_timestamp(now)?;
+        let report = if request.reconnect {
+            service.reconnect_and_reconcile(&reconciled_at)
+        } else {
+            service
+                .synchronize()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            service.reconcile(&reconciled_at)
+        }
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let dashboard = service.dashboard();
+        let snapshot_matches = report.is_clean();
+        Ok(Response::new(PaperReconciliationResponse {
+            reconciliation_id: report.reconciliation_id,
+            reconciled_at: report.reconciled_at,
+            snapshot_matches,
+            issues: report
+                .issues
+                .into_iter()
+                .map(|issue| PaperReconciliationIssue {
+                    incident_id: issue.incident_id,
+                    category: issue.category,
+                    subject: issue.subject,
+                    detail: issue.detail,
+                })
+                .collect(),
+            unknown_orders: dashboard.unknown_orders,
+            broker_connected: dashboard.broker_connected,
+            audit_sequence: dashboard.audit_sequence,
+            audit_head_hash: dashboard.audit_head_hash,
         }))
     }
 
@@ -2536,6 +2603,14 @@ mod tests {
         }
     }
 
+    fn paper_reconciliation_request(reconnect: bool) -> PaperReconciliationRequest {
+        PaperReconciliationRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            reconnect,
+        }
+    }
+
     #[test]
     fn execution_side_rejects_unspecified() {
         assert!(side(ExecutionSide::Unspecified as i32).is_err());
@@ -3103,6 +3178,228 @@ mod tests {
         ] {
             assert_eq!(code, tonic::Code::FailedPrecondition);
         }
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_applies_fills_and_surfaces_restart_discrepancies() {
+        let (service, route, scratch) = configured_paper_service("reconcile-fill");
+        let trader = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let submitted = service
+            .submit_paper_order(authorized(
+                paper_order_request("intent.grpc.paper.reconcile"),
+                &trader,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let order_id = submitted.order_id.unwrap();
+        {
+            let mut paper = route.lock().unwrap();
+            let PaperRouteAdapter::Model(adapter) = paper.broker_mut() else {
+                panic!("the test route uses the model");
+            };
+            adapter
+                .queue_fill(
+                    &order_id,
+                    decimal("quantity", "2").unwrap(),
+                    decimal("price", "100").unwrap(),
+                    decimal("fee", "0.20").unwrap(),
+                    "2026-01-02T14:31:00Z",
+                )
+                .unwrap();
+        }
+        let response = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("apply the fill, then compare the account")
+            .into_inner();
+        assert!(response.snapshot_matches, "{:?}", response.issues);
+        assert!(response.issues.is_empty());
+        assert_eq!(response.unknown_orders, 0);
+        assert!(response.broker_connected);
+        assert!(response.audit_sequence > 0);
+        assert_eq!(response.audit_head_hash.len(), 64);
+        assert_eq!(
+            route.lock().unwrap().order(&order_id).unwrap().oms.state,
+            OrderState::Filled
+        );
+
+        // The model starts empty after restart. A reconnect must compare that
+        // broker state with the restored journal, never report a clean session.
+        drop(service);
+        drop(route);
+        let reopened = paper_combo_route_from_path(&scratch.join("route.json")).unwrap();
+        let resumed = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(reopened.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let manager = risk_token(&resumed).await;
+        let after_restart = resumed
+            .reconcile_paper_account(authorized(paper_reconciliation_request(true), &manager))
+            .await
+            .expect("reconnect reports the model's missing broker state")
+            .into_inner();
+        assert!(!after_restart.snapshot_matches);
+        assert!(after_restart
+            .issues
+            .iter()
+            .any(|issue| issue.category == "CASH_MISMATCH"));
+        assert_ne!(after_restart.reconciliation_id, response.reconciliation_id);
+        drop(resumed);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_requires_a_manager_and_a_matching_account() {
+        let (service, route, scratch) = configured_paper_service("reconcile-auth");
+        let request = || paper_reconciliation_request(false);
+        assert_eq!(
+            service
+                .reconcile_paper_account(Request::new(request()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let trader = trader_token(&service).await;
+        assert_eq!(
+            service
+                .reconcile_paper_account(authorized(request(), &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let manager = risk_token(&service).await;
+        let mut wrong_tenant = request();
+        wrong_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            service
+                .reconcile_paper_account(authorized(wrong_tenant, &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut wrong_account = request();
+        wrong_account.account_id = "acct.other".to_owned();
+        assert_eq!(
+            service
+                .reconcile_paper_account(authorized(wrong_account, &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut no_route = OperatingSystemService {
+            database: None,
+            paper_combo_route: None,
+            live_kill_switch_route: None,
+            identity: None,
+            transport_tls: false,
+        };
+        no_route.identity = Some(operator_identity());
+        let manager = risk_token(&no_route).await;
+        assert_eq!(
+            no_route
+                .reconcile_paper_account(authorized(request(), &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(route.lock().unwrap().dashboard().audit_sequence, 1);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_requires_explicit_reconnect_after_poll_failure() {
+        let (service, route, scratch) = configured_paper_service("reconcile-reconnect");
+        let manager = risk_token(&service).await;
+        {
+            let mut paper = route.lock().unwrap();
+            let PaperRouteAdapter::Model(adapter) = paper.broker_mut() else {
+                panic!("the test route uses the model");
+            };
+            adapter.disconnect();
+        }
+        let error = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!route.lock().unwrap().dashboard().broker_connected);
+        let recovered = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(true), &manager))
+            .await
+            .expect("explicit reconnect")
+            .into_inner();
+        assert!(recovered.broker_connected);
+        assert!(recovered.snapshot_matches);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_drains_the_bridge_process_execution() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge route test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-reconcile", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["bridge_script"] =
+                repository_path("tests/fixtures/ibkr/fake-paper-bridge-reconciliation.py")
+                    .to_string_lossy()
+                    .into();
+            document["ibkr_bridge"] = bridge;
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let trader = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let submitted = service
+            .submit_paper_order(authorized(
+                paper_order_request("intent.grpc.bridge.reconcile"),
+                &trader,
+            ))
+            .await
+            .expect("bridge accepted the single DAY order")
+            .into_inner();
+        let order_id = submitted.order_id.unwrap();
+        assert_eq!(submitted.state, OmsOrderState::Acknowledged as i32);
+        let response = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("bridge execution is applied and its account compared")
+            .into_inner();
+        assert!(response.snapshot_matches, "{:?}", response.issues);
+        assert_eq!(
+            route.lock().unwrap().order(&order_id).unwrap().oms.state,
+            OrderState::Filled
+        );
+        assert_eq!(
+            route.lock().unwrap().dashboard().internal_cash,
+            "99799.80000000"
+        );
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     #[tokio::test]

@@ -14,6 +14,9 @@ service TradingOperatingSystem {
   rpc SubmitPaperCombo(SubmitPaperComboRequest) returns (SubmitPaperComboResponse);
   rpc SubmitPaperOrder(SubmitPaperOrderRequest) returns (SubmitPaperOrderResponse);
   rpc CancelPaperOrder(CancelPaperOrderRequest) returns (CancelPaperOrderResponse);
+  // Risk-manager operation: drain broker evidence, then compare the account
+  // snapshot. Set reconnect after an ambiguous disconnect or route restart.
+  rpc ReconcilePaperAccount(PaperReconciliationRequest) returns (PaperReconciliationResponse);
   // Operator login: password first, then a mandatory TOTP second factor.
   rpc BeginOperatorLogin(BeginOperatorLoginRequest) returns (BeginOperatorLoginResponse);
   rpc CompleteOperatorLogin(CompleteOperatorLoginRequest) returns (OperatorSession);
@@ -290,6 +293,31 @@ message CancelPaperOrderResponse {
   // previously accepted cancel does not append another journal operation.
   string operated_by = 3;
   string operated_at = 4;
+}
+
+message PaperReconciliationRequest {
+  string tenant_id = 1;
+  string account_id = 2;
+  bool reconnect = 3;
+}
+
+message PaperReconciliationIssue {
+  string incident_id = 1;
+  string category = 2;
+  string subject = 3;
+  string detail = 4;
+}
+
+message PaperReconciliationResponse {
+  string reconciliation_id = 1;
+  string reconciled_at = 2;
+  // Snapshot agreement only; this is not a clean PAPER session certificate.
+  bool snapshot_matches = 3;
+  repeated PaperReconciliationIssue issues = 4;
+  uint32 unknown_orders = 5;
+  bool broker_connected = 6;
+  uint64 audit_sequence = 7;
+  string audit_head_hash = 8;
 }
 
 message BeginOperatorLoginRequest {

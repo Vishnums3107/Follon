@@ -80,9 +80,14 @@ before risk is evaluated or an order exists. `SubmitPaperOrder` passes the
 declarative intent and operator-attested mark through the PAPER risk/OMS
 service; `CancelPaperOrder` names the account and OMS order, and journals the
 operator before calling the adapter. Both require an operator session with
-PAPER trading permission in the tenant. The route still does not synchronize
-fills from the bridge or reconcile its account (E5.2c); it is not yet an
-end-to-end broker-PAPER workflow.
+PAPER trading permission in the tenant. A separately authenticated risk manager
+can call `ReconcilePaperAccount` to drain broker events and compare the account
+snapshot. The request can explicitly reconnect after a transport failure or
+route restart. Its response includes the persisted reconciliation identity,
+discrepancies, UNKNOWN count, connection state and audit chain head. A matching
+snapshot is not a clean-session certificate. The route does not poll in the
+background, and no real TWS or IB Gateway PAPER reconciliation has been retained
+(E5.5 and E5.6).
 
 Every call also needs an authenticated operator. A configured route requires
 the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
