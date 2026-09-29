@@ -21,6 +21,20 @@ impl Side {
     }
 }
 
+/// Whether a trade moves one instrument's position strictly toward flat,
+/// without passing through it: a long position sold down that stays long or
+/// reaches zero, or a short position bought back the same way.
+///
+/// This is the one definition of a risk-reducing trade. A trade that opens a
+/// position, adds to one, reverses one through zero, or changes nothing is not
+/// one. PAPER and controlled LIVE both use it when equity is not positive and
+/// no aggregate ratio can be computed, to let an underwater account close
+/// exposure and nothing else (delivery state E7.4b).
+pub fn reduces_position(current: Decimal, projected: Decimal) -> bool {
+    (current > Decimal::ZERO && projected >= Decimal::ZERO && projected < current)
+        || (current < Decimal::ZERO && projected <= Decimal::ZERO && projected > current)
+}
+
 /// Supported first-slice order types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderType {

@@ -272,3 +272,32 @@ fn envelope_serialization_is_stable() {
         .canonical_json()
         .contains("\"event_type\":\"market.bar.v1\""));
 }
+
+/// Only a trade that moves a position strictly toward flat, without passing
+/// through it, reduces risk (delivery state E7.4b).
+#[test]
+fn only_a_trade_toward_flat_reduces_a_position() {
+    let cases = [
+        // (current, projected, reduces)
+        ("10", "4", true),
+        ("10", "0", true),
+        ("-10", "-4", true),
+        ("-10", "0", true),
+        ("10", "-2", false),
+        ("-10", "2", false),
+        ("10", "12", false),
+        ("-10", "-12", false),
+        ("10", "10", false),
+        ("-10", "-10", false),
+        ("0", "5", false),
+        ("0", "-5", false),
+        ("0", "0", false),
+    ];
+    for (current, projected, expected) in cases {
+        assert_eq!(
+            reduces_position(decimal(current), decimal(projected)),
+            expected,
+            "{current} -> {projected}"
+        );
+    }
+}

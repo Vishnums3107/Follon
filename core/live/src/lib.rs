@@ -18,8 +18,8 @@ use follon_accounting::{
 };
 use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
-    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill,
-    OrderIntent, OrderState, RiskDecision, Side, TimeInForce,
+    price_deviation_bps, reduces_position, validate_canonical_id, validate_utc_timestamp,
+    ComboIntent, Decimal, Fill, OrderIntent, OrderState, RiskDecision, Side, TimeInForce,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 
@@ -3258,19 +3258,18 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
         let mut portfolio_risk_limits = String::new();
         if let Some(composition) = self.policy.portfolio_risk.as_ref() {
-            if let Some((decision, margin_used)) =
-                self.portfolio_risk_decision(composition, intent, market, decided_at)?
-            {
-                reasons.extend(
-                    decision
-                        .reason_codes
-                        .into_iter()
-                        // `SELF_TRADE_RISK` is already independently detected above from
-                        // the same working-order state; every other reason this composed
-                        // kernel can produce is new coverage (see `PortfolioRiskComposition`).
-                        .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
-                );
-                portfolio_risk_limits = format!(
+            match self.portfolio_risk_decision(composition, intent, market, decided_at)? {
+                Some((decision, margin_used)) => {
+                    reasons.extend(
+                        decision
+                            .reason_codes
+                            .into_iter()
+                            // `SELF_TRADE_RISK` is already independently detected above from
+                            // the same working-order state; every other reason this composed
+                            // kernel can produce is new coverage (see `PortfolioRiskComposition`).
+                            .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
+                    );
+                    portfolio_risk_limits = format!(
                     ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
@@ -3288,6 +3287,16 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     render_bucket_map(&decision.metrics.currency_gross),
                     render_bucket_map(&decision.metrics.strategy_gross),
                 );
+                }
+                // Equity is not positive, so no aggregate ratio exists to check.
+                // Skipping the check outright would let an underwater account
+                // open more exposure past every aggregate limit exactly when
+                // they matter, so only a trade that moves this position toward
+                // flat may pass. The rest is refused (delivery state E7.4b).
+                None if !reduces_position(current_position, projected_position) => {
+                    reasons.push("PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned());
+                }
+                None => {}
             }
         }
         let approved = reasons.is_empty();
@@ -3361,8 +3370,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
 
     /// Builds the aggregate-risk snapshot/candidate from real service state
     /// and calls the composed `core/risk` kernel. Returns `Ok(None)` when
-    /// computed equity is not yet positive -- a benign boundary condition,
-    /// not an error; the existing per-order checks still apply on their own.
+    /// computed equity is not positive: the kernel's ratios (leverage,
+    /// drawdown, concentration) mean nothing against zero or negative equity.
+    /// That is not permission to skip the limits. The caller refuses every
+    /// order that does not reduce a position (`PORTFOLIO_EQUITY_NOT_POSITIVE`,
+    /// delivery state E7.4b), and the per-order checks apply as always.
     /// On `Some`, the second tuple element is the real margin requirement
     /// computed for the decision (`Decimal::ZERO` when `margin_rates` is not
     /// configured), returned alongside the decision because
@@ -6826,6 +6838,173 @@ mod tests {
         assert_eq!(service.canary_submissions, 1);
         assert!(service.has_unknown_order());
         let _ = fs::remove_file(&path);
+    }
+
+    /// A LIVE service whose aggregate composition is configured and whose
+    /// policy permits shorts, holding a short of 2 sold at 10, plus a marks
+    /// helper for what it would take to put it underwater.
+    fn service_holding_a_short_under_aggregate_risk(label: &str) -> LiveTradingService<TestBroker> {
+        let path = journal_path(label);
+        let mut risk_policy = policy_permitting_shorts();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        service
+            .apply_accounted_fill(
+                &Fill {
+                    execution_id: "execution.live.underwater.short".to_owned(),
+                    order_id: "order.live.underwater.short".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: amount("2"),
+                    price: amount("10"),
+                    fee: Decimal::ZERO,
+                    executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                },
+                "strategy.live.001",
+            )
+            .expect("a short position");
+        service
+    }
+
+    /// With equity not positive no aggregate ratio can be computed. Skipping
+    /// the limits then would let an underwater account open exposure past every
+    /// one of them, so only a trade that moves a position toward flat passes
+    /// (delivery state E7.4b).
+    #[test]
+    fn an_underwater_live_account_may_only_reduce_a_position() {
+        let mut service = service_holding_a_short_under_aggregate_risk("underwater-single");
+        // Cash is 1,020 against a short of 2. A mark of 600 takes equity to
+        // 1,020 - 2 * 600 = -180.
+        let mut assess = |id: &str, side: Side, quantity: &str| {
+            let mut order = intent("LIVE", id);
+            order.side = side;
+            order.quantity = amount(quantity);
+            let market = LiveMarketData {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                mark_price: amount("600"),
+                observed_at: "2026-01-02T14:32:00Z".to_owned(),
+            };
+            service
+                .evaluate_risk(&order, &market, "2026-01-02T14:32:00Z", true)
+                .expect("a risk decision")
+        };
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+        let adding = assess("intent.live.underwater.add", Side::Sell, "1");
+        assert!(adding.reason_codes.contains(&refused));
+        // The kernel that cannot run is not reported as having run.
+        assert!(!adding.evaluated_limits.contains("portfolio_gross_exposure"));
+        let reversing = assess("intent.live.underwater.flip", Side::Buy, "3");
+        assert!(reversing.reason_codes.contains(&refused));
+        // Buying the short back, in part or entirely, moves it toward flat.
+        for (id, quantity) in [
+            ("intent.live.underwater.part", "1"),
+            ("intent.live.underwater.all", "2"),
+        ] {
+            let reducing = assess(id, Side::Buy, quantity);
+            assert!(!reducing.reason_codes.contains(&refused), "{id}");
+        }
+    }
+
+    /// A combination is one atomic group, so it reduces risk only if every leg
+    /// moves its own position toward flat.
+    #[test]
+    fn an_underwater_live_account_may_only_close_every_leg_of_a_combination() {
+        let path = journal_path("underwater-combo");
+        let mut risk_policy = policy_permitting_shorts();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        for (instrument, side, price) in [
+            ("inst.us_option.spy.near", Side::Buy, "7.50"),
+            ("inst.us_option.spy.far", Side::Sell, "5"),
+        ] {
+            service
+                .apply_accounted_fill(
+                    &Fill {
+                        execution_id: format!("execution.live.underwater.{instrument}"),
+                        order_id: "order.live.underwater.vertical".to_owned(),
+                        instrument_id: instrument.to_owned(),
+                        side,
+                        quantity: amount("4"),
+                        price: amount(price),
+                        fee: Decimal::ZERO,
+                        executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                    },
+                    "strategy.live.001",
+                )
+                .expect("a leg of the vertical");
+        }
+        // Long 4 near, short 4 far. The short leg's mark rising to 30,000
+        // takes equity far below zero.
+        let market = LiveComboMarketData {
+            marks: vec![
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    mark_price: amount("7.50"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    mark_price: amount("30000"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+            ],
+        };
+        let mut assess =
+            |id: &str, near: Side, far: Side, limit: follon_domain::ComboPriceLimit| {
+                let mut structure = combo_intent(id);
+                structure.combo_quantity = amount("1");
+                structure.legs[0].side = near;
+                structure.legs[0].limit_price = amount("7.50");
+                structure.legs[1].side = far;
+                structure.legs[1].limit_price = amount("30000");
+                structure.price_limit = limit;
+                service
+                    .evaluate_combo_risk(&structure, &market, "2026-01-02T14:32:00Z", true)
+                    .expect("a combination decision")
+            };
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+        // Adding to both legs, and closing one leg while adding to the other,
+        // are refused.
+        let adding = assess(
+            "intent.live.underwater.add",
+            Side::Buy,
+            Side::Sell,
+            follon_domain::ComboPriceLimit::MinimumCredit(amount("29992.50")),
+        );
+        assert!(adding.reason_codes.contains(&refused));
+        let mixed = assess(
+            "intent.live.underwater.mixed",
+            Side::Sell,
+            Side::Sell,
+            follon_domain::ComboPriceLimit::MinimumCredit(amount("30007.50")),
+        );
+        assert!(mixed.reason_codes.contains(&refused));
+        // Order does not matter: the leg that adds may come first or last.
+        let mixed_the_other_way = assess(
+            "intent.live.underwater.mixed-reversed",
+            Side::Buy,
+            Side::Buy,
+            follon_domain::ComboPriceLimit::MaximumDebit(amount("30007.50")),
+        );
+        assert!(mixed_the_other_way.reason_codes.contains(&refused));
+        // Closing one unit of both legs is not refused for the equity.
+        let closing = assess(
+            "intent.live.underwater.close",
+            Side::Sell,
+            Side::Buy,
+            follon_domain::ComboPriceLimit::MaximumDebit(amount("29992.50")),
+        );
+        assert!(!closing.reason_codes.contains(&refused));
     }
 
     /// An adapter that declares nothing is never handed a combination, a GTC

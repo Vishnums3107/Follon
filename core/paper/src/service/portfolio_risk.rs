@@ -34,9 +34,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
 
     /// Builds the aggregate-risk snapshot/candidate from real service state
     /// and calls the composed `core/risk` kernel. Returns `Ok(None)` when
-    /// computed equity is not yet positive (e.g. a brand-new, zero-funded,
-    /// zero-position account) -- a benign boundary condition, not an error;
-    /// the existing per-order checks still apply on their own. On `Some`, the
+    /// computed equity is not positive: the kernel's ratios (leverage,
+    /// drawdown, concentration) mean nothing against zero or negative equity.
+    /// That is not permission to skip the limits. The caller refuses every
+    /// order that does not reduce a position (`PORTFOLIO_EQUITY_NOT_POSITIVE`,
+    /// delivery state E7.4b), and the per-order checks apply as always. On `Some`, the
     /// second tuple element is the real margin requirement computed for the
     /// decision (`Decimal::ZERO` when `margin_rates` is not configured),
     /// returned alongside the decision because `core/risk::AggregateRiskMetrics`

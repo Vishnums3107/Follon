@@ -223,8 +223,190 @@ fn paper_portfolio_risk_composition_rejects_a_restricted_instrument() {
         .contains(&"RESTRICTED_INSTRUMENT".to_owned()));
 }
 
+/// A service with the permissive aggregate policy composed and short exposure
+/// permitted, whose per-order bounds are wide enough for a blown-up mark.
+fn service_with_aggregate_risk_and_shorts() -> PaperTradingService<IbkrPaperAdapter> {
+    let mut risk_policy = PaperRiskPolicy {
+        max_order_quantity: decimal("quantity", "1000").unwrap(),
+        max_order_notional: decimal("notional", "1000000").unwrap(),
+        ..policy_permitting_shorts()
+    };
+    risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+        policy: permissive_portfolio_risk_policy(),
+        instrument_buckets: BTreeMap::new(),
+        margin_rates: None,
+    });
+    service_with(risk_policy)
+}
+
+/// With equity not positive no aggregate ratio can be computed. Skipping the
+/// limits then would let an underwater account open exposure past every one of
+/// them, so only a trade that moves a position toward flat passes (delivery
+/// state E7.4b).
 #[test]
-fn paper_portfolio_risk_composition_is_skipped_when_equity_is_not_positive() {
+fn an_underwater_paper_account_may_only_reduce_a_position() {
+    let mut service = service_with_aggregate_risk_and_shorts();
+    let short = OrderIntent {
+        side: Side::Sell,
+        quantity: decimal("quantity", "100").unwrap(),
+        ..intent("intent-underwater-short", "2026-01-02T14:31:00Z")
+    };
+    let opened = service
+        .submit_intent(
+            short,
+            market_at_price("100", "2026-01-02T14:31:00Z"),
+            "2026-01-02T14:31:00Z",
+        )
+        .unwrap();
+    assert!(
+        opened.decision.approved,
+        "{:?}",
+        opened.decision.reason_codes
+    );
+    service
+        .broker_mut()
+        .queue_fill(
+            &opened.order_id.unwrap(),
+            decimal("quantity", "100").unwrap(),
+            decimal("price", "100").unwrap(),
+            Decimal::ZERO,
+            "2026-01-02T14:31:01Z",
+        )
+        .unwrap();
+    service.synchronize().unwrap();
+    // Cash is now 110,000 against a short of 100. The mark rising to 1,200
+    // takes equity to 110,000 - 100 * 1,200 = -10,000.
+    let assess = |service: &mut PaperTradingService<IbkrPaperAdapter>,
+                  id: &str,
+                  side: Side,
+                  quantity: &str| {
+        service
+            .submit_intent(
+                OrderIntent {
+                    side,
+                    quantity: decimal("quantity", quantity).unwrap(),
+                    ..intent(id, "2026-01-02T14:32:00Z")
+                },
+                market_at_price("1200", "2026-01-02T14:32:00Z"),
+                "2026-01-02T14:32:00Z",
+            )
+            .unwrap()
+    };
+    let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+    // Adding to the short, and reversing it through flat, are refused.
+    let adding = assess(&mut service, "intent-underwater-add", Side::Sell, "10");
+    assert!(!adding.decision.approved);
+    assert!(adding.order_id.is_none());
+    assert!(adding.decision.reason_codes.contains(&refused));
+    // The kernel that cannot run is not reported as having run.
+    assert!(!adding
+        .decision
+        .evaluated_limits
+        .contains("portfolio_gross_exposure"));
+    let reversing = assess(&mut service, "intent-underwater-flip", Side::Buy, "150");
+    assert!(reversing.decision.reason_codes.contains(&refused));
+
+    // Buying part of the short back moves it toward flat, so it passes.
+    let reducing = assess(&mut service, "intent-underwater-reduce", Side::Buy, "50");
+    assert!(
+        reducing.decision.approved,
+        "{:?}",
+        reducing.decision.reason_codes
+    );
+    assert!(reducing.order_id.is_some());
+}
+
+/// A combination is one atomic group, so it reduces risk only if every leg
+/// moves its own position toward flat.
+#[test]
+fn an_underwater_paper_account_may_only_close_every_leg_of_a_combination() {
+    let mut service = service_with_aggregate_risk_and_shorts();
+    // The standard vertical, filled: long 4 near, short 4 far.
+    let opening = submit_lifecycle_combo(&mut service, "underwater-open");
+    let fill = combo_execution(&service, &opening, "group-underwater", "4");
+    service.broker.queue_combo_fill(fill).unwrap();
+    service.synchronize().unwrap();
+    // The short leg's mark rises to 30,000, taking equity far below zero.
+    let market = PaperComboMarketData {
+        marks: vec![
+            PaperMarketData {
+                instrument_id: "inst.us_option.spy.near".to_owned(),
+                mark_price: decimal("mark", "7.50").unwrap(),
+                observed_at: "2026-01-02T14:32:00Z".to_owned(),
+            },
+            PaperMarketData {
+                instrument_id: "inst.us_option.spy.far".to_owned(),
+                mark_price: decimal("mark", "30000").unwrap(),
+                observed_at: "2026-01-02T14:32:00Z".to_owned(),
+            },
+        ],
+    };
+    let assess = |service: &mut PaperTradingService<IbkrPaperAdapter>,
+                  id: &str,
+                  near: Side,
+                  far: Side,
+                  limit: follon_domain::ComboPriceLimit| {
+        let mut structure = combo_intent(id, "2026-01-02T14:32:00Z");
+        structure.combo_quantity = decimal("units", "1").unwrap();
+        structure.legs[0].side = near;
+        structure.legs[0].limit_price = decimal("near", "7.50").unwrap();
+        structure.legs[1].side = far;
+        structure.legs[1].limit_price = decimal("far", "30000").unwrap();
+        structure.price_limit = limit;
+        service
+            .submit_combo_intent(structure, market.clone(), "2026-01-02T14:32:00Z")
+            .unwrap()
+    };
+    let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+    // Adding to both legs, and closing one leg while adding to the other, are refused.
+    let adding = assess(
+        &mut service,
+        "underwater-add",
+        Side::Buy,
+        Side::Sell,
+        follon_domain::ComboPriceLimit::MinimumCredit(decimal("credit", "29992.50").unwrap()),
+    );
+    assert!(adding.decision.reason_codes.contains(&refused));
+    assert!(adding.order_id.is_none());
+    let mixed = assess(
+        &mut service,
+        "underwater-mixed",
+        Side::Sell,
+        Side::Sell,
+        follon_domain::ComboPriceLimit::MinimumCredit(decimal("credit", "30007.50").unwrap()),
+    );
+    assert!(mixed.decision.reason_codes.contains(&refused));
+    assert!(mixed.order_id.is_none());
+    // Order does not matter: the leg that adds may come first or last.
+    let mixed_the_other_way = assess(
+        &mut service,
+        "underwater-mixed-reversed",
+        Side::Buy,
+        Side::Buy,
+        follon_domain::ComboPriceLimit::MaximumDebit(decimal("debit", "30007.50").unwrap()),
+    );
+    assert!(mixed_the_other_way.decision.reason_codes.contains(&refused));
+
+    // Closing one unit of both legs passes.
+    let closing = assess(
+        &mut service,
+        "underwater-close",
+        Side::Sell,
+        Side::Buy,
+        follon_domain::ComboPriceLimit::MaximumDebit(decimal("debit", "29992.50").unwrap()),
+    );
+    assert!(
+        closing.decision.approved,
+        "{:?}",
+        closing.decision.reason_codes
+    );
+    assert!(closing.order_id.is_some());
+}
+
+#[test]
+fn paper_portfolio_risk_kernel_is_not_run_when_equity_is_not_positive() {
     let mut portfolio_policy = permissive_portfolio_risk_policy();
     // Tight enough that a positive-equity account would certainly reject
     // on this limit -- its absence from the rejection below is what
@@ -259,6 +441,13 @@ fn paper_portfolio_risk_composition_is_skipped_when_equity_is_not_positive() {
         .decision
         .reason_codes
         .contains(&"INSUFFICIENT_INTERNAL_CASH".to_owned()));
+    // An order that opens exposure is refused for the equity itself, not
+    // waved through because its limits could not be computed (E7.4b).
+    assert!(result
+        .decision
+        .reason_codes
+        .contains(&"PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned()));
+    // The kernel did not run, so none of its own limits is reported.
     assert!(!result
         .decision
         .reason_codes

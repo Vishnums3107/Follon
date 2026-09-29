@@ -373,6 +373,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         // combination unit count. A ten-lot butterfly is not a ten-lot order.
         let mut largest_leg_quantity = Decimal::ZERO;
         let mut widest_leg_deviation_bps = Decimal::ZERO;
+        let mut every_leg_reduces = true;
         let mut leg_evidence = Vec::with_capacity(intent.legs.len());
         for leg in &intent.legs {
             let mark = market.mark_for(&leg.instrument_id).ok_or_else(|| {
@@ -397,6 +398,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .map(|portfolio| portfolio.position_snapshot().quantity)
                 .unwrap_or(Decimal::ZERO);
             let projected = held.checked_add(intent.projected_leg_delta(leg)?)?;
+            every_leg_reduces &= reduces_position(held, projected);
             if self.policy.breaches_position_limit(projected)? {
                 reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
             }
@@ -476,18 +478,17 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
 
         let mut portfolio_risk_limits = String::new();
         if let Some(composition) = self.policy.portfolio_risk.as_ref() {
-            if let Some((decision, margin_used)) =
-                self.combo_portfolio_risk_decision(composition, intent, market, decided_at)?
-            {
-                reasons.extend(
-                    decision
-                        .reason_codes
-                        .into_iter()
-                        // `SELF_TRADE_RISK` is already detected per leg above
-                        // from the same working-order state.
-                        .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
-                );
-                portfolio_risk_limits = format!(
+            match self.combo_portfolio_risk_decision(composition, intent, market, decided_at)? {
+                Some((decision, margin_used)) => {
+                    reasons.extend(
+                        decision
+                            .reason_codes
+                            .into_iter()
+                            // `SELF_TRADE_RISK` is already detected per leg above
+                            // from the same working-order state.
+                            .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
+                    );
+                    portfolio_risk_limits = format!(
                     ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
@@ -501,6 +502,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     margin_used,
                     decision.metrics.margin_utilization_bps,
                 );
+                }
+                // The group is atomic, so every leg must move its own position
+                // toward flat for the structure to reduce risk (E7.4b).
+                None if !every_leg_reduces => {
+                    reasons.push("PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned());
+                }
+                None => {}
             }
         }
 

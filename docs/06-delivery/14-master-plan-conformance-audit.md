@@ -4317,6 +4317,55 @@ These are mandatory master-plan acceptance conditions and are currently open:
        rest of the evidence set, is not reproducible byte for byte, because its
        latencies vary by run. Neither is changed. No external gate moved.
 
+107. An account with no positive equity may only reduce risk, not skip its aggregate
+     limits (2026-09-29, rows 5.5 and 5.7; E7.4b). The treatment was left to the
+     operator, and the agent chose it under the blanket delegation recorded as Settled
+     direction item 6.
+     - **Defect.** All four risk gates, PAPER and controlled LIVE for a single order and a
+       combination, returned no aggregate decision when equity was zero or negative, and
+       added no reason. Every aggregate limit was therefore skipped for an underwater
+       account, the state in which they matter most, because the kernel's ratios are
+       meaningless against non-positive equity. An underwater account could add exposure
+       past all of them.
+     - **Decision.** Reduce-only. The alternatives were to keep skipping (fail open) or to
+       refuse everything (an account could not close a losing position). Reduce-only lets
+       exposure be closed and nothing else. It is reversible on an explicit instruction.
+     - **Behavior.**
+       - `follon_domain::reduces_position(current, projected)` is the single definition: a
+         trade reduces a position only if it moves it strictly toward flat without passing
+         through it. Opening, adding, reversing and doing nothing do not.
+       - With aggregate risk configured and equity not positive, a single order that does
+         not reduce its instrument's position is refused with `PORTFOLIO_EQUITY_NOT_POSITIVE`.
+         A combination is refused unless every leg reduces its own position, because the
+         group is atomic. A reducing order passes as before, and the kernel's own limits are
+         still not reported, because it did not run.
+       - PAPER and LIVE each apply it in their own gate. They share only the arithmetic
+         predicate, not policy.
+       - An account with no aggregate composition is unchanged, since it has no aggregate
+         limits to skip.
+     - **Tests.** Five tests were added and one strengthened.
+       - The predicate is held on both sides of flat, on an unchanged position and on
+         opening from flat.
+       - An underwater PAPER account holding a short of 100 refuses adding to it and
+         reversing it, and passes buying 50 back. An underwater PAPER account holding the
+         filled vertical refuses a combination that adds to both legs, one that closes a
+         leg and adds to the other in either order, and passes closing one unit.
+       - The two LIVE tests hold the same cases through its own gate, seeded with recorded
+         fills.
+       - The existing zero-equity test now requires the refusal as well.
+     - **Rule 5.** 20 of 20 injected defects were caught by the intended tests: each side of
+       the predicate, an underwater order never refused or always refused, the position
+       arguments swapped, the reason renamed, and the per-leg accumulation replaced by
+       `any`, by the last leg only, and by never or always refusing, in PAPER and in LIVE.
+     - **Measured result.** The Rust workspace rose from 589 to 594 passed / 0 failed /
+       3 ignored. The final `python tools/session_status.py` run measured all seven suites
+       green. The full evidence pipeline exited 0.
+     - **Boundary.** "Reduces risk" is judged per instrument on position quantity, not on
+       margin or notional: a reduction that swaps into a more volatile instrument is not a
+       concept the gate has. The reducing order must still pass every other check, including
+       cash, so an account that cannot afford to buy back its short can only reduce partly.
+       No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

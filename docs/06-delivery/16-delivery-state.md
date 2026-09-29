@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T13:44:26Z  
+**Measured at:** 2026-09-29T13:58:02Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `bf0af3d` -- feat(control-plane): bound and time-limit every strategy-worker frame -- E7.2 (2026-09-29T19:10:07+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `0beba6b` -- fix(cli): the risk benchmark records when it was measured -- E7.9 (2026-09-29T19:15:33+05:30)  
+**Uncommitted paths:** 10
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 589 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 594 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -272,7 +272,7 @@ passes it for production.
 | E7.2 | Strategy-worker frames. Each was one newline-terminated JSON line, read with an unbounded `read_line` and no deadline, and written with a blocking `write_all`. **Now** every frame is bounded before it is buffered (16 MiB, newline included), and every round trip, request write included, has a 60-second deadline. Both are `StrategyWorkerLimits`, and `ProcessStrategyWorker::spawn_bounded` sets them explicitly. A transport fault (oversized or cut-off frame, closed pipe, expired deadline) kills the worker and it is never asked again. The reader is `core/control-plane/src/worker_io.rs`, not the IBKR bridge's, because `core` cannot depend on an adapter. Audit item 105. | **done** 2026-09-29 |
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
 | E7.4a | Portfolio-risk configuration fingerprints. PAPER's and LIVE's both omitted `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`. **Now every field enters both**, through `PortfolioRiskPolicy::canonical_parts`, whose exhaustive destructuring makes a new field a compile error until it is rendered. The part is tagged `v2`, so a journal or LIVE approval made under the incomplete version-1 fingerprint is refused rather than trusted (audit item 98). | **done** 2026-09-29 |
-| E7.4b | The aggregate portfolio-risk check is skipped outright when equity is not positive. Failing closed would also refuse risk-reducing orders, such as closing positions, when an account is underwater, so the treatment is the operator's choice. | **decision** |
+| E7.4b | The aggregate portfolio-risk check was skipped outright when equity is not positive. Failing closed on everything would also have refused risk-reducing orders, such as closing positions, so the treatment was left to the operator. **Decided 2026-09-29 by the agent under the operator's blanket delegation (Settled direction item 6): reduce-only.** With aggregate risk configured, PAPER and controlled LIVE refuse every order that does not move a position strictly toward flat (`PORTFOLIO_EQUITY_NOT_POSITIVE`), a combination unless every leg does, and still pass one that reduces a position without crossing through flat. `follon_domain::reduces_position` is the one definition. Audit item 107. | **done** 2026-09-29 |
 | E7.5 | Aggregate portfolio risk in the order-submitting routes, the desktop gateway and the gRPC PAPER route. Only the read-only `follon-paper-status` composes it today. | open |
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
@@ -767,6 +767,16 @@ the reversal here with its date.
      Apache-2.0 follow the root `LICENSE` (E7.11).
    - The branch is pushed and a pull request opened, so GitHub CI can verify
      E4 (E4.3).
+
+6. **2026-09-29 — decisions taken by the agent while the operator was away.**
+   Asked to complete the backlog and told not to stop for questions, session 13
+   took the recommended, most conservative option for each decision-gated slice
+   it needed. Each is reversible: an explicit operator instruction reverses one,
+   and the reversal is recorded here with its date.
+   - **E7.4b: reduce-only.** An account whose equity is not positive may close
+     exposure and nothing else. The alternatives were to keep skipping the
+     aggregate check (fails open exactly when the account is in trouble) or to
+     refuse everything (an account could not close a losing position).
 
 ### Still unanswered
 
