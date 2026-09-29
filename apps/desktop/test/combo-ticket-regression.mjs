@@ -10,7 +10,7 @@ import {
   isComboReceipt,
   netPrice,
   parseFixed,
-} from "../dist/combo-intent.js";
+} from "../dist/orders/combo-intent.js";
 
 const appDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -99,7 +99,7 @@ assert.equal(isCancelableComboStatus("ACKNOWLEDGED"), true);
 assert.equal(isCancelableComboStatus("FILLED"), false);
 
 // The ticket submits one combination command and never routes legs as plain orders.
-const comboTicket = await readFile(resolve(appDirectory, "src", "ComboTicket.tsx"), "utf8");
+const comboTicket = await readFile(resolve(appDirectory, "src", "orders", "ComboTicket.tsx"), "utf8");
 assert.match(comboTicket, /invoke<unknown>\("submit_combo_order", \{ intent: built\.payload \}\)/u);
 assert.doesNotMatch(comboTicket, /"submit_order"/u);
 assert.doesNotMatch(comboTicket, /"close_position"/u);

@@ -1,6 +1,6 @@
 // DOM behavior tests; this small harness does not validate browser layout.
 import assert from "node:assert/strict";
-import { renderWorkspace } from "../dist/workspaces.js";
+import { renderWorkspace } from "../dist/workspaces/index.js";
 
 class Element {
   constructor(tag) {

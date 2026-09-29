@@ -11,8 +11,8 @@ import {
   parseOperationsDashboard,
   parseOptionsDashboard,
   parseStatementReconciliation,
-} from "../dist/evidence.js";
-import { parseWorkspaceSnapshot } from "../dist/workspaces.js";
+} from "../dist/evidence/index.js";
+import { parseWorkspaceSnapshot } from "../dist/workspaces/index.js";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(testDirectory, "..", "..", "..");

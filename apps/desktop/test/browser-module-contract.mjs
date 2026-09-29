@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { readFile, readdir } from "node:fs/promises";
+import { dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const appDirectory = resolve(testDirectory, "..");
+
+// A feature folder is one logical module: its contract is the concatenated source of every file in it.
+async function readTree(directory) {
+  const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+  let combined = "";
+  for (const entry of entries) {
+    const full = resolve(directory, entry.name);
+    if (entry.isDirectory()) combined += await readTree(full);
+    else if (/\.tsx?$/u.test(entry.name)) combined += `${await readFile(full, "utf8")}\n`;
+  }
+  return combined;
+}
 const index = await readFile(resolve(appDirectory, "index.html"), "utf8");
 const appShell = await readFile(resolve(appDirectory, "src", "app-shell.tsx"), "utf8");
 const styles = await readFile(resolve(appDirectory, "styles.css"), "utf8");
@@ -31,29 +43,55 @@ async function verifyModule(relativePath) {
   if (visited.has(relativePath)) return;
   visited.add(relativePath);
   const source = await readFile(resolve(appDirectory, "dist", relativePath), "utf8");
-  for (const match of source.matchAll(/from\s+["'](\.\/.+?)["']/gu)) {
+  for (const match of source.matchAll(/from\s+["'](\.{1,2}\/.+?)["']/gu)) {
     const specifier = match[1];
     assert.ok(specifier.endsWith(".js"), `${relativePath} has a browser-incompatible import: ${specifier}`);
-    await verifyModule(specifier.slice(2));
+    // Resolve against the importing module, so nested feature folders and `../` imports are followed too.
+    await verifyModule(posix.normalize(posix.join(posix.dirname(relativePath), specifier)));
   }
 }
 
 await verifyModule("main.js");
 assert.deepEqual([...visited].sort(), [
-  "ComboTicket.js",
-  "OrderTicket.js",
   "catalog.js",
-  "combo-intent.js",
   "command-palette.js",
-  "evidence.js",
+  "evidence/core.js",
+  "evidence/durability.js",
+  "evidence/index.js",
+  "evidence/operations.js",
+  "evidence/planning.js",
+  "evidence/render.js",
+  "evidence/research.js",
   "main.js",
+  "orders/ComboTicket.js",
+  "orders/OrderTicket.js",
+  "orders/combo-intent.js",
   "routes.js",
-  "workspaces.js",
+  "workspaces/administration.js",
+  "workspaces/advanced-evidence.js",
+  "workspaces/backtest-explorer.js",
+  "workspaces/command-center.js",
+  "workspaces/execution-blotter.js",
+  "workspaces/format.js",
+  "workspaces/index.js",
+  "workspaces/journal.js",
+  "workspaces/marketplace.js",
+  "workspaces/news-cockpit.js",
+  "workspaces/panels.js",
+  "workspaces/portfolio.js",
+  "workspaces/render.js",
+  "workspaces/replay-incidents.js",
+  "workspaces/research-lab.js",
+  "workspaces/risk-cockpit.js",
+  "workspaces/snapshot.js",
+  "workspaces/strategy-studio.js",
+  "workspaces/ticket-mounts.js",
+  "workspaces/visualizers.js",
 ]);
 const main = await readFile(resolve(appDirectory, "src", "main.ts"), "utf8");
 const routes = await readFile(resolve(appDirectory, "src", "routes.ts"), "utf8");
-const workspaces = await readFile(resolve(appDirectory, "src", "workspaces.ts"), "utf8");
-const orderTicket = await readFile(resolve(appDirectory, "src", "OrderTicket.tsx"), "utf8");
+const workspaces = await readTree(resolve(appDirectory, "src", "workspaces"));
+const orderTicket = await readFile(resolve(appDirectory, "src", "orders", "OrderTicket.tsx"), "utf8");
 const workspaceContracts = new Map([
   ["marketplace", ["Research asset marketplace", "Inspect asset"]],
   ["command-center", ["Daily Operating Brief", "System, broker, strategy, and risk status", "Environment readiness", "Attention queue"]],

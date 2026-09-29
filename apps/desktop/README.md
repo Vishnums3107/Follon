@@ -99,6 +99,22 @@ policy, caps individual rendered artifacts at 10 MiB, and bounds records in the
 unified workspace projection. Browser module imports use explicit `.js` URLs so
 the unbundled ESM graph works on the static server.
 
+## Source layout
+
+`src/` is organised by feature; each folder has an `index.ts` that re-exports its
+public API, and importers go through it.
+
+| Path | Holds |
+| --- | --- |
+| `react-main.tsx`, `main.ts`, `app-shell.tsx` | Entry point, gateway wiring and the React shell |
+| `routes.ts`, `catalog.ts`, `command-palette.ts` | Typed workspace routes, the feature catalogue and the palette |
+| `evidence/` | Evidence types, parsers and type guards by domain (`core`, `operations`, `research`, `planning`, `durability`) and the DOM `render` module |
+| `workspaces/` | The workspace snapshot parser, the dispatcher (`render.ts`), one module per workspace, and the shared `panels`, `visualizers`, `format` and `advanced-evidence` helpers |
+| `orders/` | The PAPER order ticket, the combination ticket and the combination-intent model |
+
+The evidence contract tests read these folders as one logical module each, so
+adding a file to a feature folder needs no test change.
+
 ## Validate the projection
 
 ```powershell

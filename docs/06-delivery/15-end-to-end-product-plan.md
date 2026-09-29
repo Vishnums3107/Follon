@@ -36,7 +36,7 @@ Source anchors:
 - [Product charter](../00-product/01-product-charter.md)
 - [Repository guide](../02-architecture/03-repository-guide.md)
 - [Strategy and backtesting contract](../03-capabilities/02-strategy-sdk-and-backtesting.md)
-- [Desktop implementation](../../apps/desktop/src/workspaces.ts)
+- [Desktop implementation](../../apps/desktop/src/workspaces/index.ts)
 - [Evidence API](../../apps/desktop/server.py)
 - [Current conformance audit](14-master-plan-conformance-audit.md)
 - [Existing release gates](03-roadmap-and-gates.md)
