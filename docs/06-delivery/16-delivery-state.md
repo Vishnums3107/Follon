@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T05:10:12Z  
+**Measured at:** 2026-09-29T05:15:11Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `0a2d380` -- ci: install the operator-approved IBKR API, pinned by hash -- E4.2 (2026-09-29T10:34:53+05:30)  
-**Uncommitted paths:** 7
+**HEAD:** `8d3b053` -- docs(delivery): foundation CI passes on a clean runner -- E4.3 (2026-09-29T10:42:13+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 538 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 539 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -267,7 +267,7 @@ passes it for production.
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
 | E7.4 | Portfolio-risk configuration. PAPER's fingerprint omits `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`, and the aggregate check is skipped outright when equity is not positive. LIVE's fingerprint needs the same check. | open |
 | E7.5 | Aggregate portfolio risk in the order-submitting routes, the desktop gateway and the gRPC PAPER route. Only the read-only `follon-paper-status` composes it today. | open |
-| E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). | open |
+| E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
 | E7.8 | The SBOM covers the desktop's Cargo workspace and records first-party licences; E7.11, on which the licences depended, is decided (MIT). | open |
 | E7.9 | The risk benchmark records when it was measured; its `observed_at` is the fixture's scenario time. | open |

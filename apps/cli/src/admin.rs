@@ -290,6 +290,17 @@ fn release_keygen(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
         &[],
         &["--key-id", "--private-key", "--trusted-key"],
     )?;
+    // Every refusal either output can meet is checked before a key exists, so
+    // a refused command writes nothing. The private key used to be written
+    // first, and stayed on disk when the trusted key was then refused
+    // (E3.11's finding; delivery state E7.6).
+    preflight_new_output(&private_key_path)?;
+    preflight_new_output(&trusted_key_path)?;
+    if std::path::absolute(&private_key_path)? == std::path::absolute(&trusted_key_path)? {
+        return Err(
+            "the private key and the trusted key must be written to different paths".into(),
+        );
+    }
     let (mut private_key, trusted_key) = generate_release_keypair(key_id)?;
     let write_result = write_new_private_key(&private_key_path, &private_key)
         .and_then(|_| publish_immutable(&trusted_key_path, &trusted_key.canonical_json()));
@@ -579,6 +590,41 @@ fn reject_symlink_output(path: &Path) -> Result<(), Box<dyn std::error::Error>> 
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err("refusing to write through a symbolic link".into())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Checks, without creating or following anything, that a brand-new output
+/// could be written at `path`: no symbolic link, nothing already there, a
+/// UTF-8 file name, and a parent that is either absent, to be created at write
+/// time, or a real directory. `release-keygen` runs it for both outputs before
+/// a key exists, so every refusal it predicts leaves nothing behind
+/// (delivery state E7.6).
+fn preflight_new_output(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    reject_symlink_output(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(format!(
+                "refusing to overwrite an existing output: {}",
+                path.display()
+            )
+            .into())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+    if path.file_name().and_then(|name| name.to_str()).is_none() {
+        return Err("output path must have a UTF-8 file name".into());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err("output parent must be a regular directory".into())
         }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),

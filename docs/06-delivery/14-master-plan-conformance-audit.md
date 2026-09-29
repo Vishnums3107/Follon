@@ -3900,6 +3900,34 @@ These are mandatory master-plan acceptance conditions and are currently open:
       same on `main`. The dependency-review step stays skipped while its repository variable is off, as the
       workflow intends. No external gate moved.
 
+97. A refused `release-keygen` leaves no private key behind (2026-09-29, Security row "Immutable audit and
+    signed release"; delivery state E7.6). Item 83 found this and left it for a decision.
+    - **The gap.** `release-keygen` generated a key pair, wrote the private key, and only then validated
+      and published the trusted key. Every refusal of the trusted key left a new private key on disk with
+      no trusted key beside it: a link at its path, an existing file there, a non-UTF-8 file name, or the
+      same path given for both outputs. Item 83's test covered the linked case but checked only for
+      staging files, so the leftover key went unnoticed.
+    - **The fix.** The command now checks both outputs before a key exists, without creating or
+      following anything. Each must be free of links, absent, UTF-8-named, and in a parent that is absent
+      or a real directory, and the two must be different paths. This decides no custody question: nothing
+      is deleted. A refusal the check predicts simply happens before any key is made.
+    - **Tests.** A new workflow test, through the real binary. An existing trusted key, one path for both
+      outputs and an existing private key are each refused, and no new file appears. The existing trusted
+      key and private key keep their contents, and a clean pair of paths still works. Item 83's link test
+      now also requires that no private key remains.
+    - **Rule 5.** 4 of 4 injected defects were caught: both checks removed, the trusted key's check
+      removed, the distinct-paths check removed, and existing outputs no longer refused. The last was first
+      written as a guarded match arm that did not compile; the runner reported it as a compile error rather
+      than a catch, and it was rewritten.
+    - **Measured result.** The Rust workspace rose from 538 to 539 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed. Its own `release-keygen` calls still
+      succeed.
+    - **Bounded remainder.** A write that fails after the checks, such as on a full disk or a filesystem
+      without hard links, can still leave the private key. Deleting it automatically is the custody decision
+      item 83 recorded. A path created by another process between the check and the write is the E7.12
+      race. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
