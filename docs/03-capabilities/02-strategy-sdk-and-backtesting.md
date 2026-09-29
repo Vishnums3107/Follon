@@ -63,6 +63,28 @@ result.
 
 The backtester uses the same strategy API and event model as production. It must model point-in-time data, corporate actions, delistings, fees/charges, bid-ask spreads, configurable slippage, partial fills, order latency, session rules, market halts, borrow constraints, deterministic seeds, and portfolio-level capital constraints.
 
+## P&L conventions
+
+The backtest crate holds two accounts, and they show fees in different places. Read
+a P&L figure with its convention in mind.
+
+| Figure | `BacktestLedger` (every replay's primary account) | `AdvancedBacktestAccount` |
+| --- | --- | --- |
+| Cost basis | Includes the buy fee (`average_cost`) | Excludes fees (`average_price`) |
+| Realized P&L | **Net of every fee**: the buy fee through the basis, the sell fee deducted | **Trading P&L before charges** |
+| Unrealized P&L | Net of the buy fee already paid | Before charges |
+| Fees | `total_fees`, informational | `execution_charges`, and `financing_charges` for financing, each reported beside P&L |
+| FIFO tax-lot P&L | Net of fees | Net of fees |
+
+The two must agree on everything that is money. The same fills leave the same cash
+and the same equity, and the difference between the two realized (or unrealized)
+figures is exactly the fees. Buying 10 at 100 with a fee of 1.5, then selling 10 at
+110 with a fee of 2, is a trading gain of 100 and fees of 3.5. The primary ledger
+reports realized P&L of 96.5, and the advanced account reports 100 with charges of 3.5.
+Both report cash of 10,096.5, and both report a FIFO tax P&L of 96.5, because each puts
+fees in its lot cost. `core/backtest/tests/pnl_conventions.rs` holds every one of these
+statements, and a change to either account that moves a fee to the other side fails it.
+
 ## Reproducibility record
 
 Every completed backtest records the strategy bundle hash, versioned and

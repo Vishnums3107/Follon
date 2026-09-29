@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T13:58:02Z  
+**Measured at:** 2026-09-29T14:03:22Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `0beba6b` -- fix(cli): the risk benchmark records when it was measured -- E7.9 (2026-09-29T19:15:33+05:30)  
-**Uncommitted paths:** 10
+**HEAD:** `277ec06` -- feat(risk): an account with no positive equity may only reduce risk -- E7.4b (2026-09-29T19:29:13+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 594 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 599 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -291,7 +291,7 @@ passes it for production.
 | E8.2 | The replay engine's own portfolio, and so the fingerprinted event stream, applies corporate actions as the ledger does. A working order across a split would apply E3.6g's decision, so the replay refuses to fill it. | open |
 | E8.3 | The worker's position snapshot and cash reflect splits and dividends. The SDK has no corporate-action hook, and adding one is a protocol change. | **decision** |
 | E8.4 | PAPER and controlled LIVE apply no corporate actions, and capsule replay has no corporate-action input. | open |
-| E8.5 | The two P&L conventions stated and tested. The primary ledger puts fees in the cost basis, while the advanced account reports trading P&L before separately attributed charges. Also clean-install and recovery evidence. | open |
+| E8.5 | The two P&L conventions stated and tested. **Done 2026-09-29 (audit item 108):** the primary ledger puts fees in the cost basis, so its realized and unrealized P&L are net of fees. The advanced account reports trading P&L before separately attributed charges. Five tests hold both, and that the two agree on cash, equity and FIFO tax P&L, and differ by exactly the fees. The conventions table is in the backtesting capability doc. **Still open:** clean-install and recovery evidence. | conventions **done**; install evidence open |
 
 ### E1 — Risk-gated multi-leg combo order path (conformance row 5.6)
 

@@ -4366,6 +4366,37 @@ These are mandatory master-plan acceptance conditions and are currently open:
        cash, so an account that cannot afford to buy back its short can only reduce partly.
        No external gate moved.
 
+108. The backtest's two P&L conventions are stated and held by tests (2026-09-29,
+     research-to-live parity; E8.5). A characterization slice: no production behavior
+     changed.
+     - **Gap.** `BacktestLedger` and `AdvancedBacktestAccount` show fees in different
+       places, and nothing stated or tested which. The primary ledger puts the buy fee
+       in the cost basis and deducts the sell fee, so its realized and unrealized P&L are
+       net of fees. The advanced account reports trading P&L before charges, with charges
+       beside it. A reader comparing the two figures, or a future change to either
+       account, could move a fee across that line without any test noticing.
+     - **What is now stated.** The backtesting capability doc has a conventions table.
+       The two accounts agree on all money: the same fills leave the same cash and
+       equity, and each realized or unrealized figure differs by exactly the fees. Each
+       also keeps a FIFO tax-lot book that includes fees, and the two tax P&Ls are equal.
+     - **Tests.** Five integration tests in `core/backtest/tests/pnl_conventions.rs`,
+       using only the public API. The worked example is a trading gain of 100 and fees of
+       3.5: the ledger's realized P&L is 96.5, the advanced account's is 100 with charges
+       of 3.5, cash is 10,096.5 in both, and both tax P&Ls are 96.5. An open position
+       shows the same split in unrealized P&L (48.5 against 50), and the same equity.
+     - **Rule 5.** 8 of 8 injected defects were caught by the intended tests: the buy fee
+       left out of the basis, the sell fee not deducted, total fees not accumulated, the
+       advanced account's realized P&L charged the fee, its charges not recorded, its
+       average price including the fee, its tax lot leaving the fee out, and the sell fee
+       leaving its cash.
+     - **Measured result.** The Rust workspace rose from 594 to 599 passed / 0 failed /
+       3 ignored. The final `python tools/session_status.py` run measured all seven
+       suites green. The full evidence pipeline exited 0.
+     - **Boundary.** Clean-install and recovery evidence, which E8.5 also names, is not
+       addressed: it needs a clean machine, not code. The conventions cover one currency
+       and one instrument, the case the doc states; FX conversion and multipliers are
+       covered by the advanced account's own tests. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
