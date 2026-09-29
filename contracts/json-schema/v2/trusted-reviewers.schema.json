@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.local/contracts/v2/trusted-reviewers.schema.json",
+  "title": "Follon trusted acceptance reviewer key set",
+  "description": "The keys whose signatures make an acceptance record count. An operator provisions and controls this file. An empty set trusts no one, so no record counts. A reviewer who leaves is removed by writing a new set, and every audit and promotion receipt names the SHA-256 of the set it used.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trusted_reviewers_schema_version", "reviewers"],
+  "properties": {
+    "trusted_reviewers_schema_version": { "const": 1 },
+    "reviewers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key_id", "reviewer_id", "public_key_hex"],
+        "properties": {
+          "key_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+          "reviewer_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+          "public_key_hex": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "The 32-byte Ed25519 public key, as `follon-admin release-keygen` writes it in a trusted key file."
+          }
+        }
+      }
+    }
+  }
+}

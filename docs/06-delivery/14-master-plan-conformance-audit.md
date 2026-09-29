@@ -4493,6 +4493,104 @@ These are mandatory master-plan acceptance conditions and are currently open:
        still lack the authenticated write boundary of E7.10 on the desktop. No external
        gate moved.
 
+111. Acceptance evidence is signed by a trusted reviewer, backed by a retained artifact, bound
+     to a release and held to fixed criteria (2026-09-29, External and business gates;
+     E6.4 and E6.5). Found by the source review behind the revised assessment, and the last
+     part of its priority 3.
+     - **Gap.** After E6.1 to E6.3 the audit still counted a record on its say-so.
+       `observed_by` and `reviewed_by` were two strings checked for inequality, and the
+       per-file hash chain is unkeyed: it exposes an edit but cannot say who wrote a record,
+       and anyone able to write the ledger could append a valid chain naming any reviewer.
+       `source_artifact_sha256` was never compared with anything, a record named no release,
+       so evidence about one build counted toward another, and "clean" was undefined: a PAPER
+       session was a subject and an outcome. The customer gate asked for one customer where
+       the roadmap asks for ten professionals or three organisations.
+     - **Behavior.**
+       - A record is schema 2. It carries the reviewer's Ed25519 signature over
+         `follon-acceptance-evidence-v2\n` and a canonical body of every field except the
+         signature and the hash, so the previous record's hash, the release, the attributes
+         and the notes are all signed. It counts only under a trusted reviewer set, only if
+         the key belongs to the reviewer the record names (`UNAUTHENTICATED`). The set is a
+         strict operator-controlled file, an empty one trusts no one, and its SHA-256 is in
+         every status and receipt.
+       - The record's artifact is re-hashed against a content-addressed artifact root. One that
+         is missing, linked or altered is `ARTIFACT_UNVERIFIED`. The record names its release
+         and counts only toward that release (`OTHER_RELEASE`), and a PAPER or LIVE session
+         names its environment, which nothing else has.
+       - The criteria are fixed (`CRITERIA_NOT_MET`, delivery state Settled direction item 6). A
+         clean session lasts at least 23,400 s, submits and reconciles an order, and closes with
+         no `UNKNOWN` order, discrepancy or unexplained incident. An unplanned reconnect
+         disqualifies it and a planned drill never does. A design partner completed a workflow
+         unaided, the options acceptance reconciled BACKTEST, PAPER and LIVE, and a customer
+         names its kind and subscription. The customer gate is ten professionals or three
+         organisations, each alternative reported.
+       - A rejection from a trusted reviewer disqualifies its subject in that gate whatever
+         its release or artifact. A rejection nobody trusted disqualifies no one. There is
+         still no correction record, which item 89 left to this policy: a session wrongly
+         rejected is re-run under a new subject id, because a rejection only lowers a count
+         and a withdrawal would be a way to raise one.
+       - A malformed, out-of-chain or mis-hashed record still fails the whole audit, as does a
+         version 1 record. A well-formed record that does not qualify is listed with its
+         reason and not counted. The status is schema 3 and the promotion receipt schema 3,
+         which add the release and the reviewer set's hash.
+       - `tools/acceptance_evidence.py` gained `audit` and `append`. `append` verifies the
+         ledger so far, refuses a repeated `evidence_id`, signs, chains, validates the whole
+         record, retains the artifact and only then writes. The promotion gate audits for the
+         release its manifest names, and the pipeline's step 23 for the release its own
+         manifest names, from `var/acceptance-trusted-reviewers.json` and
+         `var/acceptance-artifacts/`. The step writes an empty set if none exists and never
+         overwrites one.
+       - `tools/ed25519.py` is RFC 8032 in pure Python, so the audit runs anywhere with
+         nothing installed. `verify` never raises and requires a canonical response. A
+         PKCS#8 reader accepts the version 0 and version 1 keys `follon-admin release-keygen`
+         writes, and refuses a version 1 key whose public half disagrees with its seed.
+       - The version 1 schema is marked superseded and the version 2 record and reviewer-set
+         schemas are published. No version 1 ledger was ever retained.
+     - **Tests.** 57 tests were added, 19 becoming 76 across four files: 52 for the audit,
+       12 for the promotion gate, 8 for Ed25519 and 4 for the schemas.
+       - The RFC 8032 vectors are reproduced, and the module agrees with the `cryptography`
+         package where it is installed. The release key the Rust tool writes is read here.
+       - A signature from another key, another reviewer's key, an unknown key, an edited field
+         or a record moved elsewhere in the chain does not count, and the signed message is
+         rebuilt independently of the code that builds it.
+       - Each of the criteria disqualifies on its own, a planned drill never does, and the gate
+         targets and the 23,400-second floor are pinned.
+       - A missing, altered or linked artifact, another release's record and a session in the
+         wrong environment do not count. A forged rejection does not sink a subject.
+       - Ten professionals or three organisations open the customer gate, and kinds are not
+         pooled. `append` is idempotent for an artifact and refuses before it writes. The
+         command line signs, appends and audits, and refuses a missing, directory, linked or
+         malformed key or template, each by its own message, before anything is written.
+       - The promotion gate refuses another release's evidence, and its receipt binds the
+         release, the reviewer set and every ledger it counted.
+     - **Rule 5.** 55 of 55 injected defects were caught by the intended tests. Among them: the
+       signature never checked, the reviewer's name not compared, an unknown key accepted, the
+       signature leaving out the chain link, the notes or the domain, a forged rejection
+       counting, an artifact not re-hashed, a missing one counted or a link followed, another
+       release counted, each criterion removed, the gate targets lowered, customer kinds
+       pooled, each of the promotion gate's and the pipeline's bindings, and the command
+       line's key and template refusals. One survived the
+       first run: accepting an over-range Ed25519 response. The test used a response equal to
+       the group order, which the verification equation rejects by itself, so the range check
+       was never exercised. The malleable case is a valid response plus the order, which
+       satisfies the equation, and `test_a_signature_is_canonical_or_it_is_refused` now holds
+       it. A mutant that changes the range check's `>=` to `>` is equivalent, because a
+       response equal to the order fails the equation anyway, and is not counted.
+     - **Measured result.** The Python suite rose from 107 to 164 passed. The Rust workspace
+       (607 passed / 0 failed / 3 ignored) and the Tauri host (33) were untouched by this
+       slice. The final `python tools/session_status.py` run measured all seven suites green.
+       The full evidence pipeline exited 0 and published the acceptance status as schema 3,
+       bound to the manifest's release, with zero verified records and every gate open.
+     - **Boundary.** A signature says who attested, not that the attestation is true. Whoever
+       controls the trusted reviewer set controls what counts, and the tool cannot tell whether
+       two keys belong to two independent people, so `observed_by` differing from `reviewed_by`
+       is still a declared distinction. The attributes are what a reviewer attests, not values
+       read from a journal, and E5.6's retained Gateway evidence is what a record's artifact
+       should carry. The pure-Python signer is not constant-time and is for a reviewer's own
+       machine. `append` signs with the key it is given, so a reviewer with a hardened or
+       hardware signer cannot yet supply a signature made elsewhere. The operational ledger
+       root holds no record, so no external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

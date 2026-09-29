@@ -71,16 +71,42 @@ def verify_release(
         raise PromotionError(f"signed release verification failed: {reason[:512]}")
 
 
-def acceptance_ready(repository_root: Path, ledger_root: Path, target_environment: str) -> tuple[dict[str, object], bytes]:
+def release_id_of(manifest: Path) -> str:
+    """The release a manifest describes: the only release whose evidence may count for it."""
+    try:
+        release_id = json.loads(manifest.read_text(encoding="utf-8")).get("release_id")
+    except (OSError, ValueError, AttributeError) as error:
+        raise PromotionError("the release manifest is unreadable") from error
+    if not isinstance(release_id, str) or CANONICAL_ID.fullmatch(release_id) is None:
+        raise PromotionError("the release manifest names no canonical release_id")
+    return release_id
+
+
+def acceptance_ready(
+    repository_root: Path,
+    ledger_root: Path,
+    target_environment: str,
+    *,
+    trusted_reviewers: Path,
+    artifact_root: Path,
+    release_id: str,
+) -> tuple[dict[str, object], bytes]:
     """Recomputes acceptance from the ledger root with the published tool.
 
     The gate reads no status document. It used to, and a caller-authored one
     that simply declared every gate eligible passed it for production (E6.3).
-    Returns the status and the exact bytes the tool emitted, which the
-    receipt hashes.
+    It also counts only evidence a trusted reviewer signed, whose artifact is
+    retained, and that exercised this release (E6.4). Returns the status and the
+    exact bytes the tool emitted, which the receipt hashes.
     """
     result = subprocess.run(
-        [sys.executable, str(repository_root / "tools" / "acceptance_evidence.py"), str(ledger_root)],
+        [
+            sys.executable, str(repository_root / "tools" / "acceptance_evidence.py"), "audit",
+            str(ledger_root),
+            "--trusted-reviewers", str(trusted_reviewers),
+            "--artifact-root", str(artifact_root),
+            "--release-id", release_id,
+        ],
         cwd=repository_root,
         shell=False,
         stdin=subprocess.DEVNULL,
@@ -95,7 +121,7 @@ def acceptance_ready(repository_root: Path, ledger_root: Path, target_environmen
         status = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise PromotionError("acceptance tool returned malformed status") from error
-    if not isinstance(status, dict) or status.get("acceptance_status_schema_version") != 2:
+    if not isinstance(status, dict) or status.get("acceptance_status_schema_version") != 3:
         raise PromotionError("acceptance tool returned an unsupported status")
     if target_environment == "production" and status.get("all_gates_eligible") is not True:
         raise PromotionError("production promotion is blocked by open acceptance gates")
@@ -116,10 +142,13 @@ def promotion_receipt(
     change_ticket: str,
     promoted_at: str,
 ) -> dict[str, object]:
-    """The eligibility receipt. Version 2 binds the recomputed acceptance
-    status and every ledger file it counted (E6.3)."""
+    """The eligibility receipt. Version 2 bound the recomputed acceptance status and
+    every ledger file it counted (E6.3). Version 3 also names the release the evidence
+    was counted for and the reviewer key set it was authenticated against (E6.4)."""
     return {
-        "release_promotion_receipt_schema_version": 2,
+        "release_promotion_receipt_schema_version": 3,
+        "release_id": acceptance_status["release_id"],
+        "trusted_reviewers_sha256": acceptance_status["trusted_reviewers_sha256"],
         "source_environment": source_environment,
         "target_environment": target_environment,
         "manifest_sha256": sha256_file(manifest),
@@ -153,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trusted-key", required=True, type=Path)
     parser.add_argument("--artifacts-root", required=True, type=Path)
     parser.add_argument("--acceptance-ledger-root", required=True, type=Path)
+    parser.add_argument("--acceptance-trusted-reviewers", required=True, type=Path)
+    parser.add_argument("--acceptance-artifact-root", required=True, type=Path)
     parser.add_argument("--requester", required=True)
     parser.add_argument("--approver", required=True)
     parser.add_argument("--change-ticket", required=True)
@@ -178,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
             repository_root,
             arguments.acceptance_ledger_root.resolve(strict=True),
             arguments.target_environment,
+            trusted_reviewers=arguments.acceptance_trusted_reviewers.resolve(strict=True),
+            artifact_root=arguments.acceptance_artifact_root.resolve(strict=True),
+            release_id=release_id_of(arguments.manifest),
         )
         promoted_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         write_receipt(arguments.receipt, promotion_receipt(

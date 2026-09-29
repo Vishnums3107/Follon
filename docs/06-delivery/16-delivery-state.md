@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T14:21:43Z  
+**Measured at:** 2026-09-29T14:52:17Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `bd6fa27` -- feat(sbom): cover the desktop's Cargo workspace and record first-party licences -- E7.8 (2026-09-29T19:40:23+05:30)  
-**Uncommitted paths:** 13
+**HEAD:** `e61c223` -- feat(paper): the order-submitting PAPER routes can enforce aggregate portfolio limits -- E7.5 (2026-09-29T19:52:50+05:30)  
+**Uncommitted paths:** 15
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -67,7 +67,7 @@ already produced a real defect here.
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 107 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 164 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -109,6 +109,12 @@ symlink guard. Acceptance tooling checks declared IDs, internal hashes, and
 subject counts without authenticating reviewers or verifying source artifacts;
 later rejections do not retract prior accepted subjects. The promotion tool's
 acceptance subcheck trusts caller-supplied status. These limits remain open.
+**Update 2026-09-29:** they are closed in the repository by E6.1 to E6.5. The
+audit authenticates reviewers by signature, re-hashes each record's artifact,
+binds a record to a release, holds it to fixed criteria, lets a rejection
+disqualify a subject, and the promotion gate recomputes all of it rather than
+trusting a status. That is a property of the tooling. The operational ledger
+root, `var/acceptance/`, holds no record, so no external gate moved.
 
 The deeper pass ran 56 control-plane, 17 backtest, and 15 security/tool tests,
 all passing. These 88 invocations overlap the earlier suites and are not added
@@ -261,8 +267,8 @@ passes it for production.
 | E6.1 | Pipeline step 23 audits only the operational ledger root, `var/acceptance/`, so no ledger elsewhere under `var/` is ever counted. The assessment's synthetic ledger under `var/reports/` is no longer counted (audit item 86). | **done** 2026-09-28 |
 | E6.2 | A subject with any rejected record does not count toward its gate. The schema version must be the integer 1, not JSON `true`. `occurred_at` must be exactly `YYYY-MM-DDTHH:MM:SSZ`, not also a space-separated time or a week date, which both passed. A correction record, which would let a mistaken rejection be withdrawn, is part of E6.5's policy (audit item 89). | **done** 2026-09-28 |
 | E6.3 | The promotion gate recomputes eligibility from the ledger root rather than trusting a status document, and its receipt binds the ledger files it counted. The gate takes `--acceptance-ledger-root` instead of `--acceptance-status`. The status (schema 2) lists each ledger's path, SHA-256, record count and chain head, and the receipt (schema 2) carries them (audit item 90). | **done** 2026-09-28 |
-| E6.4 | Reviewer authentication, with records signed against a trusted reviewer key set; each record's source artifact re-hashed against a retained artifact root; and release and environment binding. | open, design first |
-| E6.5 | Session criteria, defined before any session counts: what "clean" means, and how a reconnect, an unresolved `UNKNOWN` or a discrepancy is treated. Also the customer gate's threshold: the tool requires 1, the roadmap 10 professionals or 3 organisations. | **decision** |
+| E6.4 | Reviewer authentication, artifact retention and release binding. **Now** a record is schema 2 and carries its reviewer's Ed25519 signature over a domain-separated canonical body. It counts only under a trusted reviewer key set (`--trusted-reviewers`, an operator-controlled file whose SHA-256 every status and receipt names), and only when the key belongs to the reviewer the record names. Its source artifact is re-hashed against a content-addressed artifact root, so a missing, altered or linked artifact is a record that cannot be checked. It names the release and, for a session, the environment, and counts only toward that release's gates. A rejection nobody trusted disqualifies no subject. `tools/ed25519.py` is RFC 8032 in pure Python, held to the RFC's vectors and, where the `cryptography` package is installed, to it, so the audit itself needs nothing installed. The status and the promotion receipt are schema 3. `audit` verifies and `append` signs, chains and retains. The version 1 schema is marked superseded, and no version 1 ledger was ever retained. Audit item 111. | **done** 2026-09-29 |
+| E6.5 | Session criteria and the customer threshold, **decided 2026-09-29 by the agent** (Settled direction item 6). A clean session lasts at least 23,400 s, submits and reconciles an order, and closes with no `UNKNOWN`, no discrepancy and no unexplained incident. An unplanned reconnect disqualifies it and a planned drill never does. Design-partner, options and customer records carry their own attributes and criteria. The customer gate is the roadmap's, 10 professionals or 3 organisations, instead of the tool's earlier 1. No correction record: a trusted rejection is permanent for its subject, and a session wrongly rejected is re-run under a new subject id. | **done** 2026-09-29 |
 
 ### E7 — The safety gaps (assessment priority 4)
 
@@ -777,6 +783,22 @@ the reversal here with its date.
      exposure and nothing else. The alternatives were to keep skipping the
      aggregate check (fails open exactly when the account is in trouble) or to
      refuse everything (an account could not close a losing position).
+   - **E6.5: what counts as a clean session, and the customer gate.** A clean
+     session lasts at least one regular US equity session (23,400 s), submits
+     and reconciles at least one order, and closes with no `UNKNOWN` order, no
+     reconciliation discrepancy and no unexplained incident. An unplanned
+     reconnect disqualifies it whatever followed, because the session did not
+     survive the fault cleanly. A planned reconnect drill is recorded and never
+     disqualifies. The alternative, tolerating a reconnect that reconciled
+     cleanly afterwards, would have let a flaky link pass the gate that exists to
+     measure it. The paying-customer gate is the roadmap's ten professionals or
+     three organisations. The tool's earlier one was a placeholder, and
+     inferring a commercial target from a technical minimum was the mistake the
+     runbook warned about. **No correction record was added**, although E6.2
+     left that to this policy: a trusted rejection is permanent for its
+     subject, and a session a reviewer wrongly rejected is re-run under a new
+     subject id. A rejection only ever lowers a count, so keeping it permanent
+     fails safe, and a withdrawal record would be a way to raise one.
 
 ### Still unanswered
 
@@ -797,8 +819,8 @@ short — detail belongs in the conformance audit.
   and decide for itself while the operator was away. Baseline at `4403b3f`: clean
   tree, all seven suites green (Rust 562 / 0 / 3, Tauri 31, Python 75), the full
   pipeline exit 0. Commits stay on `refactor/module-decomposition`, unpushed.
-- Landed seven slices, each with its rule-5 injections, all seven suites and the
-  full pipeline measured before its commit (audit items 103 to 109):
+- Landed nine slices, each with its rule-5 injections, all seven suites and the
+  full pipeline measured before its commit (audit items 103 to 111):
   - E5.4: a bridge refusal is a clean rejection, and IBKR notices no longer reject
     working orders. Found along the way: an injection that survived because it
     crashed into the failure the test expects, which was a bad injection and not a
@@ -814,10 +836,18 @@ short — detail belongs in the conformance audit.
   - E8.5: the two P&L conventions are stated and held by tests.
   - E7.8: the SBOM covers the desktop's Cargo workspace and records first-party
     licences.
-- Measured at the E7.8 commit: Rust 599 / 0 / 3, Tauri 31, Python 105, both
-  desktop suites green, the full pipeline exit 0.
-- **Next action:** see the backlog. Still waiting on the operator: E7.10, E6.5,
-  E8.3.
+  - E7.5: the order-submitting PAPER routes can enforce aggregate portfolio
+    limits, through one shared `PortfolioRiskDocument`.
+  - E6.4 and E6.5: an acceptance record is signed by a trusted reviewer, its
+    artifact re-hashed and its release bound, and it must meet criteria fixed
+    before any session counts. The criteria and the customer threshold were
+    decided by the agent (Settled direction item 6). An injection survived
+    because its test refused a response equal to the group order, which the
+    curve equation rejects by itself; the malleable case is the response plus the
+    order.
+- Measured at the E6.4 and E6.5 slice: Rust 607 / 0 / 3, Tauri 33, Python 164,
+  both desktop suites green, the full pipeline exit 0.
+- **Next action:** see the backlog. Still waiting on the operator: E7.10, E8.3.
 
 ### 2026-09-29 — session 12
 
