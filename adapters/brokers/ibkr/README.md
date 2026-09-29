@@ -44,9 +44,12 @@ protocol, the instrument map and the process arguments.
 cargo test -p follon-ibkr-paper-adapter
 ```
 
-The tests run the real process transport against a stand-in bridge,
-`tests/fixtures/ibkr/fake-paper-bridge.py` (skipped when Python is unavailable),
-and use a fake LIVE transport. None of them talks to a real TWS or Gateway
-session or to the real bridge. For what is and is not proven end to end, and the
+The tests run the real process transport against stand-in bridges under
+`tests/fixtures/ibkr/` (skipped when Python is unavailable), and use a fake LIVE
+transport. Most stand-ins imitate the wire format.
+`refusing-paper-bridge.py` instead serves the bridge's own protocol dispatcher
+with a backend that refuses, so the refusal-to-rejection mapping is tested
+across the process boundary. None of them talks to a real TWS or Gateway
+session or to a real `ibapi` connection. For what is and is not proven end to end, and the
 open gates, see
 [`docs/06-delivery/16-delivery-state.md`](../../../docs/06-delivery/16-delivery-state.md).

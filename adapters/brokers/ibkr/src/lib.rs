@@ -622,6 +622,13 @@ fn normalize_bridge_event(event: BridgeEvent) -> Result<BrokerEvent, PaperError>
             client_order_id: event.client_order_id,
             reason: required_bridge_reason(event.reason)?,
         }),
+        // A cancellation that did not happen: the order still works. The
+        // bridge reports both IBKR's own cancel failures and a cancellation it
+        // refused before anything was sent (delivery state E5.4).
+        "CANCEL_REJECTED" => Ok(BrokerEvent::CancelRejected {
+            client_order_id: event.client_order_id,
+            reason: required_bridge_reason(event.reason)?,
+        }),
         "REJECTED" => Ok(BrokerEvent::Rejected {
             client_order_id: event.client_order_id,
             reason: required_bridge_reason(event.reason)?,
@@ -1194,32 +1201,46 @@ mod tests {
         .is_err());
     }
 
-    #[test]
-    fn process_transport_round_trips_normalized_paper_evidence() {
+    /// Starts the process transport on one bridge fixture, or `None` when
+    /// Python is unavailable so the caller can skip.
+    fn fixture_transport(fixture: &str) -> Option<IbkrPaperBridgeProcessTransport> {
         let Some(python) = python_executable() else {
-            eprintln!("Python is unavailable; process transport fixture was skipped");
-            return;
+            eprintln!("Python is unavailable; the {fixture} process fixture was skipped");
+            return None;
         };
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../tests/fixtures/ibkr/fake-paper-bridge.py")
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/ibkr")
+            .join(fixture)
             .canonicalize()
             .expect("fixture path");
-        let mut transport =
+        Some(
             IbkrPaperBridgeProcessTransport::start(IbkrPaperBridgeProcessConfiguration {
                 executable: python,
-                arguments: vec![fixture.to_string_lossy().into_owned()],
+                arguments: vec![path.to_string_lossy().into_owned()],
                 request_timeout: Duration::from_secs(2),
                 max_response_bytes: 64 * 1024,
             })
-            .expect("transport starts");
-        let request = BrokerOrderRequest {
+            .expect("transport starts"),
+        )
+    }
+
+    fn single_order_request() -> BrokerOrderRequest {
+        BrokerOrderRequest {
             client_order_id: "order.1".to_owned(),
             account_id: "acct.paper.001".to_owned(),
             instrument_id: "aapl.xnas".to_owned(),
             side: Side::Buy,
             quantity: Decimal::from_str("2").expect("quantity"),
             limit_price: Some(Decimal::from_str("101.25").expect("price")),
+        }
+    }
+
+    #[test]
+    fn process_transport_round_trips_normalized_paper_evidence() {
+        let Some(mut transport) = fixture_transport("fake-paper-bridge.py") else {
+            return;
         };
+        let request = single_order_request();
 
         assert_eq!(
             transport.submit_paper_order(&request).expect("submit"),
@@ -1341,22 +1362,9 @@ mod tests {
 
     #[test]
     fn the_process_transport_sends_no_combination_to_its_bridge() {
-        let Some(python) = python_executable() else {
-            eprintln!("Python is unavailable; process transport fixture was skipped");
+        let Some(mut transport) = fixture_transport("fake-paper-bridge.py") else {
             return;
         };
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../tests/fixtures/ibkr/fake-paper-bridge.py")
-            .canonicalize()
-            .expect("fixture path");
-        let mut transport =
-            IbkrPaperBridgeProcessTransport::start(IbkrPaperBridgeProcessConfiguration {
-                executable: python,
-                arguments: vec![fixture.to_string_lossy().into_owned()],
-                request_timeout: Duration::from_secs(2),
-                max_response_bytes: 64 * 1024,
-            })
-            .expect("transport starts");
 
         assert!(transport
             .submit_paper_combo(&combination_request())
@@ -1367,24 +1375,63 @@ mod tests {
         assert!(transport.poll_paper_events().is_ok());
     }
 
+    /// The fixture runs the bridge's own dispatcher with a backend that refuses
+    /// every submission and cancellation before contacting IBKR, so this
+    /// exercises the real refusal-to-rejection mapping across the process
+    /// boundary, not a copy of it (delivery state E5.4).
     #[test]
-    fn malformed_bridge_result_poisons_the_process_session() {
-        let Some(python) = python_executable() else {
-            eprintln!("Python is unavailable; malformed process fixture was skipped");
+    fn a_bridge_refusal_is_a_clean_rejection_and_leaves_the_session_healthy() {
+        let Some(mut transport) = fixture_transport("refusing-paper-bridge.py") else {
             return;
         };
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../tests/fixtures/ibkr/malformed-paper-bridge.py")
-            .canonicalize()
-            .expect("fixture path");
-        let mut transport =
-            IbkrPaperBridgeProcessTransport::start(IbkrPaperBridgeProcessConfiguration {
-                executable: python,
-                arguments: vec![fixture.to_string_lossy().into_owned()],
-                request_timeout: Duration::from_secs(2),
-                max_response_bytes: 64 * 1024,
-            })
-            .expect("transport starts");
+
+        assert_eq!(
+            transport
+                .submit_paper_order(&single_order_request())
+                .expect("a refusal is an answer, not a failure"),
+            BrokerSubmitResult::Rejected {
+                reason: "IBKR_BRIDGE_REFUSED_INSTRUMENT_UNMAPPED".to_owned(),
+            }
+        );
+        // Nothing about a refusal is ambiguous, so the session was not poisoned.
+        transport.cancel_paper_order("order.1").expect("cancel");
+        assert_eq!(
+            transport.poll_paper_events().expect("poll"),
+            vec![BrokerEvent::CancelRejected {
+                client_order_id: "order.1".to_owned(),
+                reason: "IBKR_BRIDGE_REFUSED_ORDER_UNKNOWN".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_bridge_cancel_rejection_is_normalized_and_needs_a_reason() {
+        let event = |reason: Option<&str>| BridgeEvent {
+            event_type: "CANCEL_REJECTED".to_owned(),
+            execution_id: None,
+            client_order_id: "order.1".to_owned(),
+            broker_order_id: None,
+            quantity: None,
+            price: None,
+            fee: None,
+            executed_at: None,
+            reason: reason.map(str::to_owned),
+        };
+        assert_eq!(
+            normalize_bridge_event(event(Some("IBKR_ERROR_10148"))).expect("event"),
+            BrokerEvent::CancelRejected {
+                client_order_id: "order.1".to_owned(),
+                reason: "IBKR_ERROR_10148".to_owned(),
+            }
+        );
+        assert!(normalize_bridge_event(event(None)).is_err());
+    }
+
+    #[test]
+    fn malformed_bridge_result_poisons_the_process_session() {
+        let Some(mut transport) = fixture_transport("malformed-paper-bridge.py") else {
+            return;
+        };
 
         assert!(transport.poll_paper_events().is_err());
         let error = transport

@@ -27,8 +27,33 @@ request. The Rust adapter, `IbkrPaperGatewayAdapter`, declares exactly this
 set, so the PAPER OMS refuses a combination, a GTC intent or a replacement
 before any order exists, rather than leaving it `UNKNOWN` (delivery state
 E5.1). The gRPC PAPER route composes it when its configuration selects
-`adapter_kind: IBKR_PAPER_BRIDGE` (E5.2a). That route cannot yet submit a
-single order through it (E5.2b) or synchronize its fills (E5.2c).
+`adapter_kind: IBKR_PAPER_BRIDGE` (E5.2a). That route submits a single DAY
+order and cancels it (E5.2b), and a risk manager can drain the bridge's events
+and reconcile the account (E5.2c). It does not poll in the background.
+
+## Refusals, rejections and failures
+
+The bridge answers every request in one of three ways, and the Rust adapter
+acts on the difference (delivery state E5.4):
+
+| Answer | Meaning | What the OMS records |
+| --- | --- | --- |
+| `ok: true`, `status: REJECTED` | The bridge refused the submission **before contacting IBKR**: an unmapped instrument, another account, a malformed payload, a disconnected gateway, no order ID yet. The reason is `IBKR_BRIDGE_REFUSED_<CODE>`. | A clean rejection. The session stays connected. |
+| `ok: true`, `{}`, then a `CANCEL_REJECTED` event | A cancellation was refused before anything was sent (an unknown client order ID, a disconnected gateway), or IBKR reported that the order was not cancelled. | The order returns to its working state. |
+| `ok: false` | Anything else: the outcome may or may not have reached IBKR. | `UNKNOWN`, and the session is disconnected until it is reconnected and reconciled. |
+
+The retry of a client order ID the bridge already knows is answered from what
+it knows and is never refused as a new order would be, because that order may
+already be working at IBKR.
+
+IBKR's own message codes are classified by what they say about an order the
+bridge tracks: 202 (order cancelled) and 399 (an order warning) and the
+2100-2169 system warnings leave the order's state alone, because the state
+arrives through `orderStatus`; 135, 136, 161, 10147 and 10148 mean a
+cancellation this bridge requested did not happen; any other code on a tracked
+order remains a rejection. These are the codes IBKR documents. No retained
+Gateway session has produced them here, so the mapping is documented, not
+measured (delivery state E5.6).
 
 The fixed process arguments have this shape (values are illustrative):
 

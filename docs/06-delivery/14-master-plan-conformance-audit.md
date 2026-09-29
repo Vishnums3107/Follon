@@ -4132,6 +4132,62 @@ These are mandatory master-plan acceptance conditions and are currently open:
        account and time but does not retain which authenticated risk manager
        requested it. No external gate moved.
 
+103. A bridge refusal is now a clean rejection, and IBKR's notices no longer
+     reject working orders (2026-09-29, rows 5.5 and 5.10; E5.4).
+     - **Defect.** Every `ok: false` reply from the bridge reached `core/paper`
+       as an adapter error, which records `UNKNOWN` and disconnects the session.
+       That included a refusal made before anything reached IBKR, such as an
+       unmapped instrument. The order was then stranded, and every later order
+       was refused until reconciliation. Separately, the bridge recorded any IBKR
+       message code on a tracked order as a rejection. 202 (order cancelled), 399
+       (an order warning such as "will not be placed until the market opens") and
+       the 2100–2169 system warnings are not rejections, and a false `REJECTED`
+       records as terminal an order IBKR still holds.
+     - **Behavior.**
+       - `BridgeRefusal` marks a failure raised before `placeOrder`.
+         `validate_submit`, importable without `ibapi`, carries every submit check
+         and gives each refusal a stable code. `BridgeProtocol` answers a refused
+         submission `ok: true` with `REJECTED` and `IBKR_BRIDGE_REFUSED_<CODE>`.
+         Only a refusal is mapped: any other failure stays `ok: false`, and so
+         `UNKNOWN`.
+       - The gateway-connected check follows the lookup of a known client order
+         ID, so the retry of an order the bridge may already have placed is never
+         refused as a new one.
+       - A cancellation refused before anything was sent (an unknown client order
+         ID, a disconnected gateway) returns `{}` and queues a `CANCEL_REJECTED`
+         event. The OMS restores the working state from it, as it does for IBKR's
+         own cancel failures. The Rust adapter normalizes the new event type.
+       - The bridge remembers which cancellations it requested and reports a
+         cancel-failure code (135, 136, 161, 10147, 10148) once, only for those.
+         Codes 202 and 399 and 2100–2169 leave the order's state alone. Any other
+         code on a tracked order remains a rejection.
+     - **Tests.** 20 bridge tests and 3 Rust tests were added.
+       - The protocol layer maps a refusal to a rejection and nothing else. Each
+         submit check carries its own code, and none of them reaches `placeOrder`
+         or consumes an order ID. A disconnected gateway does not reject a known
+         order's retry.
+       - The cancel refusals become events. Each code class, and the exact edges
+         of the warning band, are pinned.
+       - A fixture runs the bridge's real dispatcher with a refusing backend
+         under the Rust process transport. The transport returns `Rejected` and
+         stays healthy, and the `CANCEL_REJECTED` event normalizes. Through the
+         gRPC route, two refused orders in a row are both `REJECTED`; before, the
+         second would have been refused because the first disconnected the route.
+     - **Rule 5.** 26 of 26 injected defects were caught by the intended tests
+       on the final files. One first attempt survived because the injection
+       crashed into the same failure result the test expects. It was a bad
+       injection, not a weak test: a working version of it was caught.
+     - **Measured result.** The Rust workspace rose from 562 to 565 passed /
+       0 failed / 3 ignored, and the Python suite from 75 to 95. The final
+       `python tools/session_status.py` run measured all seven suites green. The
+       full evidence pipeline exited 0.
+     - **Boundary.** The code table is IBKR's documentation, not a retained
+       Gateway session. The tests build the bridge's real `OfficialBackend` over
+       a mocked `ibapi` connection, so they are protocol evidence, not TWS
+       evidence. The bridge still keeps its order map in memory, so a retry of an
+       order placed by an earlier bridge process is not recognised. Neither is
+       closed by this item (E5.5 and E5.6). No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

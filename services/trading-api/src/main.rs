@@ -3156,6 +3156,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(scratch);
     }
 
+    /// A bridge that refuses before contacting IBKR is a rejection: the order
+    /// is `REJECTED`, not `UNKNOWN`, and the route stays usable. Were the first
+    /// refusal an unknown outcome the route would be disconnected and the second
+    /// submission refused outright (delivery state E5.4).
+    #[tokio::test]
+    async fn a_bridge_refusal_rejects_the_order_and_keeps_the_route_connected() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge refusal test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-refusal", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["bridge_script"] =
+                repository_path("tests/fixtures/ibkr/refusing-paper-bridge.py")
+                    .to_string_lossy()
+                    .into();
+            document["ibkr_bridge"] = bridge;
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        for intent in [
+            "intent.grpc.bridge.refused.1",
+            "intent.grpc.bridge.refused.2",
+        ] {
+            let mut market = paper_order_request(intent);
+            market.order_kind = PaperOrderKind::Market as i32;
+            market.limit_price = None;
+            let outcome = service
+                .submit_paper_order(authorized(market, &token))
+                .await
+                .expect("a refused order is an outcome, not an error")
+                .into_inner();
+            assert!(outcome.approved);
+            assert_eq!(outcome.state, OmsOrderState::Rejected as i32);
+        }
+        assert_eq!(
+            route
+                .lock()
+                .unwrap()
+                .order("order-intent.grpc.bridge.refused.2")
+                .unwrap()
+                .oms
+                .state,
+            OrderState::Rejected
+        );
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
     #[tokio::test]
     async fn paper_order_and_cancel_rpc_fail_closed_without_a_route() {
         let mut service = service();

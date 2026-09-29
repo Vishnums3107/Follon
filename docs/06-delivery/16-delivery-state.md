@@ -56,18 +56,18 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T10:48:13Z  
+**Measured at:** 2026-09-29T13:06:25Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `8eb8798` -- docs(ibkr): add the Rust adapter README and cross-link the Python bridge (2026-09-29T16:16:17+05:30)  
-**Uncommitted paths:** 0
+**HEAD:** `4403b3f` -- docs(delivery-state): record session 12 and refresh the measured status block (2026-09-29T16:20:33+05:30)  
+**Uncommitted paths:** 8
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 562 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 565 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 75 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 95 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -242,7 +242,7 @@ epic lands (see the correction under the external gates).
 | E5.1 | The real adapter refuses, before transmitting and as a clean rejection, what its bridge cannot execute. That covers combinations: the Python dispatch has no `submit_combo`, and the Rust payload drops each leg's quantity and the debit or credit sign. It also covers any time in force other than DAY. Replacement is already refused by the trait default, but `core/paper` records that refusal as `UNKNOWN`. **Landed as `PaperBrokerCapabilities`**: every adapter declares what it carries, defaulting to single DAY orders, and the service refuses anything more before risk is evaluated or an order exists. The real adapter declares the default, and its transport no longer emits `submit_combo` (audit item 87). | **done** 2026-09-28 |
 | E5.2 | The authenticated gRPC PAPER route composes the real bridge by configuration, with the model as the default. **E5.2a** binds the adapter and IBKR session to the journal fingerprint (audit item 99). **E5.2b** adds operator-attributed single-order submit and cancel over the journaled kernel (items 100–101). **E5.2c** adds a risk-manager `ReconcilePaperAccount` RPC: it drains broker events, compares the snapshot, returns its discrepancies and UNKNOWN count, and can explicitly reconnect. A stateful bridge protocol fixture applied a fill and reconciled its account; a model restart surfaced missing broker state rather than reporting clean (audit item 102). No background poller or real Gateway evidence is claimed. | E5.2a–c **done** 2026-09-29; E5.5 and E5.6 open |
 | E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
-| E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR (`REJECTED`), from transport ambiguity (`UNKNOWN`). Today every `ok: false` reply strands the order `UNKNOWN` and disconnects the session. IBKR error codes that are not rejections, such as 202 (order cancelled), need checking against a real TWS. | open |
+| E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR, from transport ambiguity. Before, every `ok: false` reply stranded the order `UNKNOWN` and disconnected the session. **Now** a refused submission answers `REJECTED` (`IBKR_BRIDGE_REFUSED_<CODE>`) and leaves the session connected, a refused cancellation is reported as a `CANCEL_REJECTED` event so the order returns to working, and anything else stays `UNKNOWN`. IBKR's notices (202, 399, the 2100–2169 warnings) no longer reject a working order, and its cancel-failure codes (135, 136, 161, 10147, 10148) report a rejected cancellation. The code table is IBKR's documented one, not measured against a real TWS (E5.6). Audit item 103. | **done** 2026-09-29 |
 | E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
 | E5.6 | Retained Gateway evidence against a real TWS or IB Gateway PAPER session: restart, reconnect, cancellation races and reconciliation. | **external** |
 | E5.7 | E5.1's analogue for controlled LIVE. `IbkrControlledLiveAdapter` inherits a refusing `submit_combo`, and `core/live` records that refusal as a transport failure: the combination becomes `UNKNOWN`, the session disconnects, and the approval and a canary slot stay consumed. Latent, since no application composes a LIVE adapter that can trade, but it needs the same capability declaration under LIVE's separate review. | open |

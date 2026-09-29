@@ -34,6 +34,36 @@ class BridgeFailure(Exception):
     """Evidence-safe protocol or broker failure."""
 
 
+class BridgeRefusal(BridgeFailure):
+    """A request refused before anything reached IBKR.
+
+    Nothing was transmitted, so the outcome is known: a submission is a clean
+    rejection, never an unknown outcome that strands the account until it is
+    reconciled (delivery state E5.4). ``code`` is a stable upper-case token and
+    is the only part of a refusal that crosses the process boundary.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# IBKR message codes, classified by what they say about an order this bridge
+# tracks (TWS API "Message Codes"). They are documented codes, not measurements:
+# no retained Gateway session has produced them here (delivery state E5.6).
+#
+# * A notice describes an order that keeps its state: 202 reports a
+#   cancellation whose result `orderStatus` carries, and 399 is an order
+#   warning such as "will not be placed until the market opens". Treating
+#   either as a rejection would record an order IBKR still holds as terminal.
+# * 2100-2169 are system warnings, such as data-farm status.
+# * A cancel-failure code says the order was not cancelled and still works.
+# * Any other code on a tracked order remains a rejection, as before.
+NOTICE_CODES = frozenset({202, 399})
+WARNING_CODES = range(2100, 2170)
+CANCEL_FAILURE_CODES = frozenset({135, 136, 161, 10147, 10148})
+
+
 class Backend(Protocol):
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -96,7 +126,15 @@ class BridgeProtocol:
             if not isinstance(payload, dict):
                 raise BridgeFailure("bridge payload must be an object")
             if operation == "submit":
-                result = self.backend.submit(payload)
+                try:
+                    result = self.backend.submit(payload)
+                except BridgeRefusal as refusal:
+                    # Nothing reached IBKR, so this is a rejection, not a failure.
+                    result = {
+                        "status": "REJECTED",
+                        "broker_order_id": None,
+                        "reason": f"IBKR_BRIDGE_REFUSED_{refusal.code}",
+                    }
             elif operation == "cancel":
                 result = self.backend.cancel(payload)
             elif operation == "poll":
@@ -191,6 +229,61 @@ def load_instruments(path: Path) -> dict[str, InstrumentContract]:
     return instruments
 
 
+@dataclass(frozen=True)
+class SubmitRequest:
+    """A submit payload that passed every check the bridge makes before IBKR is contacted."""
+
+    client_order_id: str
+    contract: InstrumentContract
+    side: str
+    quantity: str
+    limit_price: str | None
+
+
+def validate_submit(
+    payload: Any, account_id: str, instruments: dict[str, InstrumentContract]
+) -> SubmitRequest:
+    """Checks a submit payload, raising `BridgeRefusal` for anything IBKR must not see."""
+    expected = {
+        "client_order_id",
+        "account_id",
+        "instrument_id",
+        "side",
+        "quantity",
+        "limit_price",
+    }
+    try:
+        request = _object(payload, expected, "submit payload")
+        client_order_id = _canonical(request["client_order_id"], "client_order_id")
+        if _canonical(request["account_id"], "account_id") != account_id:
+            raise BridgeRefusal(
+                "ACCOUNT_MISMATCH", "submit account does not match bridge configuration"
+            )
+        instrument_id = _canonical(request["instrument_id"], "instrument_id")
+        contract = instruments.get(instrument_id)
+        if contract is None:
+            raise BridgeRefusal(
+                "INSTRUMENT_UNMAPPED", "instrument is absent from the reviewed IBKR map"
+            )
+        if not isinstance(request["side"], str) or request["side"] not in ("BUY", "SELL"):
+            raise BridgeRefusal("INVALID_SIDE", "submit side is invalid")
+        quantity = _decimal(request["quantity"], "quantity", positive=True)
+        limit_price = request["limit_price"]
+        if limit_price is not None:
+            limit_price = _decimal(limit_price, "limit_price", positive=True)
+    except BridgeRefusal:
+        raise
+    except BridgeFailure as failure:
+        raise BridgeRefusal("INVALID_REQUEST", str(failure)) from failure
+    return SubmitRequest(
+        client_order_id=client_order_id,
+        contract=contract,
+        side=request["side"],
+        quantity=quantity,
+        limit_price=limit_price,
+    )
+
+
 def create_official_backend(arguments: argparse.Namespace, instruments: dict[str, InstrumentContract]) -> Backend:
     try:
         from ibapi.client import EClient
@@ -220,6 +313,7 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
             self.execution_data: dict[str, tuple[Any, Any]] = {}
             self.commissions: dict[str, str] = {}
             self.emitted_executions: set[str] = set()
+            self.cancel_requested: set[str] = set()
             self.open_orders_done = False
             self.positions_done = False
             self.account_summary_done = False
@@ -285,6 +379,8 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 if client_order_id is None:
                     return
                 normalized = normalize_order_state(status, str(filled), str(remaining))
+                if normalized in {"CANCELLED", "FILLED", "REJECTED"}:
+                    self.cancel_requested.discard(client_order_id)
                 previous = self.orders.get(client_order_id, {}).get("state")
                 self.orders[client_order_id] = {
                     "client_order_id": client_order_id,
@@ -467,11 +563,23 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                     self.connected_ready = True
                     self.condition.notify_all()
                 return
-            if errorCode in {2104, 2106, 2107, 2108, 2158}:
+            if errorCode in NOTICE_CODES or errorCode in WARNING_CODES:
                 return
             with self.condition:
                 client_order_id = self.client_by_order.get(reqId)
-                if client_order_id is not None:
+                if client_order_id is not None and errorCode in CANCEL_FAILURE_CODES:
+                    # The order was not cancelled and still works. Only a
+                    # cancellation this bridge requested is reported, once.
+                    if client_order_id in self.cancel_requested:
+                        self.cancel_requested.discard(client_order_id)
+                        self.events.put(
+                            {
+                                "event_type": "CANCEL_REJECTED",
+                                "client_order_id": client_order_id,
+                                "reason": f"IBKR_ERROR_{errorCode}",
+                            }
+                        )
+                elif client_order_id is not None:
                     self.orders[client_order_id] = {
                         "client_order_id": client_order_id,
                         "broker_order_id": f"ibkr-paper-order-{reqId}",
@@ -521,9 +629,17 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 "IBKR PAPER gateway did not confirm the configured account",
             )
 
+        def _is_connected(self) -> bool:
+            return bool(self.app.isConnected() and self.app.connected_ready)
+
         def _require_connected(self) -> None:
-            if not self.app.isConnected() or not self.app.connected_ready:
+            if not self._is_connected():
                 raise BridgeFailure("IBKR PAPER gateway is disconnected")
+
+        def _refuse_if_disconnected(self) -> None:
+            """For an operation that has sent nothing yet: refusing is a known outcome."""
+            if not self._is_connected():
+                raise BridgeRefusal("GATEWAY_DISCONNECTED", "IBKR PAPER gateway is disconnected")
 
         def _wait(self, predicate: Any, message: str) -> None:
             deadline = time.monotonic() + arguments.timeout_seconds
@@ -558,29 +674,10 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 self.app.active_execution_request = None
 
         def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
-            self._require_connected()
-            expected = {
-                "client_order_id",
-                "account_id",
-                "instrument_id",
-                "side",
-                "quantity",
-                "limit_price",
-            }
-            request = _object(payload, expected, "submit payload")
-            client_order_id = _canonical(request["client_order_id"], "client_order_id")
-            if _canonical(request["account_id"], "account_id") != arguments.account_id:
-                raise BridgeFailure("submit account does not match bridge configuration")
-            instrument_id = _canonical(request["instrument_id"], "instrument_id")
-            contract_config = instruments.get(instrument_id)
-            if contract_config is None:
-                raise BridgeFailure("instrument is absent from the reviewed IBKR map")
-            if request["side"] not in {"BUY", "SELL"}:
-                raise BridgeFailure("submit side is invalid")
-            quantity = _decimal(request["quantity"], "quantity", positive=True)
-            limit_price = request["limit_price"]
-            if limit_price is not None:
-                limit_price = _decimal(limit_price, "limit_price", positive=True)
+            # Every refusal below precedes `placeOrder`, so `BridgeProtocol`
+            # reports it as a clean rejection (delivery state E5.4).
+            request = validate_submit(payload, arguments.account_id, instruments)
+            client_order_id = request.client_order_id
             with self.app.condition:
                 existing = self.app.order_by_client.get(client_order_id)
                 if existing is not None:
@@ -608,26 +705,31 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                         "broker_order_id": None,
                         "reason": "IBKR_SUBMIT_OUTCOME_UNKNOWN",
                     }
+                # After the retry lookup, so a disconnected gateway never turns
+                # the retry of an order it may already hold into a rejection.
+                self._refuse_if_disconnected()
                 if self.app.next_order_id is None:
-                    raise BridgeFailure("IBKR next order ID is unavailable")
+                    raise BridgeRefusal(
+                        "ORDER_ID_UNAVAILABLE", "IBKR next order ID is unavailable"
+                    )
                 order_id = self.app.next_order_id
                 self.app.next_order_id += 1
                 self.app.client_by_order[order_id] = client_order_id
                 self.app.order_by_client[client_order_id] = order_id
             contract = Contract()
-            contract.conId = contract_config.con_id
-            contract.symbol = contract_config.symbol
-            contract.secType = contract_config.security_type
-            contract.exchange = contract_config.exchange
-            contract.primaryExchange = contract_config.primary_exchange
-            contract.currency = contract_config.currency
+            contract.conId = request.contract.con_id
+            contract.symbol = request.contract.symbol
+            contract.secType = request.contract.security_type
+            contract.exchange = request.contract.exchange
+            contract.primaryExchange = request.contract.primary_exchange
+            contract.currency = request.contract.currency
             order = Order()
             order.account = arguments.broker_account
-            order.action = request["side"]
-            order.totalQuantity = Decimal(quantity)
-            order.orderType = "MKT" if limit_price is None else "LMT"
-            if limit_price is not None:
-                order.lmtPrice = float(Decimal(limit_price))
+            order.action = request.side
+            order.totalQuantity = Decimal(request.quantity)
+            order.orderType = "MKT" if request.limit_price is None else "LMT"
+            if request.limit_price is not None:
+                order.lmtPrice = float(Decimal(request.limit_price))
             order.tif = "DAY"
             order.orderRef = client_order_id
             order.transmit = True
@@ -664,12 +766,30 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
             }
 
         def cancel(self, payload: dict[str, Any]) -> dict[str, Any]:
-            self._require_connected()
             request = _object(payload, {"client_order_id"}, "cancel payload")
             client_order_id = _canonical(request["client_order_id"], "client_order_id")
-            order_id = self.app.order_by_client.get(client_order_id)
-            if order_id is None:
-                raise BridgeFailure("IBKR does not know the client order ID")
+            try:
+                self._refuse_if_disconnected()
+                order_id = self.app.order_by_client.get(client_order_id)
+                if order_id is None:
+                    raise BridgeRefusal(
+                        "ORDER_UNKNOWN", "IBKR does not know the client order ID"
+                    )
+            except BridgeRefusal as refusal:
+                # Nothing was sent, so the order still works as far as this
+                # request is concerned. It is reported the way IBKR reports a
+                # failed cancellation, as evidence the OMS restores the working
+                # state from, rather than as an ambiguous failure.
+                self.app.events.put(
+                    {
+                        "event_type": "CANCEL_REJECTED",
+                        "client_order_id": client_order_id,
+                        "reason": f"IBKR_BRIDGE_REFUSED_{refusal.code}",
+                    }
+                )
+                return {}
+            with self.app.condition:
+                self.app.cancel_requested.add(client_order_id)
             self.app.cancelOrder(order_id, "")
             return {}
 
