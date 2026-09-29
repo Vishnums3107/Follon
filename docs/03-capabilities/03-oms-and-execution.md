@@ -62,6 +62,15 @@ may bind to loopback without TLS; a non-loopback bind additionally requires a
 server TLS identity and client CA, so the write method is not exposed on an
 unauthenticated remote socket.
 
+A route may also carry an optional `portfolio_risk` block: the same document
+`follon-paper-status` reads, with gross and net exposure, leverage, concentration,
+drawdown, daily loss, margin utilisation and sector, asset-class, currency and
+strategy limits. Absent, no aggregate limit applies, as before. Present, it gates
+every order and combination the route accepts, and it is part of the journal's
+configuration fingerprint, so a journal reopens only under the limits it was written
+with. The desktop gateway's `FOLLON_DESKTOP_PAPER_CONFIG` file takes the same block.
+`core/paper` owns the document, so no application can read a limit differently.
+
 The route's `adapter_kind` chooses its broker adapter. `IBKR_PAPER_MODEL`, the
 in-process deterministic model, fills nothing on its own. `IBKR_PAPER_BRIDGE`
 starts the official-API IBKR PAPER bridge from the document's `ibkr_bridge`

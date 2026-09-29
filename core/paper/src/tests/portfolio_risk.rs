@@ -1407,3 +1407,152 @@ fn paper_peak_equity_survives_a_durable_journal_reopen() {
         .contains("portfolio_peak_equity=150000.00000000"));
     fs::remove_file(journal_path).unwrap();
 }
+
+/// The `portfolio_risk` block every PAPER application reads (delivery state
+/// E7.5): strict, exact, and identical whichever application opens it.
+mod document {
+    use super::*;
+
+    fn parse(json: &str) -> Result<PortfolioRiskDocument, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    const MINIMAL: &str = r#"{
+        "policy_version": "portfolio-risk-v1",
+        "max_gross_exposure": "500000",
+        "max_abs_net_exposure": "400000",
+        "max_leverage_bps": "20000",
+        "max_concentration_bps": "6000"
+    }"#;
+
+    #[test]
+    fn an_absent_optional_limit_is_a_limit_that_can_never_trip() {
+        let composition = parse(MINIMAL).unwrap().into_composition().unwrap();
+        let policy = &composition.policy;
+        assert_eq!(
+            policy.max_gross_exposure,
+            decimal("gross", "500000").unwrap()
+        );
+        assert_eq!(
+            policy.max_concentration_bps,
+            decimal("share", "6000").unwrap()
+        );
+        // 100% drawdown and margin utilisation cannot be reached, and no
+        // account's session P&L reaches `i64::MAX`.
+        assert_eq!(
+            policy.max_drawdown_bps,
+            decimal("drawdown", "10000").unwrap()
+        );
+        assert_eq!(
+            policy.max_margin_utilization_bps,
+            decimal("margin", "10000").unwrap()
+        );
+        assert_eq!(
+            policy.max_daily_loss,
+            Decimal::from_integer(i64::MAX).unwrap()
+        );
+        // core/paper enforces open-order count and rate itself, so the composed
+        // kernel's copies stay permanently permissive.
+        assert_eq!(policy.max_open_orders, usize::MAX);
+        assert_eq!(policy.max_order_rate, u32::MAX);
+        assert!(!policy.global_kill_switch);
+        assert!(composition.margin_rates.is_none());
+        assert!(composition.instrument_buckets.is_empty());
+    }
+
+    #[test]
+    fn every_configured_limit_reaches_the_composition() {
+        let composition = parse(
+            r#"{
+                "policy_version": "portfolio-risk-v2",
+                "max_gross_exposure": "500000",
+                "max_abs_net_exposure": "400000",
+                "max_leverage_bps": "20000",
+                "max_concentration_bps": "6000",
+                "max_drawdown_bps": "3000",
+                "max_daily_loss": "5000",
+                "max_margin_utilization_bps": "4000",
+                "allowed_instruments": ["inst.us_equity.spy"],
+                "restricted_instruments": ["inst.us_equity.qqq"],
+                "sector_limits": { "index": "250000" },
+                "asset_class_limits": { "equity": "300000" },
+                "currency_limits": { "USD": "450000" },
+                "strategy_limits": { "strategy.paper.001": "300000" },
+                "instrument_buckets": {
+                    "inst.us_equity.spy": { "asset_class": "equity", "currency": "USD", "sector": "index" }
+                },
+                "margin_rates": { "equity": { "initial_bps": 5000, "maintenance_bps": 2500 } }
+            }"#,
+        )
+        .unwrap()
+        .into_composition()
+        .unwrap();
+        let policy = &composition.policy;
+        assert_eq!(policy.version, "portfolio-risk-v2");
+        assert_eq!(
+            policy.max_drawdown_bps,
+            decimal("drawdown", "3000").unwrap()
+        );
+        assert_eq!(policy.max_daily_loss, decimal("loss", "5000").unwrap());
+        assert_eq!(
+            policy.max_margin_utilization_bps,
+            decimal("margin", "4000").unwrap()
+        );
+        assert!(policy.allowed_instruments.contains("inst.us_equity.spy"));
+        assert!(policy.restricted_instruments.contains("inst.us_equity.qqq"));
+        assert_eq!(
+            policy.sector_limits["index"],
+            decimal("limit", "250000").unwrap()
+        );
+        assert_eq!(
+            policy.asset_class_limits["equity"],
+            decimal("limit", "300000").unwrap()
+        );
+        assert_eq!(
+            policy.currency_limits["USD"],
+            decimal("limit", "450000").unwrap()
+        );
+        assert_eq!(
+            policy.strategy_limits["strategy.paper.001"],
+            decimal("limit", "300000").unwrap()
+        );
+        assert_eq!(
+            composition.instrument_buckets["inst.us_equity.spy"],
+            InstrumentBucket {
+                asset_class: "equity".to_owned(),
+                currency: "USD".to_owned(),
+                sector: "index".to_owned(),
+            }
+        );
+        let rate = &composition.margin_rates.as_ref().unwrap()["equity"];
+        assert_eq!((rate.initial_bps, rate.maintenance_bps), (5000, 2500));
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_rather_than_ignored() {
+        assert!(parse(&MINIMAL.replace("}", r#", "max_gross_expsure": "1" }"#)).is_err());
+        assert!(parse(
+            r#"{ "policy_version": "v", "max_gross_exposure": "1", "max_abs_net_exposure": "1",
+                 "max_leverage_bps": "1", "max_concentration_bps": "1",
+                 "margin_rates": { "equity": { "initial_bps": 1, "maintenance_bps": 1, "extra": 1 } } }"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_malformed_limit_names_the_field_it_came_from() {
+        let error = parse(&MINIMAL.replace("500000", "lots"))
+            .unwrap()
+            .into_composition()
+            .unwrap_err();
+        assert!(error.0.contains("max_gross_exposure"), "{}", error.0);
+        let error = parse(&MINIMAL.replace(
+            r#""6000""#,
+            r#""6000", "sector_limits": { "index": "many" }"#,
+        ))
+        .unwrap()
+        .into_composition()
+        .unwrap_err();
+        assert!(error.0.contains("sector_limits"), "{}", error.0);
+    }
+}

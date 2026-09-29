@@ -4443,6 +4443,56 @@ These are mandatory master-plan acceptance conditions and are currently open:
        machine-readable record, not a licence-compatibility clearance. No external gate
        moved.
 
+110. The order-submitting PAPER routes can enforce aggregate portfolio limits
+     (2026-09-29, rows 5.5 and 5.7; E7.5). Found by the source review behind the revised
+     assessment.
+     - **Gap.** `core/paper` composes `core/risk`'s aggregate kernel into its order gate
+       when a policy carries a `portfolio_risk` composition, but the two applications that
+       submit orders, the gRPC PAPER route and the desktop gateway, built every policy
+       with `portfolio_risk: None`. Their configuration documents had nowhere to state a
+       limit, so only the read-only `follon-paper-status` could apply one. An operator who
+       configured gross exposure, leverage, drawdown or a bucket limit found it enforced in
+       the status report and not on the orders that mattered.
+     - **Behavior.**
+       - The `portfolio_risk` document moved out of `apps/cli` into `core/paper` as
+         `PortfolioRiskDocument`, with its conversion, so the CLI, the route and the
+         gateway read one strict document and no limit can mean two things.
+       - The route's version-1 configuration and the desktop gateway's file each take it as
+         an optional block. Absent, nothing changes. Present, it gates every order and
+         combination they accept, and it is part of the journal's configuration
+         fingerprint, so a journal reopens only under the limits it was written with. A
+         block that does not parse refuses the route or disables the gateway before its
+         journal is touched.
+       - The route's JSON schema publishes the block with definitions tested equal to the
+         version-2 paper schema's, and a checked-in route fixture carries one.
+     - **Tests.** 12 tests and one fixture were added.
+       - The shared document: an absent optional limit is a limit that can never trip,
+         every configured limit reaches the composition, an unknown field is refused, and a
+         malformed limit names its field.
+       - The route: none, wide and tight limits approve, approve and reject the same order
+         with `MAX_GROSS_EXPOSURE_EXCEEDED`; a bad block refuses the route before its
+         journal; the journal reopens under its own limits and not under a changed one; and
+         the route opens the checked-in fixture.
+       - The gateway: a tight limit rejects an order and a wide one does not, and a bad
+         block disables it before its journal.
+       - The schema: the block's definitions equal the paper schema's, and five malformed
+         blocks are refused.
+     - **Rule 5.** 15 of 15 injected defects were caught by the intended tests: the block
+       ignored by the route and by the gateway, a malformed limit swallowed or reported
+       under another name, an absent limit that could trip, sector limits read from the
+       wrong field, strategy limits dropped, an unknown field ignored, an empty margin table
+       kept, the composed kernel duplicating the open-order limit, a limit that lost its
+       name, and two schema drifts.
+     - **Measured result.** The Rust workspace rose from 599 to 607 passed / 0 failed /
+       3 ignored, the Tauri host from 31 to 33, and the Python suite from 105 to 107. The
+       final `python tools/session_status.py` run measured all seven suites green. The
+       full evidence pipeline exited 0.
+     - **Boundary.** The route and gateway still take operator-attested marks, so the
+       aggregate limits are only as good as those marks (E5.3). Controlled LIVE already
+       composes aggregate risk through `LiveConfiguration` and is unchanged. The routes
+       still lack the authenticated write boundary of E7.10 on the desktop. No external
+       gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -39,6 +39,13 @@ so almost any spread with a short leg — is refused unless the operator-authore
 
 The UI never grants that permission itself.
 
+The file may also carry an optional `portfolio_risk` block, the aggregate limits
+`follon-paper-status` and the gRPC PAPER route read: gross and net exposure,
+leverage, concentration, drawdown, daily loss, margin utilisation and sector,
+asset-class, currency and strategy limits. With it, every order and combination the
+gateway submits is gated by them. An unparseable block disables the gateway before
+its journal is touched.
+
 The same file must list the venue tick size and lot size of every instrument
 the operator may trade. Both tables must list the same instruments: a file
 that lists an instrument in only one of them is refused when the gateway

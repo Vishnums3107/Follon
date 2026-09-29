@@ -56,18 +56,18 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T14:09:24Z  
+**Measured at:** 2026-09-29T14:21:43Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `b342593` -- test(backtest): state and hold the two P&L conventions -- E8.5 (2026-09-29T19:34:21+05:30)  
-**Uncommitted paths:** 8
+**HEAD:** `bd6fa27` -- feat(sbom): cover the desktop's Cargo workspace and record first-party licences -- E7.8 (2026-09-29T19:40:23+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 599 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 607 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
-| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 105 | 0 | 0 |
+| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 107 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -273,7 +273,7 @@ passes it for production.
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
 | E7.4a | Portfolio-risk configuration fingerprints. PAPER's and LIVE's both omitted `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`. **Now every field enters both**, through `PortfolioRiskPolicy::canonical_parts`, whose exhaustive destructuring makes a new field a compile error until it is rendered. The part is tagged `v2`, so a journal or LIVE approval made under the incomplete version-1 fingerprint is refused rather than trusted (audit item 98). | **done** 2026-09-29 |
 | E7.4b | The aggregate portfolio-risk check was skipped outright when equity is not positive. Failing closed on everything would also have refused risk-reducing orders, such as closing positions, so the treatment was left to the operator. **Decided 2026-09-29 by the agent under the operator's blanket delegation (Settled direction item 6): reduce-only.** With aggregate risk configured, PAPER and controlled LIVE refuse every order that does not move a position strictly toward flat (`PORTFOLIO_EQUITY_NOT_POSITIVE`), a combination unless every leg does, and still pass one that reduces a position without crossing through flat. `follon_domain::reduces_position` is the one definition. Audit item 107. | **done** 2026-09-29 |
-| E7.5 | Aggregate portfolio risk in the order-submitting routes, the desktop gateway and the gRPC PAPER route. Only the read-only `follon-paper-status` composes it today. | open |
+| E7.5 | Aggregate portfolio risk in the order-submitting routes. Only the read-only `follon-paper-status` composed it. **Now** the gRPC PAPER route's and the desktop gateway's configurations take an optional `portfolio_risk` block, the document `follon-paper-status` reads. It moved into `core/paper` as `PortfolioRiskDocument`, so no application can read a limit differently. Present, it gates every order and combination through the composed kernel and is part of the journal fingerprint; absent, nothing changes. The route's JSON schema publishes it and is tested equal to the version-2 paper schema's. Audit item 110. Controlled LIVE already composes it through `LiveConfiguration`, and is unchanged. | **done** 2026-09-29 |
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
 | E7.8 | The SBOM covered only the root Cargo lockfile and recorded no first-party licence. **Now** it also covers the desktop host's Cargo workspace and lockfile, and each first-party crate, Python package and the desktop npm package carries its declared licence, read from its own manifest, natively as CycloneDX `licenses`. The bill's own component names the repository's licence. A first-party package that declares none, or a path package this repository has no manifest for, is refused rather than left out. `apps/desktop/package.json` declares MIT. Third-party Cargo licences are still not recorded, since a lockfile does not carry them. Audit item 109. | **done** 2026-09-29 |
@@ -790,6 +790,34 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-29 — session 13
+
+- Asked to resume, complete the project end to end, update status as work lands,
+  and decide for itself while the operator was away. Baseline at `4403b3f`: clean
+  tree, all seven suites green (Rust 562 / 0 / 3, Tauri 31, Python 75), the full
+  pipeline exit 0. Commits stay on `refactor/module-decomposition`, unpushed.
+- Landed seven slices, each with its rule-5 injections, all seven suites and the
+  full pipeline measured before its commit (audit items 103 to 109):
+  - E5.4: a bridge refusal is a clean rejection, and IBKR notices no longer reject
+    working orders. Found along the way: an injection that survived because it
+    crashed into the failure the test expects, which was a bad injection and not a
+    weak test.
+  - E5.7: controlled LIVE refuses what its adapter cannot carry before an approval
+    is spent.
+  - E7.2: a strategy worker's frames are bounded and its round trips have a
+    deadline. A test that failed before killing its child hung the injection runner
+    for ten minutes through an inherited pipe, so the fixture's stalls are bounded.
+  - E7.9: the risk benchmark records when it was measured.
+  - E7.4b: an account with no positive equity may only reduce risk. The
+    operator-gated choice was taken by the agent (Settled direction item 6).
+  - E8.5: the two P&L conventions are stated and held by tests.
+  - E7.8: the SBOM covers the desktop's Cargo workspace and records first-party
+    licences.
+- Measured at the E7.8 commit: Rust 599 / 0 / 3, Tauri 31, Python 105, both
+  desktop suites green, the full pipeline exit 0.
+- **Next action:** see the backlog. Still waiting on the operator: E7.10, E6.5,
+  E8.3.
 
 ### 2026-09-29 — session 12
 

@@ -54,7 +54,7 @@ use follon_paper::{
     BrokerOrderRequest, BrokerReplaceRequest, BrokerSubmitResult, IbkrPaperAdapter,
     KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerAdapter, PaperBrokerCapabilities,
     PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy, PaperTradingService,
-    ShortExposurePolicy,
+    PortfolioRiskDocument, ShortExposurePolicy,
 };
 use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
@@ -1302,6 +1302,11 @@ struct PaperCommandRouteDocument {
     instrument_lot_sizes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     short_exposure: Option<PaperCommandShortExposureDocument>,
+    /// Aggregate portfolio limits, the same document `follon-paper-status`
+    /// reads. Absent, no aggregate limit applies to the route's orders. Present,
+    /// it gates every order and combination it accepts (delivery state E7.5).
+    #[serde(default)]
+    portfolio_risk: Option<PortfolioRiskDocument>,
     kill_switch_version: String,
     adapter_kind: String,
     /// Required when `adapter_kind` is `IBKR_PAPER_BRIDGE`, refused otherwise.
@@ -1617,7 +1622,11 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
         max_market_data_age_seconds: document.max_market_data_age_seconds,
         max_order_rate: document.max_order_rate,
         order_rate_window_seconds: document.order_rate_window_seconds,
-        portfolio_risk: None,
+        portfolio_risk: document
+            .portfolio_risk
+            .map(PortfolioRiskDocument::into_composition)
+            .transpose()
+            .map_err(|error| format!("invalid PAPER command-route portfolio_risk: {error}"))?,
         short_exposure: document
             .short_exposure
             .map(|permission| -> Result<ShortExposurePolicy, String> {
@@ -2087,6 +2096,152 @@ mod tests {
         );
         // Refused before its journal is touched (E3.10).
         assert!(!scratch.join("journal.ndjson").exists());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The route's `portfolio_risk` block with one gross-exposure limit and
+    /// every other limit wide enough never to trip.
+    fn portfolio_risk_block(max_gross_exposure: &str) -> serde_json::Value {
+        serde_json::json!({
+            "policy_version": "portfolio-risk.grpc.v1",
+            "max_gross_exposure": max_gross_exposure,
+            "max_abs_net_exposure": "1000000",
+            "max_leverage_bps": "10000",
+            "max_concentration_bps": "10000",
+        })
+    }
+
+    /// Submits the standard order through a route configured with `block`
+    /// (none, for a route with no aggregate limit) and returns whether risk
+    /// approved it and why.
+    async fn aggregate_outcome(
+        name: &str,
+        block: Option<serde_json::Value>,
+    ) -> (bool, Vec<String>) {
+        let (config, scratch) = write_route_config(name, |document| {
+            if let Some(block) = block {
+                document["portfolio_risk"] = block;
+            }
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        let outcome = service
+            .submit_paper_order(authorized(
+                paper_order_request(&format!("intent.grpc.aggregate.{name}")),
+                &token,
+            ))
+            .await
+            .expect("a risk decision")
+            .into_inner();
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+        (outcome.approved, outcome.reason_codes)
+    }
+
+    /// A route with no `portfolio_risk` block applies no aggregate limit. One
+    /// that has it gates every order by it (delivery state E7.5). The standard
+    /// order is 2 shares at 100, a gross exposure of 200.
+    #[tokio::test]
+    async fn a_route_configured_with_portfolio_risk_gates_its_orders_by_it() {
+        let (approved, reasons) = aggregate_outcome("aggregate-none", None).await;
+        assert!(approved, "{reasons:?}");
+
+        let (approved, reasons) =
+            aggregate_outcome("aggregate-wide", Some(portfolio_risk_block("1000000"))).await;
+        assert!(approved, "{reasons:?}");
+
+        let (approved, reasons) =
+            aggregate_outcome("aggregate-tight", Some(portfolio_risk_block("100"))).await;
+        assert!(!approved);
+        assert!(
+            reasons.contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_portfolio_risk_block_refuses_the_route_before_its_journal() {
+        let mut misspelled = portfolio_risk_block("100");
+        misspelled["max_gross_expsure"] = "1".into();
+        assert!(refused_route("aggregate-misspelled", |document| {
+            document["portfolio_risk"] = misspelled;
+        })
+        .contains("invalid PAPER command-route config"),);
+        assert!(refused_route("aggregate-malformed", |document| {
+            document["portfolio_risk"] = portfolio_risk_block("lots");
+        })
+        .contains("invalid PAPER command-route portfolio_risk: invalid max_gross_exposure"));
+    }
+
+    /// The limits are part of the journal's configuration fingerprint, so a
+    /// route reopens its journal only under the limits it was written with.
+    #[tokio::test]
+    async fn a_route_journal_reopens_only_under_the_portfolio_limits_it_was_written_with() {
+        let (config, scratch) = write_route_config("aggregate-fingerprint", |document| {
+            document["portfolio_risk"] = portfolio_risk_block("1000000");
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        service
+            .submit_paper_order(authorized(
+                paper_order_request("intent.grpc.aggregate.fingerprint"),
+                &token,
+            ))
+            .await
+            .expect("a risk decision");
+        drop(service);
+        drop(route);
+
+        // The same file reopens; a changed limit does not.
+        assert!(paper_combo_route_from_path(&config).is_ok());
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        document["portfolio_risk"]["max_gross_exposure"] = "999999".into();
+        let changed = scratch.join("changed.json");
+        std::fs::write(&changed, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        let refusal = paper_combo_route_from_path(&changed)
+            .err()
+            .expect("a journal must not reopen under different aggregate limits");
+        assert!(refusal.contains("PAPER command-route service"), "{refusal}");
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// The checked-in fixture the route's schema is tested against is a
+    /// configuration the route really opens, so the schema and the reader agree.
+    #[test]
+    fn the_route_opens_the_checked_in_portfolio_risk_fixture() {
+        let scratch = std::env::temp_dir().join(format!(
+            "follon-trading-api-portfolio-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository_path(
+                "tests/fixtures/config/paper-command-route-v1-portfolio-risk.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        document["journal_path"] = scratch.join("journal.ndjson").to_string_lossy().into();
+        let config = scratch.join("route.json");
+        std::fs::write(&config, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        assert!(paper_combo_route_from_path(&config).is_ok());
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
