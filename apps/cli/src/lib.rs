@@ -12,6 +12,12 @@ use sha2::{Digest, Sha256};
 /// final name visible. The link operation cannot overwrite an existing file,
 /// which keeps concurrent publishers fail-closed.
 pub fn write_immutable(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // A link at the artifact path is refused, dangling or not. `exists()`
+    // follows a link, so a dangling one looked absent: the staging file was
+    // written, the publish then failed, and the staging file was left behind.
+    // A link to identical content counted as already published (delivery
+    // state E7.1, E3.11's rule).
+    refuse_symbolic_link(path)?;
     if path.exists() {
         return if fs::read_to_string(path)? == contents {
             Ok(())
@@ -82,6 +88,20 @@ pub fn write_immutable(path: &Path, contents: &str) -> Result<(), Box<dyn std::e
     }
 }
 
+/// Refuses a symbolic link at an output path, dangling or not, without
+/// following it. An absent path passes; any other error is returned.
+pub fn refuse_symbolic_link(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing to write through a symbolic link: {}",
+            path.display()
+        )
+        .into()),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Returns a lowercase SHA-256 digest for exact UTF-8 artifact bytes.
 pub fn sha256_text(contents: &str) -> String {
     format!("{:x}", Sha256::digest(contents.as_bytes()))
@@ -103,5 +123,48 @@ mod tests {
         write_immutable(&path, "first").unwrap();
         assert!(write_immutable(&path, "different").is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn immutable_writer_refuses_a_symbolic_link_and_stages_nothing() {
+        let directory =
+            std::env::temp_dir().join(format!("follon-immutable-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("elsewhere.json");
+        let link = directory.join("artifact.json");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        if let Err(error) = linked {
+            eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+            std::fs::remove_dir_all(&directory).unwrap();
+            return;
+        }
+        let only_the_link = |directory: &Path| {
+            let mut names = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        // Dangling: refused as a link, not by whatever failed later, and no
+        // staging file is left beside it.
+        let error = write_immutable(&link, "contents").unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(
+            !target.exists(),
+            "the artifact was written through the link"
+        );
+        assert_eq!(only_the_link(&directory), vec!["artifact.json".to_owned()]);
+
+        // A link to identical content used to count as already published.
+        std::fs::write(&target, "contents").unwrap();
+        let error = write_immutable(&link, "contents").unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

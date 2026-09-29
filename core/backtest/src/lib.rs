@@ -1995,6 +1995,22 @@ impl ExperimentCatalog {
     }
 }
 
+/// Refuses a symbolic link at the experiment store's path, dangling or not.
+/// `symlink_metadata` never follows a link. The `exists()` check did, so a
+/// dangling link looked like an empty store and the first write created the
+/// store at the link's target (delivery state E7.1, E3.11's rule).
+fn refuse_symbolic_link(path: &Path) -> Result<(), BacktestError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(BacktestError(
+            "experiment store path must not be a symbolic link".to_owned(),
+        )),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(BacktestError(error.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Durable append-only local experiment catalog suitable for a single-node deployment.
 ///
 /// The file format is canonical NDJSON. A duplicate immutable record is an
@@ -2008,6 +2024,7 @@ impl FileExperimentStore {
     /// Opens and fully validates an existing experiment index before accepting writes.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BacktestError> {
         let path = path.as_ref().to_path_buf();
+        refuse_symbolic_link(&path)?;
         let mut catalog = ExperimentCatalog::default();
         if path.exists() {
             for (index, line) in fs::read_to_string(&path)
@@ -2040,6 +2057,9 @@ impl FileExperimentStore {
             }
             None => {}
         }
+        // Checked on every write, because the file is reopened each time and
+        // a link could have appeared since `open`.
+        refuse_symbolic_link(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| BacktestError(error.to_string()))?;
         }
@@ -3008,6 +3028,53 @@ mod tests {
         assert_eq!(recovered.find_by_tag("regime", "baseline").len(), 1);
         assert_eq!(recovered.export_ndjson(), record.canonical_json());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn an_experiment_store_refuses_a_symbolic_link_on_open_and_on_write() {
+        let directory = std::env::temp_dir().join(format!(
+            "follon-experiment-store-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("elsewhere.ndjson");
+        let path = directory.join("experiments.ndjson");
+        let link_to = |target: &Path, link: &Path| {
+            #[cfg(unix)]
+            let linked = std::os::unix::fs::symlink(target, link);
+            #[cfg(windows)]
+            let linked = std::os::windows::fs::symlink_file(target, link);
+            if let Err(error) = &linked {
+                eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+            }
+            linked.is_ok()
+        };
+        if !link_to(&target, &path) {
+            std::fs::remove_dir_all(&directory).unwrap();
+            return;
+        }
+        let refusal = "experiment store path must not be a symbolic link";
+        let record = ExperimentRecord {
+            experiment_id: "experiment-link-001".to_owned(),
+            run_id: "run-001".to_owned(),
+            tags: BTreeMap::new(),
+            specification_fingerprint: "a".repeat(64),
+            event_output_hash: "b".repeat(64),
+            artifact_fingerprint: "c".repeat(64),
+        };
+
+        // A dangling link looked like an empty store.
+        assert_eq!(FileExperimentStore::open(&path).err().unwrap().0, refusal);
+
+        // A link that appears after the store was opened is refused at the
+        // write, and nothing is written through it.
+        std::fs::remove_file(&path).unwrap();
+        let mut store = FileExperimentStore::open(&path).unwrap();
+        assert!(link_to(&target, &path));
+        assert_eq!(store.record(record).err().unwrap().0, refusal);
+        assert!(!target.exists(), "the record was written through the link");
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

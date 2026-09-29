@@ -150,6 +150,10 @@ fn handle_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("Processing chronological news stream...\n");
 
     let mut out_file = if let Some(ref p) = output_path {
+        // `File::create` follows a link and truncates its target, so a link
+        // at the output path, dangling or not, is refused first (delivery
+        // state E7.1, E3.11's rule).
+        follon_cli::refuse_symbolic_link(p)?;
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }

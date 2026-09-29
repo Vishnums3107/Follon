@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-28T09:14:07Z  
+**Measured at:** 2026-09-29T04:38:50Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `cafbe20` -- fix(acceptance): a rejection disqualifies its subject; records meet their exact contract -- E6.2 (2026-09-28T14:38:38+05:30)  
-**Uncommitted paths:** 6
+**HEAD:** `9ab5ae1` -- fix(release): promotion recomputes acceptance from the ledgers it binds -- E6.3 (2026-09-28T14:45:38+05:30)  
+**Uncommitted paths:** 9
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 529 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 534 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -261,7 +261,7 @@ passes it for production.
 
 | Slice | Scope | State |
 | --- | --- | --- |
-| E7.1 | E3.11's link guard for every durable writer it did not cover. The operations journal's reader reports a dangling link as a healthy empty journal. The replay `FileEventStore` and the backtest `FileExperimentStore` check `exists()` and then open with `create(true)`. `follon-news` output uses `File::create`, which truncates a link's target. `write_immutable` leaves its staging file behind on a dangling link. | open |
+| E7.1 | E3.11's link guard for every durable writer it did not cover. The operations journal's reader reports a dangling link as a healthy empty journal. The replay `FileEventStore` and the backtest `FileExperimentStore` check `exists()` and then open with `create(true)`. `follon-news` output uses `File::create`, which truncates a link's target. `write_immutable` leaves its staging file behind on a dangling link. **Each now refuses any link without following it**; the experiment store checks again at every write, because it reopens its file each time (audit item 91). | **done** 2026-09-28 |
 | E7.2 | Strategy-worker frames. Each is one newline-terminated JSON line, read with an unbounded `read_line` and no deadline. They need a bound applied before allocation and a per-frame deadline, reusing the IBKR bridge's bounded reader. | open |
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. | open |
 | E7.4 | Portfolio-risk configuration. PAPER's fingerprint omits `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`, and the aggregate check is skipped outright when equity is not positive. LIVE's fingerprint needs the same check. | open |

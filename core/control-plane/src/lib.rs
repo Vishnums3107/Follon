@@ -142,6 +142,20 @@ impl FileEventStore {
     /// Opens or creates an append-only local event log.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, EngineError> {
         let path = path.as_ref();
+        // `symlink_metadata` never follows a link. `exists()` did, so a
+        // dangling link looked absent and the open below created the log at
+        // the link's target (delivery state E7.1, E3.11's rule).
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(EngineError(
+                    "event log path must not be a symbolic link".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
         let mut event_ids = HashSet::new();
         if path.exists() {
             for (index, line) in fs::read_to_string(path)?
@@ -3459,6 +3473,37 @@ mod tests {
         .unwrap();
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].bar.close, Decimal::from_integer(100).unwrap());
+    }
+
+    #[test]
+    fn an_event_log_refuses_a_symbolic_link_even_a_dangling_one() {
+        let directory =
+            std::env::temp_dir().join(format!("follon-event-log-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("elsewhere.ndjson");
+        let link = directory.join("events.ndjson");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        if let Err(error) = linked {
+            eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+            std::fs::remove_dir_all(&directory).unwrap();
+            return;
+        }
+        let refusal = "event log path must not be a symbolic link";
+
+        assert_eq!(FileEventStore::open(&link).err().unwrap().0, refusal);
+        assert!(
+            !target.exists(),
+            "the event log was created through the link"
+        );
+
+        // A link to a real log is refused too.
+        drop(FileEventStore::open(&target).unwrap());
+        assert_eq!(FileEventStore::open(&link).err().unwrap().0, refusal);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

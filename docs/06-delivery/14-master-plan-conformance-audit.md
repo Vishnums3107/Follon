@@ -444,7 +444,7 @@ does not expose privileged mutations through the read-only evidence server.
 | --- | --- | --- |
 | Strategy/broker secret separation | Implemented | Strategy workers cannot reach adapter or credential interfaces. |
 | Secret ingress | Implemented interfaces; deployment gate | Managed-command/password/connection-string file boundaries and zeroizing broker material exist. Production mode refuses a direct database URL and requires a TLS connection string. A production vault/keychain, rotation operation, and custody evidence remain external. |
-| Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. Production HSM/KMS custody and independent approval remain external. |
+| Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. As of item 91 (2026-09-28), so do the operations journal and its reader, the replay event log, the backtest experiment store, every immutable CLI artifact and `follon-news` output. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
 | Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. As of item 85 (2026-09-28), that Semgrep job and the gitleaks check had not passed on any run visible on GitHub: Semgrep blocked on this audit's own quotation of item 41's fixed defect, and gitleaks on a fixture's secret reference. Both are fixed and verified locally at CI's pinned versions; a green GitHub run is still open (delivery state E4.3). |
 | Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. As of item 88 (2026-09-28), it reads and discards a request's declared body, up to 64 KiB, before answering, and a 15-second socket timeout bounds every read. |
@@ -3738,6 +3738,44 @@ These are mandatory master-plan acceptance conditions and are currently open:
       artifact a record names nor binds a release to the environment it was accepted in (E6.4). The
       trusted release key is still whatever file the caller passes. Requester and approver are still two
       distinct strings rather than two authenticated people. No external gate moved.
+
+91. Every durable writer E3.11 did not cover refuses a symbolic link (2026-09-28, Security row "Immutable
+    audit and signed release"; delivery state E7.1). The revised assessment named the operations journal;
+    the source review behind it found the other four.
+    - **The gaps.** Each checked `exists()`, which follows a link, or checked nothing:
+      - the operations journal opened with `create(true)`, which follows a link, and its reader treated a
+        dangling link as an absent file, reporting a healthy empty journal. `follon-operations` publishes
+        its model-risk and game-day registers from that reader;
+      - the replay `FileEventStore` and the backtest `FileExperimentStore` created their files through a
+        dangling link, and the experiment store reopens its file on every write;
+      - `follon-news replay --output` used `File::create`, which follows a link and truncates its target;
+      - `write_immutable`, behind every CLI artifact, wrote a staging file for a dangling link, failed on
+        an unrelated error, and left the staging file behind. A link to identical content counted as
+        already published.
+    - **The fix.** Each path is read with `symlink_metadata`, which never follows a link. A link, dangling
+      or not, is refused; an absent path passes; any other error is returned. The experiment store checks
+      again before every write. The CLI helper is public and is shared by `write_immutable` and
+      `follon-news`.
+    - **Tests.** Each uses a real link; where an account cannot create one, a test says so and returns.
+      Every link was created on this machine:
+      - the operations journal's open, `inspect` and `read_verified_records` refuse a dangling link and a
+        link to a real journal, and nothing is created at the target;
+      - the event log refuses both, and creates nothing at the target;
+      - the experiment store refuses a dangling link at open, and a link that appears after it was opened
+        is refused at the write, with nothing written through it;
+      - `write_immutable` refuses a dangling link with the link refusal, stages nothing, and refuses a
+        link to identical content;
+      - through the real binary, `follon-news` refuses a dangling link and a link to an operator's file,
+        which keeps its content, and still writes a plain output.
+    - **Rule 5.** 8 of 8 injected defects were caught, before and again after formatting: each guard
+      removed, the experiment store's write-time guard removed on its own, and the shared CLI guard
+      reading `fs::metadata`, which follows the link it checks.
+    - **Measured result.** The Rust workspace rose from 529 to 534 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed. The built-in strategy's bundle hash
+      changed because it covers `core/control-plane/src/lib.rs`, which this slice edits.
+    - **Bounded remainder.** Every guard still runs before its open, so a link swapped in between them is
+      not refused (E7.12). The penetration-test runbook lists the new paths. No external gate moved.
 
 ## Business-readiness decision
 
