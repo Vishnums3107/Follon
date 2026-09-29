@@ -34,7 +34,9 @@ protocol, the instrument map and the process arguments.
 - **Controlled LIVE types.** `IbkrLiveGatewayConfiguration` (loopback, LIVE ports
   `7496` / `4001`, positive canary limits), `IbkrControlledLiveAdapter`
   (implements `LiveBrokerAdapter` over an `IbkrLiveGatewayTransport`), and the
-  capital-adapter release checks. The only implementation of
+  capital-adapter release checks. The LIVE adapter declares single DAY orders and
+  price replacement, so controlled LIVE refuses a combination or a GTC intent
+  before an approval is spent. The only implementation of
   `IbkrLiveGatewayTransport` in this repository is a test fake, and the Python
   bridge refuses live ports, so nothing here reaches a LIVE session.
 

@@ -4188,6 +4188,48 @@ These are mandatory master-plan acceptance conditions and are currently open:
        order placed by an earlier bridge process is not recognised. Neither is
        closed by this item (E5.5 and E5.6). No external gate moved.
 
+104. Controlled LIVE refuses what its broker adapter cannot carry before an
+     approval is spent (2026-09-29, rows 5.6 and 5.7; E5.7). This is E5.1's
+     analogue for LIVE, under LIVE's own configuration and review.
+     - **Defect.** `LiveBrokerAdapter::submit_combo` and `replace` refuse by
+       default, and the service recorded that refusal as a transport failure. A
+       combination on such an adapter became `UNKNOWN`, the session was marked
+       disconnected, and the approval and a canary slot stayed consumed; a
+       replacement left the order `PENDING_REPLACE` and then `UNKNOWN`. The broker
+       request also carries no time in force, so a GTC intent could not reach the
+       venue as such. It was latent, because no application composes a LIVE
+       adapter that can trade.
+     - **Behavior.**
+       - `LiveBrokerCapabilities` (`combinations`, `good_til_cancelled`,
+         `replacement`) defaults to single DAY orders, and every adapter may
+         declare more through `LiveBrokerAdapter::capabilities`. It is a separate
+         type from `follon_paper::PaperBrokerCapabilities`: PAPER's declaration can
+         never widen what LIVE attempts.
+       - `submit_canary_intent` and `submit_canary_combo_intent` check it after the
+         idempotent-retry answer and before the approval is looked at.
+         `replace_order` checks it before the order moves to `PENDING_REPLACE`. A
+         refusal changes nothing: no order, no consumed approval, no canary slot, no
+         disconnect.
+       - `IbkrControlledLiveAdapter` declares replacement only, since its transport
+         contract carries `replace_live` and nothing else.
+     - **Tests.** Four service tests and one adapter test were added. An adapter that
+       declares nothing carries single DAY orders only. An undeclared combination,
+       GTC intent and replacement are each refused with the approval unspent, the
+       canary count at zero, no order, no `UNKNOWN` and the session connected, and the
+       same approval then works once the adapter declares it. The existing transport
+       failure test, which keeps a spent approval, now covers a declared adapter, the
+       only kind that can reach the broker call.
+     - **Rule 5.** 12 of 12 injected defects were caught by the intended tests on the
+       final files, including both checks moved to after the approval is spent.
+     - **Measured result.** The Rust workspace rose from 565 to 570 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+       seven suites green. The full evidence pipeline exited 0.
+     - **Boundary.** The IBKR LIVE adapter's own envelope checks, such as a market order
+       without a limit or a quantity over the canary ceiling, still return an error and
+       so `UNKNOWN`, although nothing was sent. That is a separate LIVE decision and is
+       not changed here. Nothing composes a LIVE adapter that can trade, and no
+       external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

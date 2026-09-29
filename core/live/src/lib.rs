@@ -965,8 +965,41 @@ pub struct LiveBrokerAccountSnapshot {
     pub cash: Decimal,
 }
 
+/// What one controlled-LIVE broker adapter can carry to its venue.
+///
+/// The service consults this before it consumes an approval, spends a canary
+/// slot or creates an order, so a request the adapter cannot carry is refused
+/// with nothing recorded, nothing consumed and nothing transmitted. Without it
+/// the refusal came back as a transport failure: the order became `UNKNOWN`,
+/// the session disconnected, and the approval and the canary slot stayed spent
+/// (delivery state E5.7).
+///
+/// The derived default is the narrowest set, single DAY orders. An adapter
+/// declares anything more. It is a separate type from
+/// `follon_paper::PaperBrokerCapabilities`: the environments are configured and
+/// reviewed independently, and what PAPER may carry must never widen what
+/// controlled LIVE is willing to attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveBrokerCapabilities {
+    /// Executes an atomic multi-leg combination as one order.
+    pub combinations: bool,
+    /// Carries a good-til-cancelled time in force to the venue as such,
+    /// rather than dropping or rewriting it.
+    pub good_til_cancelled: bool,
+    /// Replaces a working order's limit price.
+    pub replacement: bool,
+}
+
 /// Audited live broker interface. Implementations must be deployment-edge code.
 pub trait LiveBrokerAdapter {
+    /// Declares what this adapter can carry.
+    ///
+    /// The default is [`LiveBrokerCapabilities::default`], single DAY orders,
+    /// so an adapter that declares nothing is never handed a combination, a
+    /// GTC order or a replacement it would refuse, drop or rewrite.
+    fn capabilities(&self) -> LiveBrokerCapabilities {
+        LiveBrokerCapabilities::default()
+    }
     /// Establishes a live session using secret bytes only at the adapter boundary.
     fn connect(&mut self, account_id: &str, credential: &SecretMaterial) -> Result<(), LiveError>;
     /// Submits one OMS-generated idempotent live order.
@@ -976,7 +1009,8 @@ pub trait LiveBrokerAdapter {
     ) -> Result<LiveBrokerSubmitResult, LiveError>;
     /// Submits an atomic multi-leg combination.
     ///
-    /// The default refuses. An adapter that cannot execute a combination
+    /// Only reached when [`Self::capabilities`] declares combinations. The
+    /// default refuses. An adapter that cannot execute a combination
     /// atomically must reject the whole request *before* transmitting any leg:
     /// there is no acceptable partial outcome for a group whose legs only make
     /// sense together, and the OMS never works around this by splitting it.
@@ -991,6 +1025,8 @@ pub trait LiveBrokerAdapter {
     /// Requests cancellation by client idempotency identity.
     fn cancel(&mut self, client_order_id: &str) -> Result<(), LiveError>;
     /// Requests a price-only replacement. The result arrives through [`LiveBrokerEvent`].
+    ///
+    /// Only reached when [`Self::capabilities`] declares replacement.
     fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
         request.validate()?;
         Err(LiveError(
@@ -2254,6 +2290,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 state: existing.oms.state,
             });
         }
+        // Before the approval is looked at, let alone consumed: a refusal here
+        // leaves the approval, the canary budget and the session untouched.
+        self.ensure_route_carries(intent.time_in_force, false)?;
         let registered = self.approvals.get(approval_id).ok_or_else(|| {
             LiveError("live canary submission lacks a registered approval".to_owned())
         })?;
@@ -2396,6 +2435,29 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
     }
 
+    /// Refuses what the configured adapter cannot carry, before anything is
+    /// recorded, consumed or transmitted (delivery state E5.7).
+    fn ensure_route_carries(
+        &self,
+        time_in_force: TimeInForce,
+        combination: bool,
+    ) -> Result<(), LiveError> {
+        let capabilities = self.broker.capabilities();
+        if combination && !capabilities.combinations {
+            return Err(LiveError(
+                "the configured live broker adapter cannot execute combinations; nothing was recorded, consumed or transmitted"
+                    .to_owned(),
+            ));
+        }
+        if time_in_force == TimeInForce::GoodTilCancelled && !capabilities.good_til_cancelled {
+            return Err(LiveError(
+                "the configured live broker adapter carries only DAY orders; the GTC intent was refused before anything was recorded, consumed or transmitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Requests cancellation; a transport failure remains explicitly `UNKNOWN`.
     pub fn cancel_order(
         &mut self,
@@ -2451,6 +2513,15 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if !self.broker_connected {
             return Err(LiveError(
                 "live canary broker session is not connected; reconcile before replacement"
+                    .to_owned(),
+            ));
+        }
+        // Before the order moves to `PENDING_REPLACE`: an adapter that cannot
+        // replace would otherwise leave it `UNKNOWN` and the session
+        // disconnected (delivery state E5.7).
+        if !self.broker.capabilities().replacement {
+            return Err(LiveError(
+                "the configured live broker adapter cannot replace orders; the order was left unchanged"
                     .to_owned(),
             ));
         }
@@ -5537,9 +5608,12 @@ mod tests {
         connected: bool,
         submitted: u32,
         cancelled: u32,
+        replaced: u32,
         fail_cancel: bool,
-        /// Models an adapter with no native atomic combination support.
+        /// Models a transport failure on a combination the adapter declared.
         reject_combos: bool,
+        /// What this adapter declares it can carry.
+        capabilities: LiveBrokerCapabilities,
         events: Vec<LiveBrokerEvent>,
         snapshot: LiveBrokerAccountSnapshot,
     }
@@ -5550,8 +5624,13 @@ mod tests {
                 connected: false,
                 submitted: 0,
                 cancelled: 0,
+                replaced: 0,
                 fail_cancel: false,
                 reject_combos: false,
+                capabilities: LiveBrokerCapabilities {
+                    combinations: true,
+                    ..LiveBrokerCapabilities::default()
+                },
                 events: Vec::new(),
                 snapshot: LiveBrokerAccountSnapshot {
                     orders: Vec::new(),
@@ -5613,6 +5692,10 @@ mod tests {
     }
 
     impl LiveBrokerAdapter for TestBroker {
+        fn capabilities(&self) -> LiveBrokerCapabilities {
+            self.capabilities
+        }
+
         fn connect(
             &mut self,
             account_id: &str,
@@ -5666,6 +5749,12 @@ mod tests {
             if self.fail_cancel {
                 return Err(LiveError("test live cancel transport failed".to_owned()));
             }
+            Ok(())
+        }
+
+        fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
+            request.validate()?;
+            self.replaced += 1;
             Ok(())
         }
 
@@ -6708,8 +6797,10 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// An adapter that cannot execute an atomic combination refuses the whole
-    /// request, and the attempt is recorded rather than erased.
+    /// A declared adapter whose combination submission fails is a transport
+    /// outcome, so the attempt is recorded rather than erased. An adapter that
+    /// declares nothing never gets that far (see
+    /// `live_combo_on_an_adapter_that_cannot_execute_combinations_is_refused_before_anything_is_spent`).
     #[test]
     fn live_combo_transport_failure_leaves_the_group_unknown_and_keeps_the_approval_spent() {
         let path = journal_path("combo-transport");
@@ -6734,6 +6825,203 @@ mod tests {
         assert!(service.approvals["approval.live.001"].consumed);
         assert_eq!(service.canary_submissions, 1);
         assert!(service.has_unknown_order());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An adapter that declares nothing is never handed a combination, a GTC
+    /// order or a replacement.
+    #[test]
+    fn an_adapter_that_declares_nothing_carries_only_single_day_orders() {
+        struct Silent;
+
+        impl LiveBrokerAdapter for Silent {
+            fn connect(&mut self, _: &str, _: &SecretMaterial) -> Result<(), LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn submit(
+                &mut self,
+                _: &LiveBrokerOrderRequest,
+            ) -> Result<LiveBrokerSubmitResult, LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn cancel(&mut self, _: &str) -> Result<(), LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn poll(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn snapshot(&mut self, _: &str) -> Result<LiveBrokerAccountSnapshot, LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn reconnect(&mut self, _: &str, _: &SecretMaterial) -> Result<(), LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+        }
+
+        assert_eq!(
+            Silent.capabilities(),
+            LiveBrokerCapabilities {
+                combinations: false,
+                good_til_cancelled: false,
+                replacement: false,
+            }
+        );
+    }
+
+    /// A combination the adapter did not declare is refused before anything is
+    /// spent: the approval stays usable, the canary budget is intact, the
+    /// session stays connected and nothing is left `UNKNOWN`. The same approval
+    /// then works once the adapter can carry it (delivery state E5.7).
+    #[test]
+    fn live_combo_on_an_adapter_that_cannot_execute_combinations_is_refused_before_anything_is_spent(
+    ) {
+        let path = journal_path("combo-undeclared");
+        let intent = combo_intent("intent.live.combo.107");
+        let mut service = canary_ready(&path, &intent);
+        service.broker_mut().capabilities = LiveBrokerCapabilities::default();
+        let submit = |service: &mut LiveTradingService<TestBroker>| {
+            service.submit_canary_combo_intent(
+                intent.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+        };
+        let error = submit(&mut service).expect_err("an undeclared combination is refused");
+        assert!(
+            error.0.contains("cannot execute combinations"),
+            "{}",
+            error.0
+        );
+        assert!(service
+            .combo_order("combo-order-intent.live.combo.107")
+            .is_none());
+        assert!(!service.approvals["approval.live.001"].consumed);
+        assert_eq!(service.canary_submissions, 0);
+        assert!(!service.has_unknown_order());
+        assert!(service.broker_connected);
+        assert_eq!(service.broker_mut().submitted, 0);
+
+        service.broker_mut().capabilities.combinations = true;
+        assert!(matches!(
+            submit(&mut service).expect("the same approval works once declared"),
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        assert_eq!(service.canary_submissions, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The broker request carries no time in force, so a GTC intent would
+    /// silently become whatever the adapter places. A DAY-only adapter refuses
+    /// it before the approval is spent.
+    #[test]
+    fn live_gtc_intent_on_a_day_only_adapter_is_refused_before_anything_is_spent() {
+        let path = journal_path("gtc-undeclared");
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        let mut gtc = intent("LIVE", "intent.live.gtc.001");
+        gtc.time_in_force = TimeInForce::GoodTilCancelled;
+        let approval = approval_for(&service, &gtc);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let submit = |service: &mut LiveTradingService<TestBroker>| {
+            service.submit_canary_intent(
+                gtc.clone(),
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+        };
+        let error = submit(&mut service).expect_err("a GTC intent is refused");
+        assert!(error.0.contains("carries only DAY orders"), "{}", error.0);
+        assert!(service.orders.is_empty());
+        assert!(!service.approvals["approval.live.001"].consumed);
+        assert_eq!(service.canary_submissions, 0);
+        assert!(service.broker_connected);
+        assert_eq!(service.broker_mut().submitted, 0);
+
+        service.broker_mut().capabilities.good_til_cancelled = true;
+        assert!(matches!(
+            submit(&mut service).expect("the same approval works once declared"),
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A replacement the adapter cannot carry leaves the order working instead
+    /// of `UNKNOWN` with the session disconnected.
+    #[test]
+    fn live_replacement_on_an_adapter_that_cannot_replace_leaves_the_order_working() {
+        let path = journal_path("replace-undeclared");
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        let mut limit = intent("LIVE", "intent.live.replace.001");
+        limit.order_type = OrderType::Limit;
+        limit.limit_price = Some(amount("10"));
+        let approval = approval_for(&service, &limit);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        service
+            .submit_canary_intent(
+                limit,
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        let order_id = "order-intent.live.replace.001";
+
+        let error = service
+            .replace_order(
+                order_id,
+                amount("9"),
+                "operator.requester.001",
+                "2026-01-02T14:31:00Z",
+            )
+            .expect_err("an undeclared replacement is refused");
+        assert!(error.0.contains("cannot replace orders"), "{}", error.0);
+        assert_eq!(service.orders[order_id].oms.state, OrderState::Acknowledged);
+        assert!(!service.has_unknown_order());
+        assert!(service.broker_connected);
+        assert_eq!(service.broker_mut().replaced, 0);
+
+        service.broker_mut().capabilities.replacement = true;
+        service
+            .replace_order(
+                order_id,
+                amount("9"),
+                "operator.requester.001",
+                "2026-01-02T14:31:00Z",
+            )
+            .expect("a declared replacement is sent");
+        assert_eq!(service.broker_mut().replaced, 1);
+        assert_eq!(
+            service.orders[order_id].oms.state,
+            OrderState::PendingReplace
+        );
         let _ = fs::remove_file(&path);
     }
 

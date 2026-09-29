@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T13:06:25Z  
+**Measured at:** 2026-09-29T13:16:40Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `4403b3f` -- docs(delivery-state): record session 12 and refresh the measured status block (2026-09-29T16:20:33+05:30)  
-**Uncommitted paths:** 8
+**HEAD:** `a4ee48b` -- feat(ibkr): a bridge refusal is a clean rejection, and IBKR notices no longer reject working orders -- E5.4 (2026-09-29T18:38:13+05:30)  
+**Uncommitted paths:** 7
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 565 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 570 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -245,7 +245,7 @@ epic lands (see the correction under the external gates).
 | E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR, from transport ambiguity. Before, every `ok: false` reply stranded the order `UNKNOWN` and disconnected the session. **Now** a refused submission answers `REJECTED` (`IBKR_BRIDGE_REFUSED_<CODE>`) and leaves the session connected, a refused cancellation is reported as a `CANCEL_REJECTED` event so the order returns to working, and anything else stays `UNKNOWN`. IBKR's notices (202, 399, the 2100–2169 warnings) no longer reject a working order, and its cancel-failure codes (135, 136, 161, 10147, 10148) report a rejected cancellation. The code table is IBKR's documented one, not measured against a real TWS (E5.6). Audit item 103. | **done** 2026-09-29 |
 | E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
 | E5.6 | Retained Gateway evidence against a real TWS or IB Gateway PAPER session: restart, reconnect, cancellation races and reconciliation. | **external** |
-| E5.7 | E5.1's analogue for controlled LIVE. `IbkrControlledLiveAdapter` inherits a refusing `submit_combo`, and `core/live` records that refusal as a transport failure: the combination becomes `UNKNOWN`, the session disconnects, and the approval and a canary slot stay consumed. Latent, since no application composes a LIVE adapter that can trade, but it needs the same capability declaration under LIVE's separate review. | open |
+| E5.7 | E5.1's analogue for controlled LIVE. `IbkrControlledLiveAdapter` inherited a refusing `submit_combo`, and `core/live` recorded that refusal as a transport failure: the combination became `UNKNOWN`, the session disconnected, and the approval and a canary slot stayed consumed. **Now** every LIVE adapter declares `LiveBrokerCapabilities`, defaulting to single DAY orders. The service refuses a combination, a GTC intent or a replacement the adapter did not declare before the approval is looked at, a canary slot is spent or an order exists. It is a separate type from PAPER's, so PAPER can never widen what LIVE attempts. The IBKR LIVE adapter declares replacement only. Audit item 104. Still latent: no application composes a LIVE adapter that can trade. | **done** 2026-09-29 |
 
 ### E6 — Acceptance evidence that can be trusted (assessment priority 3)
 

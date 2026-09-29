@@ -846,6 +846,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             });
         }
 
+        // Before the approval is looked at, let alone consumed: a refusal here
+        // leaves the approval, the canary budget and the session untouched.
+        self.ensure_route_carries(intent.time_in_force, true)?;
         let registered = self.approvals.get(approval_id).ok_or_else(|| {
             LiveError("live canary combination lacks a registered approval".to_owned())
         })?;
@@ -979,10 +982,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 })
             }
             Err(error) => {
-                // An adapter that cannot execute an atomic combination returns
-                // an error here, and that is a *transport* outcome like any
-                // other: the request may or may not have reached the venue, so
-                // the combination goes to UNKNOWN and the session is marked
+                // An adapter that does not declare combinations never gets
+                // here (`ensure_route_carries` refuses first). An error from
+                // one that does is a *transport* outcome like any other: the
+                // request may or may not have reached the venue, so the
+                // combination goes to UNKNOWN and the session is marked
                 // disconnected rather than assumed untouched. The approval
                 // stays consumed and the canary counter stays incremented --
                 // an attempt was made, and pretending otherwise would let one

@@ -26,8 +26,8 @@ use follon_commercial::{
 };
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, OrderState};
 use follon_live::{
-    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest,
-    LiveBrokerReplaceRequest, LiveBrokerSubmitResult, LiveError,
+    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerCapabilities, LiveBrokerEvent,
+    LiveBrokerOrderRequest, LiveBrokerReplaceRequest, LiveBrokerSubmitResult, LiveError,
 };
 use follon_paper::{
     BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboRequest, BrokerEvent,
@@ -1073,6 +1073,18 @@ impl<T: IbkrLiveGatewayTransport> IbkrControlledLiveAdapter<T> {
 }
 
 impl<T: IbkrLiveGatewayTransport> LiveBrokerAdapter for IbkrControlledLiveAdapter<T> {
+    /// Single DAY orders and price replacement. `IbkrLiveGatewayTransport`
+    /// carries `replace_live` but no combination, and `LiveBrokerOrderRequest`
+    /// carries no time in force, so a GTC intent could not reach the venue as
+    /// such. The service therefore refuses a combination and a GTC intent
+    /// before an approval is spent (delivery state E5.7).
+    fn capabilities(&self) -> LiveBrokerCapabilities {
+        LiveBrokerCapabilities {
+            replacement: true,
+            ..LiveBrokerCapabilities::default()
+        }
+    }
+
     fn connect(&mut self, account_id: &str, credential: &SecretMaterial) -> Result<(), LiveError> {
         if account_id != self.configuration.account_id || self.emergency_stop {
             return Err(LiveError(
@@ -1601,6 +1613,25 @@ mod live_adapter_tests {
         let transport = adapter.into_transport();
         assert_eq!(transport.submissions, 1);
         assert_eq!(transport.cancel_all_calls, 1);
+    }
+
+    #[test]
+    fn the_live_adapter_declares_single_day_orders_and_replacement_only() {
+        let adapter = IbkrControlledLiveAdapter::new(
+            configuration(),
+            release(),
+            review(),
+            FakeLiveTransport::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.capabilities(),
+            LiveBrokerCapabilities {
+                combinations: false,
+                good_til_cancelled: false,
+                replacement: true,
+            }
+        );
     }
 
     #[test]
