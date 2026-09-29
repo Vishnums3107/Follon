@@ -3801,6 +3801,38 @@ These are mandatory master-plan acceptance conditions and are currently open:
       the network, which only running trusted code controls. Hashes are identical for one Python version,
       not across versions. No external gate moved.
 
+93. Tax lots follow a split, as the position always did (2026-09-28, row 5.4 and research-to-live parity;
+    delivery state E8.1). Found by the source review behind the revised assessment, and reproduced here
+    before it was fixed.
+    - **The gap.** `BacktestLedger::apply_corporate_action` scaled a split position's quantity and average
+      cost but not its FIFO tax lots. `AdvancedBacktestAccount`, which holds long and short lots, did the
+      same. Neither existing split test sold after the split or looked at a lot. Reproduced on the old code:
+      two shares bought at 100, split 2-for-1, then one sold at 55 realized -45 where +5 was due. Selling
+      the remaining three was refused with "tax disposal exceeds available long lots". The ledger's own
+      comment said such a disposal could never exceed the lots.
+    - **The fix.** `TaxLotBook::apply_split` multiplies every open lot's quantity by the ratio and divides
+      its unit cost, or a short lot's unit proceeds, by it. That is the same eight-place arithmetic the
+      accounts use for a position's average cost, so a single lot's cost and the position's stay equal. Both
+      sides are computed before either is replaced, so a failure leaves the book unchanged, and a ratio that
+      is not positive is refused. Both accounts call it from their split branch.
+    - **Tests.**
+      - In `core/accounting`: two long lots and a short lot on another instrument. The long lots scale to
+        20 @ 50.05 and 10 @ 60, and the short lot is untouched until its own 3-for-1 split, when it becomes
+        12 @ 100. A zero or negative ratio changes nothing, and an instrument without lots is a no-op.
+        Disposing all 30 shares uses a cost basis of 1601, exactly the pre-split 10 x 100.10 + 5 x 120.
+      - In `core/backtest`: the reproduced ledger case now realizes 5 and then 20, and closes every lot.
+        The advanced account closes a split long at 55 and covers a split short at 45, realizing 20 each.
+    - **Rule 5.** 6 of 6 injected defects were caught: either account's call removed, long lots left
+      unscaled, a unit cost left undivided, short lots left unscaled, and the ratio check removed.
+    - **Measured result.** The Rust workspace rose from 535 to 538 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+    - **Bounded remainder.** The replay engine's own portfolio, and so the fingerprinted event stream, is
+      still not adjusted for corporate actions, and working orders across a split are not handled (E8.2).
+      The worker's snapshot and cash still ignore them (E8.3). PAPER and LIVE apply none (E8.4). A reverse
+      split can leave fractional lot quantities, exactly as it leaves a fractional position; cash in lieu is
+      not modelled. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

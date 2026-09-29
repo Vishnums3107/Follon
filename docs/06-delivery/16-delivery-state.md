@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T04:44:43Z  
+**Measured at:** 2026-09-29T04:51:38Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `a2eca74` -- fix(security): every durable writer refuses a symbolic link -- E7.1 (2026-09-29T10:10:24+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `302406f` -- fix(worker): every strategy worker hashes strings identically in every run -- E7.3 (2026-09-29T10:16:14+05:30)  
+**Uncommitted paths:** 3
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 535 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 538 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -279,7 +279,7 @@ passes it for production.
 
 | Slice | Scope | State |
 | --- | --- | --- |
-| E8.1 | FIFO tax lots follow a split exactly as the position does: each lot's quantity scaled by the ratio and its unit cost divided by it, so its total cost is unchanged. | open |
+| E8.1 | FIFO tax lots follow a split exactly as the position does: each lot's quantity scaled by the ratio and its unit cost divided by it, so its total cost is unchanged. **Reproduced, then fixed** in both the primary ledger and the advanced account, long and short: before, a post-split partial sale realized -45 where +5 was due, and the rest was refused (audit item 93). | **done** 2026-09-28 |
 | E8.2 | The replay engine's own portfolio, and so the fingerprinted event stream, applies corporate actions as the ledger does. A working order across a split would apply E3.6g's decision, so the replay refuses to fill it. | open |
 | E8.3 | The worker's position snapshot and cash reflect splits and dividends. The SDK has no corporate-action hook, and adding one is a protocol change. | **decision** |
 | E8.4 | PAPER and controlled LIVE apply no corporate actions, and capsule replay has no corporate-action input. | open |

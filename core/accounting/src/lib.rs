@@ -1058,6 +1058,64 @@ impl TaxLotBook {
         }))
     }
 
+    /// Applies a stock split to every open lot of one instrument, long and
+    /// short: each lot's quantity is multiplied by `ratio` (new units per old
+    /// unit) and its unit cost, or unit proceeds, divided by it, in the same
+    /// eight-place arithmetic the accounts use for a position's average cost.
+    /// Both sides are computed before either is replaced, so a failure leaves
+    /// the book unchanged.
+    ///
+    /// Without it a split scaled the position but not its lots, so a sale of
+    /// more than the pre-split lot quantity was refused as exceeding the lots,
+    /// and a smaller one realized P&L against the unadjusted cost (delivery
+    /// state E8.1).
+    pub fn apply_split(
+        &mut self,
+        instrument_id: &str,
+        ratio: Decimal,
+    ) -> Result<(), AccountingError> {
+        validate_canonical_id("tax lot split instrument_id", instrument_id)
+            .map_err(|error| AccountingError(error.0))?;
+        if ratio <= Decimal::ZERO {
+            return Err(AccountingError("split ratio must be positive".to_owned()));
+        }
+        let long = match self.lots.get(instrument_id) {
+            Some(lots) => Some(
+                lots.iter()
+                    .map(|lot| {
+                        Ok(TaxLot {
+                            remaining_quantity: lot.remaining_quantity.checked_mul(ratio)?,
+                            unit_cost: lot.unit_cost.checked_div(ratio)?,
+                            ..lot.clone()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, AccountingError>>()?,
+            ),
+            None => None,
+        };
+        let short = match self.short_lots.get(instrument_id) {
+            Some(lots) => Some(
+                lots.iter()
+                    .map(|lot| {
+                        Ok(ShortTaxLot {
+                            remaining_quantity: lot.remaining_quantity.checked_mul(ratio)?,
+                            unit_proceeds: lot.unit_proceeds.checked_div(ratio)?,
+                            ..lot.clone()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, AccountingError>>()?,
+            ),
+            None => None,
+        };
+        if let Some(long) = long {
+            self.lots.insert(instrument_id.to_owned(), long);
+        }
+        if let Some(short) = short {
+            self.short_lots.insert(instrument_id.to_owned(), short);
+        }
+        Ok(())
+    }
+
     /// Stable remaining short lots for one instrument.
     pub fn short_lots(&self, instrument_id: &str) -> &[ShortTaxLot] {
         self.short_lots
@@ -1703,6 +1761,85 @@ mod tests {
                 unit_cost: amount("100"),
             })
             .unwrap());
+    }
+
+    #[test]
+    fn a_split_scales_every_open_lot_of_its_instrument_and_keeps_its_cost() {
+        let usd = currency("USD");
+        let mut book = TaxLotBook::default();
+        for (lot_id, quantity, unit_cost) in [("lot.1", "10", "100.10"), ("lot.2", "5", "120")] {
+            book.acquire(TaxLot {
+                lot_id: lot_id.to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                currency: usd.clone(),
+                opened_at: "2026-01-02T14:30:00Z".to_owned(),
+                remaining_quantity: amount(quantity),
+                unit_cost: amount(unit_cost),
+            })
+            .unwrap();
+        }
+        book.open_short(ShortTaxLot {
+            lot_id: "short.1".to_owned(),
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            currency: usd.clone(),
+            opened_at: "2026-01-02T14:30:00Z".to_owned(),
+            remaining_quantity: amount("4"),
+            unit_proceeds: amount("300"),
+        })
+        .unwrap();
+
+        book.apply_split("inst.us_equity.spy", amount("2")).unwrap();
+        let spy = book.lots("inst.us_equity.spy");
+        assert_eq!(
+            spy.iter()
+                .map(|lot| (lot.remaining_quantity, lot.unit_cost))
+                .collect::<Vec<_>>(),
+            vec![
+                (amount("20"), amount("50.05")),
+                (amount("10"), amount("60")),
+            ]
+        );
+        // Another instrument's short lot is untouched until its own split.
+        assert_eq!(
+            book.short_lots("inst.us_equity.qqq")[0].remaining_quantity,
+            amount("4")
+        );
+        book.apply_split("inst.us_equity.qqq", amount("3")).unwrap();
+        let qqq = &book.short_lots("inst.us_equity.qqq")[0];
+        assert_eq!(
+            (qqq.remaining_quantity, qqq.unit_proceeds),
+            (amount("12"), amount("100"))
+        );
+
+        // A ratio that is not positive changes nothing.
+        let before = book.lots("inst.us_equity.spy").to_vec();
+        assert!(book
+            .apply_split("inst.us_equity.spy", Decimal::ZERO)
+            .is_err());
+        assert!(book
+            .apply_split("inst.us_equity.spy", amount("-2"))
+            .is_err());
+        assert_eq!(book.lots("inst.us_equity.spy"), before.as_slice());
+        // An instrument with no lots is a no-op.
+        book.apply_split("inst.us_equity.iwm", amount("2")).unwrap();
+
+        // The whole post-split quantity disposes, at the scaled cost basis:
+        // 20 * 50.05 + 10 * 60 = 1601, exactly the pre-split 10 * 100.10 + 5 * 120.
+        let disposal = book
+            .dispose(
+                "disposal.1",
+                "inst.us_equity.spy",
+                &usd,
+                amount("30"),
+                amount("55"),
+                Decimal::ZERO,
+                "2026-01-05T14:30:00Z",
+                TaxLotSelection::Fifo,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(disposal.cost_basis, amount("1601"));
+        assert!(book.lots("inst.us_equity.spy").is_empty());
     }
 
     #[test]
