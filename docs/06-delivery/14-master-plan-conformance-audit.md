@@ -4756,6 +4756,67 @@ These are mandatory master-plan acceptance conditions and are currently open:
        still the caller's to supply. A split with an order resting across it is refused by the replay
        (E8.2), so an evaluation that hit that refusal has no capsule. No external gate moved.
 
+115. PostgreSQL evidence is append-only and news is tenant-owned (2026-09-29, Security and
+     isolation; E7.7). Found by the source review behind the revised assessment, and the first
+     database change in this repository verified against a real PostgreSQL server here.
+     - **Gap.** Migrations 0004 and 0005 promise that a rollback "never deletes or rewrites"
+       retained evidence, and the adapter only ever inserts it, but nothing in the database
+       stopped a role holding UPDATE, DELETE or TRUNCATE from doing either. The news tables had no
+       tenant column and no row-level security, so one tenant's feed was visible to all.
+     - **Behavior.** Migration 0006:
+       - attaches a `BEFORE UPDATE OR DELETE` row trigger and a `BEFORE TRUNCATE` statement trigger
+         to 16 tables, which raise `restrict_violation` naming the operation and the table:
+         domain events, the journal's transactions and lines, risk policy, strategy and
+         configuration versions, broker commands and receipts, the audit index, news headlines and
+         sentiments, FX pricing snapshots, venue capabilities, and the execution plan, route and
+         benchmark evidence;
+       - lets instrument reference and FX economics versions be closed, once, by setting
+         `effective_to` from nothing to a value, and refuses every other change, deletion and
+         truncation of them;
+       - gives the news tables a tenant, keys and foreign keys that name it, and the same
+         row-level security policy the other tables have, so another tenant sees nothing, cannot
+         write a row for the owner and cannot cause a sentiment with the owner's headline;
+       - refuses to run over news rows that exist without a tenant, and leaves nothing half done,
+         rather than guess an owner.
+       The triggers are the application's boundary and not a defence against the database's owner,
+       who can disable one, which takes a DDL statement that shows in the logs.
+     - **Tests.** Five database tests were added and three made rerunnable. Evidence cannot be
+       deleted, so a database is never reset by deleting rows, and the original three used fixed
+       identifiers that assumed an empty one. Each test now owns a tag.
+       - Every guarded table carries both triggers.
+       - A row in each append-only table refuses an update, a delete and a truncate, and survives.
+       - A version closes once and is otherwise fixed, in both versioned tables.
+       - News is owned by one tenant, isolated under a role that does not bypass row-level
+         security, keyed per tenant, and tied to a tenant that exists.
+       - An upgrade from the schema an earlier release left, built in a scratch database, refuses
+         an unowned headline, records nothing, and succeeds once the row is cleared.
+       - The always-run test now checks that migration versions are consecutive and lists the
+         guards. Six tests hold that `tools/session_status.py` reports a suite it cannot run as
+         skipped and names the variable, never as a pass and never left out.
+     - **Rule 5.** 29 of 29 injected defects were caught by the intended tests, 22 in the
+       migration and the adapter and 7 in the status tool: a guard that returns instead of
+       raising, or raises the wrong class; a table, a truncate guard or the update-and-delete guard
+       missing; a version that can be closed again, rewritten as it is closed, or not closed at
+       all; a guard list that omits the versioned tables; the migration running over unowned rows
+       or checking only one table; either news table without row-level security, or a policy that
+       lets any tenant write; global news identifiers, a foreign key that ignores the tenant or is
+       missing, and a tenant that need not exist; and the adapter not registering the migration or
+       applying the wrong number of them. The suite found two gaps in its own tests on the way,
+       sentiment isolation and the link to `tenants`, and closed them before the run.
+     - **Measured result.** A throwaway PostgreSQL 17 server, on a loopback port with its own data
+       directory, ran the eight database tests, and ran them a second time against the same
+       database. The repository's own `tools/postgres_recovery.py` took a backup of a database
+       full of guarded evidence and restored it in a drill, which reported schema migration 6.
+       The Rust workspace stayed at 638 passed / 0 failed and now reports 8 ignored instead of 3.
+       The Python suite rose from 164 to 170 passed. The final `python tools/session_status.py`
+       run measured all eight suites green, the database suite among them, and the full evidence
+       pipeline exited 0.
+     - **Boundary.** The tests ran against PostgreSQL 17 and CI runs 16, which the migration uses
+       nothing newer than, but that job has not run yet. The append-only guard holds against the
+       application's role and against a careless statement, not against the database's owner. The
+       install and upgrade path was exercised on empty tables, because no writer in this repository
+       inserts news. Nothing was pushed, so no GitHub run has seen it. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

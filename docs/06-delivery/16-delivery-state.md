@@ -56,22 +56,23 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T15:29:05Z  
+**Measured at:** 2026-09-29T15:40:34Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `4177f38` -- feat(replay): a strategy worker's portfolio snapshot follows splits and dividends -- E8.3 (2026-09-29T20:54:58+05:30)  
-**Uncommitted paths:** 5
+**HEAD:** `c6f621d` -- feat(cli): capsule replay takes an evaluation's corporate actions -- E8.4a (2026-09-29T21:00:10+05:30)  
+**Uncommitted paths:** 7
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 638 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 638 | 0 | 8 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
+| PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 8 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 164 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 170 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
-**All 7 executed suite(s) green.**
+**All 8 executed suite(s) green.**
 
 <!-- END GENERATED STATUS -- tools/session_status.py -->
 
@@ -281,12 +282,12 @@ passes it for production.
 | E7.4b | The aggregate portfolio-risk check was skipped outright when equity is not positive. Failing closed on everything would also have refused risk-reducing orders, such as closing positions, so the treatment was left to the operator. **Decided 2026-09-29 by the agent under the operator's blanket delegation (Settled direction item 6): reduce-only.** With aggregate risk configured, PAPER and controlled LIVE refuse every order that does not move a position strictly toward flat (`PORTFOLIO_EQUITY_NOT_POSITIVE`), a combination unless every leg does, and still pass one that reduces a position without crossing through flat. `follon_domain::reduces_position` is the one definition. Audit item 107. | **done** 2026-09-29 |
 | E7.5 | Aggregate portfolio risk in the order-submitting routes. Only the read-only `follon-paper-status` composed it. **Now** the gRPC PAPER route's and the desktop gateway's configurations take an optional `portfolio_risk` block, the document `follon-paper-status` reads. It moved into `core/paper` as `PortfolioRiskDocument`, so no application can read a limit differently. Present, it gates every order and combination through the composed kernel and is part of the journal fingerprint; absent, nothing changes. The route's JSON schema publishes it and is tested equal to the version-2 paper schema's. Audit item 110. Controlled LIVE already composes it through `LiveConfiguration`, and is unchanged. | **done** 2026-09-29 |
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
-| E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
+| E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE, and the news tables get a tenant. **Now** migration 0006 attaches a `BEFORE UPDATE OR DELETE` row trigger and a `BEFORE TRUNCATE` statement trigger to 16 append-only tables (domain events, the journal, risk policy, strategy and configuration versions, broker commands and receipts, the audit index, news, FX pricing and the execution evidence), each raising `restrict_violation`. Two versioned reference tables, instrument reference and FX economics, may be closed once by giving `effective_to` a value and are otherwise fixed. The news tables gained a tenant, per-tenant keys, tenant-scoped foreign keys and the row-level security every other table has, and the migration refuses to run over news rows it cannot assign, so it never guesses an owner. The triggers are the application's boundary, not a defence against the database's owner, who can disable one with a DDL statement that shows in the logs. **Verified against a real server for the first time in this environment:** a throwaway PostgreSQL 17 ran all eight database tests, twice over one database, and a backup of it restored cleanly through `tools/postgres_recovery.py`. `session_status.py` now runs the database tests whenever `FOLLON_TEST_DATABASE_URL` is set. Audit item 115. | **done** 2026-09-29 |
 | E7.8 | The SBOM covered only the root Cargo lockfile and recorded no first-party licence. **Now** it also covers the desktop host's Cargo workspace and lockfile, and each first-party crate, Python package and the desktop npm package carries its declared licence, read from its own manifest, natively as CycloneDX `licenses`. The bill's own component names the repository's licence. A first-party package that declares none, or a path package this repository has no manifest for, is refused rather than left out. `apps/desktop/package.json` declares MIT. Third-party Cargo licences are still not recorded, since a lockfile does not carry them. Audit item 109. | **done** 2026-09-29 |
 | E7.9 | The risk benchmark records when it was measured; its `observed_at` was the fixture's scenario time. **Now** the artifact is schema 2: `measured_at` is the wall-clock UTC second the run began, `scenario_observed_at` is the fixture's own as-of time, and no field named `observed_at` remains. The desktop's benchmark table shows both. Audit item 106. | **done** 2026-09-29 |
 | E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |
-| E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open. | open |
+| E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open: `O_NOFOLLOW` on Unix, and on Windows `FILE_FLAG_OPEN_REPARSE_POINT` followed by a check of the handle's own file type. **Deferred 2026-09-29, not attempted:** the Unix half cannot be compiled or tested on this Windows host (no Linux toolchain, no target, and Docker and WSL are stopped), and half a no-follow open would be worse than none. The guard sites, ten across eight crates, each check and then open; converting them means removing the check so the open itself is the guard. | open, needs a Linux environment |
 | E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
 
 ### E8 — Accounting and state parity (assessment priority 5)
@@ -807,6 +808,14 @@ the reversal here with its date.
      callback, would have versioned the protocol for information a strategy already
      receives as its portfolio, and a strategy that ignored the frame would have
      traded on a stale snapshot.
+   - **E7.7: news is tenant-owned, and a reference version may be closed once.**
+     The assessment asked for a tenant on the news tables. The alternative was to
+     treat news as one shared market feed, but feeds are licensed per customer, and
+     every other table already isolates by tenant. A reference version, meaning
+     instrument reference data or FX economics, is closed by giving it an end when
+     its successor takes over, so it is fixed except for setting `effective_to` from
+     nothing to a value, once. Refusing that too would have made the versioning
+     unusable, and allowing more would have let history be rewritten.
 
 ### Still unanswered
 
@@ -827,8 +836,8 @@ short — detail belongs in the conformance audit.
   and decide for itself while the operator was away. Baseline at `4403b3f`: clean
   tree, all seven suites green (Rust 562 / 0 / 3, Tauri 31, Python 75), the full
   pipeline exit 0. Commits stay on `refactor/module-decomposition`, unpushed.
-- Landed twelve slices, each with its rule-5 injections, all seven suites and the
-  full pipeline measured before its commit (audit items 103 to 114):
+- Landed thirteen slices, each with its rule-5 injections, all suites and the
+  full pipeline measured before its commit (audit items 103 to 115):
   - E5.4: a bridge refusal is a clean rejection, and IBKR notices no longer reject
     working orders. Found along the way: an injection that survived because it
     crashed into the failure the test expects, which was a bad injection and not a
@@ -867,8 +876,21 @@ short — detail belongs in the conformance audit.
   - E8.4a: `capsule-package` and `capsule-verify` take the evaluation's corporate
     actions with `--actions`, so a capsule of an evaluation that applied one can be
     sealed and reproduced. E8.4b, PAPER and LIVE, stays open.
-- Measured at the E8.4a slice: Rust 638 / 0 / 3, Tauri 33, Python 164, both
-  desktop suites green, the full pipeline exit 0.
+  - E7.7: PostgreSQL evidence tables refuse UPDATE, DELETE and TRUNCATE, and the news
+    tables belong to a tenant. It was the first database change verified against a
+    real server here: a throwaway PostgreSQL 17 ran the eight database tests twice
+    over one database, and a backup of it restored through the recovery tool.
+    `session_status.py` now runs those tests when `FOLLON_TEST_DATABASE_URL` is set
+    and reports them skipped when it is not. Evidence cannot be deleted, so the
+    three original database tests, which assumed an empty database, now own their
+    identifiers. An injection run crashed once on a transient Windows write error,
+    which is why the runner now backs originals up.
+- Measured at the E7.7 slice: Rust 638 / 0 / 8 ignored, PostgreSQL 8 / 0 against a
+  throwaway server, Tauri 33, Python 170, both desktop suites green, the full
+  pipeline exit 0. The CI steps `session_status.py` does not run, meaning
+  `unittest discover` over `tests/security`, the SDK and bridge tests, the JSON
+  contract syntax check, the desktop typecheck and web build, and the Tauri
+  workspace's fmt and clippy, were run by hand and passed.
 - **Next action:** see the backlog. Still waiting on the operator: E7.10.
 
 ### 2026-09-29 — session 12
