@@ -117,7 +117,11 @@ quote stream or requests a replay from a vendor.
 Install `python/strategy-sdk` into a dedicated virtual environment first, or
 explicitly supply the checked-out SDK source path with the non-secret
 `FOLLON_STRATEGY_SDK_PATH` variable. The worker process intentionally receives
-a cleared environment. Obtain the bundle hash and use an absolute Python path:
+a cleared environment; the parent sets only `PYTHONIOENCODING=utf-8`,
+`PYTHONHASHSEED=0` (so `str` and `bytes` hashing, and anything ordered by it,
+is identical in every run), and the import path. It is a same-user child
+process, not a sandbox, so run only trusted strategy code. Obtain the bundle
+hash and use an absolute Python path:
 
 ```powershell
 $env:FOLLON_STRATEGY_SDK_PATH = (Resolve-Path python/strategy-sdk/src)

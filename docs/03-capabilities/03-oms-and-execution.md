@@ -48,9 +48,10 @@ evidence. The versioned gRPC API exposes scheduled execution algorithms through
 arrival price, the full cancel-before-replace passive sequence, and synchronized
 net-price-protected option-combination plans.
 
-The same API also has a distinct `SubmitPaperCombo` command. It exists only
+The same API also has distinct `SubmitPaperCombo`, `SubmitPaperOrder`, and
+`CancelPaperOrder` commands. They exist only
 when `FOLLON_TRADING_API_PAPER_CONFIG` names a valid version-1 PAPER command
-route. That route converts the protobuf request into the canonical
+route. The combination command converts its request into the canonical
 `ComboIntent`, requires one independently supplied observation per leg, and
 calls `PaperTradingService::submit_combo_intent`; it cannot fall back to the
 planning method. The configured service owns the durable journal, exact risk
@@ -61,19 +62,48 @@ may bind to loopback without TLS; a non-loopback bind additionally requires a
 server TLS identity and client CA, so the write method is not exposed on an
 unauthenticated remote socket.
 
+The route's `adapter_kind` chooses its broker adapter. `IBKR_PAPER_MODEL`, the
+in-process deterministic model, fills nothing on its own. `IBKR_PAPER_BRIDGE`
+starts the official-API IBKR PAPER bridge from the document's `ibkr_bridge`
+section. That section is required for the bridge and refused for the model.
+The route builds the bridge's argument list itself, from fixed fields: a
+loopback host, a PAPER port, the client id, the broker account, the
+instrument map, the TWS time zone and a timeout. So no free-form argument
+reaches the process. It refuses what the bridge would refuse before any
+process starts. The journal fingerprint binds the bridge endpoint, the broker
+account, the client id, the time zone and the instrument map's SHA-256, so a
+journal is refused under a different adapter or IBKR session.
+
+The bridge carries single market or limit DAY orders only, so
+`SubmitPaperCombo` and a single GTC request on a bridge route are refused
+before risk is evaluated or an order exists. `SubmitPaperOrder` passes the
+declarative intent and operator-attested mark through the PAPER risk/OMS
+service; `CancelPaperOrder` names the account and OMS order, and journals the
+operator before calling the adapter. Both require an operator session with
+PAPER trading permission in the tenant. A separately authenticated risk manager
+can call `ReconcilePaperAccount` to drain broker events and compare the account
+snapshot. The request can explicitly reconnect after a transport failure or
+route restart. Its response includes the persisted reconciliation identity,
+discrepancies, UNKNOWN count, connection state and audit chain head. A matching
+snapshot is not a clean-session certificate. The route does not poll in the
+background, and no real TWS or IB Gateway PAPER reconciliation has been retained
+(E5.5 and E5.6).
+
 Every call also needs an authenticated operator. A configured route requires
 the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
 `BeginOperatorLogin` and `CompleteOperatorLogin` check a password and then a
-mandatory TOTP code, and return a bearer session. `SubmitPaperCombo` refuses
-three kinds of caller before it reads the intent:
+mandatory TOTP code, and return a bearer session. All three PAPER order
+commands refuse three kinds of caller before reading order details:
 
 - a caller with no session, or a malformed one (`UNAUTHENTICATED`);
 - a session whose role does not grant PAPER trading (`PERMISSION_DENIED`);
 - a session presented for another tenant (`PERMISSION_DENIED`).
 
 The directory serves one tenant. The PAPER journal records the operator as the
-combination's `submitted_by`, and an idempotent retry must come from the same
-operator. This is local PAPER engineering evidence, not external-broker or
+single or combination order's `submitted_by`, and an idempotent submit retry
+must come from the same operator. It also records the first accepted cancel
+request with the operator and server time; a cancel retry adds no second
+operation. This is local PAPER engineering evidence, not external-broker or
 production acceptance.
 
 The same route exposes `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch`
@@ -119,6 +149,9 @@ configuration file, never in the UI.
 - An accepted intent has a terminal state or an explicitly unresolved `UNKNOWN` state.
 - Duplicate broker messages cannot create duplicate fills.
 - A restart cannot silently discard working orders.
+- A cancellation is journaled as `PENDING_CANCEL` before the broker is asked.
+  A cancellation requested by an operator records who asked and when. A single
+  order an operator submits records its submitter, as a combination does (E5.2b-1).
 - A network interruption never proves that submission failed.
 - Every state transition is validated, causal, and auditable.
 - Client order IDs are generated before adapter submission and are idempotency keys where the broker supports them.

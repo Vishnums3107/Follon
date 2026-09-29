@@ -53,13 +53,50 @@
       }
     },
     "kill_switch_version": { "type": "string", "minLength": 1 },
-    "adapter_kind": { "const": "IBKR_PAPER_MODEL" },
+    "adapter_kind": { "enum": ["IBKR_PAPER_MODEL", "IBKR_PAPER_BRIDGE"], "description": "IBKR_PAPER_MODEL is the in-process deterministic model. IBKR_PAPER_BRIDGE starts the official-API IBKR PAPER bridge process, which carries single DAY orders only: a combination, a GTC order or a replacement is refused before an order exists." },
+    "ibkr_bridge": { "$ref": "#/$defs/ibkrBridge" },
     "journal_path": { "type": "string", "minLength": 1 }
   },
+  "allOf": [
+    {
+      "if": { "required": ["adapter_kind"], "properties": { "adapter_kind": { "const": "IBKR_PAPER_BRIDGE" } } },
+      "then": { "required": ["ibkr_bridge"] },
+      "else": { "not": { "required": ["ibkr_bridge"] } }
+    }
+  ],
   "$defs": {
     "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
     "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
     "positiveDecimal": { "type": "string", "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$" },
-    "basisPoints": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,3})(?:\\.[0-9]{1,8})?$" }
+    "basisPoints": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,3})(?:\\.[0-9]{1,8})?$" },
+    "ibkrBridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How the route starts the official-API IBKR PAPER bridge. The route builds the bridge's argument list from these fields, so no free-form argument reaches the process. The broker account, client id, TWS time zone and the instrument map's SHA-256 are bound into the journal fingerprint.",
+      "required": [
+        "python_executable",
+        "bridge_script",
+        "host",
+        "port",
+        "client_id",
+        "broker_account",
+        "instrument_map",
+        "tws_timezone",
+        "request_timeout_seconds",
+        "max_response_bytes"
+      ],
+      "properties": {
+        "python_executable": { "type": "string", "minLength": 1, "description": "Absolute path of the approved interpreter; the process gets no PATH." },
+        "bridge_script": { "type": "string", "minLength": 1, "description": "Absolute path of python/ibkr-gateway/src/follon_ibkr_gateway.py." },
+        "host": { "enum": ["127.0.0.1", "localhost", "::1"] },
+        "port": { "enum": [7497, 4002], "description": "The PAPER TWS (7497) or PAPER Gateway (4002) port." },
+        "client_id": { "type": "integer", "minimum": 0, "maximum": 31 },
+        "broker_account": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[^\\r\\n]+$", "description": "The IBKR paper account identifier: account metadata, not a credential." },
+        "instrument_map": { "type": "string", "minLength": 1, "description": "A regular file of at most 1 MiB, in the bridge's instrument-map format." },
+        "tws_timezone": { "type": "string", "minLength": 1, "description": "The IANA time zone TWS reports execution times in." },
+        "request_timeout_seconds": { "type": "integer", "minimum": 3, "maximum": 60, "description": "The route's deadline for each bridge request. The bridge's own IBKR timeout is two seconds shorter." },
+        "max_response_bytes": { "type": "integer", "minimum": 256, "maximum": 1048576 }
+      }
+    }
   }
 }

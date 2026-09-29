@@ -48,9 +48,13 @@ class RiskConfigurationContractTests(unittest.TestCase):
             schema["properties"]["schema_version"]["const"],
         )
         self.assertEqual(set(schema["required"]), set(fixture) - {"short_exposure"})
+        # Exactly the two adapters the service builds; the fixture is the
+        # default model (delivery state E5.2a).
         self.assertEqual(
-            fixture["adapter_kind"], schema["properties"]["adapter_kind"]["const"]
+            schema["properties"]["adapter_kind"]["enum"],
+            ["IBKR_PAPER_MODEL", "IBKR_PAPER_BRIDGE"],
         )
+        self.assertEqual(fixture["adapter_kind"], "IBKR_PAPER_MODEL")
         canonical = schema["$defs"]["canonicalId"]["pattern"]
         for field in ("account_id", "trading_calendar_id"):
             self.assertIsNotNone(re.fullmatch(canonical, fixture[field]))

@@ -1,0 +1,27 @@
+# Gitleaks configuration, read from the repository root by the CI `security`
+# job's gitleaks action.
+#
+# It extends the default rule set rather than replacing it. The one allowlist
+# covers `credential_reference`, which names a managed secret by canonical ID:
+# `core/secrets`'s `SecretReference`, "the non-sensitive reference used for
+# audit and access policy", and `canonicalId` in
+# contracts/json-schema/v1/live-configuration.schema.json. It is never the
+# secret itself, but the `generic-api-key` entropy heuristic flags values such
+# as `secret.broker.test.acct-live-001` in the LIVE configuration fixtures.
+#
+# The allowlist matches a whole line, anchored at both ends, whose only content
+# is that field holding a `secret.`-prefixed canonical ID. A token-shaped value
+# in the field, or any other value sharing its line, still fails the job.
+#
+# It deliberately has no `paths` condition. Gitleaks 8.24.3, the version the
+# action runs, ignores `condition = "AND"` in the global allowlist, so adding
+# a path would allowlist every finding under that path. That was verified
+# against a probe repository before this file was written.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "credential_reference names a managed secret by canonical ID; it is not a secret"
+regexTarget = "line"
+regexes = ['''^\s*"credential_reference"\s*:\s*"secret\.[a-z0-9._-]+",?\s*$''']

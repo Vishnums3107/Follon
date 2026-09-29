@@ -1525,6 +1525,7 @@ impl OperationalJournal {
     /// Opens or creates a process-exclusive journal after verifying every existing record.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OperationsError> {
         let path = path.as_ref().to_path_buf();
+        refuse_symbolic_link(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
@@ -1571,6 +1572,7 @@ impl OperationalJournal {
         path: impl AsRef<Path>,
     ) -> Result<(JournalInspection, Vec<JournalRecord>), OperationsError> {
         let path = path.as_ref();
+        refuse_symbolic_link(path)?;
         if !path.exists() {
             return Ok((JournalInspection::empty(), Vec::new()));
         }
@@ -2659,6 +2661,21 @@ fn markdown_text(value: &str) -> String {
     value.replace('\\', "\\\\").replace('|', "\\|")
 }
 
+/// Refuses a symbolic link at a journal path, dangling or not.
+/// `symlink_metadata` never follows a link. The `exists()` it replaced did,
+/// so a dangling link looked absent: the reader reported a healthy empty
+/// journal, and the open created the journal at the link's target
+/// (delivery state E7.1, as E3.11 did for PAPER and LIVE).
+fn refuse_symbolic_link(path: &Path) -> Result<(), OperationsError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(OperationsError(
+            "operations journal path must not be a symbolic link".to_owned(),
+        )),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_error(error)),
+        _ => Ok(()),
+    }
+}
+
 fn io_error(error: std::io::Error) -> OperationsError {
     OperationsError(error.to_string())
 }
@@ -2965,6 +2982,57 @@ mod tests {
         fs::write(&path, content).unwrap();
         assert!(OperationalJournal::inspect(&path).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    /// Links `link` to `target`, which need not exist. Returns false where
+    /// this account cannot create a symbolic link, such as Windows without
+    /// Developer Mode, after saying so.
+    fn symlink_to(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(target, link);
+        if let Err(error) = &linked {
+            eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+        }
+        linked.is_ok()
+    }
+
+    #[test]
+    fn an_operations_journal_refuses_a_symbolic_link_even_a_dangling_one() {
+        let directory = std::env::temp_dir().join(format!(
+            "follon-operations-journal-link-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("elsewhere.ndjson");
+        let link = directory.join("journal.ndjson");
+        if !symlink_to(&target, &link) {
+            fs::remove_dir_all(&directory).unwrap();
+            return;
+        }
+        let refusal = "operations journal path must not be a symbolic link";
+
+        // Following the dangling link finds nothing. The reader used to report
+        // that as a healthy empty journal, and the open created the journal at
+        // the target.
+        assert_eq!(OperationalJournal::open(&link).err().unwrap().0, refusal);
+        assert!(!target.exists(), "the journal was created through the link");
+        assert_eq!(OperationalJournal::inspect(&link).err().unwrap().0, refusal);
+        assert_eq!(
+            OperationalJournal::read_verified_records(&link)
+                .err()
+                .unwrap()
+                .0,
+            refusal
+        );
+
+        // A link to a real journal is refused too.
+        drop(OperationalJournal::open(&target).unwrap());
+        assert_eq!(OperationalJournal::open(&link).err().unwrap().0, refusal);
+        assert_eq!(OperationalJournal::inspect(&link).err().unwrap().0, refusal);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -3,8 +3,13 @@
 //! The adapter deliberately permits only documented paper ports. It translates
 //! no strategy or risk decision: the core submits normalized requests only after
 //! its own OMS and risk controls accept them. A TWS/Gateway transport plugs into
-//! [`IbkrPaperGatewayTransport`] and is continuously exercised by the core's
-//! deterministic in-memory paper model and fault-injection suite.
+//! [`IbkrPaperGatewayTransport`].
+//!
+//! The core's deterministic in-memory paper model implements the same
+//! `PaperBrokerAdapter` contract, but it is not this adapter and does not
+//! exercise it, and it can do more than this adapter's bridge: combinations,
+//! replacement and GTC orders. No application composes this adapter yet
+//! (delivery state E5.2), so it declares exactly what its bridge executes.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,7 +32,7 @@ use follon_live::{
 use follon_paper::{
     BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboRequest, BrokerEvent,
     BrokerOrderRequest, BrokerOrderSnapshot, BrokerPositionSnapshot, BrokerSubmitResult,
-    PaperBrokerAdapter, PaperError,
+    PaperBrokerAdapter, PaperBrokerCapabilities, PaperError,
 };
 use follon_secrets::SecretMaterial;
 use serde::{Deserialize, Serialize};
@@ -78,6 +83,10 @@ pub trait IbkrPaperGatewayTransport {
         request: &BrokerOrderRequest,
     ) -> Result<BrokerSubmitResult, PaperError>;
     /// Sends one normalized paper combination request (BAG order).
+    ///
+    /// No transport in this repository implements it: the official-API
+    /// Python bridge has no combination operation, and nothing builds a BAG
+    /// contract. The default refuses without transmitting anything.
     fn submit_paper_combo(
         &mut self,
         _request: &BrokerComboRequest,
@@ -467,61 +476,12 @@ impl IbkrPaperGatewayTransport for IbkrPaperBridgeProcessTransport {
         self.accept_bridge_contract(normalized)
     }
 
-    fn submit_paper_combo(
-        &mut self,
-        request: &BrokerComboRequest,
-    ) -> Result<BrokerSubmitResult, PaperError> {
-        validate_canonical_id("IBKR client_order_id", &request.client_order_id)?;
-        validate_canonical_id("IBKR account_id", &request.account_id)?;
-        for leg in &request.legs {
-            validate_canonical_id("IBKR leg instrument_id", &leg.instrument_id)?;
-            if leg.ratio == 0 {
-                return Err(PaperError(
-                    "IBKR paper combo leg ratio must be positive".to_owned(),
-                ));
-            }
-        }
-        let legs = request
-            .legs
-            .iter()
-            .map(|leg| {
-                json!({
-                    "instrument_id": leg.instrument_id,
-                    "side": leg.side.as_str(),
-                    "ratio": leg.ratio,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let value = self.request(
-            "submit_combo",
-            json!({
-                "client_order_id": request.client_order_id,
-                "account_id": request.account_id,
-                "legs": legs,
-                "limit_price": request.limit_price.map(|price| price.to_string()),
-            }),
-        )?;
-
-        let normalized = serde_json::from_value::<SubmitBridgeResult>(value)
-            .map_err(|_| PaperError("IBKR submit response is malformed".to_owned()))
-            .and_then(|result| match result.status.as_str() {
-                "ACKNOWLEDGED" => {
-                    let broker_order_id = result.broker_order_id.ok_or_else(|| {
-                        PaperError("IBKR acknowledgement has no broker order ID".to_owned())
-                    })?;
-                    validate_canonical_id("IBKR broker_order_id", &broker_order_id)?;
-                    Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
-                }
-                "REJECTED" => Ok(BrokerSubmitResult::Rejected {
-                    reason: required_bridge_reason(result.reason)?,
-                }),
-                _ => Err(PaperError(
-                    "IBKR submit response has an unknown status".to_owned(),
-                )),
-            });
-        self.accept_bridge_contract(normalized)
-    }
+    // No `submit_paper_combo` override: the bridge's dispatch has no
+    // combination operation, so the trait default refuses without sending
+    // anything. An earlier override forwarded a `submit_combo` request the
+    // bridge answered with "unsupported bridge operation", and its payload
+    // carried neither leg quantities nor the debit or credit sign
+    // (delivery state E5.1).
 
     fn cancel_paper_order(&mut self, client_order_id: &str) -> Result<(), PaperError> {
         validate_canonical_id("IBKR cancellation client_order_id", client_order_id)?;
@@ -740,6 +700,20 @@ impl<T: IbkrPaperGatewayTransport> IbkrPaperGatewayAdapter<T> {
 }
 
 impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapter<T> {
+    /// Single DAY orders only, the narrowest set. The official-API bridge
+    /// has no combination or replacement operation and places every order
+    /// DAY, and `BrokerOrderRequest` carries no time in force, so a GTC intent
+    /// would silently become DAY. The OMS therefore refuses all three before
+    /// an order exists (delivery state E5.1).
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        if account_id != self.configuration.account_id {
+            return Err(PaperError(
+                "IBKR paper adapter configuration account does not match request".to_owned(),
+            ));
+        }
+        Ok(PaperBrokerCapabilities::default())
+    }
+
     fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         if account_id != self.configuration.account_id {
             return Err(PaperError(
@@ -1264,6 +1238,133 @@ mod tests {
         assert_eq!(snapshot.cash, Decimal::from_str("797.15").expect("cash"));
         transport.cancel_paper_order("order.1").expect("cancel");
         transport.reconnect_paper().expect("reconnect");
+    }
+
+    /// Records every call that would reach the bridge.
+    #[derive(Default)]
+    struct RecordingTransport {
+        calls: Vec<&'static str>,
+    }
+
+    impl IbkrPaperGatewayTransport for RecordingTransport {
+        fn submit_paper_order(
+            &mut self,
+            _request: &BrokerOrderRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.calls.push("submit");
+            Ok(BrokerSubmitResult::Acknowledged {
+                broker_order_id: "ibkr.1".to_owned(),
+            })
+        }
+
+        fn cancel_paper_order(&mut self, _client_order_id: &str) -> Result<(), PaperError> {
+            self.calls.push("cancel");
+            Ok(())
+        }
+
+        fn poll_paper_events(&mut self) -> Result<Vec<BrokerEvent>, PaperError> {
+            self.calls.push("poll");
+            Ok(Vec::new())
+        }
+
+        fn paper_account_snapshot(
+            &mut self,
+            _account_id: &str,
+        ) -> Result<BrokerAccountSnapshot, PaperError> {
+            self.calls.push("snapshot");
+            Ok(BrokerAccountSnapshot {
+                orders: Vec::new(),
+                positions: Vec::new(),
+                cash: Decimal::ZERO,
+            })
+        }
+
+        fn reconnect_paper(&mut self) -> Result<(), PaperError> {
+            self.calls.push("reconnect");
+            Ok(())
+        }
+    }
+
+    fn paper_configuration() -> IbkrPaperGatewayConfiguration {
+        IbkrPaperGatewayConfiguration {
+            account_id: "acct.paper.001".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 7497,
+            environment: "PAPER".to_owned(),
+        }
+    }
+
+    fn combination_request() -> BrokerComboRequest {
+        BrokerComboRequest {
+            client_order_id: "order.combo.1".to_owned(),
+            account_id: "acct.paper.001".to_owned(),
+            legs: vec![
+                follon_paper::BrokerComboLeg {
+                    instrument_id: "inst.us_option.near".to_owned(),
+                    side: Side::Buy,
+                    ratio: 1,
+                    quantity: Decimal::from_str("1").expect("quantity"),
+                },
+                follon_paper::BrokerComboLeg {
+                    instrument_id: "inst.us_option.far".to_owned(),
+                    side: Side::Sell,
+                    ratio: 1,
+                    quantity: Decimal::from_str("1").expect("quantity"),
+                },
+            ],
+            limit_price: Some(Decimal::from_str("2.50").expect("limit")),
+        }
+    }
+
+    #[test]
+    fn the_real_bridge_adapter_declares_only_single_day_orders() {
+        let adapter =
+            IbkrPaperGatewayAdapter::new(paper_configuration(), RecordingTransport::default())
+                .expect("paper adapter");
+        assert_eq!(
+            adapter
+                .capabilities("acct.paper.001")
+                .expect("capabilities"),
+            PaperBrokerCapabilities::default()
+        );
+        assert!(adapter.capabilities("acct.paper.other").is_err());
+    }
+
+    #[test]
+    fn the_real_bridge_adapter_refuses_a_combination_without_reaching_the_bridge() {
+        let mut adapter =
+            IbkrPaperGatewayAdapter::new(paper_configuration(), RecordingTransport::default())
+                .expect("paper adapter");
+        assert!(adapter.submit_combo(&combination_request()).is_err());
+        assert!(adapter.into_transport().calls.is_empty());
+    }
+
+    #[test]
+    fn the_process_transport_sends_no_combination_to_its_bridge() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; process transport fixture was skipped");
+            return;
+        };
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/ibkr/fake-paper-bridge.py")
+            .canonicalize()
+            .expect("fixture path");
+        let mut transport =
+            IbkrPaperBridgeProcessTransport::start(IbkrPaperBridgeProcessConfiguration {
+                executable: python,
+                arguments: vec![fixture.to_string_lossy().into_owned()],
+                request_timeout: Duration::from_secs(2),
+                max_response_bytes: 64 * 1024,
+            })
+            .expect("transport starts");
+
+        assert!(transport
+            .submit_paper_combo(&combination_request())
+            .is_err());
+        // The fixture exits on any operation it does not implement, as the
+        // real bridge refuses one, so a session that still answers a poll
+        // was sent nothing.
+        assert!(transport.poll_paper_events().is_ok());
     }
 
     #[test]

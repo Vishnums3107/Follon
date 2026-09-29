@@ -11,6 +11,7 @@ follon-accounting = { path = "../../core/accounting" }
 follon-domain = { path = "../../core/domain" }
 follon-execution = { path = "../../core/execution" }
 follon-identity = { path = "../../core/identity" }
+follon-ibkr-paper-adapter = { path = "../../adapters/brokers/ibkr" }
 follon-live = { path = "../../core/live" }
 follon-paper = { path = "../../core/paper" }
 follon-postgres = { path = "../../adapters/persistence/postgres" }
@@ -19,6 +20,7 @@ follon-secrets = { path = "../../core/secrets" }
 prost = "0.14.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10.9"
 time = "0.3.44"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tonic = { version = "0.14.2", features = ["transport", "tls-ring"] }

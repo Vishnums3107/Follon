@@ -478,8 +478,39 @@ pub struct BrokerAccountSnapshot {
     pub cash: Decimal,
 }
 
+/// What one PAPER broker route can carry to its venue.
+///
+/// The service consults this before it evaluates risk or creates an order,
+/// so a request the route cannot carry is refused with nothing recorded,
+/// nothing transmitted and no `UNKNOWN` order left behind. Without it, a
+/// route whose adapter cannot execute a request reported the refusal as a
+/// transport failure: the order became `UNKNOWN`, the session disconnected,
+/// and nothing could ever clear it (delivery state E5.1).
+///
+/// The derived default is the narrowest set, single DAY orders. An adapter
+/// declares anything more.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaperBrokerCapabilities {
+    /// Executes an atomic multi-leg combination as one order.
+    pub combinations: bool,
+    /// Carries a good-til-cancelled time in force to the venue as such,
+    /// rather than dropping or rewriting it.
+    pub good_til_cancelled: bool,
+    /// Replaces a working order's limit price.
+    pub replacement: bool,
+}
+
 /// Paper-only broker boundary. It has no live environment parameter.
 pub trait PaperBrokerAdapter {
+    /// Declares what this adapter can carry for one account.
+    ///
+    /// The default is [`PaperBrokerCapabilities::default`], single DAY
+    /// orders, so an adapter that declares nothing is never handed a
+    /// combination, a GTC order or a replacement it would refuse, drop or
+    /// rewrite.
+    fn capabilities(&self, _account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        Ok(PaperBrokerCapabilities::default())
+    }
     /// Returns a stable non-secret fingerprint of this adapter implementation
     /// and its account-specific transport configuration.
     ///
@@ -656,6 +687,18 @@ impl PaperBrokerRegistry {
 }
 
 impl PaperBrokerAdapter for PaperBrokerRegistry {
+    /// A route carries exactly what its adapter declares.
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        validate_canonical_id("paper broker route account_id", account_id)?;
+        let route = self.routes.get(account_id).ok_or_else(|| {
+            PaperError("paper broker route is not configured for account".to_owned())
+        })?;
+        self.adapters
+            .get(&route.adapter_id)
+            .ok_or_else(|| PaperError("paper broker route adapter is unavailable".to_owned()))?
+            .capabilities(account_id)
+    }
+
     fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         validate_canonical_id("paper broker route account_id", account_id)?;
         let route = self.routes.get(account_id).ok_or_else(|| {
@@ -841,6 +884,22 @@ impl IbkrPaperAdapter {
 }
 
 impl PaperBrokerAdapter for IbkrPaperAdapter {
+    /// The model executes combinations and replacements, and never drops or
+    /// rewrites a time in force. These are model capabilities: the real
+    /// official-API bridge declares none of them (delivery state E5.1).
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        if account_id != self.account_id {
+            return Err(PaperError(
+                "IBKR paper account does not match adapter configuration".to_owned(),
+            ));
+        }
+        Ok(PaperBrokerCapabilities {
+            combinations: true,
+            good_til_cancelled: true,
+            replacement: true,
+        })
+    }
+
     fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         if account_id != self.account_id {
             return Err(PaperError(
@@ -890,13 +949,15 @@ impl PaperBrokerAdapter for IbkrPaperAdapter {
         Ok(BrokerSubmitResult::Acknowledged { broker_order_id })
     }
 
-    /// Accepts an atomic combination, mirroring the real paper bridge.
+    /// Accepts an atomic combination. This is a model capability only.
     ///
-    /// The genuine IBKR paper transport does support native BAG combinations
-    /// (`adapters/brokers/ibkr::submit_paper_combo`), so this deterministic
-    /// model of that same bridge supports them too. A model that refused what
-    /// the thing it models accepts would make the combination path untestable
-    /// against anything but a rejection.
+    /// It was added on the belief that the genuine IBKR paper transport
+    /// supports native BAG combinations. It does not: its
+    /// `submit_paper_combo` forwards a `submit_combo` request that the Python
+    /// bridge's dispatch does not implement, and nothing in the repository
+    /// builds a BAG contract (delivery state E5.1, corrected 2026-09-28). The
+    /// model keeps combinations so the OMS combination path stays testable end
+    /// to end; that is not evidence the real bridge can execute one.
     fn submit_combo(
         &mut self,
         request: &BrokerComboRequest,
@@ -1140,6 +1201,12 @@ impl<B> FaultInjectingBroker<B> {
 }
 
 impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
+    /// Exactly the inner adapter's set: every operation it declares is
+    /// forwarded, under this wrapper's fault schedule.
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        self.inner.capabilities(account_id)
+    }
+
     fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         self.inner.adapter_configuration_fingerprint(account_id)
     }
@@ -1164,6 +1231,29 @@ impl<B: PaperBrokerAdapter> PaperBrokerAdapter for FaultInjectingBroker<B> {
                 ))
             }
             Some(BrokerFault::DuplicateFirstEvent) | None => self.inner.submit(request),
+        }
+    }
+
+    /// Combinations follow the same submission fault schedule as single
+    /// orders. Before E5.1 this wrapper did not forward them, so every
+    /// combination met the trait's refusal, which the OMS recorded as
+    /// `UNKNOWN` whether or not a fault was scheduled.
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        match self.next_fault(BrokerOperation::Submit) {
+            Some(BrokerFault::Disconnect) => Err(PaperError(
+                "fault injection disconnected before paper combination submission".to_owned(),
+            )),
+            Some(BrokerFault::AmbiguousAfterSubmit) => {
+                let _ = self.inner.submit_combo(request)?;
+                Err(PaperError(
+                    "fault injection made paper combination submission outcome ambiguous"
+                        .to_owned(),
+                ))
+            }
+            Some(BrokerFault::DuplicateFirstEvent) | None => self.inner.submit_combo(request),
         }
     }
 
@@ -1309,6 +1399,37 @@ pub struct KillSwitchOperation {
     /// The authenticated operator who made the change.
     pub operator: String,
     /// Canonical UTC time the change was applied.
+    pub operated_at: String,
+}
+
+/// What an operator asked of an order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderOperationAction {
+    /// The operator requested cancellation, and the order moved to
+    /// `PENDING_CANCEL`.
+    CancelRequested,
+}
+
+impl OrderOperationAction {
+    /// Stable journal identity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CancelRequested => "CANCEL_REQUESTED",
+        }
+    }
+}
+
+/// One operator-attributed order command, as the PAPER journal records it
+/// (delivery state E5.2b).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderOperation {
+    /// The single or combination order the command addressed.
+    pub order_id: String,
+    /// What the operator asked.
+    pub action: OrderOperationAction,
+    /// The authenticated operator who asked.
+    pub operator: String,
+    /// Canonical UTC time the command was applied.
     pub operated_at: String,
 }
 
@@ -1925,6 +2046,9 @@ pub struct PaperRiskEvidence {
     pub decision: RiskDecision,
     /// The exact validated price observation evaluated by risk.
     pub market: PaperMarketData,
+    /// The authenticated operator who submitted the order, when it arrived
+    /// through an authenticated route; `None` for a direct caller (E5.2b).
+    pub submitted_by: Option<String>,
 }
 
 /// An authoritative exchange session that may count toward the paper gate.
@@ -2178,11 +2302,23 @@ struct PersistentPaperState {
     /// empty, so a journal without one re-serializes byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     kill_switch_operations: Vec<PersistentKillSwitchOperation>,
+    /// Operator-attributed order commands (E5.2b). Never written while empty,
+    /// so a journal without one re-serializes byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    order_operations: Vec<PersistentOrderOperation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistentKillSwitchOperation {
     scope: String,
+    action: String,
+    operator: String,
+    operated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentOrderOperation {
+    order_id: String,
     action: String,
     operator: String,
     operated_at: String,
@@ -2314,6 +2450,9 @@ struct PersistentRiskEvidence {
     actor: String,
     evaluated_limits: String,
     market: PersistentMarketData,
+    /// Versioned extension (E5.2b); absence retains the earlier serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submitted_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2570,6 +2709,9 @@ pub struct PaperTradingService<B> {
     /// Operator-attributed kill-switch changes, oldest first (E3.3b). A local
     /// change through [`Self::activate_kill_switch`] adds none, as before.
     kill_switch_operations: Vec<KillSwitchOperation>,
+    /// Operator-attributed order commands, oldest first (E5.2b). A direct
+    /// [`Self::cancel_order`] adds none.
+    order_operations: Vec<OrderOperation>,
     broker: B,
     broker_route_fingerprint: String,
     broker_connected: bool,
@@ -2652,6 +2794,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             risk_policy,
             kill_switches,
             kill_switch_operations: Vec::new(),
+            order_operations: Vec::new(),
             broker,
             broker_route_fingerprint,
             broker_connected: true,
@@ -2789,6 +2932,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         &self.kill_switch_operations
     }
 
+    /// Operator-attributed order commands, oldest first (E5.2b).
+    pub fn order_operations(&self) -> &[OrderOperation] {
+        &self.order_operations
+    }
+
     fn operate_kill_switch_as(
         &mut self,
         scope: KillSwitchScope,
@@ -2827,7 +2975,24 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         market: PaperMarketData,
         decided_at: &str,
     ) -> Result<PaperSubmitOutcome, PaperError> {
+        self.submit_intent_as(intent, market, decided_at, None)
+    }
+
+    /// Submits a single order on behalf of an authenticated operator, whose
+    /// identity is journaled with the risk evidence, as
+    /// [`Self::submit_combo_intent_as`] does for a combination. An idempotent
+    /// retry must come from the same submitter (delivery state E5.2b).
+    pub fn submit_intent_as(
+        &mut self,
+        intent: OrderIntent,
+        market: PaperMarketData,
+        decided_at: &str,
+        submitted_by: Option<&str>,
+    ) -> Result<PaperSubmitOutcome, PaperError> {
         self.ensure_persistence_healthy()?;
+        if let Some(operator) = submitted_by {
+            validate_canonical_id("paper order submitted_by", operator)?;
+        }
         intent.validate()?;
         validate_utc_timestamp("paper risk decision time", decided_at)?;
         market.validate()?;
@@ -2883,6 +3048,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                         .to_owned(),
                 ));
             }
+            if evidence.submitted_by.as_deref() != submitted_by {
+                return Err(PaperError(
+                    "paper order retry must come from the original submitter".to_owned(),
+                ));
+            }
             return Ok(PaperSubmitOutcome {
                 decision: evidence.decision.clone(),
                 order_id: Some(order_id),
@@ -2890,11 +3060,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             });
         }
 
+        self.ensure_route_carries(intent.time_in_force, false)?;
         let decision = self.evaluate_risk(&intent, &market, decided_at)?;
         let evidence = PaperRiskEvidence {
             intent: intent.clone(),
             decision: decision.clone(),
             market: market.clone(),
+            submitted_by: submitted_by.map(str::to_owned),
         };
         if !decision.approved {
             self.risk_evidence
@@ -3076,6 +3248,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             });
         }
 
+        self.ensure_route_carries(intent.time_in_force, true)?;
         // `evaluate_combo_risk` performs its own staleness check and updates
         // the mark cache, peak equity and daily baseline, exactly as the
         // single-order path relies on `evaluate_risk` to do.
@@ -3203,9 +3376,42 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
 
     /// Requests cancellation. A transport failure leaves the order explicitly `UNKNOWN`.
     pub fn cancel_order(&mut self, order_id: &str) -> Result<(), PaperError> {
+        self.cancel_order_attributed(order_id, None)
+    }
+
+    /// Requests cancellation of a single or combination order for an
+    /// authenticated operator. The request is journaled with the operator and
+    /// time, together with the order's move to `PENDING_CANCEL` and before the
+    /// broker is asked. A retry of a cancellation already accepted changes
+    /// nothing and journals nothing, as a repeated kill-switch change does
+    /// (delivery state E5.2b).
+    pub fn cancel_order_as(
+        &mut self,
+        order_id: &str,
+        operator: &str,
+        operated_at: &str,
+    ) -> Result<(), PaperError> {
+        validate_canonical_id("order operator", operator)?;
+        validate_utc_timestamp("order operation time", operated_at)?;
+        self.cancel_order_attributed(
+            order_id,
+            Some(OrderOperation {
+                order_id: order_id.to_owned(),
+                action: OrderOperationAction::CancelRequested,
+                operator: operator.to_owned(),
+                operated_at: operated_at.to_owned(),
+            }),
+        )
+    }
+
+    fn cancel_order_attributed(
+        &mut self,
+        order_id: &str,
+        operation: Option<OrderOperation>,
+    ) -> Result<(), PaperError> {
         self.ensure_persistence_healthy()?;
         if self.combo_orders.contains_key(order_id) {
-            return self.cancel_combo_order(order_id);
+            return self.cancel_combo_order(order_id, operation);
         }
         if !self.broker_connected {
             return Err(PaperError(
@@ -3237,6 +3443,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.order_mut(order_id)?
             .oms
             .transition(OrderState::PendingCancel, "PAPER_CANCEL_REQUESTED")?;
+        if let Some(operation) = operation {
+            self.order_operations.push(operation);
+        }
+        // Durable before the external command, as submission and combination
+        // cancellation are: a crash after the broker accepts the cancellation
+        // cannot leave the journal saying the order still works, or losing
+        // who asked for it (E5.2b).
+        self.persist()?;
         let cancel = BrokerCancelRequest {
             account_id: self.account.account_id.clone(),
             client_order_id: order_id.to_owned(),
@@ -3249,7 +3463,6 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             self.persist()?;
             return Err(error);
         }
-        self.persist()?;
         Ok(())
     }
 
@@ -3266,6 +3479,19 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         if !self.broker_connected {
             return Err(PaperError(
                 "paper broker session is disconnected; reconnect and reconcile before replacement"
+                    .to_owned(),
+            ));
+        }
+        // Before the order moves to `PENDING_REPLACE`: a route that cannot
+        // replace would otherwise leave it `UNKNOWN` and the session
+        // disconnected (delivery state E5.1).
+        if !self
+            .broker
+            .capabilities(&self.account.account_id)?
+            .replacement
+        {
+            return Err(PaperError(
+                "the configured paper broker route cannot replace orders; the order was left unchanged"
                     .to_owned(),
             ));
         }
@@ -5141,6 +5367,31 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         }
     }
 
+    /// Refuses a new order the configured broker route cannot carry. Callers
+    /// run it before risk is evaluated, because evaluation itself updates the
+    /// mark cache and equity baselines, so a refusal records, moves and
+    /// transmits nothing (delivery state E5.1).
+    fn ensure_route_carries(
+        &self,
+        time_in_force: TimeInForce,
+        combination: bool,
+    ) -> Result<(), PaperError> {
+        let capabilities = self.broker.capabilities(&self.account.account_id)?;
+        if combination && !capabilities.combinations {
+            return Err(PaperError(
+                "the configured paper broker route cannot execute combinations; nothing was recorded or transmitted"
+                    .to_owned(),
+            ));
+        }
+        if time_in_force == TimeInForce::GoodTilCancelled && !capabilities.good_til_cancelled {
+            return Err(PaperError(
+                "the configured paper broker route carries only DAY orders; the GTC intent was refused before anything was recorded or transmitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn persistent_state(&self) -> PersistentPaperState {
         let orders = self
             .orders
@@ -5331,6 +5582,16 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 .iter()
                 .map(|operation| PersistentKillSwitchOperation {
                     scope: operation.scope.clone(),
+                    action: operation.action.as_str().to_owned(),
+                    operator: operation.operator.clone(),
+                    operated_at: operation.operated_at.clone(),
+                })
+                .collect(),
+            order_operations: self
+                .order_operations
+                .iter()
+                .map(|operation| PersistentOrderOperation {
+                    order_id: operation.order_id.clone(),
                     action: operation.action.as_str().to_owned(),
                     operator: operation.operator.clone(),
                     operated_at: operation.operated_at.clone(),
@@ -5810,6 +6071,32 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 ));
             }
         }
+        let mut order_operations = Vec::with_capacity(state.order_operations.len());
+        for persisted in state.order_operations {
+            let action = match persisted.action.as_str() {
+                "CANCEL_REQUESTED" => OrderOperationAction::CancelRequested,
+                _ => {
+                    return Err(PaperError(
+                        "persisted order operation action is invalid".to_owned(),
+                    ))
+                }
+            };
+            if !orders.contains_key(&persisted.order_id)
+                && !combo_orders.contains_key(&persisted.order_id)
+            {
+                return Err(PaperError(
+                    "persisted order operation names an unknown order".to_owned(),
+                ));
+            }
+            validate_canonical_id("persisted order operator", &persisted.operator)?;
+            validate_utc_timestamp("persisted order operation time", &persisted.operated_at)?;
+            order_operations.push(OrderOperation {
+                order_id: persisted.order_id,
+                action,
+                operator: persisted.operator,
+                operated_at: persisted.operated_at,
+            });
+        }
         self.orders = orders;
         self.risk_evidence = risk_evidence;
         self.combo_orders = combo_orders;
@@ -5821,6 +6108,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         self.execution_ids = execution_ids;
         self.kill_switches = restored_switches;
         self.kill_switch_operations = kill_switch_operations;
+        self.order_operations = order_operations;
         self.incidents = incidents;
         self.last_reconciled_at = state.last_reconciled_at;
         self.last_reconciliation_clean = state.last_reconciliation_clean;
@@ -5859,52 +6147,17 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         let max_market_data_age_seconds = self.risk_policy.max_market_data_age_seconds.to_string();
         let max_order_rate = self.risk_policy.max_order_rate.to_string();
         let order_rate_window_seconds = self.risk_policy.order_rate_window_seconds.to_string();
-        // Absent for every configuration that does not opt into Slice-1
-        // aggregate-risk composition, so this leaves the fingerprint of an
-        // unconfigured operator byte-for-byte unchanged -- the same
-        // conditional-append convention already used for
-        // `broker_route_fingerprint` below.
+        // Every portfolio-risk field, through the policy's exhaustive
+        // `canonical_parts`, plus this composition's reference data and
+        // margin rates. Version 1 of this part listed the fields by hand and
+        // left out five limits, so a journal reopened under changed limits
+        // (delivery state E7.4). Absent for every configuration without
+        // aggregate-risk composition, whose fingerprint is unchanged.
         let portfolio_risk_parts: Vec<String> = self
             .risk_policy
             .portfolio_risk
             .as_ref()
-            .map(|composition| {
-                vec![
-                    composition.policy.version.clone(),
-                    composition.policy.max_gross_exposure.to_string(),
-                    composition.policy.max_abs_net_exposure.to_string(),
-                    composition.policy.max_leverage_bps.to_string(),
-                    composition.policy.max_concentration_bps.to_string(),
-                    render_bucket_map(&composition.policy.sector_limits),
-                    render_bucket_map(&composition.policy.asset_class_limits),
-                    render_bucket_map(&composition.policy.currency_limits),
-                    composition
-                        .policy
-                        .allowed_instruments
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                    composition
-                        .policy
-                        .restricted_instruments
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                    composition
-                        .instrument_buckets
-                        .iter()
-                        .map(|(instrument_id, bucket)| {
-                            format!(
-                                "{instrument_id}:{}:{}:{}",
-                                bucket.asset_class, bucket.currency, bucket.sector
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                ]
-            })
+            .map(portfolio_risk_fingerprint_parts)
             .unwrap_or_default();
         let mut parts = vec![
             "paper-configuration-v3",
@@ -5939,7 +6192,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             parts.push(&self.broker_route_fingerprint);
         }
         if !portfolio_risk_parts.is_empty() {
-            parts.push("paper-portfolio-risk-v1");
+            parts.push("paper-portfolio-risk-v2");
             for part in &portfolio_risk_parts {
                 parts.push(part);
             }
@@ -5963,6 +6216,43 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             .filter(|incident| incident.unexplained())
             .count() as u32
     }
+}
+
+/// A portfolio-risk composition's fingerprint parts, every field included:
+/// the policy's own, then its instrument buckets and margin rates.
+fn portfolio_risk_fingerprint_parts(composition: &PortfolioRiskComposition) -> Vec<String> {
+    let PortfolioRiskComposition {
+        policy,
+        instrument_buckets,
+        margin_rates,
+    } = composition;
+    let mut parts = policy.canonical_parts();
+    parts.push(format!(
+        "instrument_buckets={}",
+        instrument_buckets
+            .iter()
+            .map(|(instrument_id, bucket)| format!(
+                "{instrument_id}:{}:{}:{}",
+                bucket.asset_class, bucket.currency, bucket.sector
+            ))
+            .collect::<Vec<_>>()
+            .join("|")
+    ));
+    parts.push(format!(
+        "margin_rates={}",
+        margin_rates.as_ref().map_or_else(
+            || "none".to_owned(),
+            |rates| rates
+                .iter()
+                .map(|(asset_class, rate)| format!(
+                    "{asset_class}:{}:{}",
+                    rate.initial_bps, rate.maintenance_bps
+                ))
+                .collect::<Vec<_>>()
+                .join("|")
+        )
+    ));
+    parts
 }
 
 /// A per-instrument reference table (ticks or lots) in its canonical,
@@ -6194,6 +6484,7 @@ impl From<&PaperRiskEvidence> for PersistentRiskEvidence {
             actor: evidence.decision.actor.clone(),
             evaluated_limits: evidence.decision.evaluated_limits.clone(),
             market: PersistentMarketData::from(&evidence.market),
+            submitted_by: evidence.submitted_by.clone(),
         }
     }
 }
@@ -6218,6 +6509,9 @@ impl TryFrom<PersistentRiskEvidence> for PaperRiskEvidence {
                 "persisted risk correlation does not match its intent".to_owned(),
             ));
         }
+        if let Some(operator) = &evidence.submitted_by {
+            validate_canonical_id("persisted paper order submitted_by", operator)?;
+        }
         let decision = RiskDecision {
             decision_id: format!("paper-risk-{}", intent.intent_id),
             intent_id: intent.intent_id.clone(),
@@ -6233,6 +6527,7 @@ impl TryFrom<PersistentRiskEvidence> for PaperRiskEvidence {
             intent,
             decision,
             market: PaperMarketData::try_from(evidence.market)?,
+            submitted_by: evidence.submitted_by,
         })
     }
 }
@@ -7341,6 +7636,310 @@ mod tests {
         fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// The model behind a route that declares only the trait default, single
+    /// DAY orders, as the real IBKR bridge adapter does. It forwards every
+    /// call to the model, which could execute all of them, so only the
+    /// service's capability check stands between a request and the broker.
+    struct NarrowRouteBroker {
+        inner: IbkrPaperAdapter,
+        broker_calls: u32,
+    }
+
+    impl NarrowRouteBroker {
+        fn new() -> Self {
+            Self {
+                inner: IbkrPaperAdapter::new(&account()).unwrap(),
+                broker_calls: 0,
+            }
+        }
+    }
+
+    impl PaperBrokerAdapter for NarrowRouteBroker {
+        fn adapter_configuration_fingerprint(
+            &self,
+            account_id: &str,
+        ) -> Result<String, PaperError> {
+            self.inner.adapter_configuration_fingerprint(account_id)
+        }
+
+        fn submit(
+            &mut self,
+            request: &BrokerOrderRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.broker_calls += 1;
+            self.inner.submit(request)
+        }
+
+        fn submit_combo(
+            &mut self,
+            request: &BrokerComboRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.broker_calls += 1;
+            self.inner.submit_combo(request)
+        }
+
+        fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+            self.inner.cancel(request)
+        }
+
+        fn replace(&mut self, request: &BrokerReplaceRequest) -> Result<(), PaperError> {
+            self.broker_calls += 1;
+            self.inner.replace(request)
+        }
+
+        fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+            self.inner.poll(account_id)
+        }
+
+        fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+            self.inner.snapshot(account_id)
+        }
+
+        fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+            self.inner.reconnect(account_id)
+        }
+    }
+
+    /// A durable service over a narrow route, in a fresh directory, so a test
+    /// can prove a refusal journaled nothing.
+    fn narrow_route_service(name: &str) -> (PathBuf, PaperTradingService<NarrowRouteBroker>) {
+        let directory = std::env::temp_dir().join(format!(
+            "follon-paper-narrow-route-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let service = PaperTradingService::open_durable(
+            account(),
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            NarrowRouteBroker::new(),
+            directory.join("journal.ndjson"),
+        )
+        .unwrap();
+        (directory, service)
+    }
+
+    #[test]
+    fn a_route_without_gtc_refuses_a_gtc_intent_before_anything_is_recorded() {
+        let (directory, mut service) = narrow_route_service("gtc");
+        let at = "2026-01-02T14:31:00Z";
+        let sequence = service.dashboard().audit_sequence;
+        // On an instrument nothing else in this test touches, so any trace of
+        // it in the journal can only have come from the refused request.
+        let gtc = OrderIntent {
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            time_in_force: TimeInForce::GoodTilCancelled,
+            ..intent("intent-narrow-gtc-001", at)
+        };
+        let qqq = PaperMarketData {
+            instrument_id: "inst.us_equity.qqq".to_owned(),
+            mark_price: decimal("mark", "250").unwrap(),
+            observed_at: at.to_owned(),
+        };
+
+        let error = service.submit_intent(gtc, qqq, at).unwrap_err();
+
+        assert!(error.0.contains("carries only DAY orders"), "{}", error.0);
+        assert!(service.order("order-intent-narrow-gtc-001").is_none());
+        assert!(service
+            .risk_evidence("paper-risk-intent-narrow-gtc-001")
+            .is_none());
+        assert_eq!(service.broker_mut().broker_calls, 0);
+        let dashboard = service.dashboard();
+        assert_eq!(
+            dashboard.audit_sequence, sequence,
+            "the refusal was journaled"
+        );
+        assert!(dashboard.broker_connected);
+        assert_eq!(dashboard.unknown_orders, 0);
+
+        // The same route still carries a DAY order, and journaling it must
+        // not carry anything the refused request left behind: risk
+        // evaluation caches the request's mark, and the next record persists
+        // that cache, so a refusal after evaluation would leak it here.
+        let day = service
+            .submit_intent(intent("intent-narrow-day-001", at), market(at), at)
+            .unwrap();
+        assert!(day.decision.approved, "{:?}", day.decision.reason_codes);
+        assert_eq!(service.broker_mut().broker_calls, 1);
+        drop(service);
+        let journal = fs::read_to_string(directory.join("journal.ndjson")).unwrap();
+        assert!(
+            !journal.contains("inst.us_equity.qqq"),
+            "the refused request reached the journal"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_route_without_combinations_refuses_one_before_anything_is_recorded() {
+        // Before the capability check, the real bridge adapter answered a
+        // combination with an error the OMS records as a transport failure:
+        // the combination became UNKNOWN, the session disconnected, and every
+        // later order was refused until evidence that could never arrive.
+        let (directory, mut service) = narrow_route_service("combo");
+        let at = "2026-01-02T14:31:00Z";
+        let sequence = service.dashboard().audit_sequence;
+
+        let error = service
+            .submit_combo_intent(
+                combo_intent("intent-narrow-combo-001", at),
+                combo_market(at),
+                at,
+            )
+            .unwrap_err();
+
+        assert!(
+            error.0.contains("cannot execute combinations"),
+            "{}",
+            error.0
+        );
+        assert!(service
+            .combo_order(&OmsComboOrder::order_id_for("intent-narrow-combo-001"))
+            .is_none());
+        assert!(service
+            .combo_risk_evidence("paper-combo-risk-intent-narrow-combo-001")
+            .is_none());
+        assert_eq!(service.broker_mut().broker_calls, 0);
+        let dashboard = service.dashboard();
+        assert_eq!(
+            dashboard.audit_sequence, sequence,
+            "the refusal was journaled"
+        );
+        assert!(dashboard.broker_connected);
+        assert_eq!(dashboard.working_orders, 0);
+
+        // Nothing blocks the next single order, and journaling it carries no
+        // leg mark the refused request's risk evaluation would have cached.
+        let day = service
+            .submit_intent(intent("intent-narrow-day-002", at), market(at), at)
+            .unwrap();
+        assert!(day.decision.approved, "{:?}", day.decision.reason_codes);
+        drop(service);
+        let journal = fs::read_to_string(directory.join("journal.ndjson")).unwrap();
+        assert!(
+            !journal.contains("inst.us_option.spy.near"),
+            "the refused request reached the journal"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_route_without_replacement_refuses_one_and_leaves_the_order_unchanged() {
+        let (directory, mut service) = narrow_route_service("replace");
+        let at = "2026-01-02T14:31:00Z";
+        let resting = service
+            .submit_intent(
+                OrderIntent {
+                    order_type: OrderType::Limit,
+                    limit_price: Some(decimal("limit", "99.50").unwrap()),
+                    ..intent("intent-narrow-replace-001", at)
+                },
+                market(at),
+                at,
+            )
+            .unwrap();
+        let order_id = resting.order_id.unwrap();
+        assert_eq!(resting.state, Some(OrderState::Acknowledged));
+        let sequence = service.dashboard().audit_sequence;
+        let calls = service.broker_mut().broker_calls;
+
+        let error = service
+            .replace_order(&order_id, decimal("limit", "99").unwrap())
+            .unwrap_err();
+
+        assert!(error.0.contains("cannot replace orders"), "{}", error.0);
+        assert_eq!(
+            service.order(&order_id).unwrap().oms.state,
+            OrderState::Acknowledged
+        );
+        assert_eq!(service.broker_mut().broker_calls, calls);
+        let dashboard = service.dashboard();
+        assert_eq!(
+            dashboard.audit_sequence, sequence,
+            "the refusal was journaled"
+        );
+        assert!(dashboard.broker_connected);
+        assert_eq!(dashboard.unknown_orders, 0);
+        drop(service);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_route_declares_what_its_adapter_can_carry() {
+        let everything = PaperBrokerCapabilities {
+            combinations: true,
+            good_til_cancelled: true,
+            replacement: true,
+        };
+        assert_eq!(
+            PaperBrokerCapabilities::default(),
+            PaperBrokerCapabilities {
+                combinations: false,
+                good_til_cancelled: false,
+                replacement: false,
+            }
+        );
+        let model = IbkrPaperAdapter::new(&account()).unwrap();
+        assert_eq!(model.capabilities("acct.paper.001").unwrap(), everything);
+        assert!(model.capabilities("acct.paper.002").is_err());
+        assert_eq!(
+            NarrowRouteBroker::new()
+                .capabilities("acct.paper.001")
+                .unwrap(),
+            PaperBrokerCapabilities::default()
+        );
+        assert_eq!(
+            FaultInjectingBroker::new(IbkrPaperAdapter::new(&account()).unwrap())
+                .capabilities("acct.paper.001")
+                .unwrap(),
+            everything
+        );
+        assert_eq!(
+            FaultInjectingBroker::new(NarrowRouteBroker::new())
+                .capabilities("acct.paper.001")
+                .unwrap(),
+            PaperBrokerCapabilities::default()
+        );
+
+        // A registry route carries exactly what its own adapter declares:
+        // a narrow route and a model route side by side.
+        let second_account = PaperAccount {
+            account_id: "acct.paper.002".to_owned(),
+            ..account()
+        };
+        let mut registry = PaperBrokerRegistry::new();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: "acct.paper.001".to_owned(),
+                    adapter_id: "adapter.ibkr.paper.narrow".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(NarrowRouteBroker::new()),
+            )
+            .unwrap();
+        registry
+            .register(
+                PaperBrokerRoute {
+                    account_id: "acct.paper.002".to_owned(),
+                    adapter_id: "adapter.ibkr.paper.model".to_owned(),
+                    venue_id: "venue.ibkr.paper".to_owned(),
+                    environment: "PAPER".to_owned(),
+                },
+                Box::new(IbkrPaperAdapter::new(&second_account).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.capabilities("acct.paper.001").unwrap(),
+            PaperBrokerCapabilities::default()
+        );
+        assert_eq!(registry.capabilities("acct.paper.002").unwrap(), everything);
+        assert!(registry.capabilities("acct.paper.unrouted").is_err());
+    }
+
     #[test]
     fn a_lot_size_table_must_be_nonempty_positive_and_canonical() {
         for broken in [
@@ -7547,6 +8146,10 @@ mod tests {
 
     #[test]
     fn combo_transport_failure_leaves_the_group_unknown_and_disconnects() {
+        // Until E5.1 the fault wrapper did not forward combinations, so this
+        // passed on the trait's refusal and the scheduled fault was never
+        // consumed. It now exercises the fault itself; the test below shows
+        // an unfaulted combination reaches the model.
         let account = account();
         let adapter = IbkrPaperAdapter::new(&account).unwrap();
         let mut faulted = FaultInjectingBroker::new(adapter);
@@ -7571,6 +8174,28 @@ mod tests {
         // And an UNKNOWN combination blocks the next decision of either kind,
         // exactly as an UNKNOWN plain order does.
         assert!(service.has_unknown_order());
+    }
+
+    #[test]
+    fn the_fault_wrapper_forwards_a_combination_when_no_fault_is_scheduled() {
+        let account = account();
+        let faulted = FaultInjectingBroker::new(IbkrPaperAdapter::new(&account).unwrap());
+        let mut service = PaperTradingService::new(
+            account,
+            policy_permitting_shorts(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            faulted,
+        )
+        .unwrap();
+        let outcome = service
+            .submit_combo_intent(
+                combo_intent("combo-000025", "2026-01-02T14:30:00Z"),
+                combo_market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap();
+        assert_eq!(outcome.state, Some(OrderState::Acknowledged));
+        assert!(!service.has_unknown_order());
     }
 
     #[test]
@@ -7852,6 +8477,381 @@ mod tests {
         for corrupt in corruptions {
             let mut state = valid.clone();
             corrupt(&mut state.kill_switch_operations[0]);
+            assert!(service().restore(state).is_err());
+        }
+    }
+
+    fn scratch_journal(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "follon-paper-journal-{}-{label}.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// The journal's last recorded state, read once its service is dropped:
+    /// an open service holds the journal exclusively.
+    fn last_journal_state(path: &Path) -> serde_json::Value {
+        let journal = fs::read_to_string(path).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        record["state"].clone()
+    }
+
+    #[test]
+    fn an_authenticated_order_submitter_is_journaled_and_owns_the_retry() {
+        let journal_path = scratch_journal("order-submitted-by");
+        let account = account();
+        let open = || {
+            PaperTradingService::open_durable(
+                account.clone(),
+                policy(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account).unwrap(),
+                &journal_path,
+            )
+            .unwrap()
+        };
+        let mut service = open();
+        let order = intent("paper-000041", "2026-01-02T14:30:00Z");
+        let observation = market("2026-01-02T14:30:00Z");
+        let decided_at = "2026-01-02T14:30:02Z";
+        let outcome = service
+            .submit_intent_as(
+                order.clone(),
+                observation.clone(),
+                decided_at,
+                Some("user.trader"),
+            )
+            .unwrap();
+        assert!(outcome.decision.approved);
+        let decision_id = outcome.decision.decision_id.clone();
+        assert_eq!(
+            service
+                .risk_evidence(&decision_id)
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        // Neither another operator nor an unattributed caller may claim it.
+        for other in [Some("user.other"), None] {
+            assert!(service
+                .submit_intent_as(order.clone(), observation.clone(), decided_at, other)
+                .is_err());
+        }
+        // A malformed submitter is refused before risk sees the intent.
+        assert!(service
+            .submit_intent_as(
+                intent("paper-000042", "2026-01-02T14:30:00Z"),
+                observation.clone(),
+                decided_at,
+                Some("User Trader"),
+            )
+            .is_err());
+        assert!(service.risk_evidence("paper-risk-paper-000042").is_none());
+        // The original submitter's retry is the idempotent original.
+        let retry = service
+            .submit_intent_as(order, observation.clone(), decided_at, Some("user.trader"))
+            .unwrap();
+        assert_eq!(retry.order_id, outcome.order_id);
+        // A direct submission journals no `submitted_by` key at all, keeping
+        // the earlier serialization byte for byte.
+        service
+            .submit_intent(
+                intent("paper-000043", "2026-01-02T14:30:00Z"),
+                observation,
+                decided_at,
+            )
+            .unwrap();
+        drop(service);
+
+        let state = last_journal_state(&journal_path);
+        assert_eq!(
+            state["risk_evidence"]["paper-risk-paper-000041"]["submitted_by"],
+            "user.trader"
+        );
+        assert!(
+            state["risk_evidence"]["paper-risk-paper-000043"]
+                .get("submitted_by")
+                .is_none(),
+            "an unattributed decision must not carry submitted_by"
+        );
+        // The attribution survives a restart.
+        let reopened = open();
+        assert_eq!(
+            reopened
+                .risk_evidence(&decision_id)
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    /// The model, except that asking it to cancel stops the process, as a
+    /// crash just after the broker received the request would.
+    struct CrashOnCancelBroker(IbkrPaperAdapter);
+
+    impl PaperBrokerAdapter for CrashOnCancelBroker {
+        fn adapter_configuration_fingerprint(
+            &self,
+            account_id: &str,
+        ) -> Result<String, PaperError> {
+            self.0.adapter_configuration_fingerprint(account_id)
+        }
+
+        fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+            self.0.configuration_fingerprint(account_id)
+        }
+
+        fn permits_empty_journal(&self, account_id: &str) -> bool {
+            self.0.permits_empty_journal(account_id)
+        }
+
+        fn submit(
+            &mut self,
+            request: &BrokerOrderRequest,
+        ) -> Result<BrokerSubmitResult, PaperError> {
+            self.0.submit(request)
+        }
+
+        fn cancel(&mut self, _request: &BrokerCancelRequest) -> Result<(), PaperError> {
+            panic!("the process stopped while the broker held the cancellation")
+        }
+
+        fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+            self.0.poll(account_id)
+        }
+
+        fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+            self.0.snapshot(account_id)
+        }
+
+        fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+            self.0.reconnect(account_id)
+        }
+    }
+
+    #[test]
+    fn an_operator_cancellation_is_durable_before_the_broker_is_asked() {
+        let journal_path = scratch_journal("order-cancel-crash");
+        let account = account();
+        let mut service = PaperTradingService::open_durable(
+            account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            CrashOnCancelBroker(IbkrPaperAdapter::new(&account).unwrap()),
+            &journal_path,
+        )
+        .unwrap();
+        let order_id = service
+            .submit_intent_as(
+                intent("paper-000051", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+                Some("user.trader"),
+            )
+            .unwrap()
+            .order_id
+            .unwrap();
+        assert_eq!(
+            service.order(&order_id).unwrap().oms.state,
+            OrderState::Acknowledged
+        );
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.cancel_order_as(&order_id, "user.risk", "2026-01-02T14:31:00Z")
+        }));
+        assert!(crashed.is_err(), "the broker was never asked to cancel");
+        drop(service);
+
+        // The restarted service knows the cancellation was requested, and by
+        // whom, although the process stopped before it heard back.
+        let reopened = PaperTradingService::open_durable(
+            account.clone(),
+            policy(),
+            KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+            IbkrPaperAdapter::new(&account).unwrap(),
+            &journal_path,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.order(&order_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        assert_eq!(
+            reopened.order_operations(),
+            [OrderOperation {
+                order_id: order_id.clone(),
+                action: OrderOperationAction::CancelRequested,
+                operator: "user.risk".to_owned(),
+                operated_at: "2026-01-02T14:31:00Z".to_owned(),
+            }]
+            .as_slice()
+        );
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn an_operator_cancellation_is_journaled_once_for_a_single_order_or_a_combination() {
+        let account = account();
+        let open = |path: &Path| {
+            PaperTradingService::open_durable(
+                account.clone(),
+                policy_permitting_shorts(),
+                KillSwitchRegistry::new("paper-kills-v1").unwrap(),
+                IbkrPaperAdapter::new(&account).unwrap(),
+                path,
+            )
+            .unwrap()
+        };
+
+        // A direct, unattributed cancellation journals no operation record at
+        // all, keeping the earlier serialization byte for byte.
+        let local_path = scratch_journal("order-operations-local");
+        let mut local = open(&local_path);
+        let local_id = local
+            .submit_intent(
+                intent("paper-000060", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+            )
+            .unwrap()
+            .order_id
+            .unwrap();
+        local.cancel_order(&local_id).unwrap();
+        drop(local);
+        let local_state = last_journal_state(&local_path);
+        assert_eq!(
+            local_state["orders"][local_id.as_str()]["state"],
+            "PENDING_CANCEL"
+        );
+        assert!(local_state.get("order_operations").is_none());
+        let _ = fs::remove_file(&local_path);
+
+        let journal_path = scratch_journal("order-operations");
+        let mut service = open(&journal_path);
+        let submit = |service: &mut PaperTradingService<IbkrPaperAdapter>, intent_id: &str| {
+            service
+                .submit_intent(
+                    intent(intent_id, "2026-01-02T14:30:00Z"),
+                    market("2026-01-02T14:30:00Z"),
+                    "2026-01-02T14:30:02Z",
+                )
+                .unwrap()
+                .order_id
+                .unwrap()
+        };
+        let order_id = submit(&mut service, "paper-000061");
+        let direct_id = submit(&mut service, "paper-000062");
+        let combo_id = submit_lifecycle_combo(&mut service, "operator-cancel");
+
+        // A malformed operator or time changes nothing.
+        assert!(service
+            .cancel_order_as(&order_id, "User Risk", "2026-01-02T14:31:00Z")
+            .is_err());
+        assert!(service
+            .cancel_order_as(&order_id, "user.risk", "yesterday")
+            .is_err());
+        assert_eq!(
+            service.order(&order_id).unwrap().oms.state,
+            OrderState::Acknowledged
+        );
+        assert!(service.order_operations().is_empty());
+
+        service
+            .cancel_order_as(&order_id, "user.risk", "2026-01-02T14:31:00Z")
+            .unwrap();
+        // A retry, even by another operator, changes nothing and journals nothing.
+        service
+            .cancel_order_as(&order_id, "user.risk.second", "2026-01-02T14:31:05Z")
+            .unwrap();
+        service
+            .cancel_order_as(&combo_id, "user.risk.second", "2026-01-02T14:31:10Z")
+            .unwrap();
+        // A direct cancellation is not attributed.
+        service.cancel_order(&direct_id).unwrap();
+        let operation = |order_id: &str, operator: &str, operated_at: &str| OrderOperation {
+            order_id: order_id.to_owned(),
+            action: OrderOperationAction::CancelRequested,
+            operator: operator.to_owned(),
+            operated_at: operated_at.to_owned(),
+        };
+        let expected = vec![
+            operation(&order_id, "user.risk", "2026-01-02T14:31:00Z"),
+            operation(&combo_id, "user.risk.second", "2026-01-02T14:31:10Z"),
+        ];
+        assert_eq!(service.order_operations(), expected.as_slice());
+        for id in [&order_id, &direct_id] {
+            assert_eq!(
+                service.order(id).unwrap().oms.state,
+                OrderState::PendingCancel
+            );
+        }
+        assert_eq!(
+            service.combo_order(&combo_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        drop(service);
+
+        let state = last_journal_state(&journal_path);
+        assert_eq!(state["order_operations"].as_array().unwrap().len(), 2);
+        assert_eq!(state["order_operations"][0]["action"], "CANCEL_REQUESTED");
+        assert_eq!(state["order_operations"][1]["operator"], "user.risk.second");
+        let reopened = open(&journal_path);
+        assert_eq!(reopened.order_operations(), expected.as_slice());
+        drop(reopened);
+        let _ = fs::remove_file(&journal_path);
+    }
+
+    #[test]
+    fn a_persisted_order_attribution_must_be_well_formed() {
+        let mut attributed = service();
+        let order_id = attributed
+            .submit_intent_as(
+                intent("paper-000071", "2026-01-02T14:30:00Z"),
+                market("2026-01-02T14:30:00Z"),
+                "2026-01-02T14:30:02Z",
+                Some("user.trader"),
+            )
+            .unwrap()
+            .order_id
+            .unwrap();
+        attributed
+            .cancel_order_as(&order_id, "user.risk", "2026-01-02T14:31:00Z")
+            .unwrap();
+        let valid = attributed.persistent_state();
+        let mut restored = service();
+        restored.restore(valid.clone()).unwrap();
+        assert_eq!(restored.order_operations().len(), 1);
+        assert_eq!(
+            restored
+                .risk_evidence("paper-risk-paper-000071")
+                .unwrap()
+                .submitted_by
+                .as_deref(),
+            Some("user.trader")
+        );
+        let corruptions: [fn(&mut PersistentPaperState); 5] = [
+            |state| state.order_operations[0].order_id = "order-paper-000099".to_owned(),
+            |state| state.order_operations[0].action = "CANCEL".to_owned(),
+            |state| state.order_operations[0].operator = "User Risk".to_owned(),
+            |state| state.order_operations[0].operated_at = "yesterday".to_owned(),
+            |state| {
+                state
+                    .risk_evidence
+                    .get_mut("paper-risk-paper-000071")
+                    .unwrap()
+                    .submitted_by = Some("User Trader".to_owned());
+            },
+        ];
+        for corrupt in corruptions {
+            let mut state = valid.clone();
+            corrupt(&mut state);
             assert!(service().restore(state).is_err());
         }
     }
@@ -8976,6 +9976,73 @@ mod tests {
             strategy_limits: BTreeMap::new(),
             max_news_slippage_bps: None,
             max_spread_multiplier_bps: None,
+        }
+    }
+
+    #[test]
+    fn every_portfolio_risk_limit_is_part_of_the_configuration_fingerprint() {
+        // Version 1 of the portfolio-risk fingerprint part omitted these, so a
+        // journal reopened under any change to them (delivery state E7.4).
+        let fingerprint = |change: &dyn Fn(&mut PortfolioRiskComposition)| {
+            let mut composition = PortfolioRiskComposition {
+                policy: permissive_portfolio_risk_policy(),
+                instrument_buckets: BTreeMap::new(),
+                margin_rates: None,
+            };
+            change(&mut composition);
+            let mut risk_policy = policy();
+            risk_policy.portfolio_risk = Some(composition);
+            service_with(risk_policy).configuration_fingerprint()
+        };
+        let base = fingerprint(&|_| {});
+        type Change = Box<dyn Fn(&mut PortfolioRiskComposition)>;
+        let changes: Vec<(&str, Change)> = vec![
+            (
+                "max_daily_loss",
+                Box::new(|c| {
+                    c.policy.max_daily_loss = decimal("loss", "1234").unwrap();
+                }),
+            ),
+            (
+                "max_drawdown_bps",
+                Box::new(|c| {
+                    c.policy.max_drawdown_bps = decimal("drawdown", "1234").unwrap();
+                }),
+            ),
+            (
+                "max_margin_utilization_bps",
+                Box::new(|c| {
+                    c.policy.max_margin_utilization_bps = decimal("margin", "1234").unwrap();
+                }),
+            ),
+            (
+                "strategy_limits",
+                Box::new(|c| {
+                    c.policy.strategy_limits.insert(
+                        "strategy.paper.001".to_owned(),
+                        decimal("limit", "1000").unwrap(),
+                    );
+                }),
+            ),
+            (
+                "margin_rates",
+                Box::new(|c| {
+                    c.margin_rates = Some(BTreeMap::from([(
+                        "equity".to_owned(),
+                        follon_accounting::MarginRate {
+                            initial_bps: 5_000,
+                            maintenance_bps: 2_500,
+                        },
+                    )]));
+                }),
+            ),
+        ];
+        for (limit, change) in &changes {
+            assert_ne!(
+                fingerprint(change.as_ref()),
+                base,
+                "{limit} is not in the fingerprint"
+            );
         }
     }
 

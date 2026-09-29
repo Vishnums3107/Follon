@@ -444,10 +444,10 @@ does not expose privileged mutations through the read-only evidence server.
 | --- | --- | --- |
 | Strategy/broker secret separation | Implemented | Strategy workers cannot reach adapter or credential interfaces. |
 | Secret ingress | Implemented interfaces; deployment gate | Managed-command/password/connection-string file boundaries and zeroizing broker material exist. Production mode refuses a direct database URL and requires a TLS connection string. A production vault/keychain, rotation operation, and custody evidence remain external. |
-| Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. Production HSM/KMS custody and independent approval remain external. |
+| Immutable audit and signed release | Implemented locally | Hash-chained journals, canonical manifests, detached Ed25519 signatures, and trusted-key verification exist. As of item 83 (2026-09-27), the PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs refuse a symbolic link, dangling or not. As of item 91 (2026-09-28), so do the operations journal and its reader, the replay event log, the backtest experiment store, every immutable CLI artifact and `follon-news` output. Production HSM/KMS custody and independent approval remain external. |
 | SBOM | Implemented 2026-08-22 | `tools/generate_sbom.py` creates a deterministic CycloneDX 1.6 Cargo/npm/Python inventory bound to source revision and lockfile hashes; CI tests, generates, and retains it. Vulnerability disposition remains a release operation. |
-| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. |
-| Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. |
+| Dependency/static/secret scanning | Partial | CI has advisory/dependency and secret checks plus compiler/lint/test gates. As of item 41 (2026-09-20), a real Semgrep SAST job (`p/owasp-top-ten`, `p/rust`, `p/python`, `p/typescript`, `p/secrets`, `--error`) runs in CI and gates the build; every GitHub Action reference is pinned from a mutable tag to its resolved commit SHA; Dependabot enforces a 7-day-minimum cooldown. **Corrected in place 2026-09-25 (item 68).** This cell said DAST "remain[s] external". That was accurate when written, and it is now false for a repository-authored scan. `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API with authenticated and unauthenticated probes. An independent DAST product run against a real deployment, and named security-operation ownership, remain external. As of item 85 (2026-09-28), that Semgrep job and the gitleaks check had not passed on any run visible on GitHub: Semgrep blocked on this audit's own quotation of item 41's fixed defect, and gitleaks on a fixture's secret reference. Both are fixed and verified locally at CI's pinned versions; a green GitHub run is still open (delivery state E4.3). |
+| Dashboard authentication | Partial | Production mode requires protected credentials; exact constant-time Basic auth, no-store/CSP headers, direct-peer sliding-window rate limiting, `429` and `Retry-After` are tested. This is an operator-only loopback gate. As of item 88 (2026-09-28), it reads and discards a request's declared body, up to 64 KiB, before answering, and a 15-second socket timeout bounds every read. |
 | MFA, short sessions, revocation, customer RBAC and tenant isolation | Implemented kernel/schema; deployment gate | Argon2id, password policy/rotation, TOTP with bounded challenges, hashed one-time recovery codes, lockout, opaque hashed 15-minute sessions, security-version revocation, five roles, tenant authorization, and PostgreSQL RLS schema are tested. Production enrollment, out-of-band delivery, support, and customer acceptance remain external. |
 | TLS and encryption at rest | TLS topology implemented; custody gate | Production Compose requires gRPC mTLS and a client-certificate dashboard proxy, pinned reviewed images, certificate secret files, and PostgreSQL `sslmode=require`. Certificate issuance/rotation, encrypted volume/KMS ownership, and deployed proof remain external. |
 | Request idempotency | Implemented for durable event boundary | Orders/releases/artifacts remain idempotent; PostgreSQL event append binds tenant key to content and atomically creates outbox state. Production gateway/load evidence remains external. |
@@ -1764,7 +1764,11 @@ These are mandatory master-plan acceptance conditions and are currently open:
       repeat of the same identity. A transport failure leaves the combination `UNKNOWN` rather than guessing.
       `IbkrPaperAdapter` now accepts native combinations, because the real paper bridge it models
       (`adapters/brokers/ibkr::submit_paper_combo`) does; a model that refused what the thing it models
-      accepts would leave the path testable only against a rejection. **The part that matters most for safety
+      accepts would leave the path testable only against a rejection. **Corrected in place 2026-09-28: the
+      premise was false.** `submit_paper_combo` only forwards a `submit_combo` request to the Python bridge,
+      whose dispatch has no such operation and answers `unsupported bridge operation`; nothing in the
+      repository builds an IBKR BAG contract. The model's combination support is a model capability, not
+      parity with the real bridge (delivery state E5.1). **The part that matters most for safety
       is integration, not submission**: open orders, the rate window, reserved cash, the `UNKNOWN` guard and
       self-trade all now read both order maps through shared helpers, because a combination invisible to the
       single-order gate would be a hole in exactly the limits it is subject to. Its legs are individually
@@ -3448,6 +3452,686 @@ These are mandatory master-plan acceptance conditions and are currently open:
       or accepts odd lots, is not modelled. Price improvement and midpoint prints are not modelled either.
       No external gate moved.
 
+85. Foundation CI's failures with an obvious fix (2026-09-28, Security and Reliability; delivery state
+    E4.1). Reported by the revised assessment and reproduced here from GitHub's logs.
+    - **The gaps.** GitHub's `Verify foundation` workflow has not passed on any run visible there, back to
+      at least 2026-09-05. Main run 36334101143 failed three jobs, and PR run 36333055826 a fourth:
+      - `sast`: the one blocking finding was `generic.nginx.security.request-host-used` on line 1516 of
+        this audit, which quotes item 41's fixed defect. The nginx rules select their targets by a `conf`
+        path glob, which this file's name matches. Measured with Semgrep 1.177.0, the version CI pins: the
+        same text is flagged in a file named `conformance-notes.md` and not in one named `plain-notes.md`.
+      - `security`, on the PR run: gitleaks 8.24.3's `generic-api-key` flagged the `credential_reference`
+        field of two LIVE configuration fixtures, whose value is a canonical ID beginning `secret.broker.`.
+        That value names a managed secret; `core/secrets` documents `SecretReference` as
+        "the non-sensitive reference used for audit and access policy". A push to main scans only its own
+        commits, which is why the main run passed. A full-history scan found three findings, all this one.
+      - `desktop`: clippy stopped in `glib-sys`'s build script, "Package glib-2.0 was not found in the
+        pkg-config search path", because the runner lacks Tauri's Linux libraries. The native tests after
+        it were skipped.
+      - `python-and-contracts`: six IBKR bridge tests import `ibapi`, which the runner lacks. Which IBKR
+        API distribution CI may install is a decision (E4.2), so that job is unchanged here. The bridge
+        README said its suite runs "without TWS or `ibapi`", false since those six tests were added.
+    - **The fixes.**
+      - Semgrep excludes this audit as a path. Excluding the rule instead would stop scanning
+        `infra/nginx.dashboard.conf`. The audit's secrets remain covered by gitleaks.
+      - `.gitleaks.toml` extends the default rules with one allowlist: a line, anchored at both ends,
+        holding only `credential_reference` with a `secret.`-prefixed canonical ID. It has no `paths`
+        condition, because gitleaks 8.24.3 ignores `condition = "AND"` in the global allowlist, so a path
+        would allowlist every finding beneath it. That was measured before this file was written: with a
+        path and the condition, a real-looking key under the fixture directory, the same reference
+        elsewhere, and a token-shaped value in the field were all allowlisted.
+      - The desktop job installs Tauri v2's documented Ubuntu prerequisites before its native steps.
+      - The bridge README states what its suite needs. Eight tests need neither TWS nor `ibapi`. Six need
+        `ibapi`, and pass against 9.81.1.post1, the only version they have run against. On Windows,
+        `zoneinfo` also needs the `tzdata` package.
+      - The security job's test step was named "Verify deterministic SBOM generation" but runs every test
+        under `tests/security`. It is renamed.
+    - **Verification.** Each configuration change was checked in both directions, the rule-5 method
+      applied to configuration:
+      - Semgrep, the exact CI command plus the exclusion: 0 findings on 329 files, exit 0. With
+        `proxy_set_header Host $host;` re-injected into `infra/nginx.dashboard.conf`, the same command
+        blocked it, exit 1. The file was restored byte for byte.
+      - Gitleaks over the whole history, 100 commits, with the configuration: no findings, exit 0. In a
+        probe repository the canonical reference was allowed, and three leaks were still reported: a
+        real-looking key in the fixture directory, a token-shaped value in the allowlisted field, and a
+        real-looking key sharing a line with a canonical reference. A control run without the
+        configuration reported every probe file.
+      - The bridge suite as CI runs it, without `ibapi` but with `tzdata`: 14 run, the same 6 errors,
+        8 passed. With `ibapi` 9.81.1.post1: 14 passed.
+      - Not verified: the desktop fix. Docker's daemon was not running and this machine has no other
+        Linux environment, so it stays unverified until the workflow runs on GitHub (E4.3).
+    - **Measured result.** Configuration and documentation only. The final `python tools/session_status.py`
+      run, over this exact tree, measured all seven suites green with the Rust workspace unchanged at 521
+      passed / 0 failed / 3 ignored. The evidence pipeline was not run: its acceptance step would publish
+      the assessment's synthetic record, which E6.1 fixes next. No external gate moved.
+
+86. The evidence pipeline counts only the operational acceptance ledgers (2026-09-28, External and
+    operational gates; delivery state E6.1). Found while verifying the revised assessment.
+    - **The gap.** Pipeline step 23 ran `tools/acceptance_evidence.py` over `var/` itself, and the tool
+      counts every `*.acceptance.ndjson` beneath its root. The 2026-09-27 assessment retained a synthetic
+      boundary-experiment ledger under `var/reports/`: one structurally valid `paying_customer` record,
+      invented to probe the tool's limits and labelled as such in its notes. An in-memory run of the tool
+      over this machine's `var/` counted it as one verified record, with the paying-customer gate
+      eligible. The pipeline had not run since that ledger was written, so nothing false was published;
+      its next run would have published it.
+    - **The fix.** Step 23 is now `publish_acceptance_status(var_dir)`, which audits only `var/acceptance/`,
+      the operational ledger root, and creates it empty when absent. The tool refuses a missing root rather
+      than reporting zero, and an empty root is the truth when no ledger has been retained. The production
+      runbook names the root and says to keep review and synthetic ledgers out of it. The assessment's
+      ledger is left where it was: it is the assessment's retained evidence, and it is now outside what
+      counts.
+    - **Tests.** `PipelineAcceptanceRootTests` runs the pipeline's own step against a temporary `var/`:
+      - a valid synthetic customer ledger under `reports/` is not counted, and the gate stays ineligible;
+      - a ledger under the operational root is counted;
+      - an absent root is created empty and reports zero records.
+    - **Rule 5.** 3 of 3 injected defects were caught:
+      - the root reverted to `var/` itself, the original defect. Only the first test failed, on the count;
+      - the root no longer created, after which the tool refused the missing directory;
+      - the root moved to a directory that counts nothing, caught by the second test.
+    - **Measured result.** Python rose from 55 to 58 passed; the Rust workspace is unchanged at 521 passed /
+      0 failed / 3 ignored. The final `python tools/session_status.py` run measured all seven suites green,
+      and the full evidence pipeline exited 0, including step 23b's scan (85 probes, 0 failed). The
+      published `var/follon-acceptance-status.json` reports zero verified records and every gate
+      ineligible, with the synthetic ledger still present under `var/reports/`.
+    - **Bounded remainder.** The tool still trusts whatever sits under its root. A subject rejected after it
+      was accepted still counts (E6.2), the promotion gate still trusts a caller-supplied status document
+      (E6.3), and nothing authenticates a reviewer or re-hashes a source artifact (E6.4). No external gate
+      moved.
+
+87. A PAPER route declares what it can carry, and the OMS refuses the rest before an order exists
+    (2026-09-28, row 5.6 and Architecture; delivery state E5.1). Found while verifying the revised
+    assessment.
+    - **The gap.** The real IBKR PAPER adapter could not execute three things the OMS would send it, and
+      each left the order worse off than a refusal:
+      - A combination. `IbkrPaperBridgeProcessTransport::submit_paper_combo` forwarded a `submit_combo`
+        request, whose payload carried neither leg quantities nor the debit or credit sign, to a Python
+        bridge whose dispatch has no such operation. The bridge answers `unsupported bridge operation`.
+        The OMS records any adapter error as a transport failure, so the combination became `UNKNOWN`,
+        the session disconnected, and every later order was refused with
+        `UNKNOWN_ORDER_REQUIRES_RECONCILIATION`. Leaving `UNKNOWN` needs broker evidence, which the bridge
+        could never send for an order it never placed.
+      - A GTC intent. `BrokerOrderRequest` has no time in force and the bridge places every order DAY,
+        so a GTC intent would have been placed DAY with nothing recording the change.
+      - A replacement. The adapter inherits the trait's refusal, which the OMS meets after moving the
+        order to `PENDING_REPLACE`, so it too became `UNKNOWN` with the session disconnected.
+
+      No application composes the real adapter yet (E5.2), so none of this could happen in a shipped
+      application. It would have been the first thing an integration met.
+    - **The fix.** `PaperBrokerCapabilities` declares, per adapter and account, whether a route executes
+      combinations, carries GTC, and replaces orders. Its default is the narrowest set, single DAY
+      orders, so an adapter that declares nothing is never handed more.
+      - The service asks before it evaluates risk, because evaluation itself caches the request's mark
+        and moves the equity baselines. Anything the route cannot carry is refused with nothing
+        recorded, nothing transmitted, and the session still connected. Replacement is asked before the
+        order moves.
+      - The model declares all three, as model capabilities. The registry answers for its route's
+        adapter. The desktop's `ManualFillAdapter` declares everything but replacement, which it never
+        forwarded.
+      - The real adapter declares the default, and its transport no longer sends `submit_combo`; the
+        trait's default refuses without transmitting.
+    - **A test that passed for the wrong reason.** `FaultInjectingBroker` never forwarded `submit_combo`.
+      So `combo_transport_failure_leaves_the_group_unknown_and_disconnects` passed on the trait's
+      refusal: its scheduled Disconnect fault was never consumed, and every combination through the
+      wrapper became `UNKNOWN` whether or not a fault was scheduled. A first version of this slice gave
+      the wrapper no combinations, that test failed, and the reason was found. The wrapper now forwards
+      combinations under the same fault schedule as single orders. A new test shows that an unfaulted
+      combination through it is acknowledged, so the old test can no longer pass on a refusal.
+    - **Tests.**
+      - A narrow route refuses a GTC intent, a combination and a replacement. After each refusal no
+        order and no risk evidence exist, the broker was not called, the durable journal's sequence is
+        unchanged, the session is connected, and no order is `UNKNOWN`. The same route then carries a
+        DAY order.
+      - The refused GTC intent is on an instrument nothing else in its test touches, and so are the
+        refused combination's legs. After the next DAY order is journaled, neither appears anywhere in
+        the journal, so each refusal came before risk evaluation cached its mark.
+      - Each adapter's declaration: the default, the model, the fault wrapper over the model and over a
+        narrow route, and a registry holding a narrow route beside a model route.
+      - The real adapter declares the default and refuses a combination without calling its transport.
+        Its process transport, run against the fake bridge fixture, sends nothing for a combination: the
+        fixture exits on any operation it does not implement, and it still answers a poll afterwards.
+      - The desktop adapter declares everything but replacement.
+    - **Rule 5.** 14 of 14 injected defects were caught, each by a failing assertion rather than a compile
+      error:
+      - each of the three checks removed;
+      - each submission check moved after risk evaluation, caught only by the journal assertion;
+      - the model declaring no combinations, and the registry answering the default;
+      - the fault wrapper stripping combinations, ignoring its schedule, or not forwarding them at all;
+      - the real adapter declaring combinations or GTC, and its transport sending `submit_combo` again;
+      - the desktop adapter declaring replacement.
+    - **Measured result.** The Rust workspace rose from 521 to 529 passed / 0 failed / 3 ignored,
+      and the Tauri host from 30 to 31. The final `python tools/session_status.py` run measured all seven
+      suites green. The first full pipeline run failed one probe of step 23b's scan: H32, a DELETE with a
+      two-byte body sent to the dashboard, got no response. That is a flake which predates this slice and
+      lies outside it. In isolation it lost 12 responses in 1,000 with a body and none without, and the
+      next slice fixes it (E7.13). The rerun exited 0, with the scan at 85 probes and 0 failed.
+    - **Bounded remainder.** Controlled LIVE has the same shape: `IbkrControlledLiveAdapter` inherits a
+      refusing `submit_combo`, and `core/live` records that refusal as a transport failure that keeps the
+      approval and a canary slot consumed (E5.7, latent). A refusal from the bridge itself, such as an
+      unmapped instrument, still becomes `UNKNOWN` (E5.4). No external gate moved.
+
+88. The dashboard reads a request's declared body before it answers (2026-09-28, Security row "Dashboard
+    authentication"; delivery state E7.13). Found when scan probe H32 failed during item 87's first
+    pipeline run.
+    - **The gap.** The dashboard serves `GET`, and answers any other method with the standard library's
+      501, without reading a declared request body. Closing a connection with input unread resets it, and
+      the reset can reach the client before the client reads the response, which destroys it. Probe H32
+      sends `DELETE` with a two-byte body, recorded no response, and rightly treats that as a failure.
+      - Measured with the probe's own client against the real handler: 19 of 1,000 responses were lost.
+      - With the body sent just after the headers, every response was lost.
+      - Behind the production nginx proxy the same race would surface as a 502.
+    - **The fix.**
+      - `parse_request` runs once per request, after its headers and before any dispatch, including the
+        standard library's 501. It now reads and discards a declared body of at most 64 KiB.
+      - A larger or malformed declaration is never read, and the connection closes after the response.
+      - Every read now has a 15-second socket timeout. Before, no read had one, and a client that declared
+        a body and never sent it would have held its handler thread indefinitely once bodies were read.
+    - **Tests.** Four contract tests run against a real server, each sending the body one byte at a time
+      just after the headers:
+      - POST, PUT, DELETE and PATCH each keep their 501;
+      - a GET keeps its 200;
+      - a declared body that never arrives cannot hold the server: with the timeout shortened, the client
+        gets its 501 instead of timing out, and the default timeout is finite;
+      - a declared 10 MiB body is never read: with a handler timeout longer than the client's, the 501
+        still arrives.
+
+      The suite ran 15 times without a failure.
+    - **Rule 5.** 4 of 4 injected defects were caught: the discard removed, one byte of the body left
+      unread, the 64 KiB bound removed, and the timeout removed. The second was missed at first, because the
+      buffered reader pulled both bytes off the socket anyway, so the injection changed nothing observable.
+      The test now sends the body in pieces, so a short read leaves input unread, and is caught.
+    - **Measured result.** The dashboard contract suite rose from 20 to 24 tests; the Rust
+      workspaces are unchanged at 529 and 31. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with step 23b's scan at 85 probes, 0
+      failed. H32's own request against the real handler lost 19 responses in 1,000 before the fix and
+      none after.
+    - **Bounded remainder.** A chunked request body is not read. The timeout also bounds how long a slow
+      client may take to receive a large evidence download: at most 15 seconds, where there was no limit.
+      No external gate moved.
+
+89. A rejection disqualifies its subject, and acceptance records are held to their exact contract
+    (2026-09-28, External and operational gates; delivery state E6.2). Reported by the revised assessment,
+    whose synthetic experiment showed a later rejection leaving a customer gate eligible.
+    - **The gaps.**
+      - A rejected record only incremented a per-gate counter; its `subject_id` was ignored. A subject
+        accepted and then rejected still counted toward its gate, and so did one rejected and then
+        accepted.
+      - `acceptance_evidence_schema_version` was compared with `!=`, so JSON `true`, which Python treats
+        as 1, passed, and so did 1.0.
+      - `occurred_at` was checked by `fromisoformat` plus its length and trailing `Z`. A space in place of
+        the `T`, and an ISO week date such as `2026-W35-1T10:00:00Z`, have the same length and passed.
+      - A test was named for refusing duplicate evidence IDs but only ever tampered with a record.
+    - **The fix.**
+      - Within each gate, any subject with a rejected record is subtracted from the accepted subjects,
+        whichever record came first. The ledger has no correction record, so an acceptance can neither
+        outlive a later rejection nor overturn an earlier one. Each gate reports `disqualified_subjects`.
+        A rejection in one gate does not touch another.
+      - The schema version must be the integer 1: `type`, not `isinstance`, because `bool` is an `int`.
+      - `occurred_at` must match `YYYY-MM-DDTHH:MM:SSZ` in ASCII digits, then parse as a real UTC time.
+      - The production runbook states the counting rule.
+    - **Tests.** Six new cases, on top of the tampering test, now named for what it does: rejection after
+      acceptance, rejection before acceptance, a rejection confined to its own subject and gate, a boolean
+      or float schema version, six non-canonical timestamps including February 30 and Arabic-Indic
+      digits, and a real duplicate evidence ID.
+    - **Rule 5.** 6 of 6 injected defects were caught, each by the test written for it: the subtraction
+      removed, the latest record allowed to win, a rejection disqualifying the subject in every gate, the
+      version compared by equality only, the old timestamp parser restored, and the duplicate check
+      removed.
+    - **Measured result.** Python rose from 58 to 64 passed; the Rust workspace is unchanged
+      at 529 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+      The published status reports zero verified records, every gate ineligible, and
+      `disqualified_subjects` in each gate.
+    - **Bounded remainder.** A mistaken rejection cannot be withdrawn: a correction record, and who may
+      write one, is a policy decision with the session criteria (E6.5). The status still carries nothing
+      that ties it to the ledger files it counted, and the promotion gate still trusts a supplied status
+      (E6.3). Nothing authenticates a reviewer (E6.4). No external gate moved.
+
+90. Promotion recomputes acceptance from the ledgers, and its receipt binds what it counted (2026-09-28,
+    Security row "Immutable audit and signed release" and External and operational gates; delivery state
+    E6.3). Reported by the revised assessment.
+    - **The gap.** `tools/release_promotion_gate.py` read a caller-supplied status document through
+      `--acceptance-status` and trusted its `all_gates_eligible`. A two-field document,
+      `{"acceptance_status_schema_version": 1, "all_gates_eligible": true}`, passed it for production. The
+      status itself carried nothing tying it to the ledgers it came from, so even a genuine one could not
+      show which ledger state it counted. A status that was not a JSON object also escaped the gate's
+      error handling as a traceback; the gate now parses only its own tool's output, which is always
+      an object, so that path is closed by construction rather than by a test.
+    - **The fix.**
+      - The gate takes `--acceptance-ledger-root` instead. It runs `tools/acceptance_evidence.py` over that
+        root itself and trusts only what the tool prints. A tool failure blocks promotion to every
+        environment, and production still needs every gate eligible.
+      - The status is schema 2 and lists, for each ledger file counted, its path relative to the root, its
+        SHA-256, its record count and its chain head, all taken from the bytes the tool validated.
+      - The receipt is schema 2. It hashes the exact bytes the tool emitted and carries every ledger
+        binding.
+      - The production runbook's command and description are updated.
+    - **Tests.** In `tests/security/test_release_promotion_gate.py`, which covered only the approval rule:
+      - production is refused over an empty ledger root;
+      - a status document is not an input: two documents declaring every gate eligible, placed in the
+        ledger root itself, change nothing, and the parser refuses `--acceptance-status`;
+      - production becomes eligible only when the ledgers meet every gate, and one missing PAPER session
+        blocks it;
+      - a tampered ledger blocks staging and production alike;
+      - staging needs verifiable ledgers but not eligibility;
+      - the receipt's status hash is of the tool's exact bytes, and it binds each ledger file's SHA-256.
+
+      In the acceptance tests, the status binds two ledgers, one in a subdirectory, by relative path,
+      SHA-256, record count and head.
+    - **Rule 5.** 8 of 8 injected defects were caught:
+      - production no longer refused on open gates;
+      - the acceptance tool's failure ignored;
+      - `--acceptance-status` accepted again;
+      - the status dropping its bindings, one hashing the path instead of the bytes, and one recording the
+        genesis hash as its head;
+      - the receipt omitting the ledgers, or hashing a re-serialized status instead of the tool's bytes.
+
+      One injection was first refused by the runner as ambiguous, because its text appears twice in the
+      gate. It was re-anchored and caught. An early version of the `--acceptance-status` assertion would
+      have passed on missing required arguments alone. It now supplies every argument, so only the
+      unrecognized one can end the parse.
+    - **Measured result.** Python rose from 64 to 71 passed; the Rust workspace is unchanged
+      at 529 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+      The published status is schema 2 with zero verified records, every gate ineligible, and an empty
+      `ledgers` list, because no operational ledger has been retained.
+    - **Bounded remainder.** The gate still authenticates no reviewer, and it neither re-hashes the source
+      artifact a record names nor binds a release to the environment it was accepted in (E6.4). The
+      trusted release key is still whatever file the caller passes. Requester and approver are still two
+      distinct strings rather than two authenticated people. No external gate moved.
+
+91. Every durable writer E3.11 did not cover refuses a symbolic link (2026-09-28, Security row "Immutable
+    audit and signed release"; delivery state E7.1). The revised assessment named the operations journal;
+    the source review behind it found the other four.
+    - **The gaps.** Each checked `exists()`, which follows a link, or checked nothing:
+      - the operations journal opened with `create(true)`, which follows a link, and its reader treated a
+        dangling link as an absent file, reporting a healthy empty journal. `follon-operations` publishes
+        its model-risk and game-day registers from that reader;
+      - the replay `FileEventStore` and the backtest `FileExperimentStore` created their files through a
+        dangling link, and the experiment store reopens its file on every write;
+      - `follon-news replay --output` used `File::create`, which follows a link and truncates its target;
+      - `write_immutable`, behind every CLI artifact, wrote a staging file for a dangling link, failed on
+        an unrelated error, and left the staging file behind. A link to identical content counted as
+        already published.
+    - **The fix.** Each path is read with `symlink_metadata`, which never follows a link. A link, dangling
+      or not, is refused; an absent path passes; any other error is returned. The experiment store checks
+      again before every write. The CLI helper is public and is shared by `write_immutable` and
+      `follon-news`.
+    - **Tests.** Each uses a real link; where an account cannot create one, a test says so and returns.
+      Every link was created on this machine:
+      - the operations journal's open, `inspect` and `read_verified_records` refuse a dangling link and a
+        link to a real journal, and nothing is created at the target;
+      - the event log refuses both, and creates nothing at the target;
+      - the experiment store refuses a dangling link at open, and a link that appears after it was opened
+        is refused at the write, with nothing written through it;
+      - `write_immutable` refuses a dangling link with the link refusal, stages nothing, and refuses a
+        link to identical content;
+      - through the real binary, `follon-news` refuses a dangling link and a link to an operator's file,
+        which keeps its content, and still writes a plain output.
+    - **Rule 5.** 8 of 8 injected defects were caught, before and again after formatting: each guard
+      removed, the experiment store's write-time guard removed on its own, and the shared CLI guard
+      reading `fs::metadata`, which follows the link it checks.
+    - **Measured result.** The Rust workspace rose from 529 to 534 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed. The built-in strategy's bundle hash
+      changed because it covers `core/control-plane/src/lib.rs`, which this slice edits.
+    - **Bounded remainder.** Every guard still runs before its open, so a link swapped in between them is
+      not refused (E7.12). The penetration-test runbook lists the new paths. No external gate moved.
+
+92. Every strategy worker hashes strings identically in every run (2026-09-28, research-to-live parity
+    and Reliability; delivery state E7.3). Found by the source review behind the revised assessment.
+    - **The gap.** The parent clears the worker's environment and sets only `PYTHONIOENCODING` and an
+      import path. With `PYTHONHASHSEED` unset, Python seeds `hash()` of `str` and `bytes` randomly per
+      process. A strategy that iterates a set of symbols, or anything ordered by such hashes, could
+      therefore decide in a different order in two runs of one replay. A capsule's byte-for-byte replay
+      check would then fail at random rather than report a real change.
+    - **The fix.** `spawn_inner`, behind every worker constructor including the capsule's sandboxed one,
+      sets `PYTHONHASHSEED=0`. The CLI README states the worker's full environment and that the worker is
+      a same-user process for trusted code only.
+    - **Test.** A fixture worker, `tests/fixtures/worker/hash-seed-worker.py`, speaks protocol v1 and
+      answers every callback with an error whose code is the hash of a fixed string. The test starts it
+      four times through `ProcessStrategyWorker::spawn` and requires the same code each time.
+    - **Rule 5.** 2 of 2 injected defects were caught, before and after formatting: the seed removed, and
+      the seed set to `random`.
+    - **Measured result.** The Rust workspace rose from 534 to 535 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed. Its strategy capsule, replayed by a
+      seeded worker, still sealed `VERIFIED_PORTABLE`.
+    - **Bounded remainder.** The backtest configuration's `seed` is still provenance only. It does not seed
+      a strategy's own `random`, as the E7.3 row records, and a strategy may still read the clock, files or
+      the network, which only running trusted code controls. Hashes are identical for one Python version,
+      not across versions. No external gate moved.
+
+93. Tax lots follow a split, as the position always did (2026-09-28, row 5.4 and research-to-live parity;
+    delivery state E8.1). Found by the source review behind the revised assessment, and reproduced here
+    before it was fixed.
+    - **The gap.** `BacktestLedger::apply_corporate_action` scaled a split position's quantity and average
+      cost but not its FIFO tax lots. `AdvancedBacktestAccount`, which holds long and short lots, did the
+      same. Neither existing split test sold after the split or looked at a lot. Reproduced on the old code:
+      two shares bought at 100, split 2-for-1, then one sold at 55 realized -45 where +5 was due. Selling
+      the remaining three was refused with "tax disposal exceeds available long lots". The ledger's own
+      comment said such a disposal could never exceed the lots.
+    - **The fix.** `TaxLotBook::apply_split` multiplies every open lot's quantity by the ratio and divides
+      its unit cost, or a short lot's unit proceeds, by it. That is the same eight-place arithmetic the
+      accounts use for a position's average cost, so a single lot's cost and the position's stay equal. Both
+      sides are computed before either is replaced, so a failure leaves the book unchanged, and a ratio that
+      is not positive is refused. Both accounts call it from their split branch.
+    - **Tests.**
+      - In `core/accounting`: two long lots and a short lot on another instrument. The long lots scale to
+        20 @ 50.05 and 10 @ 60, and the short lot is untouched until its own 3-for-1 split, when it becomes
+        12 @ 100. A zero or negative ratio changes nothing, and an instrument without lots is a no-op.
+        Disposing all 30 shares uses a cost basis of 1601, exactly the pre-split 10 x 100.10 + 5 x 120.
+      - In `core/backtest`: the reproduced ledger case now realizes 5 and then 20, and closes every lot.
+        The advanced account closes a split long at 55 and covers a split short at 45, realizing 20 each.
+    - **Rule 5.** 6 of 6 injected defects were caught: either account's call removed, long lots left
+      unscaled, a unit cost left undivided, short lots left unscaled, and the ratio check removed.
+    - **Measured result.** The Rust workspace rose from 535 to 538 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+    - **Bounded remainder.** The replay engine's own portfolio, and so the fingerprinted event stream, is
+      still not adjusted for corporate actions, and working orders across a split are not handled (E8.2).
+      The worker's snapshot and cash still ignore them (E8.3). PAPER and LIVE apply none (E8.4). A reverse
+      split can leave fractional lot quantities, exactly as it leaves a fractional position; cash in lieu is
+      not modelled. No external gate moved.
+
+94. CI installs the IBKR API the operator approved, pinned by hash (2026-09-29, Reliability; delivery state
+    E4.2). Item 85 left the Python job's `ibapi` failure for this decision.
+    - **The decision.** Asked which IBKR API distribution CI may install, the operator chose `ibapi`
+      9.81.1.post1 from PyPI (Settled direction item 5). It is IBKR's own upload (IBG LLC, 2020-12-06),
+      under the IB API Non-Commercial License or the IB API Commercial License, and it is the only version
+      the bridge's six official-backend tests have run against.
+    - **The change.** `python/ibkr-gateway/requirements-ci.txt` pins that release by version and by SHA-256,
+      and the `python-and-contracts` job installs it with `--require-hashes` before the bridge tests. The
+      hash, `49f6678b...9cd6`, is the one PyPI publishes for the release's only file, its source archive,
+      and it matched the file downloaded here. The bridge README states the pin and the command.
+    - **Verification.** In a freshly created environment, the pinned install succeeded and all 14 bridge
+      tests passed; `tzdata` was added only because Windows has no system time-zone database. With one
+      byte of the hash changed, pip refused the install ("THESE PACKAGES DO NOT MATCH THE HASHES").
+    - **Measured result.** Configuration and documentation only. The final
+      `python tools/session_status.py` run measured all seven suites green, unchanged at Rust 538 and
+      Python 71, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+    - **Bounded remainder.** 9.81 dates from 2020, and current TWS API releases are 10.x. Whether the bridge
+      runs against a current TWS or IB Gateway build is unverified until E5.6's real session. A deployment
+      must record and review its own distribution. The job's storage-adapter and server-contract steps
+      have never run on GitHub, because the bridge step failed before them; a green run is E4.3. No
+      external gate moved.
+
+95. Every first-party licence declaration is MIT, as the root `LICENSE` is (2026-09-29, Architecture and
+    release supply chain; delivery state E7.11). Reported by the revised assessment.
+    - **The gap.** The root `LICENSE` is the MIT License, while the Cargo workspace, which all 21 member
+      crates inherit, the separate desktop host crate and the strategy SDK declared Apache-2.0, and the
+      storage adapter declared nothing. The assessment asked that this be resolved before any rights or
+      distribution claim.
+    - **The decision.** Asked which licence was intended, the operator chose MIT (Settled direction item 5).
+    - **The change.**
+      - `[workspace.package]` and the desktop host declare `license = "MIT"`.
+      - Both Python packages declare `license = "MIT"`, the PEP 639 SPDX form that setuptools 77 and later
+        expect. The table form is deprecated there, and its removal date has passed. The strategy SDK's
+        build requirement rises from setuptools 68 to 77, the first version that reads the string form.
+      - The README gains a licence section.
+      - `tests/security/test_licence_declarations.py` holds `LICENSE`, every Cargo manifest and both Python
+        packages to the one licence.
+    - **Verification.**
+      - `cargo metadata` reports MIT for all 21 root-workspace packages and for the desktop host.
+      - Both Python wheels built in isolation without a deprecation warning, and each records
+        `License-Expression: MIT`.
+      - The test failed before the change, on the Cargo and Python declarations.
+      - Rule 5: 4 of 4 injected defects were caught, each declaration reverted or dropped in turn.
+    - **Measured result.** Python rose from 71 to 74 passed; the Rust workspace is unchanged at
+      538 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+      seven suites green, and the full evidence pipeline exited 0 with the scan at 85 probes, 0 failed.
+    - **Bounded remainder.** The SBOM still records no first-party licence (E7.8). Contributor provenance
+      and third-party notices, which the assessment also named, are a review for the owner, not a
+      metadata change. No external gate moved.
+
+96. Foundation CI passes on a clean runner (2026-09-29, Reliability and Security; delivery state E4.3). This
+    is the revised assessment's first completion criterion: every foundation job runs its required steps
+    and passes.
+    - **The run.** GitHub Actions run 36524632774, for pull request 31 at `0a2d380`, completed with all
+      six jobs successful: `rust`, `postgres-integration`, `security`, `sast`, `python-and-contracts` and
+      `desktop`. It is the first run of `Verify foundation` visible on GitHub to pass. Every earlier one,
+      back to at least 2026-09-05, failed.
+    - **What it verified that could not be verified locally.**
+      - The desktop job installed Tauri's Linux libraries (item 85), and clippy and the native tests then
+        ran and passed. This machine has no Linux environment.
+      - The `python-and-contracts` job installed the hash-pinned `ibapi` (item 94). Its storage-adapter
+        and server-contract steps ran on GitHub for the first time, and passed, including item 88's
+        socket tests on Linux.
+    - **Bounded remainder.** It is a pull-request run. The push run on `main` after merging confirms the
+      same on `main`. The dependency-review step stays skipped while its repository variable is off, as the
+      workflow intends. No external gate moved.
+
+97. A refused `release-keygen` leaves no private key behind (2026-09-29, Security row "Immutable audit and
+    signed release"; delivery state E7.6). Item 83 found this and left it for a decision.
+    - **The gap.** `release-keygen` generated a key pair, wrote the private key, and only then validated
+      and published the trusted key. Every refusal of the trusted key left a new private key on disk with
+      no trusted key beside it: a link at its path, an existing file there, a non-UTF-8 file name, or the
+      same path given for both outputs. Item 83's test covered the linked case but checked only for
+      staging files, so the leftover key went unnoticed.
+    - **The fix.** The command now checks both outputs before a key exists, without creating or
+      following anything. Each must be free of links, absent, UTF-8-named, and in a parent that is absent
+      or a real directory, and the two must be different paths. This decides no custody question: nothing
+      is deleted. A refusal the check predicts simply happens before any key is made.
+    - **Tests.** A new workflow test, through the real binary. An existing trusted key, one path for both
+      outputs and an existing private key are each refused, and no new file appears. The existing trusted
+      key and private key keep their contents, and a clean pair of paths still works. Item 83's link test
+      now also requires that no private key remains.
+    - **Rule 5.** 4 of 4 injected defects were caught: both checks removed, the trusted key's check
+      removed, the distinct-paths check removed, and existing outputs no longer refused. The last was first
+      written as a guarded match arm that did not compile; the runner reported it as a compile error rather
+      than a catch, and it was rewritten.
+    - **Measured result.** The Rust workspace rose from 538 to 539 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, and the full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed. Its own `release-keygen` calls still
+      succeed.
+    - **Bounded remainder.** A write that fails after the checks, such as on a full disk or a filesystem
+      without hard links, can still leave the private key. Deleting it automatically is the custody decision
+      item 83 recorded. A path created by another process between the check and the write is the E7.12
+      race. No external gate moved.
+
+98. Every portfolio-risk limit enters the PAPER and LIVE configuration fingerprints (2026-09-29, rows 5.3 and
+    5.10; delivery state E7.4a). Found by the source review behind the revised assessment.
+    - **The gap.** Both environments listed the portfolio-risk policy's fields by hand for their
+      configuration fingerprint, and both left out `max_daily_loss`, `max_drawdown_bps`,
+      `max_margin_utilization_bps`, `strategy_limits` and the composition's `margin_rates`. The fingerprint
+      is what a journal reopens under and what a LIVE approval binds, so a journal reopened, and a LIVE
+      approval stayed valid, after any of those limits changed.
+    - **The fix.**
+      - `PortfolioRiskPolicy::canonical_parts` in `core/risk` renders all 21 fields in a fixed order. Its
+        destructuring names every field and has no `..`, so a field added later does not compile until
+        it is rendered.
+      - PAPER and LIVE each build their part from it, plus the composition's instrument buckets and
+        margin rates. Each environment keeps its own copy of that rendering, as each keeps its own risk
+        gate.
+      - The part's tag moves from `v1` to `v2` in both environments. A journal or LIVE approval made under
+        the incomplete fingerprint is refused, not trusted, because unchanged limits cannot be shown.
+      - A configuration without portfolio risk contributes no part, so its fingerprint is byte-for-byte
+        unchanged. The checked-in PAPER and LIVE journal fixtures, whose configurations have none, still
+        reopen.
+    - **Tests.** In `core/risk`, changing any one of the 21 fields changes the canonical parts. In PAPER
+      and LIVE, changing any of the five omitted limits changes the configuration fingerprint.
+    - **Rule 5.** 5 of 5 injected defects were caught: a field dropped from the canonical parts, either
+      environment never rendering its margin rates, and either environment keeping only the first six
+      policy parts.
+    - **Measured result.** The Rust workspace rose from 539 to 542 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, after a
+      first run failed clippy's `type_complexity` on the new tests, which now use a type alias. The full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed, and both checked-in journal
+      fixtures still reopen.
+    - **Bounded remainder.** The check is still skipped outright when equity is not positive. Whether to
+      fail closed, which would also refuse risk-reducing orders, is the operator's decision (E7.4b).
+      Neither order-submitting route composes portfolio risk at all (E7.5). No external gate moved.
+
+99. The gRPC PAPER route composes the real IBKR PAPER bridge by configuration (2026-09-29, row 5.6 and
+    research-to-live parity; delivery state E5.2a). The operator chose this route first (Settled direction
+    item 5).
+    - **The gap.** No application composed `IbkrPaperGatewayAdapter`. The gRPC route accepted only
+      `adapter_kind: IBKR_PAPER_MODEL`, so the real bridge was reachable from no running service.
+    - **The fix.**
+      - `adapter_kind: IBKR_PAPER_BRIDGE`, with a required `ibkr_bridge` section, starts the official-API
+        bridge process. The model stays the default. A model route with the section is refused, and so is
+        a bridge route without it.
+      - The route builds the bridge's argument list itself, from fixed fields, so no free-form argument
+        reaches the process. The bridge's own timeout is two seconds inside the route's deadline, so the
+        bridge answers before the route gives up.
+      - Before any process starts, the route refuses what the bridge would refuse. That covers a
+        non-loopback host or a non-PAPER port, a relative interpreter, a timeout outside 3 to 60 seconds,
+        a client id above 31, and an empty, over-long or multi-line broker account. It also covers a
+        missing, linked, or over-1 MiB instrument map.
+      - The route fingerprint binds more than the gateway fingerprint, which covers only the account, host,
+        port and environment. It adds the broker account, client id, TWS time zone and the instrument
+        map's SHA-256, so a journal is refused under another IBKR session. The model's fingerprint is
+        byte-for-byte unchanged, so every existing model journal still reopens.
+      - The version-1 route schema describes the section and ties it to the adapter kind. A second
+        checked-in fixture, `paper-command-route-v1-bridge.json`, validates against it, and the service
+        parses both fixtures.
+    - **Found while building it.** The gateway fingerprint alone would have let a journal written against
+      one IBKR broker account, client id or instrument map reopen against another. The bridge also refuses
+      a client id above 31, which nothing on the Rust side checked. Neither the gateway adapter's
+      constructor nor `PaperTradingService::open_durable` contacts the bridge, so a client id the bridge
+      refuses would have opened a route whose bridge had already exited.
+    - **Tests.**
+      - The adapter kind and section must agree, and every bridge limit above is refused. None of these
+        refusals leaves a journal.
+      - The real bridge's own `parse_arguments` parses the route's argument list back to the same
+        configuration. That needs neither TWS nor `ibapi`.
+      - A bridge route over the fake bridge fixture declares single DAY orders only. `SubmitPaperCombo`
+        over the authenticated boundary is refused with no order and no risk evidence recorded, and the
+        broker session stays connected.
+      - A journal is refused across adapters, and under a changed broker account, client id, time zone or
+        instrument-map content. It still reopens after a timeout change.
+      - Both checked-in fixtures parse, and the schema refuses what the service refuses. The risk
+        contract test pins the schema's two adapter kinds.
+    - **Rule 5.** 28 of 28 injected defects were caught, each by the intended test.
+      - 18 were in the route:
+        - the fingerprint dropping the session, or equalling the model's;
+        - the session dropping the broker account, client id or time zone, or hashing the map's path
+          instead of its bytes;
+        - each of the six bridge limits loosened;
+        - the map check following a link or ignoring size;
+        - the bridge's timeout not two seconds shorter, `--environment PAPER` dropped, or a fixed route
+          deadline;
+        - the model accepting a bridge section.
+      - 10 were in the schema: the adapter kinds widened, the section's tie to the kind broken either
+        way, and a live port, any host, client id 32, a timeout of 2 or 61, a multi-line account or a
+        free-form field accepted.
+    - **Measured result.** The Rust workspace rose from 542 to 548 passed / 0 failed / 3 ignored, and
+      the Python suite from 74 to 75. The final `python tools/session_status.py` run measured all seven
+      suites green. A first run failed the Python suite: `test_risk_contracts` still pinned the schema's
+      old single adapter kind, and now pins the two. The full evidence pipeline exited 0, with the scan at
+      85 probes and 0 failed.
+    - **Bounded remainder.** A bridge route still trades nothing. Its only order RPC submits combinations,
+      which the bridge refuses (E5.2b), and nothing polls the bridge's fills or reconciles its account
+      (E5.2c). The route does not check the TWS time zone name; the bridge refuses one it cannot resolve, and
+      that surfaces at the first broker call. Nothing here was run against a real TWS or IB Gateway (E5.6).
+      No external gate moved.
+
+100. An attributed single PAPER order records who submitted it; an attributed cancellation records who
+     requested it. Cancellation is durable before the broker is asked (2026-09-29, rows 5.5 and
+     5.10; delivery state E5.2b-1). This is the kernel half of E5.2b. The gRPC
+     route's single-order submit and cancel follow as E5.2b-2.
+     - **The gap.**
+       - `PaperTradingService` recorded who submitted a combination, and who moved a kill switch. For a
+         single order it recorded nobody, and a cancellation named nobody for either kind.
+       - A single-order cancellation also moved the order to `PENDING_CANCEL` and asked the broker before
+         journaling anything. A crash after the broker accepted it left the journal saying the order still
+         worked. Submission and combination cancellation had always journaled first, and controlled
+         LIVE journals every pending cancellation first, with its actor.
+     - **The fix.**
+       - `submit_intent_as` journals the operator with the order's risk evidence, as
+         `submit_combo_intent_as` does, and an idempotent retry must come from that operator.
+         `submit_intent` is the unattributed form, unchanged.
+       - `cancel_order_as` covers single orders and combinations. It records an `OrderOperation` (order,
+         `CANCEL_REQUESTED`, operator, time) in the same journal write as the move to `PENDING_CANCEL`. A
+         retry of an accepted cancellation changes nothing and journals nothing, as a repeated kill-switch
+         change does. `cancel_order` is the unattributed form.
+       - A single-order cancellation now journals `PENDING_CANCEL` before the broker is asked, and writes
+         no second, identical record after the broker accepts.
+       - Both additions are written only when present, so an existing journal re-serializes byte-for-byte.
+         A restore refuses an operation that names an unknown order, an unknown action, or a malformed
+         operator or time, and a malformed persisted submitter.
+     - **Tests.**
+       - An attributed order journals its submitter and survives a restart. Another operator's retry and an
+         unattributed retry are refused, and so is a malformed submitter, before risk sees the intent. An
+         unattributed order journals no `submitted_by` key.
+       - A broker stand-in that stops the process when asked to cancel. The restarted service finds the
+         order `PENDING_CANCEL` and the operator's request journaled.
+       - Operator cancellations of a single order and a combination are each journaled once. A malformed
+         operator or time changes nothing. A direct cancellation is not attributed, and the record
+         survives a restart.
+       - Each malformed persisted field is refused on restore.
+     - **Rule 5.** 19 of 19 injected defects were caught by the intended tests on the final files.
+     - **Measured result.** The Rust workspace rose from 548 to 552 passed / 0 failed / 3 ignored. The final `python tools/session_status.py` run measured all seven suites green. The full evidence pipeline exited 0; its local DAST scan reported 85 probes, 0 failed.
+     - **Bounded remainder.** No route calls these yet (E5.2b-2). Replacement is not attributed; no route
+       offers it, and the IBKR bridge cannot carry it (E5.1). Controlled LIVE is unchanged, since it already
+       did both. No external gate moved.
+
+101. The authenticated gRPC PAPER route now exposes a single-order submit and an
+     account-bound cancel (2026-09-29, rows 5.5 and 5.10; E5.2b-2). This closes
+     the route half of E5.2b over item 100's journaled kernel.
+     - **Contract.** Version-1 `SubmitPaperOrder` carries the canonical intent,
+       fixed-point quantity and optional limit, explicit DAY or GTC, and an
+       operator-attested mark and observation time. `CancelPaperOrder` names the
+       tenant, configured account and OMS order. Both require a bearer session
+       with `PaperTrade` permission before reading the order details.
+     - **Behavior.** The submit route calls `PaperTradingService::submit_intent_as`
+       and returns its risk decision and actual OMS state, including a rejection
+       without an order. The cancel route calls `cancel_order_as`, which journals
+       the operator and `PENDING_CANCEL` before the adapter call; it returns the
+       resulting state. The kernel handles single and atomic combination order
+       IDs. The account is checked against the configured route before a cancel.
+     - **Tests.** The model route persists an authenticated submit and cancel
+       across restart, with idempotent retries, and the same cancel RPC handles
+       a combination order. Missing session, wrong role or
+       tenant, wrong account, invalid limit, stale mark, and missing route are
+       refused. A fake bridge process accepts a single DAY market order and
+       cancellation; a GTC request is refused before creating risk evidence.
+       An excessive quantity returns a risk rejection without an OMS order.
+       Removing the submitter argument made the durable-operator test fail and
+       was reverted.
+     - **Measured result.** The Rust workspace rose from 552 to 558 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run
+       measured all seven suites green. The full evidence pipeline exited 0;
+       its artifacts remain local engineering evidence.
+     - **Boundary.** The mark remains operator-attested. The bridge's fills are
+       not synchronized or reconciled by this route (E5.2c); the fake bridge
+       is a protocol fixture, not TWS or IB Gateway evidence. No external gate
+       moved.
+
+102. The gRPC PAPER route can now drain broker evidence and reconcile a
+     configured account on an authenticated risk-manager request (2026-09-29,
+     rows 5.5 and 5.10; E5.2c). It uses the existing durable PAPER kernel;
+     the route has no background poller.
+     - **Contract.** `ReconcilePaperAccount` requires a tenant and account, and
+       an explicit `reconnect` flag after an ambiguous disconnect or restart.
+       Only a session with `RiskPolicyManage` permission may call it. The
+       response carries the persisted reconciliation ID and time, every issue,
+       the UNKNOWN count, broker connection state, and audit sequence/head.
+       `snapshot_matches` means only that this snapshot comparison found no
+       issue; it is not a clean-session certificate.
+     - **Behavior.** A connected call synchronizes broker events before taking
+       the independent snapshot. A reconnect call uses the kernel's
+       `reconnect_and_reconcile`, which reconnects, drains delayed evidence,
+       then compares. The route refuses an absent route or another account,
+       and reports broker errors rather than returning a clean result.
+     - **Tests.** A model execution is applied before reconciliation; reopening
+       its journal against a fresh empty model produces cash and position
+       discrepancies. A disconnected model needs an explicit reconnect.
+       Missing session, trader role, wrong tenant/account and missing route are
+       refused. A stateful Python bridge protocol fixture submits a DAY order,
+       emits its execution on poll, and returns a matching account snapshot.
+       Removing the event drain made the bridge test fail with filled quantity,
+       order state, position and cash mismatches; it was restored.
+     - **Measured result.** The Rust workspace rose from 558 to 562 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run
+       measured all seven suites green. The full evidence pipeline exited 0;
+       its artifacts remain local engineering evidence.
+     - **Boundary.** The fixture is synthetic test input under `tests/fixtures/`,
+       not operating evidence. A real IBKR PAPER account still needs scoped
+       snapshot comparison, Gateway logs, restart/reconnect/cancel races, and
+       independent review (E5.5–E5.6). The reconciliation journal names the
+       account and time but does not retain which authenticated risk manager
+       requested it. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
@@ -3455,6 +4139,13 @@ repository mechanisms and packages are deployable candidates after automated
 verification, but the open external gates above are material. The next
 master-plan action remains to configure and independently review the real IBKR
 PAPER environment, retain 30 clean sessions, complete security/legal/deployment
-approvals, and record them through the tamper-evident acceptance ledger. Broad
+approvals, and record them through the tamper-evident acceptance ledger. As of
+2026-09-28 a configured environment is not enough on its own: no application
+composes the real IBKR PAPER bridge yet (delivery state E5), so that
+composition comes first. As of 2026-09-29 the gRPC PAPER route composes it by
+configuration (item 99), and it can submit a single DAY order and cancel it
+(item 101), and a risk manager can invoke broker synchronization and
+reconciliation (item 102). These routes still lack real Gateway evidence,
+fresh market inputs, and reviewed account scope (delivery state E5.3–E5.6). Broad
 LIVE or commercial promotion before those gates would violate the plan's own
 evidence-gated sequence.

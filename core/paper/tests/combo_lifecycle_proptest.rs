@@ -25,8 +25,9 @@ use follon_domain::{
 use follon_paper::{
     BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboExecution, BrokerComboExecutionLeg,
     BrokerComboRequest, BrokerEvent, BrokerOrderRequest, BrokerSubmitResult, IbkrPaperAdapter,
-    KillSwitchRegistry, PaperAccount, PaperBrokerAdapter, PaperComboMarketData, PaperError,
-    PaperMarketData, PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
+    KillSwitchRegistry, PaperAccount, PaperBrokerAdapter, PaperBrokerCapabilities,
+    PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy, PaperTradingService,
+    ShortExposurePolicy,
 };
 use proptest::prelude::*;
 
@@ -51,6 +52,13 @@ struct ReplayingAdapter {
 }
 
 impl PaperBrokerAdapter for ReplayingAdapter {
+    /// The model's set, less replacement, which this adapter does not forward.
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        Ok(PaperBrokerCapabilities {
+            replacement: false,
+            ..self.inner.capabilities(account_id)?
+        })
+    }
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
         self.inner.submit(request)
     }

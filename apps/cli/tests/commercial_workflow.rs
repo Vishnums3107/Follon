@@ -40,6 +40,70 @@ fn symlink_to(target: &Path, link: &Path) -> bool {
 }
 
 #[test]
+fn a_refused_release_keygen_leaves_no_private_key_behind() {
+    // The private key was written first and stayed on disk whenever the
+    // trusted key was then refused (E3.11's finding). Every refusal either
+    // output can meet is now checked before a key exists (E7.6).
+    let workspace = std::env::temp_dir().join(format!(
+        "follon-admin-keygen-preflight-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).unwrap();
+    let keygen = |private_key: &Path, trusted_key: &Path| {
+        command()
+            .arg("release-keygen")
+            .arg("--key-id")
+            .arg("release.key.preflight.001")
+            .arg("--private-key")
+            .arg(private_key)
+            .arg("--trusted-key")
+            .arg(trusted_key)
+            .output()
+            .expect("admin command should start")
+    };
+    let private = workspace.join("release.pk8");
+
+    // A trusted key already exists at its path.
+    let existing = workspace.join("trusted.json");
+    fs::write(&existing, "{}").unwrap();
+    let output = keygen(&private, &existing);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("existing output"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!private.exists(), "a private key was left behind");
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "{}");
+
+    // Both outputs name one path.
+    let same = workspace.join("both.json");
+    let output = keygen(&same, &same);
+    assert!(!output.status.success());
+    assert!(!same.exists(), "a private key was left behind");
+
+    // A private key already exists; the trusted key is not written either.
+    fs::write(&private, "keep").unwrap();
+    let fresh_trusted = workspace.join("fresh-trusted.json");
+    let output = keygen(&private, &fresh_trusted);
+    assert!(!output.status.success());
+    assert!(!fresh_trusted.exists());
+    assert_eq!(fs::read_to_string(&private).unwrap(), "keep");
+
+    // A clean pair of paths still works.
+    let (good_private, good_trusted) = (workspace.join("good.pk8"), workspace.join("good.json"));
+    let output = keygen(&good_private, &good_trusted);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(good_private.exists() && good_trusted.exists());
+    fs::remove_dir_all(&workspace).unwrap();
+}
+
+#[test]
 fn an_admin_output_refuses_a_dangling_symbolic_link() {
     let workspace =
         std::env::temp_dir().join(format!("follon-admin-output-link-{}", std::process::id()));
@@ -86,6 +150,11 @@ fn an_admin_output_refuses_a_dangling_symbolic_link() {
         assert!(!target.exists(), "an output was written through the link");
         assert_eq!(staged(), Vec::<String>::new());
     }
+    // Refusing the linked trusted key no longer leaves the private key (E7.6).
+    assert!(
+        !workspace.join("release.pk8").exists(),
+        "a private key was left behind"
+    );
     fs::remove_dir_all(&workspace).unwrap();
 }
 

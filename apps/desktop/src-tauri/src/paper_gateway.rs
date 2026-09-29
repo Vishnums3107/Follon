@@ -19,7 +19,10 @@
 //!   there is no matching engine or order book to interact with beyond that.
 //!   Swapping in the real external adapter later requires no change above
 //!   this module's `RiskOmsGateway` boundary: `PaperOmsGateway` would simply
-//!   be generic over a different concrete `PaperBrokerAdapter`.
+//!   be generic over a different concrete `PaperBrokerAdapter`. That adapter
+//!   declares only single DAY orders, so behind it the combination ticket and
+//!   GTC orders would be refused before any order exists (delivery state
+//!   E5.1).
 //!
 //! Every other Risk/OMS guarantee (rate limiting, price collar, kill
 //! switches, idempotent submission, durable append-only audit journal) is the
@@ -36,8 +39,8 @@ use follon_domain::{
 use follon_paper::{
     BrokerCancelRequest, BrokerComboExecution, BrokerComboExecutionLeg, BrokerComboRequest,
     BrokerOrderRequest, BrokerSubmitResult, IbkrPaperAdapter, KillSwitchRegistry, PaperAccount,
-    PaperBrokerAdapter, PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy,
-    PaperTradingService, ShortExposurePolicy,
+    PaperBrokerAdapter, PaperBrokerCapabilities, PaperComboMarketData, PaperError, PaperMarketData,
+    PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -134,6 +137,16 @@ impl ManualFillAdapter {
 }
 
 impl PaperBrokerAdapter for ManualFillAdapter {
+    /// The model's set, less replacement: this adapter forwards combinations
+    /// and every time in force to the model, but not `replace`, for which it
+    /// inherits the trait's refusal. The desktop exposes no replacement.
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        Ok(PaperBrokerCapabilities {
+            replacement: false,
+            ..self.inner.capabilities(account_id)?
+        })
+    }
+
     fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
         self.inner.adapter_configuration_fingerprint(account_id)
     }
@@ -676,7 +689,8 @@ impl RiskOmsGateway for PaperOmsGateway {
 /// On-disk shape of the desktop's PAPER trading configuration.
 ///
 /// It is the flat version-1 `paper-command-route` document without that
-/// document's `schema_version` and `adapter_kind`. It is not the nested
+/// document's `schema_version`, `adapter_kind` and optional `ibkr_bridge`: the
+/// desktop always composes the model. It is not the nested
 /// document `follon-paper-status` reads (`apps/cli/src/paper.rs`). Both
 /// refuse unknown fields, so one file cannot serve both. This comment
 /// previously claimed that it could.
@@ -845,6 +859,29 @@ mod tests {
 
     fn test_gateway(name: &str) -> (PaperOmsGateway, PathBuf, PathBuf) {
         test_gateway_with(name, "")
+    }
+
+    #[test]
+    fn the_manual_fill_adapter_declares_everything_but_replacement() {
+        // It forwards combinations and every time in force to the model, but
+        // not `replace`. Declaring replacement would let the OMS move an
+        // order to PENDING_REPLACE and then record the trait's refusal as
+        // UNKNOWN, disconnecting the session.
+        let account = PaperAccount {
+            account_id: "acct.desktop.paper.test".to_owned(),
+            currency: "USD".to_owned(),
+            initial_cash: decimal("initial_cash", "100000").unwrap(),
+            environment: "PAPER".to_owned(),
+        };
+        let adapter = ManualFillAdapter::new(&account).unwrap();
+        assert_eq!(
+            adapter.capabilities("acct.desktop.paper.test").unwrap(),
+            PaperBrokerCapabilities {
+                combinations: true,
+                good_til_cancelled: true,
+                replacement: false,
+            }
+        );
     }
 
     /// `extra` is spliced verbatim into the configuration document, e.g. an

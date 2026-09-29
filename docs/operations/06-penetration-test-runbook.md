@@ -27,7 +27,7 @@ written authorization.
 | Area | Required result |
 | --- | --- |
 | Tenant ledger | Unprivileged users cannot append, replace, truncate, or replay an event ID; a modified record fails chain verification. |
-| Durable journals | A PAPER journal, controlled-LIVE journal or commercial ledger path that is a symbolic link, dangling or not, is refused before any file is created or read. The check precedes the open, so a link swapped in between them is a known remainder to probe. |
+| Durable journals | A PAPER journal, controlled-LIVE journal, operations journal, commercial ledger, replay event log, experiment store, immutable CLI artifact or `follon-news` output path that is a symbolic link, dangling or not, is refused before any file is created or read. The check precedes the open, so a link swapped in between them is a known remainder to probe. |
 | Entitlement | Expired, suspended, cancelled, missing, or mismatched-plan subscription evidence denies mutable access. |
 | Release chain | Modified artifact, signature, manifest, key ID, or self-host pointer blocks readiness. |
 | Secrets | No credential reaches CLI argument logs, environment dumps, canonical JSON, compose files, image layers, or evidence artifacts. |

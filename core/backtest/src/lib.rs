@@ -387,7 +387,9 @@ impl BacktestLedger {
     /// a new lot at its exact all-in unit cost (price plus fee); a sell
     /// disposes existing lots FIFO. The sell branch of `apply_fill` above
     /// already refuses a sell exceeding the held quantity before this is
-    /// reached, so a disposal here can never exceed available lots. Lot
+    /// reached, so a disposal here can never exceed available lots. That
+    /// holds only because a split scales the lots with the position; until
+    /// E8.1 it did not, and a post-split sale was refused here. Lot
     /// selection is fixed at FIFO rather than exposing a configurable
     /// policy — a bounded simplification, not a correctness gap.
     fn apply_tax_lot_fill(&mut self, fill: &Fill) -> Result<(), BacktestError> {
@@ -462,6 +464,10 @@ impl BacktestLedger {
             return Ok(());
         };
         let (entry_type, quantity_delta, cash_delta) = if split {
+            // The FIFO lots follow the position. Scaling only the position
+            // left a later sale disposing more than the lots held, or at the
+            // unadjusted cost (delivery state E8.1).
+            self.tax_lots.apply_split(instrument_id, value)?;
             let previous_quantity = position.quantity;
             position.quantity = position.quantity.checked_mul(value)?;
             position.average_cost = position.average_cost.checked_div(value)?;
@@ -1190,6 +1196,9 @@ impl AdvancedBacktestAccount {
         };
         match action {
             CorporateAction::Split { ratio, .. } => {
+                // Long and short lots follow the position (delivery state
+                // E8.1).
+                self.tax_lots.apply_split(action.instrument_id(), *ratio)?;
                 position.quantity = position.quantity.checked_mul(*ratio)?;
                 if position.quantity != Decimal::ZERO {
                     position.average_price = position.average_price.checked_div(*ratio)?;
@@ -1995,6 +2004,22 @@ impl ExperimentCatalog {
     }
 }
 
+/// Refuses a symbolic link at the experiment store's path, dangling or not.
+/// `symlink_metadata` never follows a link. The `exists()` check did, so a
+/// dangling link looked like an empty store and the first write created the
+/// store at the link's target (delivery state E7.1, E3.11's rule).
+fn refuse_symbolic_link(path: &Path) -> Result<(), BacktestError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(BacktestError(
+            "experiment store path must not be a symbolic link".to_owned(),
+        )),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(BacktestError(error.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Durable append-only local experiment catalog suitable for a single-node deployment.
 ///
 /// The file format is canonical NDJSON. A duplicate immutable record is an
@@ -2008,6 +2033,7 @@ impl FileExperimentStore {
     /// Opens and fully validates an existing experiment index before accepting writes.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BacktestError> {
         let path = path.as_ref().to_path_buf();
+        refuse_symbolic_link(&path)?;
         let mut catalog = ExperimentCatalog::default();
         if path.exists() {
             for (index, line) in fs::read_to_string(&path)
@@ -2040,6 +2066,9 @@ impl FileExperimentStore {
             }
             None => {}
         }
+        // Checked on every write, because the file is reopened each time and
+        // a link could have appeared since `open`.
+        refuse_symbolic_link(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| BacktestError(error.to_string()))?;
         }
@@ -2572,6 +2601,148 @@ mod tests {
         );
     }
 
+    fn spy_fill(execution_id: &str, side: Side, quantity: &str, price: &str) -> Fill {
+        Fill {
+            execution_id: execution_id.to_owned(),
+            order_id: format!("order-{execution_id}"),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side,
+            quantity: Decimal::from_str(quantity).unwrap(),
+            price: Decimal::from_str(price).unwrap(),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-05T14:30:00Z".to_owned(),
+        }
+    }
+
+    fn spy_split() -> CorporateAction {
+        CorporateAction::Split {
+            action_id: "action-split-e81".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            effective_at: "2026-01-03T00:00:00Z".to_owned(),
+            ratio: Decimal::from_integer(2).unwrap(),
+        }
+    }
+
+    #[test]
+    fn ledger_tax_lots_follow_a_split() {
+        // Before E8.1 the split scaled the position (2 -> 4) but not its lot
+        // (still 2 @ 100): the partial sale realized 55 - 100 = -45, and the
+        // remaining 3 could not be sold at all ("tax disposal exceeds
+        // available long lots").
+        let mut ledger = BacktestLedger::new("USD", Decimal::from_integer(1_000).unwrap()).unwrap();
+        ledger
+            .apply_fill(&Fill {
+                executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                ..spy_fill("exec-e81-buy", Side::Buy, "2", "100")
+            })
+            .unwrap();
+        ledger.apply_corporate_action(&spy_split()).unwrap();
+        let lots = ledger.tax_lots("inst.us_equity.spy");
+        assert_eq!(lots.len(), 1);
+        assert_eq!(
+            lots[0].remaining_quantity,
+            Decimal::from_integer(4).unwrap()
+        );
+        assert_eq!(lots[0].unit_cost, Decimal::from_integer(50).unwrap());
+
+        ledger
+            .apply_fill(&spy_fill("exec-e81-sell-1", Side::Sell, "1", "55"))
+            .unwrap();
+        assert_eq!(
+            ledger.realized_tax_pnl().unwrap(),
+            Decimal::from_integer(5).unwrap()
+        );
+        ledger
+            .apply_fill(&spy_fill("exec-e81-sell-2", Side::Sell, "3", "55"))
+            .unwrap();
+        assert_eq!(
+            ledger.realized_tax_pnl().unwrap(),
+            Decimal::from_integer(20).unwrap()
+        );
+        assert!(ledger.tax_lots("inst.us_equity.spy").is_empty());
+    }
+
+    #[test]
+    fn advanced_account_long_and_short_tax_lots_follow_a_split() {
+        let usd = Currency::new("USD").unwrap();
+        let terms = AdvancedInstrumentTerms {
+            currency: usd.clone(),
+            asset_class: "equity".to_owned(),
+            multiplier: Decimal::from_integer(1).unwrap(),
+            shortable: true,
+            borrow_available: Decimal::from_integer(10).unwrap(),
+            borrow_rate_bps: 0,
+        };
+        let new_account = || {
+            AdvancedBacktestAccount::new(BTreeMap::from([(
+                usd.clone(),
+                Decimal::from_integer(10_000).unwrap(),
+            )]))
+            .unwrap()
+        };
+        let fill = |account: &mut AdvancedBacktestAccount, fill: Fill| {
+            account
+                .apply_fill(&fill, &terms, BacktestExecutionCharges::default())
+                .unwrap()
+        };
+
+        // Long: 2 @ 100 becomes 4 @ 50, and all four sell at 55 for 20.
+        let mut long = new_account();
+        fill(
+            &mut long,
+            Fill {
+                executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                ..spy_fill("exec-e81-long-buy", Side::Buy, "2", "100")
+            },
+        );
+        long.apply_corporate_action(&spy_split()).unwrap();
+        let lots = long.tax_lots("inst.us_equity.spy");
+        assert_eq!(
+            (lots[0].remaining_quantity, lots[0].unit_cost),
+            (
+                Decimal::from_integer(4).unwrap(),
+                Decimal::from_integer(50).unwrap()
+            )
+        );
+        fill(
+            &mut long,
+            spy_fill("exec-e81-long-sell", Side::Sell, "4", "55"),
+        );
+        assert_eq!(
+            long.tax_realized_pnl(&usd),
+            Decimal::from_integer(20).unwrap()
+        );
+
+        // Short: 2 @ 100 proceeds becomes 4 @ 50, and covering all four at 45
+        // realizes 20.
+        let mut short = new_account();
+        fill(
+            &mut short,
+            Fill {
+                executed_at: "2026-01-02T14:30:00Z".to_owned(),
+                ..spy_fill("exec-e81-short-sell", Side::Sell, "2", "100")
+            },
+        );
+        short.apply_corporate_action(&spy_split()).unwrap();
+        let lots = short.short_tax_lots("inst.us_equity.spy");
+        assert_eq!(
+            (lots[0].remaining_quantity, lots[0].unit_proceeds),
+            (
+                Decimal::from_integer(4).unwrap(),
+                Decimal::from_integer(50).unwrap()
+            )
+        );
+        fill(
+            &mut short,
+            spy_fill("exec-e81-short-cover", Side::Buy, "4", "45"),
+        );
+        assert_eq!(
+            short.tax_realized_pnl(&usd),
+            Decimal::from_integer(20).unwrap()
+        );
+        assert!(short.short_tax_lots("inst.us_equity.spy").is_empty());
+    }
+
     #[test]
     fn ledger_fifo_tax_lots_track_disposal_cost_basis_independent_of_average_cost() {
         let mut ledger = BacktestLedger::new("USD", Decimal::from_integer(1_000).unwrap()).unwrap();
@@ -3008,6 +3179,53 @@ mod tests {
         assert_eq!(recovered.find_by_tag("regime", "baseline").len(), 1);
         assert_eq!(recovered.export_ndjson(), record.canonical_json());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn an_experiment_store_refuses_a_symbolic_link_on_open_and_on_write() {
+        let directory = std::env::temp_dir().join(format!(
+            "follon-experiment-store-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("elsewhere.ndjson");
+        let path = directory.join("experiments.ndjson");
+        let link_to = |target: &Path, link: &Path| {
+            #[cfg(unix)]
+            let linked = std::os::unix::fs::symlink(target, link);
+            #[cfg(windows)]
+            let linked = std::os::windows::fs::symlink_file(target, link);
+            if let Err(error) = &linked {
+                eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised");
+            }
+            linked.is_ok()
+        };
+        if !link_to(&target, &path) {
+            std::fs::remove_dir_all(&directory).unwrap();
+            return;
+        }
+        let refusal = "experiment store path must not be a symbolic link";
+        let record = ExperimentRecord {
+            experiment_id: "experiment-link-001".to_owned(),
+            run_id: "run-001".to_owned(),
+            tags: BTreeMap::new(),
+            specification_fingerprint: "a".repeat(64),
+            event_output_hash: "b".repeat(64),
+            artifact_fingerprint: "c".repeat(64),
+        };
+
+        // A dangling link looked like an empty store.
+        assert_eq!(FileExperimentStore::open(&path).err().unwrap().0, refusal);
+
+        // A link that appears after the store was opened is refused at the
+        // write, and nothing is written through it.
+        std::fs::remove_file(&path).unwrap();
+        let mut store = FileExperimentStore::open(&path).unwrap();
+        assert!(link_to(&target, &path));
+        assert_eq!(store.record(record).err().unwrap().0, refusal);
+        assert!(!target.exists(), "the record was written through the link");
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

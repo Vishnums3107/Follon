@@ -1,15 +1,19 @@
 //! Deployed gRPC topology for broker-neutral execution planning, portfolio
 //! risk, multi-currency margin valuation, and configured risk-gated PAPER
-//! combination submission.
+//! order submission, cancellation, and broker reconciliation.
 //!
 //! Every write RPC requires a bearer session from an operator in the
 //! configured operator directory: password plus a mandatory TOTP second
-//! factor. `SubmitPaperCombo` needs a role that grants PAPER trading, and
+//! factor. PAPER order commands need a role that grants PAPER trading, and
 //! `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` need one that grants
 //! kill-switch operation (risk_manager), each in the request's tenant. The
 //! directory serves one tenant, so a route is reachable only by that tenant's
-//! operators, and the PAPER journal records who submitted and who moved a
-//! switch.
+//! operators, and the PAPER journal records who submitted, cancelled, and
+//! moved a switch.
+//!
+//! `ReconcilePaperAccount` requires risk-policy management permission. It
+//! drains the broker event queue and compares the account snapshot; no
+//! background polling is implied.
 //!
 //! `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` need the same
 //! kill-switch permission, against a configured controlled-LIVE route. That
@@ -28,12 +32,17 @@ use follon_accounting::{
     value_margin_account, Currency, FxBook, FxQuote, MarginPolicy, MarginPosition, MarginRate,
 };
 use follon_domain::{
-    validate_canonical_id, ComboIntent, ComboIntentLeg, Decimal, OrderState, Side, TimeInForce,
+    validate_canonical_id, ComboIntent, ComboIntentLeg, Decimal, OrderIntent, OrderState,
+    OrderType, Side, TimeInForce,
 };
 use follon_execution::{
     plan_execution, plan_option_combo, plan_passive_repricing, ChildInstruction as CoreChild,
     ChildOrderKind as CoreChildOrderKind, ComboPriceLimit, ExecutionAlgorithm, OptionComboLeg,
     ParentOrder, PassiveMarketObservation, PassiveRepricePolicy,
+};
+use follon_ibkr_paper_adapter::{
+    IbkrPaperBridgeProcessConfiguration, IbkrPaperBridgeProcessTransport, IbkrPaperGatewayAdapter,
+    IbkrPaperGatewayConfiguration,
 };
 use follon_identity::{IdentityService, LoginOutcome, OperatorDirectory, Permission};
 use follon_live::{
@@ -41,8 +50,11 @@ use follon_live::{
     LiveBrokerSubmitResult, LiveConfiguration, LiveError, LiveKillSwitchScope, LiveTradingService,
 };
 use follon_paper::{
-    IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperComboMarketData,
-    PaperMarketData, PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
+    BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboRequest, BrokerEvent,
+    BrokerOrderRequest, BrokerReplaceRequest, BrokerSubmitResult, IbkrPaperAdapter,
+    KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerAdapter, PaperBrokerCapabilities,
+    PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy, PaperTradingService,
+    ShortExposurePolicy,
 };
 use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
@@ -51,6 +63,7 @@ use follon_risk::{
 };
 use follon_secrets::SecretMaterial;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::signal;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
@@ -68,16 +81,111 @@ use api::{
     PaperKillSwitchResponse, RevokeOperatorSessionRequest, RevokeOperatorSessionResponse,
 };
 use api::{
-    BucketLimit, CancelReplaceInstruction, ChildInstruction, ChildOrderKind, ComboLegInstruction,
-    ComboPriceLimitKind, CurrencyAmount, ExecutionAlgorithmKind, ExecutionPlanRequest,
-    ExecutionPlanResponse, ExecutionSide, HealthRequest, HealthResponse, MarginAccountRequest,
-    MarginAccountResponse, OmsOrderState, OptionComboRequest, OptionComboResponse,
-    OrderTimeInForceKind, PaperComboMarketObservation, PassiveRepricingRequest,
-    PassiveRepricingResponse, PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics,
-    SubmitPaperComboRequest, SubmitPaperComboResponse,
+    BucketLimit, CancelPaperOrderRequest, CancelPaperOrderResponse, CancelReplaceInstruction,
+    ChildInstruction, ChildOrderKind, ComboLegInstruction, ComboPriceLimitKind, CurrencyAmount,
+    ExecutionAlgorithmKind, ExecutionPlanRequest, ExecutionPlanResponse, ExecutionSide,
+    HealthRequest, HealthResponse, MarginAccountRequest, MarginAccountResponse, OmsOrderState,
+    OptionComboRequest, OptionComboResponse, OrderTimeInForceKind, PaperComboMarketObservation,
+    PaperOrderKind, PaperReconciliationIssue, PaperReconciliationRequest,
+    PaperReconciliationResponse, PassiveRepricingRequest, PassiveRepricingResponse,
+    PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics, SubmitPaperComboRequest,
+    SubmitPaperComboResponse, SubmitPaperOrderRequest, SubmitPaperOrderResponse,
 };
 
-type PaperComboRoute = Arc<Mutex<PaperTradingService<IbkrPaperAdapter>>>;
+type PaperComboRoute = Arc<Mutex<PaperTradingService<PaperRouteAdapter>>>;
+
+/// The PAPER route's broker adapter, chosen by its document's `adapter_kind`
+/// (delivery state E5.2a).
+///
+/// The model stays the default and keeps its empty route fingerprint, so
+/// every existing route journal reopens exactly as before. The real bridge
+/// binds its endpoint and its IBKR session into the journal fingerprint, so a
+/// journal written under one adapter, broker account or instrument map is
+/// refused under another.
+enum PaperRouteAdapter {
+    /// The in-process deterministic model: it fills nothing on its own.
+    Model(IbkrPaperAdapter),
+    /// The official-API IBKR PAPER bridge process, which carries single
+    /// DAY orders only (E5.1).
+    Bridge {
+        adapter: Box<IbkrPaperGatewayAdapter<IbkrPaperBridgeProcessTransport>>,
+        /// What the gateway fingerprint leaves out: the IBKR broker account,
+        /// client id, TWS time zone and the instrument map's SHA-256.
+        session: String,
+    },
+}
+
+impl PaperRouteAdapter {
+    fn inner(&self) -> &dyn PaperBrokerAdapter {
+        match self {
+            Self::Model(adapter) => adapter,
+            Self::Bridge { adapter, .. } => adapter.as_ref(),
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn PaperBrokerAdapter {
+        match self {
+            Self::Model(adapter) => adapter,
+            Self::Bridge { adapter, .. } => adapter.as_mut(),
+        }
+    }
+}
+
+impl PaperBrokerAdapter for PaperRouteAdapter {
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        self.inner().capabilities(account_id)
+    }
+
+    fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        self.inner().adapter_configuration_fingerprint(account_id)
+    }
+
+    fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        match self {
+            // Unchanged, so a model route's existing journal still reopens.
+            Self::Model(adapter) => adapter.configuration_fingerprint(account_id),
+            Self::Bridge { adapter, session } => Ok(format!(
+                "paper-route-ibkr-bridge-v1|{}|{session}",
+                adapter.adapter_configuration_fingerprint(account_id)?
+            )),
+        }
+    }
+
+    fn permits_empty_journal(&self, account_id: &str) -> bool {
+        self.inner().permits_empty_journal(account_id)
+    }
+
+    fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
+        self.inner_mut().submit(request)
+    }
+
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        self.inner_mut().submit_combo(request)
+    }
+
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+        self.inner_mut().cancel(request)
+    }
+
+    fn replace(&mut self, request: &BrokerReplaceRequest) -> Result<(), PaperError> {
+        self.inner_mut().replace(request)
+    }
+
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+        self.inner_mut().poll(account_id)
+    }
+
+    fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+        self.inner_mut().snapshot(account_id)
+    }
+
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+        self.inner_mut().reconnect(account_id)
+    }
+}
 type LiveKillSwitchRoute = Arc<Mutex<LiveTradingService<KillSwitchOnlyLiveAdapter>>>;
 type OperatorIdentity = Arc<Mutex<IdentityService>>;
 
@@ -523,6 +631,161 @@ impl TradingOperatingSystem for OperatingSystemService {
         }))
     }
 
+    async fn submit_paper_order(
+        &self,
+        request: Request<SubmitPaperOrderRequest>,
+    ) -> Result<Response<SubmitPaperOrderResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let operator = self
+            .identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::PaperTrade,
+                now_epoch_seconds()?,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        let intent = paper_order_intent(&request)?;
+        let market = PaperMarketData {
+            instrument_id: request.instrument_id.clone(),
+            mark_price: decimal("mark_price", &request.mark_price)?,
+            observed_at: request.observed_at.clone(),
+        };
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition("PAPER Risk/OMS route is not configured; no order was sent")
+        })?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        let outcome = service
+            .submit_intent_as(intent, market, &request.decided_at, Some(&operator.user_id))
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(SubmitPaperOrderResponse {
+            decision_id: outcome.decision.decision_id,
+            approved: outcome.decision.approved,
+            reason_codes: outcome.decision.reason_codes,
+            policy_version: outcome.decision.policy_version,
+            order_id: outcome.order_id,
+            state: outcome
+                .state
+                .map(oms_order_state)
+                .unwrap_or(OmsOrderState::Unspecified) as i32,
+            submitted_by: operator.user_id,
+        }))
+    }
+
+    async fn cancel_paper_order(
+        &self,
+        request: Request<CancelPaperOrderRequest>,
+    ) -> Result<Response<CancelPaperOrderResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        let operator = self
+            .identity()?
+            .authorize(&token, &request.tenant_id, Permission::PaperTrade, now)
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        validate_canonical_id("account_id", &request.account_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        validate_canonical_id("order_id", &request.order_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER Risk/OMS route is not configured; no order was cancelled",
+            )
+        })?;
+        let operated_at = utc_timestamp(now)?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        if request.account_id != service.account_id() {
+            return Err(Status::permission_denied("access denied"));
+        }
+        service
+            .cancel_order_as(&request.order_id, &operator.user_id, &operated_at)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let state = service
+            .order(&request.order_id)
+            .map(|order| order.oms.state)
+            .or_else(|| {
+                service
+                    .combo_order(&request.order_id)
+                    .map(|order| order.oms.state)
+            })
+            .ok_or_else(|| Status::internal("cancelled order is missing from PAPER OMS"))?;
+        Ok(Response::new(CancelPaperOrderResponse {
+            order_id: request.order_id,
+            state: oms_order_state(state) as i32,
+            operated_by: operator.user_id,
+            operated_at,
+        }))
+    }
+
+    async fn reconcile_paper_account(
+        &self,
+        request: Request<PaperReconciliationRequest>,
+    ) -> Result<Response<PaperReconciliationResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        self.identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::RiskPolicyManage,
+                now,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        validate_canonical_id("account_id", &request.account_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER Risk/OMS route is not configured; no reconciliation ran",
+            )
+        })?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        if request.account_id != service.account_id() {
+            return Err(Status::permission_denied("access denied"));
+        }
+        let reconciled_at = utc_timestamp(now)?;
+        let report = if request.reconnect {
+            service.reconnect_and_reconcile(&reconciled_at)
+        } else {
+            service
+                .synchronize()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            service.reconcile(&reconciled_at)
+        }
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let dashboard = service.dashboard();
+        let snapshot_matches = report.is_clean();
+        Ok(Response::new(PaperReconciliationResponse {
+            reconciliation_id: report.reconciliation_id,
+            reconciled_at: report.reconciled_at,
+            snapshot_matches,
+            issues: report
+                .issues
+                .into_iter()
+                .map(|issue| PaperReconciliationIssue {
+                    incident_id: issue.incident_id,
+                    category: issue.category,
+                    subject: issue.subject,
+                    detail: issue.detail,
+                })
+                .collect(),
+            unknown_orders: dashboard.unknown_orders,
+            broker_connected: dashboard.broker_connected,
+            audit_sequence: dashboard.audit_sequence,
+            audit_head_hash: dashboard.audit_head_hash,
+        }))
+    }
+
     async fn begin_operator_login(
         &self,
         request: Request<BeginOperatorLoginRequest>,
@@ -772,6 +1035,49 @@ impl TradingOperatingSystem for OperatingSystemService {
     }
 }
 
+fn paper_order_intent(request: &SubmitPaperOrderRequest) -> Result<OrderIntent, Status> {
+    if request.environment != "PAPER" {
+        return Err(Status::invalid_argument(
+            "SubmitPaperOrder accepts the PAPER environment only",
+        ));
+    }
+    let order_type = match PaperOrderKind::try_from(request.order_kind) {
+        Ok(PaperOrderKind::Market) => OrderType::Market,
+        Ok(PaperOrderKind::Limit) => OrderType::Limit,
+        _ => return Err(Status::invalid_argument("order kind is required")),
+    };
+    let time_in_force = match OrderTimeInForceKind::try_from(request.time_in_force) {
+        Ok(OrderTimeInForceKind::Day) => TimeInForce::Day,
+        Ok(OrderTimeInForceKind::GoodTilCancelled) => TimeInForce::GoodTilCancelled,
+        _ => return Err(Status::invalid_argument("time in force is required")),
+    };
+    let intent = OrderIntent {
+        intent_id: request.intent_id.clone(),
+        account_id: request.account_id.clone(),
+        strategy_id: request.strategy_id.clone(),
+        instrument_id: request.instrument_id.clone(),
+        correlation_id: request.correlation_id.clone(),
+        side: side(request.side)?,
+        quantity: decimal("quantity", &request.quantity)?,
+        order_type,
+        limit_price: request
+            .limit_price
+            .as_deref()
+            .map(|value| decimal("limit_price", value))
+            .transpose()?,
+        time_in_force,
+        rationale: request.rationale.clone(),
+        created_at: request.created_at.clone(),
+        strategy_version: request.strategy_version.clone(),
+        configuration_version: request.configuration_version.clone(),
+        environment: request.environment.clone(),
+    };
+    intent
+        .validate()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(intent)
+}
+
 fn paper_combo_intent(request: &SubmitPaperComboRequest) -> Result<ComboIntent, Status> {
     if request.environment != "PAPER" {
         return Err(Status::invalid_argument(
@@ -998,7 +1304,33 @@ struct PaperCommandRouteDocument {
     short_exposure: Option<PaperCommandShortExposureDocument>,
     kill_switch_version: String,
     adapter_kind: String,
+    /// Required when `adapter_kind` is `IBKR_PAPER_BRIDGE`, refused otherwise.
+    #[serde(default)]
+    ibkr_bridge: Option<IbkrBridgeDocument>,
     journal_path: String,
+}
+
+/// How the route starts the official-API IBKR PAPER bridge process. The
+/// route builds the bridge's argument list itself, so no free-form argument
+/// can reach the process (delivery state E5.2a).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IbkrBridgeDocument {
+    /// Absolute path of the approved interpreter; the process gets no PATH.
+    python_executable: String,
+    /// Absolute path of `python/ibkr-gateway/src/follon_ibkr_gateway.py`.
+    bridge_script: String,
+    host: String,
+    port: u16,
+    client_id: u32,
+    /// The IBKR paper account identifier: account metadata, not a credential.
+    broker_account: String,
+    instrument_map: String,
+    tws_timezone: String,
+    /// The route's deadline for each bridge request. The bridge's own IBKR
+    /// timeout is two seconds shorter, so it answers before the route gives up.
+    request_timeout_seconds: u64,
+    max_response_bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -1127,6 +1459,132 @@ impl RuntimeConfig {
     }
 }
 
+/// Everything the route needs to start the IBKR PAPER bridge.
+struct IbkrBridgeLaunch {
+    gateway: IbkrPaperGatewayConfiguration,
+    process: IbkrPaperBridgeProcessConfiguration,
+    session: String,
+}
+
+/// Validates a bridge section the way the bridge itself does, so a route the
+/// bridge would refuse to serve never opens, and builds the bridge's fixed
+/// argument list (delivery state E5.2a).
+fn ibkr_bridge_launch(
+    account_id: &str,
+    bridge: IbkrBridgeDocument,
+) -> Result<IbkrBridgeLaunch, String> {
+    let gateway = IbkrPaperGatewayConfiguration {
+        account_id: account_id.to_owned(),
+        host: bridge.host.clone(),
+        port: bridge.port,
+        environment: "PAPER".to_owned(),
+    };
+    gateway
+        .validate()
+        .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+    if !(3..=60).contains(&bridge.request_timeout_seconds) {
+        return Err(
+            "PAPER command-route IBKR bridge request_timeout_seconds must be from 3 to 60"
+                .to_owned(),
+        );
+    }
+    if bridge.client_id > 31 {
+        return Err("PAPER command-route IBKR bridge client_id must be from 0 to 31".to_owned());
+    }
+    if bridge.broker_account.is_empty()
+        || bridge.broker_account.chars().count() > 64
+        || bridge.broker_account.contains(['\r', '\n'])
+    {
+        return Err("PAPER command-route IBKR bridge broker_account is invalid".to_owned());
+    }
+    // The bridge refuses a linked or oversized map; so does the route, and it
+    // binds the map's exact bytes into the journal fingerprint.
+    let map = Path::new(&bridge.instrument_map);
+    let map_is_regular = std::fs::symlink_metadata(map)
+        .map(|metadata| metadata.file_type().is_file() && metadata.len() <= 1024 * 1024)
+        .unwrap_or(false);
+    let map_bytes = map_is_regular
+        .then(|| std::fs::read(map).ok())
+        .flatten()
+        .ok_or_else(|| {
+            "PAPER command-route IBKR bridge instrument_map is missing, linked or too large"
+                .to_owned()
+        })?;
+    let session = serde_json::to_string(&[
+        bridge.broker_account.as_str(),
+        &bridge.client_id.to_string(),
+        bridge.tws_timezone.as_str(),
+        &format!("{:x}", Sha256::digest(&map_bytes)),
+    ])
+    .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+    let process = IbkrPaperBridgeProcessConfiguration {
+        executable: PathBuf::from(&bridge.python_executable),
+        arguments: vec![
+            bridge.bridge_script,
+            "--host".to_owned(),
+            bridge.host,
+            "--port".to_owned(),
+            bridge.port.to_string(),
+            "--client-id".to_owned(),
+            bridge.client_id.to_string(),
+            "--account-id".to_owned(),
+            account_id.to_owned(),
+            "--broker-account".to_owned(),
+            bridge.broker_account,
+            "--instrument-map".to_owned(),
+            bridge.instrument_map,
+            "--tws-timezone".to_owned(),
+            bridge.tws_timezone,
+            "--environment".to_owned(),
+            "PAPER".to_owned(),
+            "--timeout-seconds".to_owned(),
+            (bridge.request_timeout_seconds - 2).to_string(),
+        ],
+        request_timeout: std::time::Duration::from_secs(bridge.request_timeout_seconds),
+        max_response_bytes: bridge.max_response_bytes,
+    };
+    process
+        .validate()
+        .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+    Ok(IbkrBridgeLaunch {
+        gateway,
+        process,
+        session,
+    })
+}
+
+/// Builds the route's adapter from its `adapter_kind`: the model, which stays
+/// the default, or the official-API IBKR PAPER bridge (delivery state E5.2a).
+fn paper_route_adapter(
+    account: &PaperAccount,
+    adapter_kind: &str,
+    bridge: Option<IbkrBridgeDocument>,
+) -> Result<PaperRouteAdapter, String> {
+    match (adapter_kind, bridge) {
+        ("IBKR_PAPER_MODEL", None) => IbkrPaperAdapter::new(account)
+            .map(PaperRouteAdapter::Model)
+            .map_err(|error| format!("PAPER command-route adapter: {error}")),
+        ("IBKR_PAPER_MODEL", Some(_)) => {
+            Err("a PAPER command route on the model takes no ibkr_bridge section".to_owned())
+        }
+        ("IBKR_PAPER_BRIDGE", None) => Err(
+            "a PAPER command route on the IBKR bridge requires an ibkr_bridge section".to_owned(),
+        ),
+        ("IBKR_PAPER_BRIDGE", Some(bridge)) => {
+            let launch = ibkr_bridge_launch(&account.account_id, bridge)?;
+            let transport = IbkrPaperBridgeProcessTransport::start(launch.process)
+                .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+            IbkrPaperGatewayAdapter::new(launch.gateway, transport)
+                .map(|adapter| PaperRouteAdapter::Bridge {
+                    adapter: Box::new(adapter),
+                    session: launch.session,
+                })
+                .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))
+        }
+        _ => Err("unsupported PAPER command-route adapter kind".to_owned()),
+    }
+}
+
 fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read PAPER command-route config: {error}"))?;
@@ -1134,9 +1592,6 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
         .map_err(|error| format!("invalid PAPER command-route config: {error}"))?;
     if document.schema_version != 1 {
         return Err("unsupported PAPER command-route schema version".to_owned());
-    }
-    if document.adapter_kind != "IBKR_PAPER_MODEL" {
-        return Err("unsupported PAPER command-route adapter kind".to_owned());
     }
     let account = PaperAccount {
         account_id: document.account_id,
@@ -1195,8 +1650,8 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
             })
             .collect::<Result<_, String>>()?,
     };
-    let broker = IbkrPaperAdapter::new(&account)
-        .map_err(|error| format!("PAPER command-route adapter: {error}"))?;
+    // Built before the journal is opened, so a refused adapter leaves no journal.
+    let broker = paper_route_adapter(&account, &document.adapter_kind, document.ibkr_bridge)?;
     let service = PaperTradingService::open_durable(
         account,
         policy,
@@ -1635,6 +2090,441 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// An absolute interpreter path, because the bridge process gets no PATH.
+    fn python_executable() -> Option<PathBuf> {
+        ["python", "python3"].into_iter().find_map(|candidate| {
+            std::process::Command::new(candidate)
+                .args([
+                    "-c",
+                    "import pathlib,sys;print(pathlib.Path(sys.executable).resolve())",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|output| PathBuf::from(output.trim()))
+                .filter(|path| path.is_absolute() && path.is_file())
+        })
+    }
+
+    fn repository_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+            .canonicalize()
+            .expect("repository path")
+    }
+
+    /// A bridge section that starts the repository's fake bridge fixture in
+    /// place of the official-API bridge. The fixture ignores its arguments.
+    fn fake_bridge_section(python: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "python_executable": python.to_string_lossy(),
+            "bridge_script": repository_path("tests/fixtures/ibkr/fake-paper-bridge.py")
+                .to_string_lossy(),
+            "host": "127.0.0.1",
+            "port": 7497,
+            "client_id": 7,
+            "broker_account": "DU_TEST_ACCOUNT",
+            "instrument_map": repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json")
+                .to_string_lossy(),
+            "tws_timezone": "America/New_York",
+            "request_timeout_seconds": 5,
+            "max_response_bytes": 65536,
+        })
+    }
+
+    fn refused_route(name: &str, adjust: impl FnOnce(&mut serde_json::Value)) -> String {
+        let (config, scratch) = write_route_config(name, adjust);
+        let refusal = paper_combo_route_from_path(&config)
+            .err()
+            .expect("the route must be refused");
+        // Every refusal happens before the journal is touched (E3.10).
+        assert!(
+            !scratch.join("journal.ndjson").exists(),
+            "{name} left a journal"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        refusal
+    }
+
+    /// A bridge route whose section differs from the fake bridge's in one way.
+    fn refused_bridge(name: &str, change: impl FnOnce(&mut serde_json::Value)) -> String {
+        let python = python_executable().unwrap_or_else(|| PathBuf::from("/unused"));
+        refused_route(name, |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            change(&mut bridge);
+            document["ibkr_bridge"] = bridge;
+        })
+    }
+
+    #[test]
+    fn a_route_refuses_an_adapter_it_cannot_build() {
+        // A bridge section that does not match the adapter kind.
+        assert_eq!(
+            refused_route("model-with-bridge", |document| {
+                document["ibkr_bridge"] = fake_bridge_section(Path::new("/unused"));
+            }),
+            "a PAPER command route on the model takes no ibkr_bridge section"
+        );
+        assert_eq!(
+            refused_route("bridge-without-section", |document| {
+                document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            }),
+            "a PAPER command route on the IBKR bridge requires an ibkr_bridge section"
+        );
+        assert_eq!(
+            refused_route("unknown-kind", |document| {
+                document["adapter_kind"] = "IBKR_LIVE".into();
+            }),
+            "unsupported PAPER command-route adapter kind"
+        );
+    }
+
+    #[test]
+    fn a_bridge_route_refuses_what_the_bridge_would_refuse() {
+        // The bridge only ever reaches a local PAPER port.
+        assert!(
+            refused_bridge("live-port", |bridge| bridge["port"] = 7496.into())
+                .contains("accepts only a local PAPER TWS (7497) or Gateway (4002) endpoint")
+        );
+        assert!(
+            refused_bridge("remote-host", |bridge| bridge["host"] = "10.0.0.5".into())
+                .contains("accepts only a local PAPER TWS (7497) or Gateway (4002) endpoint")
+        );
+        // The interpreter must be an absolute path to a real file.
+        assert!(refused_bridge("relative-interpreter", |bridge| {
+            bridge["python_executable"] = "python".into();
+        })
+        .contains("invalid IBKR paper bridge process configuration"));
+        // The bridge's own limits, refused here before a process starts.
+        let timeout =
+            "PAPER command-route IBKR bridge request_timeout_seconds must be from 3 to 60";
+        assert_eq!(
+            refused_bridge("short-timeout", |bridge| {
+                bridge["request_timeout_seconds"] = 2.into();
+            }),
+            timeout
+        );
+        assert_eq!(
+            refused_bridge("long-timeout", |bridge| {
+                bridge["request_timeout_seconds"] = 61.into();
+            }),
+            timeout
+        );
+        assert_eq!(
+            refused_bridge("client-id", |bridge| bridge["client_id"] = 32.into()),
+            "PAPER command-route IBKR bridge client_id must be from 0 to 31"
+        );
+        let account = "PAPER command-route IBKR bridge broker_account is invalid";
+        for (name, value) in [
+            ("empty-account", String::new()),
+            ("long-account", "D".repeat(65)),
+            ("split-account", "DU1\nDU2".to_owned()),
+        ] {
+            assert_eq!(
+                refused_bridge(name, |bridge| bridge["broker_account"] = value.into()),
+                account,
+                "{name}"
+            );
+        }
+        let map = "PAPER command-route IBKR bridge instrument_map is missing, linked or too large";
+        assert_eq!(
+            refused_bridge("missing-map", |bridge| {
+                bridge["instrument_map"] = "no-such-instrument-map.json".into();
+            }),
+            map
+        );
+        assert_eq!(
+            refused_bridge("directory-map", |bridge| {
+                bridge["instrument_map"] = repository_path("tests/fixtures/ibkr")
+                    .to_string_lossy()
+                    .into_owned()
+                    .into();
+            }),
+            map
+        );
+        let maps = std::env::temp_dir().join(format!(
+            "follon-trading-api-refused-maps-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&maps);
+        std::fs::create_dir_all(&maps).expect("map directory");
+        let oversized = maps.join("oversized.json");
+        std::fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).expect("oversized map");
+        assert_eq!(
+            refused_bridge("oversized-map", |bridge| {
+                bridge["instrument_map"] = oversized.to_string_lossy().into_owned().into();
+            }),
+            map
+        );
+        // A link to a valid map, as the bridge also refuses.
+        let link = maps.join("linked.json");
+        let target = repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        match linked {
+            Ok(()) => assert_eq!(
+                refused_bridge("linked-map", |bridge| {
+                    bridge["instrument_map"] = link.to_string_lossy().into_owned().into();
+                }),
+                map
+            ),
+            Err(error) => {
+                eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised")
+            }
+        }
+        let _ = std::fs::remove_dir_all(&maps);
+    }
+
+    /// The argument list the route builds is one the real bridge parses to
+    /// the same configuration. It needs neither TWS nor `ibapi`.
+    #[test]
+    fn the_real_bridge_parses_the_arguments_the_route_builds() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge argument test was skipped");
+            return;
+        };
+        let mut section = fake_bridge_section(&python);
+        section["bridge_script"] =
+            repository_path("python/ibkr-gateway/src/follon_ibkr_gateway.py")
+                .to_string_lossy()
+                .into_owned()
+                .into();
+        section["port"] = 4002.into();
+        section["client_id"] = 31.into();
+        let bridge: IbkrBridgeDocument = serde_json::from_value(section).expect("bridge section");
+        let launch = ibkr_bridge_launch("acct.grpc.paper.test", bridge).expect("bridge launch");
+        let arguments = &launch.process.arguments;
+        assert!(arguments[0].ends_with("follon_ibkr_gateway.py"));
+        let parsed = std::process::Command::new(&launch.process.executable)
+            .arg("-c")
+            .arg(
+                "import json, sys\n\
+                 sys.path.insert(0, sys.argv[1])\n\
+                 from follon_ibkr_gateway import parse_arguments\n\
+                 parsed = vars(parse_arguments(sys.argv[2:]))\n\
+                 parsed['instrument_map'] = str(parsed['instrument_map'])\n\
+                 print(json.dumps(parsed, sort_keys=True))",
+            )
+            .arg(repository_path("python/ibkr-gateway/src"))
+            .args(&arguments[1..])
+            .output()
+            .expect("run the bridge's argument parser");
+        assert!(
+            parsed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&parsed.stdout).expect("parsed arguments");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "host": "127.0.0.1",
+                "port": 4002,
+                "client_id": 31,
+                "account_id": "acct.grpc.paper.test",
+                "broker_account": "DU_TEST_ACCOUNT",
+                "instrument_map": repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json")
+                    .to_string_lossy(),
+                "tws_timezone": "America/New_York",
+                "environment": "PAPER",
+                // Two seconds inside the route's own five-second deadline.
+                "timeout_seconds": 3.0,
+            })
+        );
+        assert_eq!(
+            launch.process.request_timeout,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(launch.process.max_response_bytes, 65536);
+    }
+
+    /// The service reads the checked-in fixtures its schema describes, so the
+    /// reader and the schema cannot drift apart unnoticed.
+    #[test]
+    fn the_checked_in_route_fixtures_are_documents_the_route_reads() {
+        for (fixture, kind, bridge) in [
+            ("paper-command-route-v1.json", "IBKR_PAPER_MODEL", false),
+            (
+                "paper-command-route-v1-bridge.json",
+                "IBKR_PAPER_BRIDGE",
+                true,
+            ),
+        ] {
+            let contents = std::fs::read_to_string(repository_path(&format!(
+                "tests/fixtures/config/{fixture}"
+            )))
+            .expect("route fixture");
+            let document: PaperCommandRouteDocument =
+                serde_json::from_str(&contents).expect(fixture);
+            assert_eq!(document.adapter_kind, kind, "{fixture}");
+            assert_eq!(document.ibkr_bridge.is_some(), bridge, "{fixture}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_route_refuses_a_combination_before_anything_is_recorded() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge route test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-combo", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            document["ibkr_bridge"] = fake_bridge_section(&python);
+        });
+        let route = paper_combo_route_from_path(&config).expect("bridge route opens");
+        assert_eq!(
+            route
+                .lock()
+                .expect("PAPER route")
+                .broker_mut()
+                .capabilities("acct.grpc.paper.test")
+                .expect("capabilities"),
+            PaperBrokerCapabilities::default()
+        );
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        let status = service
+            .submit_paper_combo(authorized(
+                paper_combo_request("intent.grpc.bridge.1"),
+                &token,
+            ))
+            .await
+            .expect_err("the IBKR bridge cannot execute a combination");
+        assert!(
+            status.message().contains("cannot execute combinations"),
+            "{}",
+            status.message()
+        );
+        {
+            let paper = route.lock().expect("PAPER route");
+            assert!(paper
+                .combo_order("combo-order-intent.grpc.bridge.1")
+                .is_none());
+            assert!(paper
+                .combo_risk_evidence("paper-combo-risk-intent.grpc.bridge.1")
+                .is_none());
+            assert!(paper.dashboard().broker_connected);
+        }
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_journal_reopens_only_under_the_adapter_and_session_it_was_written_with() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the adapter-binding test was skipped");
+            return;
+        };
+        const MISMATCH: &str =
+            "paper journal configuration fingerprint does not match supplied configuration";
+        // The fingerprint binds the map's bytes, so the journal's map is a copy
+        // this test can change.
+        let map_directory = std::env::temp_dir().join(format!(
+            "follon-trading-api-instrument-map-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&map_directory).expect("map directory");
+        let map = map_directory.join("instruments.json");
+        std::fs::copy(
+            repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json"),
+            &map,
+        )
+        .expect("copy the instrument map");
+        let bridge_with = |document: &mut serde_json::Value,
+                           change: &dyn Fn(&mut serde_json::Value)| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["instrument_map"] = map.to_string_lossy().into_owned().into();
+            change(&mut bridge);
+            document["ibkr_bridge"] = bridge;
+        };
+        let reopen = |name: &str, journal: &Path, adjust: &dyn Fn(&mut serde_json::Value)| {
+            let (config, scratch) = write_route_config(name, |document| {
+                adjust(document);
+                document["journal_path"] = journal.to_string_lossy().into_owned().into();
+            });
+            let outcome = paper_combo_route_from_path(&config).map(drop);
+            let _ = std::fs::remove_dir_all(&scratch);
+            outcome
+        };
+        let refusal = |outcome: Result<(), String>| {
+            let error = outcome.expect_err("the journal must be refused");
+            assert!(error.contains(MISMATCH), "{error}");
+        };
+
+        // Written under the model, then offered to the bridge.
+        let (model_config, model_scratch) = write_route_config("binding-model", |_| {});
+        drop(paper_combo_route_from_path(&model_config).expect("model route opens"));
+        let model_journal = model_scratch.join("journal.ndjson");
+        refusal(reopen("model-to-bridge", &model_journal, &|document| {
+            bridge_with(document, &|_| {})
+        }));
+
+        // Written under the bridge, then offered to the model.
+        let (bridge_config, bridge_scratch) =
+            write_route_config("binding-bridge", |document| bridge_with(document, &|_| {}));
+        drop(paper_combo_route_from_path(&bridge_config).expect("bridge route opens"));
+        let bridge_journal = bridge_scratch.join("journal.ndjson");
+        refusal(reopen("bridge-to-model", &bridge_journal, &|_| {}));
+
+        // The same bridge endpoint with a different IBKR session.
+        type Change = Box<dyn Fn(&mut serde_json::Value)>;
+        let sessions: Vec<(&str, Change)> = vec![
+            (
+                "broker-account",
+                Box::new(|bridge| bridge["broker_account"] = "DU_OTHER".into()),
+            ),
+            (
+                "client-id",
+                Box::new(|bridge| bridge["client_id"] = 8.into()),
+            ),
+            (
+                "tws-timezone",
+                Box::new(|bridge| bridge["tws_timezone"] = "Europe/London".into()),
+            ),
+        ];
+        for (name, change) in &sessions {
+            refusal(reopen(name, &bridge_journal, &|document| {
+                bridge_with(document, change)
+            }));
+        }
+        // The bridge's timeouts and limits are not part of the session.
+        reopen("longer-timeout", &bridge_journal, &|document| {
+            bridge_with(document, &|bridge| {
+                bridge["request_timeout_seconds"] = 10.into()
+            })
+        })
+        .expect("a timeout change keeps the journal");
+
+        // The same map path with different contents.
+        let original = std::fs::read_to_string(&map).expect("map");
+        std::fs::write(&map, original.replace("123456", "654321")).expect("change the map");
+        refusal(reopen("map-contents", &bridge_journal, &|document| {
+            bridge_with(document, &|_| {})
+        }));
+        std::fs::write(&map, original).expect("restore the map");
+
+        // Each still reopens under its own adapter and session.
+        assert!(paper_combo_route_from_path(&model_config).is_ok());
+        assert!(paper_combo_route_from_path(&bridge_config).is_ok());
+        let _ = std::fs::remove_dir_all(&model_scratch);
+        let _ = std::fs::remove_dir_all(&bridge_scratch);
+        let _ = std::fs::remove_dir_all(&map_directory);
+    }
+
     fn paper_combo_request(intent_id: &str) -> SubmitPaperComboRequest {
         SubmitPaperComboRequest {
             tenant_id: "tenant.alpha".to_owned(),
@@ -1678,6 +2568,46 @@ mod tests {
                     observed_at: "2026-01-02T14:30:00Z".to_owned(),
                 },
             ],
+        }
+    }
+
+    fn paper_order_request(intent_id: &str) -> SubmitPaperOrderRequest {
+        SubmitPaperOrderRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            intent_id: intent_id.to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            strategy_id: "strategy.grpc.test".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            correlation_id: format!("corr-{intent_id}"),
+            side: ExecutionSide::Buy as i32,
+            quantity: "2".to_owned(),
+            order_kind: PaperOrderKind::Limit as i32,
+            limit_price: Some("100".to_owned()),
+            time_in_force: OrderTimeInForceKind::Day as i32,
+            rationale: "gRPC single-order test".to_owned(),
+            created_at: "2026-01-02T14:30:00Z".to_owned(),
+            strategy_version: "strategy.grpc.v1".to_owned(),
+            configuration_version: "config.grpc.v1".to_owned(),
+            environment: "PAPER".to_owned(),
+            decided_at: "2026-01-02T14:30:02Z".to_owned(),
+            mark_price: "100".to_owned(),
+            observed_at: "2026-01-02T14:30:00Z".to_owned(),
+        }
+    }
+
+    fn paper_cancel_request(order_id: &str) -> CancelPaperOrderRequest {
+        CancelPaperOrderRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            order_id: order_id.to_owned(),
+        }
+    }
+
+    fn paper_reconciliation_request(reconnect: bool) -> PaperReconciliationRequest {
+        PaperReconciliationRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            reconnect,
         }
     }
 
@@ -1940,6 +2870,535 @@ mod tests {
         assert_eq!(order.oms.state, OrderState::Acknowledged);
         drop(paper);
         drop(reopened);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_submits_and_cancels_with_durable_operator_evidence() {
+        let (service, route, scratch) = configured_paper_service("single-order");
+        let token = trader_token(&service).await;
+        let request = paper_order_request("intent.grpc.paper.single.1");
+        let submitted = service
+            .submit_paper_order(authorized(request.clone(), &token))
+            .await
+            .expect("risk-gated single order")
+            .into_inner();
+        assert!(submitted.approved);
+        assert_eq!(submitted.submitted_by, "user.trader");
+        assert_eq!(submitted.state, OmsOrderState::Acknowledged as i32);
+        let order_id = submitted.order_id.expect("approved order id");
+        let repeated = service
+            .submit_paper_order(authorized(request, &token))
+            .await
+            .expect("idempotent retry")
+            .into_inner();
+        assert_eq!(repeated.order_id.as_deref(), Some(order_id.as_str()));
+        assert_eq!(repeated.decision_id, submitted.decision_id);
+        let cancelled = service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .expect("cancel request")
+            .into_inner();
+        assert_eq!(cancelled.order_id, order_id);
+        assert_eq!(cancelled.state, OmsOrderState::PendingCancel as i32);
+        assert_eq!(cancelled.operated_by, "user.trader");
+        assert!(!cancelled.operated_at.is_empty());
+        service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .expect("idempotent cancel retry");
+        {
+            let paper = route.lock().unwrap();
+            assert_eq!(paper.order_operations().len(), 1);
+            assert_eq!(paper.order_operations()[0].operator, "user.trader");
+            assert_eq!(
+                paper
+                    .risk_evidence(&submitted.decision_id)
+                    .unwrap()
+                    .submitted_by
+                    .as_deref(),
+                Some("user.trader")
+            );
+        }
+        drop(service);
+        drop(route);
+        let reopened = paper_combo_route_from_path(&scratch.join("route.json")).unwrap();
+        let paper = reopened.lock().unwrap();
+        assert_eq!(
+            paper.order(&order_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        assert_eq!(paper.order_operations().len(), 1);
+        drop(paper);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_checks_authentication_account_and_evidence() {
+        let (service, route, scratch) = configured_paper_service("single-auth");
+        let request = || paper_order_request("intent.grpc.paper.single.auth");
+        assert_eq!(
+            service
+                .submit_paper_order(Request::new(request()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let viewer = login(
+            &service,
+            "viewer@example.com",
+            &test_directory().viewer_secret,
+        )
+        .await;
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(request(), &viewer))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let trader = trader_token(&service).await;
+        let mut wrong_tenant = request();
+        wrong_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(wrong_tenant, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut no_limit = request();
+        no_limit.limit_price = None;
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(no_limit, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut stale = request();
+        stale.observed_at = "2026-01-02T14:00:00Z".to_owned();
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(stale, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let mut wrong_account = request();
+        wrong_account.account_id = "acct.other".to_owned();
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(wrong_account, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let mut cancel_other = paper_cancel_request("order.someone.else");
+        cancel_other.account_id = "acct.other".to_owned();
+        assert_eq!(
+            service
+                .cancel_paper_order(authorized(cancel_other, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .cancel_paper_order(authorized(
+                    paper_cancel_request("order.someone.else"),
+                    &viewer
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert!(route
+            .lock()
+            .unwrap()
+            .risk_evidence("paper-risk-intent.grpc.paper.single.auth")
+            .is_none());
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_returns_a_risk_rejection_without_creating_an_order() {
+        let (service, route, scratch) = configured_paper_service("single-rejection");
+        let token = trader_token(&service).await;
+        let mut request = paper_order_request("intent.grpc.paper.single.rejected");
+        request.quantity = "101".to_owned();
+        let outcome = service
+            .submit_paper_order(authorized(request, &token))
+            .await
+            .expect("risk decision")
+            .into_inner();
+        assert!(!outcome.approved);
+        assert!(outcome
+            .reason_codes
+            .contains(&"MAX_ORDER_QUANTITY_EXCEEDED".to_owned()));
+        assert!(outcome.order_id.is_none());
+        assert_eq!(outcome.state, OmsOrderState::Unspecified as i32);
+        assert_eq!(outcome.submitted_by, "user.trader");
+        assert!(route
+            .lock()
+            .unwrap()
+            .risk_evidence(&outcome.decision_id)
+            .is_some());
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_cancel_rpc_cancels_a_combination_through_the_same_oms_boundary() {
+        let (service, route, scratch) = configured_paper_service("combo-cancel");
+        let token = trader_token(&service).await;
+        let submitted = service
+            .submit_paper_combo(authorized(
+                paper_combo_request("intent.grpc.paper.combo.cancel"),
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let order_id = submitted.order_id.unwrap();
+        let cancelled = service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(cancelled.state, OmsOrderState::PendingCancel as i32);
+        let paper = route.lock().unwrap();
+        assert_eq!(
+            paper.combo_order(&order_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        assert_eq!(paper.order_operations().len(), 1);
+        assert_eq!(paper.order_operations()[0].operator, "user.trader");
+        drop(paper);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_reaches_the_bridge_only_for_supported_single_day_orders() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge route test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-single", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            document["ibkr_bridge"] = fake_bridge_section(&python);
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        let mut gtc = paper_order_request("intent.grpc.bridge.gtc");
+        gtc.time_in_force = OrderTimeInForceKind::GoodTilCancelled as i32;
+        let error = service
+            .submit_paper_order(authorized(gtc, &token))
+            .await
+            .expect_err("real bridge cannot carry GTC");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(route
+            .lock()
+            .unwrap()
+            .risk_evidence("paper-risk-intent.grpc.bridge.gtc")
+            .is_none());
+
+        let mut market = paper_order_request("intent.grpc.bridge.day");
+        market.order_kind = PaperOrderKind::Market as i32;
+        market.limit_price = None;
+        let submitted = service
+            .submit_paper_order(authorized(market, &token))
+            .await
+            .expect("fake bridge accepted a single DAY market order")
+            .into_inner();
+        assert!(submitted.approved);
+        assert_eq!(submitted.state, OmsOrderState::Acknowledged as i32);
+        let order_id = submitted.order_id.unwrap();
+        assert_eq!(
+            route
+                .lock()
+                .unwrap()
+                .order(&order_id)
+                .unwrap()
+                .broker_order_id
+                .as_deref(),
+            Some("ibkr.41")
+        );
+        let cancelled = service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .expect("fake bridge accepted cancellation")
+            .into_inner();
+        assert_eq!(cancelled.state, OmsOrderState::PendingCancel as i32);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_and_cancel_rpc_fail_closed_without_a_route() {
+        let mut service = service();
+        service.identity = Some(operator_identity());
+        let token = trader_token(&service).await;
+        for code in [
+            service
+                .submit_paper_order(authorized(
+                    paper_order_request("intent.grpc.no.route"),
+                    &token,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            service
+                .cancel_paper_order(authorized(paper_cancel_request("order.no.route"), &token))
+                .await
+                .unwrap_err()
+                .code(),
+        ] {
+            assert_eq!(code, tonic::Code::FailedPrecondition);
+        }
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_applies_fills_and_surfaces_restart_discrepancies() {
+        let (service, route, scratch) = configured_paper_service("reconcile-fill");
+        let trader = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let submitted = service
+            .submit_paper_order(authorized(
+                paper_order_request("intent.grpc.paper.reconcile"),
+                &trader,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let order_id = submitted.order_id.unwrap();
+        {
+            let mut paper = route.lock().unwrap();
+            let PaperRouteAdapter::Model(adapter) = paper.broker_mut() else {
+                panic!("the test route uses the model");
+            };
+            adapter
+                .queue_fill(
+                    &order_id,
+                    decimal("quantity", "2").unwrap(),
+                    decimal("price", "100").unwrap(),
+                    decimal("fee", "0.20").unwrap(),
+                    "2026-01-02T14:31:00Z",
+                )
+                .unwrap();
+        }
+        let response = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("apply the fill, then compare the account")
+            .into_inner();
+        assert!(response.snapshot_matches, "{:?}", response.issues);
+        assert!(response.issues.is_empty());
+        assert_eq!(response.unknown_orders, 0);
+        assert!(response.broker_connected);
+        assert!(response.audit_sequence > 0);
+        assert_eq!(response.audit_head_hash.len(), 64);
+        assert_eq!(
+            route.lock().unwrap().order(&order_id).unwrap().oms.state,
+            OrderState::Filled
+        );
+
+        // The model starts empty after restart. A reconnect must compare that
+        // broker state with the restored journal, never report a clean session.
+        drop(service);
+        drop(route);
+        let reopened = paper_combo_route_from_path(&scratch.join("route.json")).unwrap();
+        let resumed = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(reopened.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let manager = risk_token(&resumed).await;
+        let after_restart = resumed
+            .reconcile_paper_account(authorized(paper_reconciliation_request(true), &manager))
+            .await
+            .expect("reconnect reports the model's missing broker state")
+            .into_inner();
+        assert!(!after_restart.snapshot_matches);
+        assert!(after_restart
+            .issues
+            .iter()
+            .any(|issue| issue.category == "CASH_MISMATCH"));
+        assert_ne!(after_restart.reconciliation_id, response.reconciliation_id);
+        drop(resumed);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_requires_a_manager_and_a_matching_account() {
+        let (service, route, scratch) = configured_paper_service("reconcile-auth");
+        let request = || paper_reconciliation_request(false);
+        assert_eq!(
+            service
+                .reconcile_paper_account(Request::new(request()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let trader = trader_token(&service).await;
+        assert_eq!(
+            service
+                .reconcile_paper_account(authorized(request(), &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let manager = risk_token(&service).await;
+        let mut wrong_tenant = request();
+        wrong_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            service
+                .reconcile_paper_account(authorized(wrong_tenant, &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut wrong_account = request();
+        wrong_account.account_id = "acct.other".to_owned();
+        assert_eq!(
+            service
+                .reconcile_paper_account(authorized(wrong_account, &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut no_route = OperatingSystemService {
+            database: None,
+            paper_combo_route: None,
+            live_kill_switch_route: None,
+            identity: None,
+            transport_tls: false,
+        };
+        no_route.identity = Some(operator_identity());
+        let manager = risk_token(&no_route).await;
+        assert_eq!(
+            no_route
+                .reconcile_paper_account(authorized(request(), &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(route.lock().unwrap().dashboard().audit_sequence, 1);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_requires_explicit_reconnect_after_poll_failure() {
+        let (service, route, scratch) = configured_paper_service("reconcile-reconnect");
+        let manager = risk_token(&service).await;
+        {
+            let mut paper = route.lock().unwrap();
+            let PaperRouteAdapter::Model(adapter) = paper.broker_mut() else {
+                panic!("the test route uses the model");
+            };
+            adapter.disconnect();
+        }
+        let error = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!route.lock().unwrap().dashboard().broker_connected);
+        let recovered = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(true), &manager))
+            .await
+            .expect("explicit reconnect")
+            .into_inner();
+        assert!(recovered.broker_connected);
+        assert!(recovered.snapshot_matches);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_reconciliation_rpc_drains_the_bridge_process_execution() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge route test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-reconcile", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["bridge_script"] =
+                repository_path("tests/fixtures/ibkr/fake-paper-bridge-reconciliation.py")
+                    .to_string_lossy()
+                    .into();
+            document["ibkr_bridge"] = bridge;
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let trader = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let submitted = service
+            .submit_paper_order(authorized(
+                paper_order_request("intent.grpc.bridge.reconcile"),
+                &trader,
+            ))
+            .await
+            .expect("bridge accepted the single DAY order")
+            .into_inner();
+        let order_id = submitted.order_id.unwrap();
+        assert_eq!(submitted.state, OmsOrderState::Acknowledged as i32);
+        let response = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("bridge execution is applied and its account compared")
+            .into_inner();
+        assert!(response.snapshot_matches, "{:?}", response.issues);
+        assert_eq!(
+            route.lock().unwrap().order(&order_id).unwrap().oms.state,
+            OrderState::Filled
+        );
+        assert_eq!(
+            route.lock().unwrap().dashboard().internal_cash,
+            "99799.80000000"
+        );
+        drop(service);
+        drop(route);
         let _ = std::fs::remove_dir_all(scratch);
     }
 

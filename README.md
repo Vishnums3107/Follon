@@ -13,7 +13,7 @@ This repository is an **active trading platform**.
 It contains the decomposed product plan, versioned contracts, deterministic
 research/replay and PAPER paths, advanced broker-neutral execution planning,
 portfolio-wide risk, multi-currency/margin accounting, customer IAM primitives,
-transactional PostgreSQL persistence, and a versioned gRPC service. The ten
+transactional PostgreSQL persistence, and a versioned gRPC service. The twelve
 operating workspaces are packaged with React/Vite and a Tauri v2 host. The
 desktop uses privileged IPC commands to submit declarative order intents and
 order-management requests to the application routing boundary.
@@ -46,8 +46,10 @@ The source plan is retained as `Solo Trading Operating System Master Plan.pdf`.
   content-addressed configuration, portable
   self-describing result artifacts, completion manifests, and local experiment
   metadata/export.
-- Python strategy contracts that can submit intents but cannot access adapters
-  or credentials.
+- Python strategy contracts that submit validated intents without receiving
+  adapter handles or broker credentials through the protocol. Workers are
+  same-user child processes, not operating-system security sandboxes; only
+  trusted strategy code should run.
 - A PAPER-only OMS with versioned risk limits, fresh-market checks, cash
   reservation, durable evidence/restart recovery, reconciliation, kill
   switches, reconnect handling, deterministic broker fault injection, and a
@@ -116,6 +118,25 @@ for the deployment and evidence sequence.
 
 ## Current evidence boundary
 
+- The desktop and PAPER status CLI compose local model adapters. The gRPC PAPER
+  route selects the model by default or the official IBKR PAPER process bridge
+  by configuration. Its checked-in Python backend submits single market/limit
+  DAY orders only; the route can submit and cancel those orders. An authenticated
+  risk manager can drain broker events and compare the account snapshot through
+  `ReconcilePaperAccount`.
+  The real adapter declares exactly that, so the PAPER OMS refuses a
+  combination, a GTC intent or a replacement on that route before any order
+  exists.
+- The primary strategy backtest route is funded and long-only. Advanced
+  margin, financing, and short accounting are separate model calculations;
+  their presence does not enable those strategies in the primary runner.
+- Native and gRPC PAPER routes omit the optional aggregate portfolio-risk
+  composition. Native requests use operator-attested price/time and lack
+  separate operator authentication; browser REST projections remain read-only.
+- Acceptance tools verify record structure, internal hashes, and declared
+  reviewer IDs, not reviewer authentication or underlying broker artifacts.
+  See the [current repository assessment](docs/analysis/project-status-2026-09-27.md)
+  for source-backed limits, CI status, and evidence requirements.
 - The checked-in operational adapter is IBKR PAPER-only. PAPER composition now
   uses an OMS-owned, account-isolated adapter registry; additional routes need
   their own reviewed adapter contract and reconciliation evidence.
@@ -130,3 +151,9 @@ for the deployment and evidence sequence.
 No feature is represented as broker-approved, custody-capable, regulated,
 mobile-enabled, or operationally live until the relevant phase's contract,
 adapter evidence, reconciliation, and release gates are complete.
+
+## Licence
+
+Follon is released under the MIT License; see [`LICENSE`](LICENSE). Every Cargo
+manifest and Python package declares the same licence, and
+`tests/security/test_licence_declarations.py` keeps them in agreement.

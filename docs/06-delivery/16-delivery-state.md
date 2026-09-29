@@ -56,18 +56,18 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-27T16:22:10Z  
-**Branch:** `feat/risk-evidence-and-replay-hardening`  
-**HEAD:** `a0f750a` -- feat(replay): refuse to fill a working limit off a changed tick grid -- E3.6h (2026-09-27T20:51:20+05:30)  
-**Uncommitted paths:** 0
+**Measured at:** 2026-09-29T08:12:58Z  
+**Branch:** `docs/project-status-assessment-2026-09-27`  
+**HEAD:** `7306f8c` -- feat(trading-api): authenticated PAPER single-order and cancel RPCs -- E5.2b-2 (2026-09-29T13:35:25+05:30)  
+**Uncommitted paths:** 7
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 521 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 562 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
-| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 30 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 55 | 0 | 0 |
+| Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 75 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -75,10 +75,223 @@ already produced a real defect here.
 
 <!-- END GENERATED STATUS -- tools/session_status.py -->
 
+## Current repository assessment as of 27 September 2026
+
+The examined GitHub `main` snapshot is `4adb0909430d723c800fb1a2fd4bddb8aaddd792`,
+which merged [PR 30](https://github.com/Vishnums3107/Follon/pull/30). The local
+measurement above passes every suite; that does **not** mean GitHub CI is green.
+The [main foundation run](https://github.com/Vishnums3107/Follon/actions/runs/36334101143)
+passed Rust, PostgreSQL integration, and security, but failed three jobs:
+
+- Python/IBKR tests: six tests could not import `ibapi` on the clean runner.
+- Linux desktop Clippy: the runner could not find `glib-2.0` through pkg-config.
+- SAST: one rule matched the historical vulnerable Nginx Host example in the
+  conformance document; the actual deployment configuration uses a fixed Host.
+
+A fresh `tools/dast_scan.py` run at `2026-09-27T16:49:11Z` passed 85 probes with
+zero failures. It remains a repository-authored local scan, not an independent
+security assessment. Two fresh SPY fixture backtests reproduced all four output
+types byte for byte. Root and native dependency audits exited 0; the native
+lockfile retains seven allowed warnings. No external acceptance gate moved:
+the inspected acceptance artifact has zero verified records.
+
+The [revised project assessment](../analysis/project-status-2026-09-27.md)
+supersedes the first report after deeper source review. The desktop, gRPC PAPER
+route, and PAPER CLI compose local models; the real IBKR PAPER process bridge
+requires application integration. Its Python dispatch lacks combination
+submission, and the real adapter lacks replacement. Native/API PAPER routes
+omit optional aggregate portfolio risk. The primary backtest runner is funded
+and long-only; advanced account models do not widen that executable route.
+
+The Python worker does not supply broker secrets through its protocol but is
+not an operating-system sandbox. Operations journals lack the PAPER/LIVE
+symlink guard. Acceptance tooling checks declared IDs, internal hashes, and
+subject counts without authenticating reviewers or verifying source artifacts;
+later rejections do not retract prior accepted subjects. The promotion tool's
+acceptance subcheck trusts caller-supplied status. These limits remain open.
+
+The deeper pass ran 56 control-plane, 17 backtest, and 15 security/tool tests,
+all passing. These 88 invocations overlap the earlier suites and are not added
+to their totals. An isolated synthetic experiment reproduced the acceptance
+and promotion-subcheck limits; no full promotion or actual acceptance ran.
+
+The earlier monetary range relied on unvalidated staffing effort and is
+withdrawn as a project-specific estimate. Realizable market value and company
+valuation remain undetermined. Engineering priorities are clean-runner CI,
+one integrated broker-PAPER workflow, and trustworthy acceptance evidence.
+External progress still requires 30 independently reviewed clean PAPER sessions.
+
+### Verified against source on 2026-09-28
+
+Session 10 checked the assessment against source before acting on it. Three
+independent read-only reviews covered broker integration, safety and parity,
+and acceptance and documentation. Every CI failure was reproduced from its
+GitHub log, and Semgrep and gitleaks were re-run locally at the versions CI
+pins. Every source claim checked holds. One claim did not hold, and it was
+this document's own: E1.3a's statement that the real bridge accepts
+combinations, corrected in place below. The reviews also found defects the
+assessment did not name, each now a backlog slice. Where a defect is known
+from reading source but not yet reproduced, it says so:
+
+- **A combination sent to the real bridge strands the account** (E5.1). The
+  Python bridge answers `unsupported bridge operation`, and `core/paper`
+  records any adapter error as a transport failure. The combination becomes
+  `UNKNOWN` and the session disconnected. Every later order is then refused
+  with `UNKNOWN_ORDER_REQUIRES_RECONCILIATION`, and the evidence that could
+  clear it can never arrive. Traced in source; not run against a bridge.
+- **Time in force cannot reach the broker** (E5.1). `BrokerOrderRequest` has
+  no such field, so the real bridge would place a GTC intent as DAY. Every
+  local bridge refusal, such as an unmapped instrument, also becomes `UNKNOWN`
+  rather than `REJECTED` (E5.4).
+- **A pipeline run would publish a fabricated customer** (E6.1). Step 23
+  audits every `*.acceptance.ndjson` under `var/`, and the assessment's
+  synthetic boundary-experiment ledger lies under `var/reports/`. An in-memory
+  run of the tool over `var/` counted it as an eligible paying customer.
+- **Tax lots ignore splits** (E8.1). The primary ledger scales a split
+  position's quantity and cost but not its FIFO tax lots, so by source a
+  post-split sale larger than the pre-split lots would be refused as
+  exceeding them, aborting the backtest.
+- **Worker hash order differs per process** (E7.3). The strategy worker's
+  environment is cleared and `PYTHONHASHSEED` is never set.
+- **Five portfolio-risk limit groups are outside the configuration
+  fingerprint** (E7.4): daily loss, drawdown, margin utilisation, strategy
+  limits and margin rates. A journal therefore reopens under changed limits
+  unnoticed.
+- **Four more writers lack E3.11's link guard** (E7.1), beyond the operations
+  journal the assessment named: the replay event store, the backtest
+  experiment store, `follon-news` output (which truncates a link's target),
+  and `write_immutable`'s staging file.
+- **The release SBOM omits the desktop's Cargo workspace** (E7.8), including
+  Tauri, and records no first-party licence.
+- **The risk benchmark's `observed_at` is the fixture's configured value**
+  (E7.9), not when it ran.
+- **Foundation CI has not passed on any run visible on GitHub**, back to at
+  least 2026-09-05 (E4). Gitleaks also fails on a pull request whose range
+  includes the LIVE fixtures' `credential_reference`, which names a secret
+  store entry rather than holding a secret.
+
 ## The backlog that code can actually close
 
-Ordered by the sequence recommended below, not by size. "Slices" are
-session-sized units; each is independently landable.
+"Slices" are session-sized units; each is independently landable. **Since
+2026-09-28 the order is the revised assessment's §15, adopted by the operator
+(Settled direction item 4)**, and each epic's completion evidence is the
+assessment's. E1 is done, E2 stays deferred, and E3 records partials, several
+of whose remainders now sit in E7.
+
+| Order | Epic | Completion evidence |
+| --- | --- | --- |
+| 1 | E4 — foundation CI on a clean runner | All six foundation jobs run their required steps and pass on the reviewed commit |
+| 2 | E5 — one integrated broker-PAPER workflow | Supported order, TIF and cancel semantics; Gateway logs; attributable reconciliation and restart results |
+| 3 | E6 — acceptance evidence that can be trusted | Authenticated reviewers, re-hashed artifacts, release and environment binding, criteria and rejection policy |
+| 4 | E7 — the safety gaps | Worker deadlines and limits, a trusted-code policy, native authentication, portfolio-risk composition, journal handling |
+| 5 | E8 — accounting and state parity, and installation | A corporate-action worker/order/ledger test; P&L conventions; clean install and recovery evidence |
+| 6 | External | 30 qualifying PAPER sessions; five design partners completing normal workflows unaided |
+
+A slice marked **decision** needs the operator first. One marked **external**
+cannot be closed in this repository.
+
+### E4 — Foundation CI on a clean runner (assessment priority 1)
+
+GitHub's `Verify foundation` workflow has not passed on any run visible there,
+back to at least 2026-09-05. **Since 2026-09-29 it passes:** run 36524632774, on PR 31,
+was green in all six jobs (E4.3). On main run 36334101143, for `4adb090`, three of
+the six jobs failed. Each was reproduced from its log:
+
+- `python-and-contracts`: six IBKR bridge tests import `ibapi`, which the
+  runner lacks, and the storage and server-contract steps after them were
+  skipped.
+- `desktop`: clippy could not find `glib-2.0`, because the runner lacks
+  Tauri's Linux libraries, and the native tests after it were skipped.
+- `sast`: Semgrep's nginx rules select their targets by a `conf` path glob,
+  which the conformance audit's file name matches, and the audit quotes item
+  41's fixed Host-header defect verbatim.
+
+PR run 36333055826 also failed `security`. Gitleaks' `generic-api-key` rule
+flagged a LIVE fixture's `credential_reference`.
+
+| Slice | Scope | State |
+| --- | --- | --- |
+| E4.1 | The three failures with an obvious fix. Semgrep excludes the audit as a path, keeping the nginx rules on the real configuration. Gitleaks allowlists a `credential_reference` line holding a canonical secret reference, and nothing broader. The desktop job installs Tauri's documented Linux libraries. The bridge README's stale "without `ibapi`" instruction is corrected. Semgrep and gitleaks were verified both ways at CI's versions; the desktop fix is unverified until CI runs (audit item 85). | **done** 2026-09-28 |
+| E4.2 | An approved IBKR API distribution for the bridge's six official-backend tests. The only version they have run against is `ibapi` 9.81.1.post1 from PyPI, the one this machine has, published under IBKR's API licence. Current TWS API releases are 10.x, which reportedly rename `commission_report`, an import the bridge uses. **Decided 2026-09-29: pin 9.81.1.post1.** CI installs it from a hash-pinned `python/ibkr-gateway/requirements-ci.txt`, whose hash is PyPI's published digest; in a fresh environment it installs and all 14 bridge tests pass, and a wrong hash is refused (audit item 94). | **done** 2026-09-29 |
+| E4.3 | A green GitHub run of all six jobs on the reviewed commit. It needs a push, which the operator approved on 2026-09-29, and E4.1's desktop fix is unverified until it runs. **Run 36524632774, for PR 31 at `0a2d380`, passed all six jobs**: the first passing run visible on GitHub. It verified the desktop libraries and ran the Python job's later steps for the first time. The push run on `main` after merging re-confirms it (audit item 96). | **done** 2026-09-29 |
+
+### E5 — One integrated broker-PAPER workflow (assessment priority 2)
+
+**What exists.** A PAPER kernel with risk-gated orders, reservations, fills,
+recovery, reconnect and reconciliation; and a real PAPER-only adapter,
+`IbkrPaperGatewayAdapter`, over `IbkrPaperBridgeProcessTransport` and the
+official-API Python bridge. The bridge supports single MKT and LMT DAY orders,
+cancellation, polling, snapshots and reconnect.
+
+**What is missing.** When the revised assessment was checked, no
+application composed the real adapter, and `IbkrPaperGatewayAdapter` was
+constructed nowhere, not even in a test. E5.1's tests were the first to
+construct it. Since E5.2a (2026-09-29) the gRPC PAPER route composes it when
+its configuration says `adapter_kind: IBKR_PAPER_BRIDGE`. Since E5.2b-2 it
+submits supported single DAY orders and cancellations. Since E5.2c it can
+drain broker evidence and reconcile the account on an authenticated risk
+manager request. It does not poll in the background, and no real IBKR PAPER
+account has been reconciled through it (E5.5 and E5.6).
+
+The desktop wraps the model in `ManualFillAdapter`, and `follon-paper-status`
+always builds `IbkrPaperAdapter`. The 30-session gate cannot begin until this
+epic lands (see the correction under the external gates).
+
+| Slice | Scope | State |
+| --- | --- | --- |
+| E5.1 | The real adapter refuses, before transmitting and as a clean rejection, what its bridge cannot execute. That covers combinations: the Python dispatch has no `submit_combo`, and the Rust payload drops each leg's quantity and the debit or credit sign. It also covers any time in force other than DAY. Replacement is already refused by the trait default, but `core/paper` records that refusal as `UNKNOWN`. **Landed as `PaperBrokerCapabilities`**: every adapter declares what it carries, defaulting to single DAY orders, and the service refuses anything more before risk is evaluated or an order exists. The real adapter declares the default, and its transport no longer emits `submit_combo` (audit item 87). | **done** 2026-09-28 |
+| E5.2 | The authenticated gRPC PAPER route composes the real bridge by configuration, with the model as the default. **E5.2a** binds the adapter and IBKR session to the journal fingerprint (audit item 99). **E5.2b** adds operator-attributed single-order submit and cancel over the journaled kernel (items 100–101). **E5.2c** adds a risk-manager `ReconcilePaperAccount` RPC: it drains broker events, compares the snapshot, returns its discrepancies and UNKNOWN count, and can explicitly reconnect. A stateful bridge protocol fixture applied a fill and reconciled its account; a model restart surfaced missing broker state rather than reporting clean (audit item 102). No background poller or real Gateway evidence is claimed. | E5.2a–c **done** 2026-09-29; E5.5 and E5.6 open |
+| E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
+| E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR (`REJECTED`), from transport ambiguity (`UNKNOWN`). Today every `ok: false` reply strands the order `UNKNOWN` and disconnects the session. IBKR error codes that are not rejections, such as 202 (order cancelled), need checking against a real TWS. | open |
+| E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
+| E5.6 | Retained Gateway evidence against a real TWS or IB Gateway PAPER session: restart, reconnect, cancellation races and reconciliation. | **external** |
+| E5.7 | E5.1's analogue for controlled LIVE. `IbkrControlledLiveAdapter` inherits a refusing `submit_combo`, and `core/live` records that refusal as a transport failure: the combination becomes `UNKNOWN`, the session disconnects, and the approval and a canary slot stay consumed. Latent, since no application composes a LIVE adapter that can trade, but it needs the same capability declaration under LIVE's separate review. | open |
+
+### E6 — Acceptance evidence that can be trusted (assessment priority 3)
+
+`tools/acceptance_evidence.py` validates record structure, a per-file hash
+chain, and distinct declared observer and reviewer strings, then counts
+accepted subjects. `tools/release_promotion_gate.py` verifies a real Ed25519
+release signature, but trusts a caller-supplied acceptance status: a document
+reading `{"acceptance_status_schema_version": 1, "all_gates_eligible": true}`
+passes it for production.
+
+| Slice | Scope | State |
+| --- | --- | --- |
+| E6.1 | Pipeline step 23 audits only the operational ledger root, `var/acceptance/`, so no ledger elsewhere under `var/` is ever counted. The assessment's synthetic ledger under `var/reports/` is no longer counted (audit item 86). | **done** 2026-09-28 |
+| E6.2 | A subject with any rejected record does not count toward its gate. The schema version must be the integer 1, not JSON `true`. `occurred_at` must be exactly `YYYY-MM-DDTHH:MM:SSZ`, not also a space-separated time or a week date, which both passed. A correction record, which would let a mistaken rejection be withdrawn, is part of E6.5's policy (audit item 89). | **done** 2026-09-28 |
+| E6.3 | The promotion gate recomputes eligibility from the ledger root rather than trusting a status document, and its receipt binds the ledger files it counted. The gate takes `--acceptance-ledger-root` instead of `--acceptance-status`. The status (schema 2) lists each ledger's path, SHA-256, record count and chain head, and the receipt (schema 2) carries them (audit item 90). | **done** 2026-09-28 |
+| E6.4 | Reviewer authentication, with records signed against a trusted reviewer key set; each record's source artifact re-hashed against a retained artifact root; and release and environment binding. | open, design first |
+| E6.5 | Session criteria, defined before any session counts: what "clean" means, and how a reconnect, an unresolved `UNKNOWN` or a discrepancy is treated. Also the customer gate's threshold: the tool requires 1, the roadmap 10 professionals or 3 organisations. | **decision** |
+
+### E7 — The safety gaps (assessment priority 4)
+
+| Slice | Scope | State |
+| --- | --- | --- |
+| E7.1 | E3.11's link guard for every durable writer it did not cover. The operations journal's reader reports a dangling link as a healthy empty journal. The replay `FileEventStore` and the backtest `FileExperimentStore` check `exists()` and then open with `create(true)`. `follon-news` output uses `File::create`, which truncates a link's target. `write_immutable` leaves its staging file behind on a dangling link. **Each now refuses any link without following it**; the experiment store checks again at every write, because it reopens its file each time (audit item 91). | **done** 2026-09-28 |
+| E7.2 | Strategy-worker frames. Each is one newline-terminated JSON line, read with an unbounded `read_line` and no deadline. They need a bound applied before allocation and a per-frame deadline, reusing the IBKR bridge's bounded reader. | open |
+| E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
+| E7.4a | Portfolio-risk configuration fingerprints. PAPER's and LIVE's both omitted `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`. **Now every field enters both**, through `PortfolioRiskPolicy::canonical_parts`, whose exhaustive destructuring makes a new field a compile error until it is rendered. The part is tagged `v2`, so a journal or LIVE approval made under the incomplete version-1 fingerprint is refused rather than trusted (audit item 98). | **done** 2026-09-29 |
+| E7.4b | The aggregate portfolio-risk check is skipped outright when equity is not positive. Failing closed would also refuse risk-reducing orders, such as closing positions, when an account is underwater, so the treatment is the operator's choice. | **decision** |
+| E7.5 | Aggregate portfolio risk in the order-submitting routes, the desktop gateway and the gRPC PAPER route. Only the read-only `follon-paper-status` composes it today. | open |
+| E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
+| E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
+| E7.8 | The SBOM covers the desktop's Cargo workspace and records first-party licences; E7.11, on which the licences depended, is decided (MIT). | open |
+| E7.9 | The risk benchmark records when it was measured; its `observed_at` is the fixture's scenario time. | open |
+| E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
+| E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |
+| E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open. | open |
+| E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
+
+### E8 — Accounting and state parity (assessment priority 5)
+
+| Slice | Scope | State |
+| --- | --- | --- |
+| E8.1 | FIFO tax lots follow a split exactly as the position does: each lot's quantity scaled by the ratio and its unit cost divided by it, so its total cost is unchanged. **Reproduced, then fixed** in both the primary ledger and the advanced account, long and short: before, a post-split partial sale realized -45 where +5 was due, and the rest was refused (audit item 93). | **done** 2026-09-28 |
+| E8.2 | The replay engine's own portfolio, and so the fingerprinted event stream, applies corporate actions as the ledger does. A working order across a split would apply E3.6g's decision, so the replay refuses to fill it. | open |
+| E8.3 | The worker's position snapshot and cash reflect splits and dividends. The SDK has no corporate-action hook, and adding one is a protocol change. | **decision** |
+| E8.4 | PAPER and controlled LIVE apply no corporate actions, and capsule replay has no corporate-action input. | open |
+| E8.5 | The two P&L conventions stated and tested. The primary ledger puts fees in the cost basis, while the advanced account reports trading P&L before separately attributed charges. Also clean-install and recovery evidence. | open |
 
 ### E1 — Risk-gated multi-leg combo order path (conformance row 5.6)
 
@@ -98,6 +311,11 @@ has landed. What remains for row 5.6 is external — broker-backed PAPER
 acceptance of a real combination against IBKR, and the options-acceptance gate
 below. The desktop still has no live market-data feed, so every leg's
 observation is operator-attested, exactly as for the single-order ticket.
+**Corrected in place 2026-09-28:** "nothing structural" was false for the real
+broker. Every E1 slice landed against the model adapter. The Python bridge has
+no combination operation, the Rust payload omits each leg's quantity and the
+debit or credit sign, and the event normalizer cannot produce a
+`ComboExecution`, so a combination cannot reach IBKR at all (E5.1).
 
 | Slice | Scope | State |
 | --- | --- | --- |
@@ -202,7 +420,12 @@ covered by a test named after it.
 - **`IbkrPaperAdapter` now accepts native combinations**, because the real
   paper bridge it models (`adapters/brokers/ibkr::submit_paper_combo`) does. A
   model that refused what the thing it models accepts would leave the whole
-  path untestable against anything but a rejection.
+  path untestable against anything but a rejection. **Corrected in place
+  2026-09-28: the premise was false.** `submit_paper_combo` only forwards a
+  `submit_combo` request to the Python bridge, whose dispatch has no such
+  operation and answers `unsupported bridge operation`. Nothing in the
+  repository builds an IBKR BAG contract. The model's combination support is a
+  model capability, not parity with the real bridge (E5.1).
 
 **A pre-existing finding this slice surfaced, not a regression it caused.**
 Several `#[serde(default)]` fields in `PersistentPaperState` carried comments
@@ -417,7 +640,12 @@ They are legitimate *schema-conformance examples* and are no longer copied into
 `var/`. The gap is that 29 of the 32 have no computation anywhere in the
 repository. Two categories are now computed by the pipeline
 (`decision-reconstruction` and `strategy-capsule-manifest`); the other 30
-panels correctly render an empty state.
+panels correctly render an empty state. **Corrected in place 2026-09-28:** "no
+computation anywhere in the repository" overstated it. What holds is that no
+producer publishes those contracts. Related algorithms exist for some, such as
+`core/options`'s frozen-chain scenarios and `core/risk`'s portfolio
+aggregation, but none produces its category's contract, so the panels stay
+empty until one does.
 
 | Slice | Scope | State |
 | --- | --- | --- |
@@ -446,14 +674,14 @@ The 29: `adapter-qualification`, `assistant-evidence`, `assumption-regime-monito
 | E3.1 | **E3.1a done 2026-09-25 (audit item 66):** the main artifact (schema 3) and report carry the advanced-account economics, and the sidecar is gone. **Multi-account allocation is frozen** by `03-roadmap-and-gates.md` until the preceding gates are independently evidenced; the operator chose not to override the gate. | 5.4 |
 | E3.2 | Property/model/fault coverage beyond the ten landed slices (OMS lifecycle, option settlement, portfolio aggregation, and — since 2026-09-24 — the PAPER and controlled-LIVE atomic-combination lifecycles, EMS scheduling legality, algo-wheel allocation, passive repricing, smart routing, and — since 2026-09-25 — margin valuation and financing accrual, item 64). No named candidate remains; further property coverage is open-ended. The two smart-routing contract ambiguities of audit item 62 were resolved by operator decision (item 63). | Reliability |
 | E3.6 | **Done 2026-09-24 (audit item 61).** PAPER and controlled-LIVE risk now refuse an unlisted instrument (`INSTRUMENT_TICK_SIZE_UNCONFIGURED`) and an off-grid limit (`LIMIT_PRICE_OFF_TICK_GRID`) against a required per-instrument tick table in every configuration. **E3.6b done 2026-09-26 (audit item 69):** each combination leg meets the plain-order tick rule, and the net limit must sit on the finest leg grid. **E3.6c done 2026-09-26 (audit item 70):** a required per-instrument lot table in every configuration; an unlisted instrument, or a quantity that is not a whole number of lots, is refused for a plain order and for each combination leg's contract quantity. **E3.6d done 2026-09-26 (audit item 73):** the replay engine behind every backtest applies the same tick and lot rules, from the instrument's effective reference data, on the bar and news paths, and a fill cap must be a whole number of lots. **E3.6e done 2026-09-27 (audit item 74):** a simulated fill prints on the fill bar's tick grid, rounded against the trader (a buy up, a sell down) before its limit is checked. **E3.6f done 2026-09-27 (audit item 76):** PAPER and controlled LIVE refuse at startup a policy whose tick and lot tables list different instruments. **E3.6g done 2026-09-27 (audit item 79), as the operator decided:** a replay refuses to fill a working order off a lot size that changed while it worked. **E3.6h done 2026-09-27 (audit item 84), applying the same decision:** a replay refuses to fill a working limit order whose limit a tick change left off the new grid. Remainder: a venue's own response to an increment change (cancel, reprice or odd-lot acceptance), price improvement and midpoint prints are not modelled. | 5.4 / 5.5 / 5.7 |
-| E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. **E3.3b done 2026-09-26 (audit item 71):** `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` require a session whose role grants kill-switch operation (`risk_manager`), and the PAPER journal records the operator and server time of every change. **E3.3c done 2026-09-27 (audit item 81), as the operator decided:** `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` on a controlled-LIVE route that holds no broker connection and can only halt, sharing `follon-live-status`'s configuration parser; the LIVE journal records the operator. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes, LIVE order RPCs, a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
+| E3.3 | **E3.3a done 2026-09-25 (audit item 67):** `SubmitPaperCombo` requires an operator session (Argon2id password plus mandatory TOTP, from a one-tenant directory provisioned by `follon-admin operator-add`) whose role grants PAPER trading, and the PAPER journal records `submitted_by`. **E3.3b done 2026-09-26 (audit item 71):** `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` require a session whose role grants kill-switch operation (`risk_manager`), and the PAPER journal records the operator and server time of every change. **E3.3c done 2026-09-27 (audit item 81), as the operator decided:** `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` on a controlled-LIVE route that holds no broker connection and can only halt, sharing `follon-live-status`'s configuration parser; the LIVE journal records the operator. Open: persisted sessions, approval/four-eyes policy on writes, authenticated Tauri IPC writes (now E7.10), LIVE order RPCs, a managed secret store for the directory, and the separate deployment review (external). The REST boundary stays read-only. | Architecture |
 | E3.4 | **Done 2026-09-25 as a repository-authored scan (audit item 68), as the operator decided.** `tools/dast_scan.py` (pipeline step 23b) scans a local loopback deployment of the dashboard and trading API: 69 probes when it landed, and 76 since E3.3b added the kill-switch RPCs. It found and fixed a runtime-version disclosure. An independent DAST product run against a real deployment stays external, alongside the penetration-test gate. | Security |
 | E3.5 | **Done 2026-09-25 (audit item 65), scoped as the operator decided.** `repair_quote_gaps` and `follon-repair-quotes` fill recorded quote-sequence gaps only from a supplied recovery batch. They never interpolate, refuse a contradicting batch, and declare every residual gap. Remainder, now part of the row 5.2 vendor gate: nothing records a live quote stream, re-requests a gap window from a vendor, or refuses to trade on an incomplete stream. | 5.2 |
 | E3.7 | **Done 2026-09-26 (audit item 72).** Replay risk priced an intent from the bar that produced it, whatever that bar's instrument, so a QQQ order raised on SPY's bar was judged at SPY's price. `RiskPolicy::evaluate` now refuses a mark for another instrument, and the bar and news paths refuse such an intent before recording it, as PAPER does. Remainder: the engine holds no mark except the current bar, so one instrument cannot be traded on another's bar. | 5.4 |
 | E3.8 | **Done 2026-09-27 (audit item 75).** Configuration, bundle and built-in-strategy hashes cover checked-in bytes, and with no `.gitattributes` a Windows checkout (CRLF) published different hashes from CI's Linux checkout (LF) for one commit. `.gitattributes` now checks every text file out with LF on every platform, the pipeline's advanced-fixture generator writes LF, and `tests/security/test_checkout_line_endings.py` names any stale file. **E3.8b done 2026-09-27 (audit item 80):** that test's byte check no longer skips an edited input, a skip that under pytest hid a later input's failure. Remainder: a file an editor saves with CRLF is hashed as saved until it is checked out again. | Reliability |
 | E3.9 | **Done 2026-09-27 (audit item 77).** The version-2 PAPER configuration schema declared neither the tick nor the lot table, so it rejected both version-2 fixtures that `follon-paper-status` reads. It now matches version 1, and `tests/security/test_configuration_contracts.py` holds 17 configuration fixtures to their schemas. Remainder: output and evidence documents are outside that test. | Architecture |
 | E3.10 | **Done 2026-09-27 (audit item 78).** PAPER opened its journal, creating the file, before validating its configuration, so a refused start left an empty journal. It now validates first, as controlled LIVE does. The desktop gateway's configuration comment, which claimed one file could serve both it and `follon-paper-status`, is corrected. **E3.10b done 2026-09-27 (audit item 82):** a composition that may only reopen a journal, the legacy route a version-1 configuration builds, opens it without creating anything, so its refusal leaves no file or directory either. | 5.5 / 5.10 |
-| E3.11 | **Done 2026-09-27 (audit item 83).** The PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs each refused a symbolic link only after `exists()`, which follows it, so a dangling link passed. Each journal and the ledger were then created at the link's target, and the ledger's verified read reported an empty ledger. Each now reads `symlink_metadata` and refuses any link. Remainder: the check precedes the open, so a link swapped in between is not refused; and a refused `release-keygen` trusted key leaves its new private key on disk, which is a custody decision. | Security |
+| E3.11 | **Done 2026-09-27 (audit item 83).** The PAPER and controlled-LIVE journals, the commercial ledger and `follon-admin`'s outputs each refused a symbolic link only after `exists()`, which follows it, so a dangling link passed. Each journal and the ledger were then created at the link's target, and the ledger's verified read reported an empty ledger. Each now reads `symlink_metadata` and refuses any link. Remainder: the check precedes the open, so a link swapped in between is not refused; and a refused `release-keygen` trusted key leaves its new private key on disk, which is a custody decision. Both remainders are now E7 slices (E7.12 and E7.6), as are the writers E3.11 did not cover (E7.1). | Security |
 
 ## The backlog that code cannot close
 
@@ -463,7 +691,7 @@ reads **not approved for capital-bearing or customer-facing production use**.
 
 | Gate | Required | Progress |
 | --- | --- | --- |
-| PAPER reliability | 30 clean real PAPER sessions, no unexplained discrepancy | 0/30 |
+| PAPER reliability | 30 clean real PAPER sessions, no unexplained discrepancy | 0/30; cannot start before E5 composes the real bridge |
 | Controlled LIVE | 60 clean small-capital sessions after reviewed approval | 0/60 |
 | Operator usability | 5 design partners completing workflows unaided | 0/5 |
 | Options acceptance | 1 independently verified option-capable broker export reconciled across BACKTEST/PAPER/LIVE | 0/1 |
@@ -477,6 +705,12 @@ Two gates deserve calling out because they are cheap and currently at zero:
 the **30 PAPER sessions** need only a configured IBKR paper account and elapsed
 time, and they are the single highest-signal validation available. The
 **options acceptance** gate is what E1 is a prerequisite for.
+**Corrected in place 2026-09-28:** the 30 sessions do not "need only a
+configured IBKR paper account and elapsed time". That was false: no
+application composes the real IBKR PAPER bridge, so a configured account has
+nothing in this repository to connect to. The sessions need E5 first, then the
+account and elapsed time. The options gate also needs a combination path to
+IBKR, which does not exist (E5.1).
 
 ## Settled direction
 
@@ -495,7 +729,10 @@ the reversal here with its date.
    force now:
    - The **30 clean PAPER sessions** gate is the top external priority. It is
      at 0/30, needs only a configured IBKR paper account and elapsed time, and
-     is the highest-signal validation available.
+     is the highest-signal validation available. **Corrected in place
+     2026-09-28:** "needs only a configured IBKR paper account and elapsed
+     time" was false. It needs E5 first, because no application composes the
+     real bridge.
    - Multi-tenant, IAM and commercial foundations are **kept warm, not
      extended** — they exist and stay tested; no new customer-facing surface is
      built until the PAPER gate is met.
@@ -515,6 +752,21 @@ the reversal here with its date.
      authenticated Tauri IPC writes, and a managed store for the operator
      directory. So does the PAPER journal schema-migration question, which
      was not chosen.
+4. **2026-09-28 — the revised assessment's priorities are adopted.** Asked to
+   update the goals according to the Revision 2 assessment, the backlog now
+   follows its §15 order as epics E4 to E8. This refines item 2 rather than
+   reversing it: the PAPER gate stays the top external priority, and E5 is
+   what makes it reachable. It reverses nothing item 3 keeps warm.
+   Authenticated Tauri IPC writes (E7.10) stay a decision, although the
+   assessment lists native authentication under its priority 4.
+5. **2026-09-29 — four decisions, asked after the E4 to E8 re-plan.**
+   - The real IBKR PAPER bridge goes first into the authenticated gRPC PAPER
+     route (E5.2).
+   - CI installs `ibapi` 9.81.1.post1 from PyPI, hash-pinned (E4.2).
+   - The repository's licence is MIT. The Cargo and SDK metadata that said
+     Apache-2.0 follow the root `LICENSE` (E7.11).
+   - The branch is pushed and a pull request opened, so GitHub CI can verify
+     E4 (E4.3).
 
 ### Still unanswered
 
@@ -528,6 +780,76 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-29 — session 11
+
+- Landed E5.2b-2: the authenticated gRPC PAPER route now submits a single
+  market or limit order through risk/OMS and cancels a single or combination
+  order, with tenant and account checks and journaled operator identity.
+  A fake bridge accepted a DAY market order and cancellation; GTC was refused
+  before risk evidence. These tests are protocol evidence, not TWS evidence.
+- An injected omission of the submitter failed the durable-operator regression
+  test, then was reverted. E5.2c adds a risk-manager reconciliation RPC over
+  the configured route. A stateful bridge protocol fixture produced a fill
+  and matching snapshot; a model restart surfaced discrepancies. Omitting the
+  broker event drain failed the bridge regression, then was reverted (item 102).
+- The full evidence pipeline exited 0 after both slices. Final suite counts
+  for E5.2c are in the generated status block above.
+- **Next action:** define the real IBKR PAPER account scope and fresh market
+  input for this route (E5.3 and E5.5), then retain Gateway evidence for
+  restart, reconnect, cancellation races and reconciliation (E5.6). E5.4's
+  bridge refusal distinction and the other external gates remain open.
+
+### 2026-09-28/29 — session 10
+
+- Asked to analyse the Revision 2 assessment, act on it, develop further, and
+  update the goals to match it. Baseline at `4adb090` on
+  `docs/project-status-assessment-2026-09-27`: all seven suites green (Rust
+  521 / 0 / 3, Tauri 30, Python 55), with the assessment's docs uncommitted.
+- Checked every source claim before acting on it. Three read-only reviews ran,
+  each CI failure was reproduced from its GitHub log, and Semgrep 1.177.0 and
+  gitleaks 8.24.3 were re-run locally. Every claim held. One claim of this
+  document's own was false: E1.3a's statement that the real bridge accepts
+  combinations. The reviews also found defects the assessment did not name.
+- Re-planned the backlog around the assessment's §15 as epics E4 to E8, and
+  corrected false claims in place (Settled direction item 4).
+- Landed 15 slices, each measured with all seven suites and the full
+  pipeline, with rule-5 injections throughout (audit items 85 to 99):
+  - E4.1: foundation CI's three fixable failures.
+  - E6.1: the pipeline had counted the assessment's synthetic customer, and
+    would have published it.
+  - E5.1: adapters declare capabilities, and the real bridge refuses
+    combinations, GTC and replacement before an order exists. Found along
+    the way: a fault-injection test that had passed for the wrong reason.
+  - E7.13: a dashboard reset that flaked scan probe H32.
+  - E6.2 and E6.3: rejection handling, and a promotion gate that recomputes
+    acceptance from the ledgers.
+  - E7.1, E7.3 and E8.1: link guards, a worker hash seed, and tax lots that
+    follow splits (reproduced first).
+  - E4.2, E7.11, E7.6 and E7.4a: CI's `ibapi`, the MIT licence, keygen
+    pre-validation, and complete risk fingerprints.
+  - E5.2a: the gRPC PAPER route composes the real IBKR bridge by
+    configuration. Found along the way: the gateway fingerprint alone would
+    have let a journal reopen against another IBKR broker account.
+- The operator decided four questions (Settled direction item 5):
+  - the gRPC route gets the real bridge first;
+  - CI pins `ibapi` 9.81.1.post1;
+  - the licence is MIT;
+  - the branch is pushed and a pull request opened. That is PR 31.
+- **Foundation CI is green on GitHub for the first time:** runs 36524632774
+  and 36525083347 passed all six jobs (E4.3, audit item 96).
+- Measured at the E5.2a commit: all seven suites green (Rust 548 / 0 / 3,
+  Tauri 31, Python 75). The full pipeline exited 0, with the scan at 85 of 85
+  probes.
+- **Next action:** E5.2b-2, authenticated single-order submit and cancel on the
+  gRPC PAPER route over the journaled kernel (E5.2b-1), because its only order
+  RPC submits combinations, which the bridge cannot carry. Then E5.2c,
+  synchronize and reconcile. After that comes the
+  operator's own PAPER session (E5.6). Still waiting on the operator:
+  - E7.4b: the equity-not-positive policy;
+  - E7.10: native desktop authentication;
+  - E6.5: session criteria and the customer threshold;
+  - E8.3: a corporate-action hook for the worker.
 
 ### 2026-09-27 — session 9
 

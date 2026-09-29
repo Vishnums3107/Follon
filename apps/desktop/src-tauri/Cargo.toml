@@ -5,7 +5,7 @@ description = "Follon trading operations desktop"
 authors = ["Follon Contributors"]
 edition = "2021"
 rust-version = "1.85"
-license = "Apache-2.0"
+license = "MIT"
 
 [lib]
 name = "follon_desktop_lib"

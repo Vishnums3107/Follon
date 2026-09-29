@@ -31,6 +31,7 @@ CONFIGURATION_CONTRACTS = {
     "live-v1.json": "v1/live-configuration.schema.json",
     "live-v1-portfolio-risk.json": "v1/live-configuration.schema.json",
     "paper-command-route-v1.json": "v1/paper-command-route.schema.json",
+    "paper-command-route-v1-bridge.json": "v1/paper-command-route.schema.json",
     "operations-v1.json": "v1/operations-configuration.schema.json",
     "options-v1.json": "v1/options-configuration.schema.json",
     "commercial-data-inventory-v1.json": "v1/commercial-data-inventory.schema.json",
@@ -107,6 +108,39 @@ class ConfigurationContractTests(unittest.TestCase):
                 fixture = load(FIXTURE_ROOT / fixture_name)
                 errors = [error.message for error in validator.iter_errors(fixture)]
                 self.assertEqual(errors, [])
+
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jsonschema"), "full validation needs jsonschema"
+    )
+    def test_the_route_schema_ties_the_bridge_section_to_its_adapter_kind(self) -> None:
+        # The service refuses a bridge section on the model and requires one
+        # on the bridge (delivery state E5.2a); the schema says the same.
+        import jsonschema
+
+        schema = load(SCHEMA_ROOT / "v1" / "paper-command-route.schema.json")
+        validator = jsonschema.validators.validator_for(schema)(schema)
+        model = load(FIXTURE_ROOT / "paper-command-route-v1.json")
+        bridge = load(FIXTURE_ROOT / "paper-command-route-v1-bridge.json")
+        section = bridge["ibkr_bridge"]
+        refused = {
+            "model with a bridge section": {**model, "ibkr_bridge": section},
+            "bridge without a section": {**model, "adapter_kind": "IBKR_PAPER_BRIDGE"},
+            "unknown adapter kind": {**model, "adapter_kind": "IBKR_LIVE"},
+            "live port": {**bridge, "ibkr_bridge": {**section, "port": 7496}},
+            "remote host": {**bridge, "ibkr_bridge": {**section, "host": "10.0.0.5"}},
+            "client id": {**bridge, "ibkr_bridge": {**section, "client_id": 32}},
+            "short timeout": {**bridge, "ibkr_bridge": {**section, "request_timeout_seconds": 2}},
+            "long timeout": {**bridge, "ibkr_bridge": {**section, "request_timeout_seconds": 61}},
+            "split account": {**bridge, "ibkr_bridge": {**section, "broker_account": "DU1\nDU2"}},
+            "free-form arguments": {**bridge, "ibkr_bridge": {**section, "arguments": ["--port", "7496"]}},
+        }
+        for name, document in refused.items():
+            with self.subTest(refused=name):
+                self.assertFalse(validator.is_valid(document))
+        for name, document in {"model": model, "bridge": bridge}.items():
+            with self.subTest(accepted=name):
+                self.assertTrue(validator.is_valid(document))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,9 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import tempfile
+import time
 import unittest
 from email.message import Message
 from http import HTTPStatus
@@ -284,6 +286,102 @@ class DashboardServerContract(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
+
+    def serve(self) -> tuple[server.ThreadingHTTPServer, Thread]:
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
+        thread = Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        return httpd, thread
+
+    def stop(self, httpd: server.ThreadingHTTPServer, thread: Thread) -> None:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+    def raw_status(self, port: int, head: bytes, body: bytes = b"", delay: float = 0.05) -> int:
+        """Sends a request's head, then its body one byte at a time, each after
+        `delay`, and returns the status the client could read: 0 if the
+        connection was reset first, -1 if the server sent nothing before the
+        client's timeout. Sending the body in pieces also catches a server that
+        reads less than the declared length."""
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        response = b""
+        try:
+            client.sendall(head)
+            if body:
+                for index in range(len(body)):
+                    time.sleep(delay)
+                    try:
+                        client.sendall(body[index:index + 1])
+                    except OSError:
+                        break
+                time.sleep(delay)
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        except TimeoutError:
+            return -1
+        except OSError:
+            return 0
+        finally:
+            client.close()
+        status_line = response.split(b"\r\n", 1)[0]
+        return int(status_line.split()[1]) if status_line.startswith(b"HTTP/") else 0
+
+    def test_a_refused_method_keeps_its_response_when_its_body_follows_the_headers(self) -> None:
+        # Closing a connection with unread input resets it, and the reset can
+        # destroy the response before the client reads it. With the body sent
+        # just after the headers, an unread body lost the 501 every time; scan
+        # probe H32 met the same race intermittently (E7.13).
+        httpd, thread = self.serve()
+        try:
+            for method in ("POST", "PUT", "DELETE", "PATCH"):
+                head = (
+                    f"{method} /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "Content-Length: 2\r\n\r\n"
+                ).encode()
+                self.assertEqual(self.raw_status(httpd.server_address[1], head, b"{}"), 501, method)
+        finally:
+            self.stop(httpd, thread)
+
+    def test_a_get_keeps_its_response_when_a_body_follows_the_headers(self) -> None:
+        httpd, thread = self.serve()
+        try:
+            head = b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n"
+            self.assertEqual(self.raw_status(httpd.server_address[1], head, b"{}"), 200)
+        finally:
+            self.stop(httpd, thread)
+
+    def test_a_declared_body_that_never_arrives_cannot_hold_the_server(self) -> None:
+        # The body is read before the response, so a client that declares one
+        # and sends nothing is cut off by the handler's timeout. The default is
+        # finite; the test shortens it only to stay fast.
+        self.assertIsInstance(server.DashboardHandler.timeout, (int, float))
+        self.assertGreater(server.DashboardHandler.timeout, 0)
+        self.assertLessEqual(server.DashboardHandler.timeout, 60)
+        with patch.object(server.DashboardHandler, "timeout", 1):
+            httpd, thread = self.serve()
+            try:
+                head = b"DELETE /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n"
+                self.assertEqual(self.raw_status(httpd.server_address[1], head), 501)
+            finally:
+                self.stop(httpd, thread)
+
+    def test_an_oversized_declared_body_is_never_read(self) -> None:
+        # A handler timeout longer than the client's own: were the bound not
+        # applied, the server would wait for 10 MiB and the client time out.
+        with patch.object(server.DashboardHandler, "timeout", 30):
+            httpd, thread = self.serve()
+            try:
+                head = (
+                    b"DELETE /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    b"Content-Length: 10485760\r\n\r\n"
+                )
+                self.assertEqual(self.raw_status(httpd.server_address[1], head), 501)
+            finally:
+                self.stop(httpd, thread)
 
     def test_security_headers_block_privileged_browser_features(self) -> None:
         handler = object.__new__(server.DashboardHandler)

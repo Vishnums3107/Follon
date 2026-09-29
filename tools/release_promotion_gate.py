@@ -71,13 +71,68 @@ def verify_release(
         raise PromotionError(f"signed release verification failed: {reason[:512]}")
 
 
-def acceptance_ready(status_path: Path, target_environment: str) -> str:
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-    if status.get("acceptance_status_schema_version") != 1:
-        raise PromotionError("acceptance status has an unsupported schema")
+def acceptance_ready(repository_root: Path, ledger_root: Path, target_environment: str) -> tuple[dict[str, object], bytes]:
+    """Recomputes acceptance from the ledger root with the published tool.
+
+    The gate reads no status document. It used to, and a caller-authored one
+    that simply declared every gate eligible passed it for production (E6.3).
+    Returns the status and the exact bytes the tool emitted, which the
+    receipt hashes.
+    """
+    result = subprocess.run(
+        [sys.executable, str(repository_root / "tools" / "acceptance_evidence.py"), str(ledger_root)],
+        cwd=repository_root,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        reason = stderr.splitlines()[-1] if stderr else "verification failed"
+        raise PromotionError(f"acceptance ledgers failed verification: {reason[:512]}")
+    try:
+        status = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PromotionError("acceptance tool returned malformed status") from error
+    if not isinstance(status, dict) or status.get("acceptance_status_schema_version") != 2:
+        raise PromotionError("acceptance tool returned an unsupported status")
     if target_environment == "production" and status.get("all_gates_eligible") is not True:
         raise PromotionError("production promotion is blocked by open acceptance gates")
-    return sha256_file(status_path)
+    return status, result.stdout
+
+
+def promotion_receipt(
+    *,
+    source_environment: str,
+    target_environment: str,
+    manifest: Path,
+    signature: Path,
+    trusted_key: Path,
+    acceptance_status: dict[str, object],
+    acceptance_status_bytes: bytes,
+    requester: str,
+    approver: str,
+    change_ticket: str,
+    promoted_at: str,
+) -> dict[str, object]:
+    """The eligibility receipt. Version 2 binds the recomputed acceptance
+    status and every ledger file it counted (E6.3)."""
+    return {
+        "release_promotion_receipt_schema_version": 2,
+        "source_environment": source_environment,
+        "target_environment": target_environment,
+        "manifest_sha256": sha256_file(manifest),
+        "signature_sha256": sha256_file(signature),
+        "trusted_key_sha256": sha256_file(trusted_key),
+        "acceptance_status_sha256": hashlib.sha256(acceptance_status_bytes).hexdigest(),
+        "acceptance_ledgers": acceptance_status["ledgers"],
+        "requester": requester,
+        "approver": approver,
+        "change_ticket": change_ticket,
+        "promoted_at": promoted_at,
+        "decision": "eligible",
+    }
 
 
 def write_receipt(path: Path, value: object) -> None:
@@ -97,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--signature", required=True, type=Path)
     parser.add_argument("--trusted-key", required=True, type=Path)
     parser.add_argument("--artifacts-root", required=True, type=Path)
-    parser.add_argument("--acceptance-status", required=True, type=Path)
+    parser.add_argument("--acceptance-ledger-root", required=True, type=Path)
     parser.add_argument("--requester", required=True)
     parser.add_argument("--approver", required=True)
     parser.add_argument("--change-ticket", required=True)
@@ -119,25 +174,25 @@ def main(argv: list[str] | None = None) -> int:
             arguments.trusted_key.resolve(strict=True),
             arguments.artifacts_root.resolve(strict=True),
         )
-        acceptance_hash = acceptance_ready(
-            arguments.acceptance_status.resolve(strict=True),
+        acceptance_status, acceptance_status_bytes = acceptance_ready(
+            repository_root,
+            arguments.acceptance_ledger_root.resolve(strict=True),
             arguments.target_environment,
         )
         promoted_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        write_receipt(arguments.receipt, {
-            "release_promotion_receipt_schema_version": 1,
-            "source_environment": arguments.source_environment,
-            "target_environment": arguments.target_environment,
-            "manifest_sha256": sha256_file(arguments.manifest),
-            "signature_sha256": sha256_file(arguments.signature),
-            "trusted_key_sha256": sha256_file(arguments.trusted_key),
-            "acceptance_status_sha256": acceptance_hash,
-            "requester": arguments.requester,
-            "approver": arguments.approver,
-            "change_ticket": arguments.change_ticket,
-            "promoted_at": promoted_at,
-            "decision": "eligible",
-        })
+        write_receipt(arguments.receipt, promotion_receipt(
+            source_environment=arguments.source_environment,
+            target_environment=arguments.target_environment,
+            manifest=arguments.manifest,
+            signature=arguments.signature,
+            trusted_key=arguments.trusted_key,
+            acceptance_status=acceptance_status,
+            acceptance_status_bytes=acceptance_status_bytes,
+            requester=arguments.requester,
+            approver=arguments.approver,
+            change_ticket=arguments.change_ticket,
+            promoted_at=promoted_at,
+        ))
     except (PromotionError, OSError, json.JSONDecodeError) as error:
         print(f"release promotion gate failed: {error}", file=sys.stderr)
         return 2

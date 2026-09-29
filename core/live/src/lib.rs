@@ -4831,6 +4831,44 @@ impl RegisteredLiveApproval {
     }
 }
 
+/// A portfolio-risk composition's fingerprint parts, every field included:
+/// the policy's own, then its instrument buckets and margin rates. LIVE keeps
+/// its own copy of this rendering, as it keeps its own risk gate.
+fn portfolio_risk_fingerprint_parts(composition: &PortfolioRiskComposition) -> Vec<String> {
+    let PortfolioRiskComposition {
+        policy,
+        instrument_buckets,
+        margin_rates,
+    } = composition;
+    let mut parts = policy.canonical_parts();
+    parts.push(format!(
+        "instrument_buckets={}",
+        instrument_buckets
+            .iter()
+            .map(|(instrument_id, bucket)| format!(
+                "{instrument_id}:{}:{}:{}",
+                bucket.asset_class, bucket.currency, bucket.sector
+            ))
+            .collect::<Vec<_>>()
+            .join("|")
+    ));
+    parts.push(format!(
+        "margin_rates={}",
+        margin_rates.as_ref().map_or_else(
+            || "none".to_owned(),
+            |rates| rates
+                .iter()
+                .map(|(asset_class, rate)| format!(
+                    "{asset_class}:{}:{}",
+                    rate.initial_bps, rate.maintenance_bps
+                ))
+                .collect::<Vec<_>>()
+                .join("|")
+        )
+    ));
+    parts
+}
+
 fn configuration_fingerprint(
     account: &LiveAccount,
     policy: &LiveRiskPolicy,
@@ -4849,49 +4887,16 @@ fn configuration_fingerprint(
     let max_market_data_age_seconds = policy.max_market_data_age_seconds.to_string();
     let max_order_rate = policy.max_order_rate.to_string();
     let order_rate_window_seconds = policy.order_rate_window_seconds.to_string();
-    // Absent for every configuration that does not opt into Slice-1 aggregate-
-    // risk composition, so this leaves the fingerprint of an unconfigured
-    // operator byte-for-byte unchanged.
+    // Every portfolio-risk field, through the policy's exhaustive
+    // `canonical_parts`, plus this composition's reference data and margin
+    // rates. Version 1 of this part listed the fields by hand and left out
+    // five limits, so a journal reopened, and an approval stayed valid, under
+    // changed limits (delivery state E7.4). Absent for every configuration
+    // without aggregate-risk composition, whose fingerprint is unchanged.
     let portfolio_risk_parts: Vec<String> = policy
         .portfolio_risk
         .as_ref()
-        .map(|composition| {
-            vec![
-                composition.policy.version.clone(),
-                composition.policy.max_gross_exposure.to_string(),
-                composition.policy.max_abs_net_exposure.to_string(),
-                composition.policy.max_leverage_bps.to_string(),
-                composition.policy.max_concentration_bps.to_string(),
-                render_bucket_map(&composition.policy.sector_limits),
-                render_bucket_map(&composition.policy.asset_class_limits),
-                render_bucket_map(&composition.policy.currency_limits),
-                composition
-                    .policy
-                    .allowed_instruments
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("|"),
-                composition
-                    .policy
-                    .restricted_instruments
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("|"),
-                composition
-                    .instrument_buckets
-                    .iter()
-                    .map(|(instrument_id, bucket)| {
-                        format!(
-                            "{instrument_id}:{}:{}:{}",
-                            bucket.asset_class, bucket.currency, bucket.sector
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("|"),
-            ]
-        })
+        .map(portfolio_risk_fingerprint_parts)
         .unwrap_or_default();
     let mut parts = vec![
         "live-configuration-v3",
@@ -4917,7 +4922,7 @@ fn configuration_fingerprint(
         &kill_switches.version,
     ];
     if !portfolio_risk_parts.is_empty() {
-        parts.push("live-portfolio-risk-v1");
+        parts.push("live-portfolio-risk-v2");
         for part in &portfolio_risk_parts {
             parts.push(part);
         }
@@ -7358,6 +7363,70 @@ mod tests {
         assert!(decision.evaluated_limits.contains("recent_order_count=2"));
         drop(service);
         std::fs::remove_file(path).expect("remove test journal");
+    }
+
+    #[test]
+    fn every_portfolio_risk_limit_is_part_of_the_live_configuration_fingerprint() {
+        // Version 1 of the portfolio-risk part omitted these, so a journal
+        // reopened, and an approval stayed valid, under any change to them
+        // (delivery state E7.4).
+        let switches = LiveKillSwitchRegistry::new("live-kills-v1").expect("switches");
+        let fingerprint = |change: &dyn Fn(&mut PortfolioRiskComposition)| {
+            let mut composition = PortfolioRiskComposition {
+                policy: permissive_portfolio_risk_policy(),
+                instrument_buckets: BTreeMap::new(),
+                margin_rates: None,
+            };
+            change(&mut composition);
+            let mut risk_policy = policy();
+            risk_policy.portfolio_risk = Some(composition);
+            configuration_fingerprint(&account(), &risk_policy, &switches)
+        };
+        let base = fingerprint(&|_| {});
+        type Change = Box<dyn Fn(&mut PortfolioRiskComposition)>;
+        let changes: Vec<(&str, Change)> = vec![
+            (
+                "max_daily_loss",
+                Box::new(|c| c.policy.max_daily_loss = amount("1234")),
+            ),
+            (
+                "max_drawdown_bps",
+                Box::new(|c| c.policy.max_drawdown_bps = amount("1234")),
+            ),
+            (
+                "max_margin_utilization_bps",
+                Box::new(|c| {
+                    c.policy.max_margin_utilization_bps = amount("1234");
+                }),
+            ),
+            (
+                "strategy_limits",
+                Box::new(|c| {
+                    c.policy
+                        .strategy_limits
+                        .insert("strategy.live.001".to_owned(), amount("1000"));
+                }),
+            ),
+            (
+                "margin_rates",
+                Box::new(|c| {
+                    c.margin_rates = Some(BTreeMap::from([(
+                        "equity".to_owned(),
+                        follon_accounting::MarginRate {
+                            initial_bps: 5_000,
+                            maintenance_bps: 2_500,
+                        },
+                    )]));
+                }),
+            ),
+        ];
+        for (limit, change) in &changes {
+            assert_ne!(
+                fingerprint(change.as_ref()),
+                base,
+                "{limit} is not in the fingerprint"
+            );
+        }
     }
 
     #[test]

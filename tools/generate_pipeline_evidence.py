@@ -18,6 +18,11 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 VAR_DIR = REPOSITORY_ROOT / "var"
+# The one directory under var/ whose `*.acceptance.ndjson` ledgers count
+# toward the external gates. Everything else under var/ is generated
+# evidence, a report, or review material; a ledger there is never
+# operational acceptance evidence (E6.1).
+ACCEPTANCE_LEDGER_DIRECTORY = "acceptance"
 
 
 def sha256_file(path: Path) -> str:
@@ -61,6 +66,34 @@ def run_step(
             print(f"    {line}")
     print("    [OK]")
     return result
+
+
+def publish_acceptance_status(var_dir: Path) -> Path:
+    """Step 23: audits the operational acceptance ledgers and publishes their gate counts.
+
+    Only `var_dir/acceptance` is audited. The tool searches its root
+    recursively, so a root of `var/` itself counted every ledger anywhere
+    beneath it, including the synthetic boundary-experiment ledger the
+    2026-09-27 assessment retained under `var/reports/`. Its invented paying
+    customer would have been published as an eligible gate (E6.1).
+
+    The directory is created empty when absent. An empty directory is the
+    truth when no ledger has been retained, and the tool refuses a missing
+    root rather than reporting zero.
+    """
+    ledger_root = var_dir / ACCEPTANCE_LEDGER_DIRECTORY
+    ledger_root.mkdir(parents=True, exist_ok=True)
+    target = var_dir / "follon-acceptance-status.json"
+    run_step(
+        "Step 23: Auditing External Acceptance Ledgers & Real Gate Counts",
+        [
+            sys.executable, "tools/acceptance_evidence.py",
+            str(ledger_root),
+            "--output", str(target),
+        ],
+        targets=[target],
+    )
+    return target
 
 
 def main() -> None:
@@ -754,17 +787,9 @@ def main() -> None:
         targets=[readiness_target],
     )
 
-    # 23. Tamper-Evident Acceptance Status Ledger Gate Counts
-    acceptance_target = VAR_DIR / "follon-acceptance-status.json"
-    run_step(
-        "Step 23: Auditing External Acceptance Ledgers & Real Gate Counts",
-        [
-            sys.executable, "tools/acceptance_evidence.py",
-            str(VAR_DIR),
-            "--output", str(acceptance_target),
-        ],
-        targets=[acceptance_target],
-    )
+    # 23. Tamper-Evident Acceptance Status Ledger Gate Counts, from the
+    # operational ledger root only.
+    publish_acceptance_status(VAR_DIR)
 
     # 23b. Repository-authored dynamic scan (E3.4). Starts the real dashboard
     # and trading API on loopback and probes them over the network. It is not

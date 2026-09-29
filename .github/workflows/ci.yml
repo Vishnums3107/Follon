@@ -48,7 +48,8 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - name: Verify deterministic SBOM generation
+      - name: Run repository security and contract tests
+        # Every test under tests/security, of which SBOM determinism is one.
         run: python -m unittest discover -s tests/security -v
       - name: Generate release SBOM
         run: python tools/generate_sbom.py --source-revision "$GITHUB_SHA" --output build/follon-sbom.cdx.json
@@ -74,6 +75,14 @@ jobs:
         # (verified 2026-09-20), not on a real insecure-temp-file or
         # injection pattern, so `--error` would gate the build on noise
         # rather than a finding.
+        #
+        # The conformance audit is excluded as a path, not a rule. The nginx
+        # rules select their targets by a `conf` path glob, which the audit's
+        # file name matches ("...-conformance-audit.md"), and the audit is
+        # prose that quotes the Host-header defect item 41 fixed. Excluding
+        # the rule instead would stop scanning infra/nginx.dashboard.conf;
+        # re-injecting that defect there still fails this step (verified
+        # 2026-09-28). The audit's secrets coverage remains with gitleaks.
         run: |
           semgrep scan \
             --config p/owasp-top-ten \
@@ -83,6 +92,7 @@ jobs:
             --config p/secrets \
             --exclude-rule rust.lang.security.temp-dir.temp-dir \
             --exclude-rule rust.lang.security.args.args \
+            --exclude docs/06-delivery/14-master-plan-conformance-audit.md \
             --metrics=off \
             --error
 
@@ -134,6 +144,12 @@ jobs:
         env:
           PYTHONPATH: python/strategy-sdk/src
         run: python -m unittest discover -s python/strategy-sdk/tests -v
+      - name: Install the pinned IBKR API
+        # ibapi 9.81.1.post1, hash-pinned, as the operator approved on
+        # 2026-09-29 (delivery state E4.2). The bridge's six official-backend
+        # tests import it. Without it they error, and every later step in this
+        # job is skipped.
+        run: python -m pip install --require-hashes -r python/ibkr-gateway/requirements-ci.txt
       - name: Run IBKR bridge protocol tests
         env:
           PYTHONPATH: python/ibkr-gateway/src
@@ -163,6 +179,20 @@ jobs:
         working-directory: apps/desktop
       - run: npm run build:web
         working-directory: apps/desktop
+      - name: Install Tauri Linux prerequisites
+        # Tauri v2's documented Ubuntu prerequisites. `glib-sys`, `gtk` and
+        # `webkit2gtk` find these system libraries through pkg-config when
+        # the native host compiles, so clippy and the native tests cannot
+        # build without them. Before this step the job stopped at clippy with
+        # "Package glib-2.0 was not found in the pkg-config search path".
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
       - name: Check native formatting
         run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
       - name: Lint native command boundary
