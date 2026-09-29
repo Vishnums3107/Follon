@@ -4660,6 +4660,67 @@ These are mandatory master-plan acceptance conditions and are currently open:
        policy's share-denominated limits are the operator's configuration and are not rescaled.
        No external gate moved.
 
+113. A strategy worker's portfolio snapshot follows splits and dividends (2026-09-29, Reliability
+     and quality conformance, research-to-live parity; E8.3). Found by the source review behind the
+     revised assessment, and decided by the agent under the operator's blanket delegation.
+     - **Gap.** The host builds the portfolio and cash a worker is handed for every callback, from
+       `WorkerRuntimeServices`, and only fills updated it. A split left the worker's quantity, cost
+       and mark at their pre-split values until the next fill, and a dividend never reached its
+       cash at all. A worker that sized an exit from the snapshot it was shown sold a quantity the
+       account no longer held, and its cash drifted from the ledger's by every dividend. The item
+       had been held for the operator on the belief that a corporate-action hook is a worker
+       protocol change. It is not: the snapshot is the host's to build, so keeping it true needs a
+       trait method and no new frame.
+     - **Behavior.**
+       - `CorporateActionEffect` says what an action did to an account: a split with its ratio and
+         the position the engine now holds, or a dividend with the cash the ledger credited. Each
+         is validated, and a split effect must describe a held position.
+       - `Strategy::on_corporate_action` receives it. The default does nothing, so no existing
+         strategy changes. `BacktestRunner` delivers an effect after the ledger and the engine have
+         applied the action, and only when the account changed: a split that finds nothing held, a
+         dividend on no shares and a dividend that rounds to no cash are not delivered. A strategy's
+         refusal stops the run.
+       - `ProcessStrategyWorker` refuses an effect for another account and applies the rest to the
+         services its snapshot is built from. A split takes the engine's quantity and cost and
+         divides the mark, so the mark follows the shares, and a dividend adds the ledger's credit
+         to cash. Everything is checked before anything changes, and a mark the split would round
+         to nothing is refused rather than left for the SDK to reject.
+       - The worker protocol and the Python SDK are unchanged. A strategy sees a corporate action
+         as a correct portfolio.
+     - **Tests.** 11 tests and one fixture worker were added.
+       - Inline, 3: the snapshot after a split (quantity, cost, mark, cash) and after a dividend;
+         ten refusals, each leaving the snapshot untouched, the last a mark rounded to nothing;
+         and the effect's action, account and instrument.
+       - `core/backtest/tests/corporate_action_delivery.rs`, 8: a split's effect, a dividend
+         credited on the two shares the split left, no effect for an action that changed nothing,
+         none for a dividend that rounds to no cash, a strategy's refusal stopping the run, and
+         three with a real worker process (`tests/fixtures/worker/portfolio-following-worker.py`).
+         That worker sells whatever its snapshot says it holds. It sells the post-split quantity,
+         it is shown the dividend's cash, and what it last saw equals the ledger's quantity and
+         cash. It refuses an effect for another account, a dividend of nothing, a split of what it
+         does not hold and a split with no ratio.
+       - The shared runner fixtures moved to `core/backtest/tests/common/mod.rs`, which the split
+         tests now use too.
+     - **Rule 5.** 26 of 26 injected defects were caught by the intended tests: the effect not
+       validated or its ids unchecked; a split keeping the old quantity or cost, leaving the mark
+       alone or multiplying it, or keeping a mark rounded to nothing; a split creating a position
+       the worker never held; a dividend crediting nothing or debiting; a flat, zero-ratio or
+       zero-dividend effect accepted; the effect naming the wrong account or instrument; the
+       worker accepting another account's effect or ignoring every effect; and the runner never
+       delivering, swallowing a refusal, crediting something other than the ledger's cash,
+       delivering a credit that rounds to nothing, looking up the wrong ledger entry, naming
+       another account or passing the wrong ratio. One injection did not compile and proved
+       nothing; it was rewritten and caught. The runner's filter on the engine's events by account
+       is defensive and has no observable effect in a single-account replay, so it is not
+       counted.
+     - **Measured result.** The Rust workspace rose from 626 to 637 passed / 0 failed / 3 ignored.
+       The final `python tools/session_status.py` run measured all seven suites green, and the full
+       evidence pipeline exited 0.
+     - **Boundary.** PAPER and controlled LIVE apply no corporate actions, and capsule replay has
+       no corporate-action input (E8.4). The hook reaches `ProcessStrategyWorker`, the only
+       strategy that keeps a snapshot; a strategy that keeps its own state in Python is told by its
+       portfolio, not by an event. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

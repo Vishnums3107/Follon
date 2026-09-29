@@ -15,7 +15,8 @@ use follon_accounting::{
     TaxLotBook, TaxLotSelection,
 };
 use follon_control_plane::{
-    EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
+    CorporateActionEffect, EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions,
+    ReplayEngine, Strategy,
 };
 use follon_domain::{
     validate_canonical_id, validate_utc_timestamp, Bar, Decimal, DecimalError, DomainError,
@@ -2272,27 +2273,61 @@ impl BacktestRunner {
                 .is_some_and(|action| action.effective_at() <= historical_bar.event_time.as_str())
             {
                 let action = &actions[next_action];
+                let entries_before = ledger.entries().len();
                 ledger.apply_corporate_action(action)?;
-                if let CorporateAction::Split {
-                    action_id,
-                    instrument_id,
-                    ratio,
-                    ..
-                } = action
-                {
-                    // The ledger is one book and the engine's portfolio another. The
-                    // strategy's callbacks and the event stream project the engine's,
-                    // so it follows the split too (delivery state E8.2). A cash
-                    // dividend is income, which only the ledger holds.
-                    for event in self.engine.apply_split(
-                        &mut store,
+                // What the strategy is told: what the action did to this account, and
+                // nothing when it changed nothing (E8.3).
+                let effect = match action {
+                    CorporateAction::Split {
                         action_id,
                         instrument_id,
-                        *ratio,
-                        &historical_bar.event_time,
-                    )? {
-                        canonical_events.push(event.canonical_json());
+                        ratio,
+                        ..
+                    } => {
+                        // The ledger is one book and the engine's portfolio another. The
+                        // strategy's callbacks and the event stream project the engine's,
+                        // so it follows the split too (delivery state E8.2).
+                        let mut position = None;
+                        for event in self.engine.apply_split(
+                            &mut store,
+                            action_id,
+                            instrument_id,
+                            *ratio,
+                            &historical_bar.event_time,
+                        )? {
+                            if let EventPayload::Position(snapshot) = &event.payload {
+                                if snapshot.account_id == input.account_id {
+                                    position = Some(snapshot.clone());
+                                }
+                            }
+                            canonical_events.push(event.canonical_json());
+                        }
+                        position.map(|position| CorporateActionEffect::Split {
+                            action_id: action_id.clone(),
+                            ratio: *ratio,
+                            position,
+                        })
                     }
+                    // A cash dividend is income, which only the ledger holds. It booked
+                    // the dividend, or nothing when the account held no shares, and the
+                    // strategy is told exactly the cash it credited.
+                    CorporateAction::CashDividend {
+                        action_id,
+                        instrument_id,
+                        ..
+                    } => ledger
+                        .entries()
+                        .get(entries_before)
+                        .filter(|entry| entry.cash_delta > Decimal::ZERO)
+                        .map(|entry| CorporateActionEffect::CashDividend {
+                            action_id: action_id.clone(),
+                            account_id: input.account_id.clone(),
+                            instrument_id: instrument_id.clone(),
+                            cash_credited: entry.cash_delta,
+                        }),
+                };
+                if let Some(effect) = effect {
+                    strategy.on_corporate_action(&effect)?;
                 }
                 applied_corporate_action_ids.push(action.action_id().to_owned());
                 next_action += 1;

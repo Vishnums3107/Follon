@@ -7,238 +7,31 @@
 //! a strategy that held one share across a 2:1 split and then sold the two it now held
 //! was refused: the engine still believed it held one, and the whole backtest aborted.
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
+mod common;
 
-use follon_backtest::{
-    BacktestInput, BacktestRunner, BacktestSpec, CompletedBacktest, DatasetManifest,
+use common::{
+    amount, decimal_of, events, positions, run_with, split, RoundTrip, ACCOUNT, INSTRUMENT,
 };
-use follon_control_plane::{
-    DeterministicFillModel, EngineError, HistoricalBar, MarketPreconditions, ReplayEngine,
-    RiskPolicy, Strategy,
-};
-use follon_domain::{Bar, Decimal, OrderIntent, OrderType, Side, TimeInForce};
-use follon_instrument::{
-    AssetClass, Instrument, InstrumentRegistry, InstrumentVersion, StaticTradingCalendar,
-    TradingSession,
-};
+use follon_backtest::{BacktestError, CompletedBacktest};
+use follon_domain::Decimal;
 use follon_market_data::CorporateAction;
 
-const ACCOUNT: &str = "acct-paper-001";
-const INSTRUMENT: &str = "inst.us_equity.spy";
 const SPLIT_ID: &str = "action-split-001";
 
-fn amount(value: &str) -> Decimal {
-    Decimal::from_str(value).unwrap()
-}
-
-/// Buys one share on its first bar and sells `sell_quantity` on its fourth. Each order
-/// fills on the bar after the one that produced it, so the entry fills on the second bar
-/// and the exit on the fifth.
-struct RoundTrip {
-    bars_seen: u32,
-    sell_quantity: i64,
-}
-
-impl Strategy for RoundTrip {
-    fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError> {
-        self.bars_seen += 1;
-        let (side, quantity, tag) = match self.bars_seen {
-            1 => (Side::Buy, 1, "entry"),
-            4 => (Side::Sell, self.sell_quantity, "exit"),
-            _ => return Ok(None),
-        };
-        Ok(Some(OrderIntent {
-            intent_id: format!("intent-split-{tag}"),
-            account_id: ACCOUNT.to_owned(),
-            strategy_id: "strategy-split-001".to_owned(),
-            instrument_id: bar.instrument_id.clone(),
-            correlation_id: format!("corr-split-{tag}"),
-            side,
-            quantity: Decimal::from_integer(quantity)?,
-            order_type: OrderType::Market,
-            limit_price: None,
-            time_in_force: TimeInForce::Day,
-            rationale: "split parity regression".to_owned(),
-            created_at: replay_time.to_owned(),
-            strategy_version: "strategy-split-v1".to_owned(),
-            configuration_version: "cfg-v1".to_owned(),
-            environment: "SIMULATION".to_owned(),
-        }))
-    }
-}
-
-fn bar_at(price: &str) -> Bar {
-    let close = amount(price);
-    Bar {
-        instrument_id: INSTRUMENT.to_owned(),
-        open: close,
-        high: close.checked_add(amount("1")).unwrap(),
-        low: close.checked_sub(amount("1")).unwrap(),
-        close,
-        volume: amount("1000"),
-        interval_seconds: 60,
-        exchange_timezone: "America/New_York".to_owned(),
-    }
-}
-
-/// Five bars. The first two trade near 100 and the last three near 50, because a 2:1
-/// split lands between the second and the third.
-fn input(actions: Vec<CorporateAction>) -> BacktestInput {
-    let prices = ["100", "100", "50", "50", "50"];
-    BacktestInput {
-        account_id: ACCOUNT.to_owned(),
-        currency: "USD".to_owned(),
-        initial_cash: amount("1000"),
-        bars: prices
-            .iter()
-            .enumerate()
-            .map(|(index, price)| HistoricalBar {
-                event_time: format!("2026-01-02T14:{:02}:00Z", 30 + index),
-                bar: bar_at(price),
-            })
-            .collect(),
-        corporate_actions: actions,
-    }
-}
-
 fn split_at(effective_at: &str, ratio: &str) -> CorporateAction {
-    CorporateAction::Split {
-        action_id: SPLIT_ID.to_owned(),
-        instrument_id: INSTRUMENT.to_owned(),
-        effective_at: effective_at.to_owned(),
-        ratio: amount(ratio),
-    }
+    split(SPLIT_ID, effective_at, ratio)
 }
 
+/// A 2:1 split between the second bar and the third.
 fn two_for_one() -> Vec<CorporateAction> {
     vec![split_at("2026-01-02T14:31:30Z", "2")]
-}
-
-fn spec(input: &BacktestInput) -> BacktestSpec {
-    let dataset_bars: Vec<_> = input
-        .bars
-        .iter()
-        .map(|bar| (bar.event_time.clone(), bar.bar.clone()))
-        .collect();
-    BacktestSpec {
-        strategy_bundle_hash: "a".repeat(64),
-        dataset: DatasetManifest::from_market_data(
-            "dataset.spy",
-            "v1",
-            "reference-example-1",
-            "universe.spy",
-            &dataset_bars,
-            &input.corporate_actions,
-        )
-        .unwrap(),
-        configuration_id: "config.test".to_owned(),
-        configuration_version: "cfg-v1".to_owned(),
-        configuration_hash: "b".repeat(64),
-        seed: 7,
-        engine_version: "engine-v1".to_owned(),
-        starts_at: "2026-01-02T14:30:00Z".to_owned(),
-        ends_at: "2026-01-02T14:34:00Z".to_owned(),
-    }
-}
-
-fn market() -> (InstrumentRegistry, StaticTradingCalendar) {
-    let calendar = StaticTradingCalendar::new(
-        "cal.us_equities.nyse",
-        vec![TradingSession {
-            exchange_date: "2026-01-02".to_owned(),
-            opens_at: "2026-01-02T14:30:00Z".to_owned(),
-            closes_at: "2026-01-02T21:00:00Z".to_owned(),
-        }],
-    )
-    .unwrap();
-    let mut instruments = InstrumentRegistry::default();
-    instruments
-        .register(InstrumentVersion {
-            instrument: Instrument {
-                instrument_id: INSTRUMENT.to_owned(),
-                symbol: "SPY".to_owned(),
-                exchange_symbol: "SPY".to_owned(),
-                asset_class: AssetClass::Etf,
-                venue: "venue.nyse_arca".to_owned(),
-                currency: "USD".to_owned(),
-                broker_ids: BTreeMap::new(),
-                tick_size: amount("0.01"),
-                lot_size: amount("1"),
-                multiplier: amount("1"),
-                trading_calendar_id: "cal.us_equities.nyse".to_owned(),
-            },
-            effective_from: "2026-01-01T00:00:00Z".to_owned(),
-            effective_to: None,
-            reference_version: "reference-example-1".to_owned(),
-        })
-        .unwrap();
-    (instruments, calendar)
-}
-
-fn engine() -> ReplayEngine {
-    ReplayEngine::new(
-        "2026-01-02T14:30:00Z",
-        "engine-v1",
-        "cfg-v1",
-        RiskPolicy {
-            version: "risk-v1".to_owned(),
-            global_kill_switch: false,
-            max_quantity: amount("10"),
-            max_notional: amount("10000"),
-            max_price_deviation_bps: amount("500"),
-            max_news_slippage_bps: None,
-            max_news_spread_multiplier_bps: None,
-        },
-        DeterministicFillModel {
-            spread_bps: Decimal::ZERO,
-            slippage_bps: Decimal::ZERO,
-            flat_fee: amount("0.10"),
-            latency_bars: 0,
-            max_fill_quantity: None,
-        },
-    )
-    .unwrap()
 }
 
 fn run(
     actions: Vec<CorporateAction>,
     sell_quantity: i64,
-) -> Result<CompletedBacktest, follon_backtest::BacktestError> {
-    let input = input(actions);
-    let spec = spec(&input);
-    let (instruments, calendar) = market();
-    let market = MarketPreconditions {
-        instruments: &instruments,
-        calendar: &calendar,
-    };
-    BacktestRunner::new(spec, engine()).unwrap().run(
-        &mut RoundTrip {
-            bars_seen: 0,
-            sell_quantity,
-        },
-        &input,
-        &market,
-    )
-}
-
-fn events(completed: &CompletedBacktest) -> Vec<serde_json::Value> {
-    completed
-        .canonical_events
-        .iter()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
-}
-
-fn positions(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
-    events
-        .iter()
-        .filter(|event| event["event_type"] == "portfolio.position_updated.v1")
-        .collect()
-}
-
-fn decimal_of(value: &serde_json::Value) -> Decimal {
-    amount(value.as_str().unwrap())
+) -> Result<CompletedBacktest, BacktestError> {
+    run_with(&mut RoundTrip::new(sell_quantity), actions)
 }
 
 #[test]

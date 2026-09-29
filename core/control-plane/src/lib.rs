@@ -502,6 +502,87 @@ impl EventSink for FileEventStore {
     }
 }
 
+/// What a corporate action did to the account a strategy trades (delivery state E8.3).
+///
+/// A strategy reads its position and cash from the portfolio snapshot it is handed, and
+/// that snapshot follows fills. Without this a split or a dividend would leave it stale
+/// until the next fill, and the strategy would size an exit from a quantity the account no
+/// longer holds. Only an action that changed the account is delivered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CorporateActionEffect {
+    /// A split multiplied a held position's quantity by `ratio`. `position` is the
+    /// position after the split, as the replay engine holds it.
+    Split {
+        /// Immutable canonical corporate-action identity.
+        action_id: String,
+        /// New shares per old share.
+        ratio: Decimal,
+        /// The account's position in the instrument after the split.
+        position: PositionSnapshot,
+    },
+    /// A cash dividend credited the account for the shares it held.
+    CashDividend {
+        /// Immutable canonical corporate-action identity.
+        action_id: String,
+        /// The account credited.
+        account_id: String,
+        /// The instrument that paid.
+        instrument_id: String,
+        /// The cash credited, which is what the ledger booked.
+        cash_credited: Decimal,
+    },
+}
+
+impl CorporateActionEffect {
+    /// The corporate action's identity.
+    pub fn action_id(&self) -> &str {
+        match self {
+            Self::Split { action_id, .. } | Self::CashDividend { action_id, .. } => action_id,
+        }
+    }
+
+    /// The account the action changed.
+    pub fn account_id(&self) -> &str {
+        match self {
+            Self::Split { position, .. } => &position.account_id,
+            Self::CashDividend { account_id, .. } => account_id,
+        }
+    }
+
+    /// The instrument the action concerned.
+    pub fn instrument_id(&self) -> &str {
+        match self {
+            Self::Split { position, .. } => &position.instrument_id,
+            Self::CashDividend { instrument_id, .. } => instrument_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EngineError> {
+        validate_canonical_id("corporate action id", self.action_id())?;
+        validate_canonical_id("corporate action account_id", self.account_id())?;
+        validate_canonical_id("corporate action instrument_id", self.instrument_id())?;
+        match self {
+            Self::Split {
+                ratio, position, ..
+            } => {
+                if *ratio <= Decimal::ZERO || position.quantity == Decimal::ZERO {
+                    return Err(EngineError(
+                        "a split effect needs a positive ratio and a held position".to_owned(),
+                    ));
+                }
+            }
+            Self::CashDividend { cash_credited, .. } => {
+                if *cash_credited <= Decimal::ZERO {
+                    return Err(EngineError(
+                        "a dividend effect must credit a positive amount".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The only strategy interaction point in the trading kernel.
 pub trait Strategy {
     /// Handles one normalized bar and may emit exactly one declarative intent.
@@ -537,6 +618,17 @@ pub trait Strategy {
         _fill: &Fill,
         _position: &PositionSnapshot,
     ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Receives what a corporate action did to the account, after the replay applied it
+    /// to the ledger and the engine's portfolio.
+    ///
+    /// The default deliberately does nothing. Isolated workers use this hook, as they use
+    /// [`Self::on_execution`], to keep the portfolio snapshot they are handed true to the
+    /// ledger. It changes nothing a strategy could not already see, and it needs no worker
+    /// protocol: the snapshot is built by the host for every callback.
+    fn on_corporate_action(&mut self, _effect: &CorporateActionEffect) -> Result<(), EngineError> {
         Ok(())
     }
 }
@@ -705,6 +797,44 @@ impl WorkerRuntimeServices {
                 mark_price: fill.price,
             },
         );
+        Ok(())
+    }
+
+    /// Applies what a corporate action did to the account, so the next snapshot a strategy
+    /// is handed matches the ledger (E8.3). Everything is checked before anything changes.
+    fn apply_corporate_action(
+        &mut self,
+        effect: &CorporateActionEffect,
+    ) -> Result<(), EngineError> {
+        effect.validate()?;
+        match effect {
+            CorporateActionEffect::Split {
+                ratio, position, ..
+            } => {
+                let held = self.positions.get(&position.instrument_id).ok_or_else(|| {
+                    EngineError("worker service snapshot holds no position to split".to_owned())
+                })?;
+                // The mark follows the shares: after a split of n each is worth 1/n. The
+                // next bar refreshes it, but a callback that carries no bar would not.
+                let mark_price = held.mark_price.checked_div(*ratio)?;
+                if mark_price <= Decimal::ZERO {
+                    return Err(EngineError(
+                        "split would round the worker's mark price down to nothing".to_owned(),
+                    ));
+                }
+                self.positions.insert(
+                    position.instrument_id.clone(),
+                    WorkerPortfolioPosition {
+                        quantity: position.quantity,
+                        average_cost: position.average_cost,
+                        mark_price,
+                    },
+                );
+            }
+            CorporateActionEffect::CashDividend { cash_credited, .. } => {
+                self.cash = self.cash.checked_add(*cash_credited)?;
+            }
+        }
         Ok(())
     }
 
@@ -1241,6 +1371,18 @@ impl Strategy for ProcessStrategyWorker {
     ) -> Result<(), EngineError> {
         if let Some(services) = self.services.as_mut() {
             services.apply_execution(fill, position)?;
+        }
+        Ok(())
+    }
+
+    fn on_corporate_action(&mut self, effect: &CorporateActionEffect) -> Result<(), EngineError> {
+        if effect.account_id() != self.identity.account_id {
+            return Err(EngineError(
+                "corporate action effect belongs to another account than the worker's".to_owned(),
+            ));
+        }
+        if let Some(services) = self.services.as_mut() {
+            services.apply_corporate_action(effect)?;
         }
         Ok(())
     }
@@ -5430,6 +5572,193 @@ mod tests {
                 replay_time,
             )
             .is_err());
+    }
+
+    /// Services that hold one share bought at 100 with a 0.10 fee, and 899.90 of cash.
+    fn services_holding_one_share(price: &str) -> WorkerRuntimeServices {
+        let mut services = WorkerRuntimeServices::new(StrategyWorkerServicesConfig {
+            currency: "USD".to_owned(),
+            initial_cash: Decimal::from_integer(1_000).unwrap(),
+        })
+        .unwrap();
+        let fill = Fill {
+            execution_id: "exec.worker.001".to_owned(),
+            order_id: "order.worker.001".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(1).unwrap(),
+            price: Decimal::from_str(price).unwrap(),
+            fee: Decimal::from_str("0.10").unwrap(),
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        };
+        let position = PositionSnapshot {
+            account_id: "acct.paper.001".to_owned(),
+            instrument_id: fill.instrument_id.clone(),
+            quantity: Decimal::from_integer(1).unwrap(),
+            average_cost: Decimal::from_str("100.10").unwrap(),
+            realized_pnl: Decimal::ZERO,
+        };
+        services.apply_execution(&fill, &position).unwrap();
+        services
+    }
+
+    fn split_effect(
+        instrument_id: &str,
+        ratio: &str,
+        quantity: &str,
+        average_cost: &str,
+    ) -> CorporateActionEffect {
+        CorporateActionEffect::Split {
+            action_id: "action-split-001".to_owned(),
+            ratio: Decimal::from_str(ratio).unwrap(),
+            position: PositionSnapshot {
+                account_id: "acct.paper.001".to_owned(),
+                instrument_id: instrument_id.to_owned(),
+                quantity: Decimal::from_str(quantity).unwrap(),
+                average_cost: Decimal::from_str(average_cost).unwrap(),
+                realized_pnl: Decimal::ZERO,
+            },
+        }
+    }
+
+    fn dividend_effect_for(
+        action_id: &str,
+        account_id: &str,
+        instrument_id: &str,
+        cash_credited: &str,
+    ) -> CorporateActionEffect {
+        CorporateActionEffect::CashDividend {
+            action_id: action_id.to_owned(),
+            account_id: account_id.to_owned(),
+            instrument_id: instrument_id.to_owned(),
+            cash_credited: Decimal::from_str(cash_credited).unwrap(),
+        }
+    }
+
+    fn dividend_effect(action_id: &str, cash_credited: &str) -> CorporateActionEffect {
+        dividend_effect_for(
+            action_id,
+            "acct.paper.001",
+            "inst.us_equity.spy",
+            cash_credited,
+        )
+    }
+
+    #[test]
+    fn worker_services_follow_a_split_and_a_dividend() {
+        let at = "2026-01-02T14:32:00Z";
+        let mut services = services_holding_one_share("100");
+        services
+            .apply_corporate_action(&split_effect("inst.us_equity.spy", "2", "2", "50.05"))
+            .unwrap();
+
+        let payload = services.service_payload(at);
+        let position = &payload["portfolio"]["positions"][0];
+        // The position is the engine's, and the mark follows the shares: 100 became 50.
+        assert_eq!(position["quantity"], "2.00000000");
+        assert_eq!(position["average_cost"], "50.05000000");
+        assert_eq!(position["mark_price"], "50.00000000");
+        assert_eq!(
+            payload["portfolio"]["cash_by_currency"][0]["amount"],
+            "899.90000000"
+        );
+
+        // A dividend changes cash and nothing about the position.
+        services
+            .apply_corporate_action(&dividend_effect("action-dividend-001", "0.50"))
+            .unwrap();
+        let payload = services.service_payload(at);
+        assert_eq!(payload["portfolio"]["positions"][0], *position);
+        assert_eq!(
+            payload["portfolio"]["cash_by_currency"][0]["amount"],
+            "900.40000000"
+        );
+    }
+
+    #[test]
+    fn worker_services_refuse_an_effect_they_cannot_apply_and_change_nothing() {
+        let at = "2026-01-02T14:32:00Z";
+        let mut services = services_holding_one_share("100");
+        let before = services.service_payload(at);
+        for (name, effect) in [
+            (
+                "a split of a position the services do not hold",
+                split_effect("inst.us_equity.qqq", "2", "2", "50.05"),
+            ),
+            (
+                "a split with a zero ratio",
+                split_effect("inst.us_equity.spy", "0", "2", "50.05"),
+            ),
+            (
+                "a split with a negative ratio",
+                split_effect("inst.us_equity.spy", "-2", "2", "50.05"),
+            ),
+            (
+                "a split that leaves a flat position",
+                split_effect("inst.us_equity.spy", "2", "0", "0"),
+            ),
+            (
+                "a dividend that credits nothing",
+                dividend_effect("action-dividend-001", "0"),
+            ),
+            (
+                "a dividend that debits",
+                dividend_effect("action-dividend-001", "-0.50"),
+            ),
+            (
+                "an action that is not canonical",
+                dividend_effect("Not Canonical", "0.50"),
+            ),
+            (
+                "an account that is not canonical",
+                dividend_effect_for(
+                    "action-dividend-001",
+                    "Not Canonical",
+                    "inst.us_equity.spy",
+                    "0.50",
+                ),
+            ),
+            (
+                "an instrument that is not canonical",
+                dividend_effect_for(
+                    "action-dividend-001",
+                    "acct.paper.001",
+                    "Not Canonical",
+                    "0.50",
+                ),
+            ),
+        ] {
+            assert!(
+                services.apply_corporate_action(&effect).is_err(),
+                "{name} was accepted"
+            );
+            assert_eq!(services.service_payload(at), before, "{name}");
+        }
+
+        // A mark the split would round to nothing is refused too, as the SDK would refuse a
+        // position with no mark, and nothing moves.
+        let mut tiny = services_holding_one_share("0.00000001");
+        let before = tiny.service_payload(at);
+        let error = tiny
+            .apply_corporate_action(&split_effect("inst.us_equity.spy", "2", "2", "50.05"))
+            .unwrap_err();
+        assert_eq!(
+            error.0,
+            "split would round the worker's mark price down to nothing"
+        );
+        assert_eq!(tiny.service_payload(at), before);
+    }
+
+    #[test]
+    fn a_corporate_action_effect_names_its_action_account_and_instrument() {
+        for effect in [
+            split_effect("inst.us_equity.spy", "2", "2", "50.05"),
+            dividend_effect("action-split-001", "0.50"),
+        ] {
+            assert_eq!(effect.action_id(), "action-split-001");
+            assert_eq!(effect.account_id(), "acct.paper.001");
+            assert_eq!(effect.instrument_id(), "inst.us_equity.spy");
+        }
     }
 
     #[test]

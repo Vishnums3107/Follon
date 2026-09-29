@@ -104,12 +104,20 @@ none, and each action applies once.
 A cash dividend is income, which only the ledger books. The engine's portfolio holds a
 position and its trading P&L and no cash.
 
+A strategy is told what an action did to its account through `Strategy::on_corporate_action`,
+after the ledger and the engine have applied it: a split delivers the position as the engine
+now holds it, and a dividend delivers the cash the ledger credited. An action that changed
+nothing, because the account held none of the instrument or the credit rounded to no cash,
+is not delivered. The strategy worker's host applies the effect to the services it builds the
+portfolio snapshot from, so the next callback shows the post-split quantity, cost and mark
+and the credited cash. The worker protocol and the Python SDK are unchanged: a strategy sees a
+corporate action as a correct portfolio, never as a message.
+
 A venue's response to a split, which adjusts or cancels a resting order, is not modelled.
 An order resting in the instrument cannot be carried across the split, because its
 quantity and limit are in pre-split units, so the replay refuses the run rather than fill
 it at a price level it was not written for. That is the rule the replay already applies to
-a lot-size change. Three things still do not follow a split: the strategy worker's own
-position snapshot, which changes only at the next execution; the risk policy's
+a lot-size change. Two things still do not follow a split: the risk policy's
 share-denominated limits, which are the operator's configuration; and PAPER and controlled
 LIVE, which apply no corporate actions at all.
 
