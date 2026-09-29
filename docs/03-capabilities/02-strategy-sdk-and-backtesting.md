@@ -49,6 +49,16 @@ a dedicated Python environment with `follon-strategy-sdk` installed. It has no
 broker credential or adapter interface. The contract schema is
 `contracts/json-schema/v1/strategy-worker-frame.schema.json`.
 
+A worker is untrusted code behind a pipe, so the host bounds it. A frame is one
+newline-terminated line of at most 16 MiB, refused before it is buffered in
+full. Each callback has a 60-second deadline that also covers the write of its
+request, so a worker that stops reading cannot hang a replay. These are the
+defaults of `StrategyWorkerLimits`. An oversized or cut-off frame, a closed pipe
+or an expired deadline is a transport fault: the worker's process is ended and
+it is never asked another question, because no later answer could be matched to
+a request. The deadline only ends a replay with an error; time never enters a
+result.
+
 ## Event-driven backtester
 
 The backtester uses the same strategy API and event model as production. It must model point-in-time data, corporate actions, delistings, fees/charges, bid-ask spreads, configurable slippage, partial fills, order latency, session rules, market halts, borrow constraints, deterministic seeds, and portfolio-level capital constraints.

@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T13:16:40Z  
+**Measured at:** 2026-09-29T13:38:51Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `a4ee48b` -- feat(ibkr): a bridge refusal is a clean rejection, and IBKR notices no longer reject working orders -- E5.4 (2026-09-29T18:38:13+05:30)  
-**Uncommitted paths:** 7
+**HEAD:** `1056d12` -- feat(live): controlled LIVE refuses what its adapter cannot carry before an approval is spent -- E5.7 (2026-09-29T18:46:50+05:30)  
+**Uncommitted paths:** 6
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 570 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 587 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -269,7 +269,7 @@ passes it for production.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E7.1 | E3.11's link guard for every durable writer it did not cover. The operations journal's reader reports a dangling link as a healthy empty journal. The replay `FileEventStore` and the backtest `FileExperimentStore` check `exists()` and then open with `create(true)`. `follon-news` output uses `File::create`, which truncates a link's target. `write_immutable` leaves its staging file behind on a dangling link. **Each now refuses any link without following it**; the experiment store checks again at every write, because it reopens its file each time (audit item 91). | **done** 2026-09-28 |
-| E7.2 | Strategy-worker frames. Each is one newline-terminated JSON line, read with an unbounded `read_line` and no deadline. They need a bound applied before allocation and a per-frame deadline, reusing the IBKR bridge's bounded reader. | open |
+| E7.2 | Strategy-worker frames. Each was one newline-terminated JSON line, read with an unbounded `read_line` and no deadline, and written with a blocking `write_all`. **Now** every frame is bounded before it is buffered (16 MiB, newline included), and every round trip, request write included, has a 60-second deadline. Both are `StrategyWorkerLimits`, and `ProcessStrategyWorker::spawn_bounded` sets them explicitly. A transport fault (oversized or cut-off frame, closed pipe, expired deadline) kills the worker and it is never asked again. The reader is `core/control-plane/src/worker_io.rs`, not the IBKR bridge's, because `core` cannot depend on an adapter. Audit item 105. | **done** 2026-09-29 |
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
 | E7.4a | Portfolio-risk configuration fingerprints. PAPER's and LIVE's both omitted `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`. **Now every field enters both**, through `PortfolioRiskPolicy::canonical_parts`, whose exhaustive destructuring makes a new field a compile error until it is rendered. The part is tagged `v2`, so a journal or LIVE approval made under the incomplete version-1 fingerprint is refused rather than trusted (audit item 98). | **done** 2026-09-29 |
 | E7.4b | The aggregate portfolio-risk check is skipped outright when equity is not positive. Failing closed would also refuse risk-reducing orders, such as closing positions, when an account is underwater, so the treatment is the operator's choice. | **decision** |

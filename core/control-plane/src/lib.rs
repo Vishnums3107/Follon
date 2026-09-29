@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::io::{self, Write};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 
 use follon_domain::{
@@ -24,6 +24,11 @@ use sha2::{Digest, Sha256};
 
 pub mod capsule;
 pub mod provenance;
+mod worker_io;
+
+pub use worker_io::StrategyWorkerLimits;
+
+use worker_io::WorkerTransport;
 
 pub use capsule::{
     build_strategy_bundle, extract_strategy_bundle, open_strategy_bundle, read_strategy_capsule,
@@ -846,12 +851,18 @@ impl WorkerRuntimeServices {
 /// The child receives only normalized market bars and immutable strategy
 /// context. Its output is parsed and validated as an intent before the risk
 /// engine sees it; a worker never receives adapters or credentials.
+///
+/// Every frame is bounded before it is buffered and every round trip has a
+/// deadline ([`StrategyWorkerLimits`]). A transport fault, meaning an oversized
+/// or truncated frame, a closed pipe or an expired deadline, ends the worker:
+/// its process is killed and it answers nothing further, because after a fault
+/// nothing says which request an answer belongs to.
 pub struct ProcessStrategyWorker {
     identity: StrategyWorkerIdentity,
     services: Option<WorkerRuntimeServices>,
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    transport: WorkerTransport,
+    terminated: bool,
 }
 
 impl ProcessStrategyWorker {
@@ -861,7 +872,24 @@ impl ProcessStrategyWorker {
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
     ) -> Result<Self, EngineError> {
-        Self::spawn_inner(program, arguments, identity, None, None)
+        Self::spawn_inner(
+            program,
+            arguments,
+            identity,
+            None,
+            None,
+            StrategyWorkerLimits::DEFAULT,
+        )
+    }
+
+    /// Starts a worker under explicit frame limits instead of the defaults.
+    pub fn spawn_bounded(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+        limits: StrategyWorkerLimits,
+    ) -> Result<Self, EngineError> {
+        Self::spawn_inner(program, arguments, identity, None, None, limits)
     }
 
     /// Starts a worker with bounded point-in-time data, portfolio, state, and
@@ -878,6 +906,7 @@ impl ProcessStrategyWorker {
             identity,
             Some(WorkerRuntimeServices::new(services)?),
             None,
+            StrategyWorkerLimits::DEFAULT,
         )
     }
 
@@ -899,6 +928,7 @@ impl ProcessStrategyWorker {
             identity,
             Some(WorkerRuntimeServices::new(services)?),
             Some(sandbox),
+            StrategyWorkerLimits::DEFAULT,
         )
     }
 
@@ -908,8 +938,10 @@ impl ProcessStrategyWorker {
         identity: StrategyWorkerIdentity,
         services: Option<WorkerRuntimeServices>,
         sandbox: Option<&StrategyWorkerSandbox>,
+        limits: StrategyWorkerLimits,
     ) -> Result<Self, EngineError> {
         identity.validate()?;
+        limits.validate()?;
         let mut command = Command::new(program);
         command
             .args(arguments)
@@ -945,11 +977,20 @@ impl ProcessStrategyWorker {
             identity,
             services,
             child,
-            stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            transport: WorkerTransport::start(stdin, stdout, limits),
+            terminated: false,
         };
         worker.verify_ready()?;
         Ok(worker)
+    }
+
+    /// Ends a worker after a transport fault. Its framing state is unknown, so
+    /// it is never asked another question.
+    fn terminate(&mut self) {
+        self.terminated = true;
+        self.transport.close_input();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     fn verify_ready(&mut self) -> Result<(), EngineError> {
@@ -982,14 +1023,15 @@ impl ProcessStrategyWorker {
     }
 
     fn read_frame(&mut self) -> Result<serde_json::Value, EngineError> {
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(EngineError(
-                "strategy worker closed stdout before returning a response".to_owned(),
-            ));
-        }
-        serde_json::from_str(&line)
+        let line = match self.transport.receive() {
+            Ok(line) => line,
+            Err(fault) => {
+                let error = fault.describe(self.transport.limits());
+                self.terminate();
+                return Err(error);
+            }
+        };
+        serde_json::from_slice(&line)
             .map_err(|error| EngineError(format!("strategy worker emitted invalid JSON: {error}")))
     }
 
@@ -1065,15 +1107,17 @@ impl ProcessStrategyWorker {
                 .expect("worker request frame remains an object")
                 .insert("services".to_owned(), services.service_payload(replay_time));
         }
+        if self.terminated {
+            return Err(EngineError(
+                "strategy worker was ended by an earlier transport fault".to_owned(),
+            ));
+        }
         let serialized =
-            serde_json::to_string(&frame).expect("serializing a JSON worker frame cannot fail");
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| EngineError("strategy worker stdin is already closed".to_owned()))?;
-        stdin.write_all(serialized.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
+            serde_json::to_vec(&frame).expect("serializing a JSON worker frame cannot fail");
+        if let Err(error) = self.transport.send(serialized) {
+            self.terminate();
+            return Err(error);
+        }
 
         let response = self.read_frame()?;
         let object = response
@@ -1204,7 +1248,7 @@ impl Strategy for ProcessStrategyWorker {
 
 impl Drop for ProcessStrategyWorker {
     fn drop(&mut self) {
-        self.stdin.take();
+        self.transport.close_input();
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -3498,24 +3542,249 @@ mod tests {
         })
     }
 
-    #[test]
-    fn two_runs_of_a_worker_hash_strings_identically() {
-        let Some(python) = python_executable() else {
-            eprintln!("Python is unavailable; the worker hash-seed fixture was skipped");
-            return;
-        };
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/worker/hash-seed-worker.py")
-            .canonicalize()
-            .expect("fixture path");
-        let identity = StrategyWorkerIdentity {
+    fn worker_identity() -> StrategyWorkerIdentity {
+        StrategyWorkerIdentity {
             account_id: "acct.paper.001".to_owned(),
             strategy_id: "strategy-worker-001".to_owned(),
             strategy_version: "v1".to_owned(),
             configuration_version: "cfg-v1".to_owned(),
             strategy_bundle_hash: "a".repeat(64),
             environment: "SIMULATION".to_owned(),
+        }
+    }
+
+    fn worker_fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/worker")
+            .join(name)
+            .canonicalize()
+            .expect("fixture path")
+    }
+
+    /// Starts the misbehaving fixture in one mode under explicit limits, or
+    /// `None` when Python is unavailable so the caller can skip.
+    fn misbehaving_worker(
+        mode: &str,
+        size: Option<usize>,
+        limits: StrategyWorkerLimits,
+    ) -> Option<ProcessStrategyWorker> {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the {mode} worker fixture was skipped");
+            return None;
         };
+        let identity = worker_identity();
+        let mut arguments: Vec<OsString> = vec![
+            worker_fixture("misbehaving-worker.py").into_os_string(),
+            identity.strategy_bundle_hash.clone().into(),
+            identity.strategy_id.clone().into(),
+            identity.strategy_version.clone().into(),
+            mode.into(),
+        ];
+        arguments.extend(size.map(|size| OsString::from(size.to_string())));
+        Some(
+            ProcessStrategyWorker::spawn_bounded(python.as_os_str(), arguments, identity, limits)
+                .expect("worker starts"),
+        )
+    }
+
+    fn worker_limits(max_frame_bytes: usize, deadline_millis: u64) -> StrategyWorkerLimits {
+        StrategyWorkerLimits {
+            max_frame_bytes,
+            frame_deadline: std::time::Duration::from_millis(deadline_millis),
+        }
+    }
+
+    /// Runs a worker round trip on another thread, so a missing bound or
+    /// deadline fails the test instead of hanging it. The outcome is the error
+    /// text and whether the worker's process had been ended.
+    fn failed_round_trip(mut worker: ProcessStrategyWorker, bar: Bar) -> (String, bool) {
+        let (sender, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let error = worker
+                .request_intent(&bar, "2026-01-02T14:31:00Z")
+                .expect_err("the worker misbehaves");
+            let ended = worker.child.try_wait().expect("child status").is_some();
+            let _ = sender.send((error.0, ended));
+        });
+        outcome
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the round trip returned neither an answer nor an error")
+    }
+
+    #[test]
+    fn a_worker_that_never_answers_ends_at_the_frame_deadline() {
+        let Some(worker) = misbehaving_worker("silent", None, worker_limits(64 * 1024, 500)) else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(
+            error.contains("did not answer within the 0.5 second frame deadline"),
+            "{error}"
+        );
+        assert!(ended, "the unresponsive worker's process was left running");
+    }
+
+    #[test]
+    fn a_worker_that_stops_reading_cannot_hang_the_write() {
+        let Some(worker) = misbehaving_worker("deaf", None, worker_limits(64 * 1024, 1_000)) else {
+            return;
+        };
+        // Far past any pipe buffer, so the write blocks against a worker that
+        // never reads.
+        let heavy = Bar {
+            instrument_id: "a".repeat(4 * 1024 * 1024),
+            ..bar()
+        };
+        let (error, ended) = failed_round_trip(worker, heavy);
+        assert!(error.contains("frame deadline"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn an_endless_frame_is_refused_at_the_limit_not_buffered_to_its_end() {
+        let Some(worker) = misbehaving_worker("endless", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("65536 byte frame limit"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn an_oversized_complete_frame_is_refused() {
+        let Some(worker) = misbehaving_worker("oversized", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("frame limit"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_frame_cut_off_mid_line_is_a_transport_fault() {
+        let Some(worker) = misbehaving_worker("truncated", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("in the middle of a frame"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn the_frame_limit_counts_the_newline_and_admits_exactly_the_limit() {
+        let limit = 8 * 1024;
+        let Some(mut worker) =
+            misbehaving_worker("exact", Some(limit), worker_limits(limit, 30_000))
+        else {
+            return;
+        };
+        let error = worker
+            .request_intent(&bar(), "2026-01-02T14:31:00Z")
+            .expect_err("the fixture answers with an error frame");
+        assert_eq!(
+            error.0,
+            "strategy worker rejected the callback: fixture.exact"
+        );
+        drop(worker);
+
+        let Some(worker) =
+            misbehaving_worker("exact", Some(limit + 1), worker_limits(limit, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("8192 byte frame limit"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_worker_within_its_limits_keeps_answering() {
+        let Some(mut worker) = misbehaving_worker("well", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        for _ in 0..3 {
+            let error = worker
+                .request_intent(&bar(), "2026-01-02T14:31:00Z")
+                .expect_err("the fixture rejects every callback");
+            assert_eq!(error.0, "strategy worker rejected the callback: fixture.ok");
+        }
+        assert!(!worker.terminated);
+    }
+
+    #[test]
+    fn a_worker_ended_by_a_fault_answers_nothing_further() {
+        let Some(mut worker) = misbehaving_worker("silent", None, worker_limits(64 * 1024, 300))
+        else {
+            return;
+        };
+        let first = worker
+            .request_intent(&bar(), "2026-01-02T14:31:00Z")
+            .expect_err("the fixture never answers");
+        assert!(first.0.contains("frame deadline"), "{}", first.0);
+        let second = worker
+            .request_intent(&bar(), "2026-01-02T14:31:01Z")
+            .expect_err("an ended worker is not asked again");
+        assert!(
+            second.0.contains("ended by an earlier transport fault"),
+            "{}",
+            second.0
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_json_is_a_protocol_error_not_a_transport_fault() {
+        let Some(mut worker) =
+            misbehaving_worker("garbage", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let error = worker
+            .request_intent(&bar(), "2026-01-02T14:31:00Z")
+            .expect_err("the fixture answers with garbage");
+        assert!(error.0.contains("emitted invalid JSON"), "{}", error.0);
+        assert!(!worker.terminated);
+    }
+
+    #[test]
+    fn worker_limits_that_would_fail_a_well_formed_worker_are_refused() {
+        for limits in [
+            worker_limits(StrategyWorkerLimits::MIN_FRAME_BYTES - 1, 1_000),
+            worker_limits(64 * 1024, 0),
+        ] {
+            assert!(limits.validate().is_err(), "{limits:?}");
+        }
+        assert!(StrategyWorkerLimits::DEFAULT.validate().is_ok());
+        assert!(worker_limits(StrategyWorkerLimits::MIN_FRAME_BYTES, 1)
+            .validate()
+            .is_ok());
+        assert_eq!(
+            StrategyWorkerLimits::default(),
+            StrategyWorkerLimits::DEFAULT
+        );
+        // Refused before any process starts.
+        let refusal = ProcessStrategyWorker::spawn_bounded(
+            "unused-program",
+            Vec::<OsString>::new(),
+            worker_identity(),
+            worker_limits(100, 1_000),
+        )
+        .err()
+        .expect("a frame limit below the minimum is refused");
+        assert!(refusal.0.contains("at least 4096 bytes"), "{}", refusal.0);
+    }
+
+    #[test]
+    fn two_runs_of_a_worker_hash_strings_identically() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the worker hash-seed fixture was skipped");
+            return;
+        };
+        let fixture = worker_fixture("hash-seed-worker.py");
+        let identity = worker_identity();
         // The fixture answers every callback with an error whose code is the
         // hash of a fixed string, so the error text exposes each process's
         // string-hash seed.

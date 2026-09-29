@@ -4230,6 +4230,57 @@ These are mandatory master-plan acceptance conditions and are currently open:
        not changed here. Nothing composes a LIVE adapter that can trade, and no
        external gate moved.
 
+105. A strategy worker can no longer exhaust the host's memory or hang a replay
+     (2026-09-29, Security and Reliability; E7.2). Found by the source review behind
+     the revised assessment (item 92's review).
+     - **Defect.** `ProcessStrategyWorker` read each frame with an unbounded
+       `read_line`, waited for it with no deadline, and wrote requests with a
+       blocking `write_all`. A worker that printed one endless line grew the host's
+       memory without limit. One that never answered, or stopped reading its input
+       while a large request was being written, hung the replay forever.
+     - **Behavior.**
+       - `core/control-plane/src/worker_io.rs` moves each pipe direction to its own
+         thread. The reader buffers at most `max_frame_bytes + 1` bytes per frame, so
+         the bound applies before the allocation, and it counts the newline: a frame
+         of exactly the limit is accepted and one byte more is not. Every round trip
+         waits at most `frame_deadline` for its answer, and that wait covers the
+         write of the request.
+       - `StrategyWorkerLimits` defaults to 16 MiB frames and a 60-second deadline.
+         The four existing constructors use it, and `spawn_bounded` sets it
+         explicitly. A limit below 4 KiB or a zero deadline is refused before a
+         process starts.
+       - A transport fault kills the worker's process and marks it ended. It is never
+         asked again, because after a fault nothing says which request a later answer
+         belongs to. A line that is not JSON is still a protocol error, not a
+         transport fault.
+       - `ProcessStrategyWorker` keeps no `stdin` or `stdout` of its own any more. The
+         built-in strategy's bundle hash changed because it covers
+         `core/control-plane/src/lib.rs`, which this slice edits.
+     - **Tests.** 17 tests and a fixture were added. `tests/fixtures/worker/misbehaving-worker.py`
+       is a worker that stays silent, stops reading, streams a frame with no end, sends
+       an oversized, cut-off, non-JSON or exactly-sized frame, or behaves.
+       - Six unit tests hold the reader: the newline counts, frames come one at a time,
+         and an endless reader that errors after 64 KiB shows the reader buffers only
+         the limit. A seventh shows a send to a worker that has gone is refused.
+       - Process tests: a silent worker ends at the deadline, and a worker that stops
+         reading cannot hang the write of a 4 MiB request. An endless, oversized or
+         cut-off frame is refused, and an exactly-limit frame is accepted. An ended
+         worker answers nothing further, and a worker within its limits keeps answering.
+         Each failing round trip runs behind a 30-second watchdog, so a missing bound or
+         deadline fails the test instead of hanging it.
+     - **Rule 5.** 15 of 15 injected defects were caught by the intended tests on the
+       final files, including the read bound removed, off-by-one on either side of the
+       limit, the deadline replaced by an hour, and a fault that no longer ends the
+       process. One run showed why the fixture's stalls are now bounded: an unended
+       worker holds the test's pipes open and hung the runner for ten minutes.
+     - **Measured result.** The Rust workspace rose from 570 to 587 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+       seven suites green. The full evidence pipeline exited 0.
+     - **Boundary.** The limits are not yet exposed on the `follon-backtest` command
+       line, and a worker is still not an operating-system sandbox: it can consume CPU
+       and memory of its own. It only stops the host from being exhausted through its
+       pipes. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
