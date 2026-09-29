@@ -51,3 +51,25 @@ Make the smallest change that satisfies the requested behavior. Add focused regr
 - Security/release work: run the affected `tests/security` or tool checks and report generated artifacts without committing credentials or environment secrets.
 
 Finish with the behavior changed, contracts/invariants protected, validation actually run, and any external gate or operational evidence still required.
+
+## Push and PR checkpoint
+
+When a workstream adds or modifies 3,000 or more lines of tracked code, stop at
+that boundary and publish the completed slice before continuing. Measure the
+threshold from Git's diff against the branch starting point; count added lines
+and changed replacement lines, and exclude deletions, generated artifacts,
+lockfiles, and documentation unless the workstream explicitly treats them as
+code. At the checkpoint:
+
+1. Run the focused validation and ensure the worktree contains only the
+	intended slice.
+2. Create a descriptive commit without bundling unrelated changes.
+3. Push the current branch to its upstream remote.
+4. Open a pull request against the repository's intended base branch, or update
+   the existing PR for the branch. Do not create a duplicate PR.
+5. Record the PR URL, commit, measured line count, and queued or completed CI
+   status before resuming work.
+
+This checkpoint does not replace the normal requirement to push and raise a PR
+when the user explicitly requests it, and it must not be used to split a
+behavioral change across an unsafe or non-compiling boundary.
