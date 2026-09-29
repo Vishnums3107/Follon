@@ -897,10 +897,10 @@ short — detail belongs in the conformance audit.
   confirmed against one. E7.12 needs a Linux toolchain for its Unix half. E8.4b is
   blocked by the PAPER journal schema-migration question, which the operator did not
   choose. E7.10 waits on the operator, and E2.2+ stays deferred by Settled direction
-  item 2. Every external gate is still at zero. Nothing was pushed: the branch holds
-  23 commits that `main` does not, ten from session 12's decomposition and thirteen
-  from this session, and the repository is public, so gitleaks over history and the
-  CI Semgrep command come first.
+  item 2. Every external gate is still at zero. Nothing was pushed: none of session
+  12's decomposition or this session's thirteen slices, or the documentation commits
+  around them, is on `main`, and the repository is public, so gitleaks over history
+  and the CI Semgrep command come first.
 
 ### 2026-09-29 — session 12
 
