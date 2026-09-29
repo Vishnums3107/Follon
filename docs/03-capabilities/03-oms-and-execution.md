@@ -48,9 +48,10 @@ evidence. The versioned gRPC API exposes scheduled execution algorithms through
 arrival price, the full cancel-before-replace passive sequence, and synchronized
 net-price-protected option-combination plans.
 
-The same API also has a distinct `SubmitPaperCombo` command. It exists only
+The same API also has distinct `SubmitPaperCombo`, `SubmitPaperOrder`, and
+`CancelPaperOrder` commands. They exist only
 when `FOLLON_TRADING_API_PAPER_CONFIG` names a valid version-1 PAPER command
-route. That route converts the protobuf request into the canonical
+route. The combination command converts its request into the canonical
 `ComboIntent`, requires one independently supplied observation per leg, and
 calls `PaperTradingService::submit_combo_intent`; it cannot fall back to the
 planning method. The configured service owns the durable journal, exact risk
@@ -73,25 +74,31 @@ process starts. The journal fingerprint binds the bridge endpoint, the broker
 account, the client id, the time zone and the instrument map's SHA-256, so a
 journal is refused under a different adapter or IBKR session.
 
-The bridge carries single DAY orders only, so `SubmitPaperCombo` on a bridge
-route is refused before risk is evaluated or an order exists. The route has
-no single-order RPC yet (delivery state E5.2b), and it does not yet
-synchronize fills from the bridge (E5.2c). A bridge route therefore trades
-nothing today.
+The bridge carries single market or limit DAY orders only, so
+`SubmitPaperCombo` and a single GTC request on a bridge route are refused
+before risk is evaluated or an order exists. `SubmitPaperOrder` passes the
+declarative intent and operator-attested mark through the PAPER risk/OMS
+service; `CancelPaperOrder` names the account and OMS order, and journals the
+operator before calling the adapter. Both require an operator session with
+PAPER trading permission in the tenant. The route still does not synchronize
+fills from the bridge or reconcile its account (E5.2c); it is not yet an
+end-to-end broker-PAPER workflow.
 
 Every call also needs an authenticated operator. A configured route requires
 the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
 `BeginOperatorLogin` and `CompleteOperatorLogin` check a password and then a
-mandatory TOTP code, and return a bearer session. `SubmitPaperCombo` refuses
-three kinds of caller before it reads the intent:
+mandatory TOTP code, and return a bearer session. All three PAPER order
+commands refuse three kinds of caller before reading order details:
 
 - a caller with no session, or a malformed one (`UNAUTHENTICATED`);
 - a session whose role does not grant PAPER trading (`PERMISSION_DENIED`);
 - a session presented for another tenant (`PERMISSION_DENIED`).
 
 The directory serves one tenant. The PAPER journal records the operator as the
-combination's `submitted_by`, and an idempotent retry must come from the same
-operator. This is local PAPER engineering evidence, not external-broker or
+single or combination order's `submitted_by`, and an idempotent submit retry
+must come from the same operator. It also records the first accepted cancel
+request with the operator and server time; a cancel retry adds no second
+operation. This is local PAPER engineering evidence, not external-broker or
 production acceptance.
 
 The same route exposes `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch`

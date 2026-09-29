@@ -118,10 +118,11 @@ for the deployment and evidence sequence.
 
 ## Current evidence boundary
 
-- The desktop, gRPC PAPER route, and PAPER status CLI currently compose local
-  model adapters. The official IBKR PAPER process bridge is implemented as a
-  library component but is not wired into those application compositions.
-  Its checked-in Python backend submits single market/limit DAY orders only.
+- The desktop and PAPER status CLI compose local model adapters. The gRPC PAPER
+  route selects the model by default or the official IBKR PAPER process bridge
+  by configuration. Its checked-in Python backend submits single market/limit
+  DAY orders only; the route can submit and cancel those orders but does not
+  yet synchronize fills or reconcile the broker account.
   The real adapter declares exactly that, so the PAPER OMS refuses a
   combination, a GTC intent or a replacement on that route before any order
   exists.

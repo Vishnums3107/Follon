@@ -4065,6 +4065,38 @@ These are mandatory master-plan acceptance conditions and are currently open:
        offers it, and the IBKR bridge cannot carry it (E5.1). Controlled LIVE is unchanged, since it already
        did both. No external gate moved.
 
+101. The authenticated gRPC PAPER route now exposes a single-order submit and an
+     account-bound cancel (2026-09-29, rows 5.5 and 5.10; E5.2b-2). This closes
+     the route half of E5.2b over item 100's journaled kernel.
+     - **Contract.** Version-1 `SubmitPaperOrder` carries the canonical intent,
+       fixed-point quantity and optional limit, explicit DAY or GTC, and an
+       operator-attested mark and observation time. `CancelPaperOrder` names the
+       tenant, configured account and OMS order. Both require a bearer session
+       with `PaperTrade` permission before reading the order details.
+     - **Behavior.** The submit route calls `PaperTradingService::submit_intent_as`
+       and returns its risk decision and actual OMS state, including a rejection
+       without an order. The cancel route calls `cancel_order_as`, which journals
+       the operator and `PENDING_CANCEL` before the adapter call; it returns the
+       resulting state. The kernel handles single and atomic combination order
+       IDs. The account is checked against the configured route before a cancel.
+     - **Tests.** The model route persists an authenticated submit and cancel
+       across restart, with idempotent retries, and the same cancel RPC handles
+       a combination order. Missing session, wrong role or
+       tenant, wrong account, invalid limit, stale mark, and missing route are
+       refused. A fake bridge process accepts a single DAY market order and
+       cancellation; a GTC request is refused before creating risk evidence.
+       An excessive quantity returns a risk rejection without an OMS order.
+       Removing the submitter argument made the durable-operator test fail and
+       was reverted.
+     - **Measured result.** The Rust workspace rose from 552 to 558 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run
+       measured all seven suites green. The full evidence pipeline exited 0;
+       its artifacts remain local engineering evidence.
+     - **Boundary.** The mark remains operator-attested. The bridge's fills are
+       not synchronized or reconciled by this route (E5.2c); the fake bridge
+       is a protocol fixture, not TWS or IB Gateway evidence. No external gate
+       moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
@@ -4076,7 +4108,8 @@ approvals, and record them through the tamper-evident acceptance ledger. As of
 2026-09-28 a configured environment is not enough on its own: no application
 composes the real IBKR PAPER bridge yet (delivery state E5), so that
 composition comes first. As of 2026-09-29 the gRPC PAPER route composes it by
-configuration (item 99), but it cannot yet submit an order the bridge carries
-or synchronize its fills (delivery state E5.2b and E5.2c). Broad
+configuration (item 99), and it can submit a single DAY order and cancel it
+(item 101), but it cannot yet synchronize or reconcile broker evidence
+(delivery state E5.2c). Broad
 LIVE or commercial promotion before those gates would violate the plan's own
 evidence-gated sequence.

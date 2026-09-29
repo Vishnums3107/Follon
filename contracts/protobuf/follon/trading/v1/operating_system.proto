@@ -12,6 +12,8 @@ service TradingOperatingSystem {
   // Requires `authorization: Bearer <session>` from CompleteOperatorLogin, for
   // an operator whose role grants PAPER trading in the request's tenant.
   rpc SubmitPaperCombo(SubmitPaperComboRequest) returns (SubmitPaperComboResponse);
+  rpc SubmitPaperOrder(SubmitPaperOrderRequest) returns (SubmitPaperOrderResponse);
+  rpc CancelPaperOrder(CancelPaperOrderRequest) returns (CancelPaperOrderResponse);
   // Operator login: password first, then a mandatory TOTP second factor.
   rpc BeginOperatorLogin(BeginOperatorLoginRequest) returns (BeginOperatorLoginResponse);
   rpc CompleteOperatorLogin(CompleteOperatorLoginRequest) returns (OperatorSession);
@@ -175,6 +177,12 @@ enum OrderTimeInForceKind {
   ORDER_TIME_IN_FORCE_KIND_GOOD_TIL_CANCELLED = 2;
 }
 
+enum PaperOrderKind {
+  PAPER_ORDER_KIND_UNSPECIFIED = 0;
+  PAPER_ORDER_KIND_MARKET = 1;
+  PAPER_ORDER_KIND_LIMIT = 2;
+}
+
 enum OmsOrderState {
   OMS_ORDER_STATE_UNSPECIFIED = 0;
   OMS_ORDER_STATE_CREATED = 1;
@@ -231,6 +239,57 @@ message SubmitPaperComboResponse {
   OmsOrderState state = 6;
   // The authenticated operator the PAPER journal records as the submitter.
   string submitted_by = 7;
+}
+
+// One declarative order and an independently supplied, operator-attested mark.
+// Submission always passes through the configured PAPER risk and OMS service.
+message SubmitPaperOrderRequest {
+  string tenant_id = 1;
+  string intent_id = 2;
+  string account_id = 3;
+  string strategy_id = 4;
+  string instrument_id = 5;
+  string correlation_id = 6;
+  ExecutionSide side = 7;
+  string quantity = 8;
+  PaperOrderKind order_kind = 9;
+  optional string limit_price = 10;
+  OrderTimeInForceKind time_in_force = 11;
+  string rationale = 12;
+  string created_at = 13;
+  string strategy_version = 14;
+  string configuration_version = 15;
+  string environment = 16;
+  string decided_at = 17;
+  string mark_price = 18;
+  string observed_at = 19;
+}
+
+message SubmitPaperOrderResponse {
+  string decision_id = 1;
+  bool approved = 2;
+  repeated string reason_codes = 3;
+  string policy_version = 4;
+  optional string order_id = 5;
+  OmsOrderState state = 6;
+  string submitted_by = 7;
+}
+
+// A single or atomic combination order can be cancelled by its OMS id.
+// The account is checked against the configured route before the OMS acts.
+message CancelPaperOrderRequest {
+  string tenant_id = 1;
+  string account_id = 2;
+  string order_id = 3;
+}
+
+message CancelPaperOrderResponse {
+  string order_id = 1;
+  OmsOrderState state = 2;
+  // Authenticated caller and server time for this request. A retry of a
+  // previously accepted cancel does not append another journal operation.
+  string operated_by = 3;
+  string operated_at = 4;
 }
 
 message BeginOperatorLoginRequest {

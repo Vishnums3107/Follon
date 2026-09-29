@@ -1,15 +1,15 @@
 //! Deployed gRPC topology for broker-neutral execution planning, portfolio
 //! risk, multi-currency margin valuation, and configured risk-gated PAPER
-//! combination submission.
+//! order submission and cancellation.
 //!
 //! Every write RPC requires a bearer session from an operator in the
 //! configured operator directory: password plus a mandatory TOTP second
-//! factor. `SubmitPaperCombo` needs a role that grants PAPER trading, and
+//! factor. PAPER order commands need a role that grants PAPER trading, and
 //! `ActivatePaperKillSwitch` and `ReleasePaperKillSwitch` need one that grants
 //! kill-switch operation (risk_manager), each in the request's tenant. The
 //! directory serves one tenant, so a route is reachable only by that tenant's
-//! operators, and the PAPER journal records who submitted and who moved a
-//! switch.
+//! operators, and the PAPER journal records who submitted, cancelled, and
+//! moved a switch.
 //!
 //! `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` need the same
 //! kill-switch permission, against a configured controlled-LIVE route. That
@@ -28,7 +28,8 @@ use follon_accounting::{
     value_margin_account, Currency, FxBook, FxQuote, MarginPolicy, MarginPosition, MarginRate,
 };
 use follon_domain::{
-    validate_canonical_id, ComboIntent, ComboIntentLeg, Decimal, OrderState, Side, TimeInForce,
+    validate_canonical_id, ComboIntent, ComboIntentLeg, Decimal, OrderIntent, OrderState,
+    OrderType, Side, TimeInForce,
 };
 use follon_execution::{
     plan_execution, plan_option_combo, plan_passive_repricing, ChildInstruction as CoreChild,
@@ -76,13 +77,14 @@ use api::{
     PaperKillSwitchResponse, RevokeOperatorSessionRequest, RevokeOperatorSessionResponse,
 };
 use api::{
-    BucketLimit, CancelReplaceInstruction, ChildInstruction, ChildOrderKind, ComboLegInstruction,
-    ComboPriceLimitKind, CurrencyAmount, ExecutionAlgorithmKind, ExecutionPlanRequest,
-    ExecutionPlanResponse, ExecutionSide, HealthRequest, HealthResponse, MarginAccountRequest,
-    MarginAccountResponse, OmsOrderState, OptionComboRequest, OptionComboResponse,
-    OrderTimeInForceKind, PaperComboMarketObservation, PassiveRepricingRequest,
-    PassiveRepricingResponse, PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics,
-    SubmitPaperComboRequest, SubmitPaperComboResponse,
+    BucketLimit, CancelPaperOrderRequest, CancelPaperOrderResponse, CancelReplaceInstruction,
+    ChildInstruction, ChildOrderKind, ComboLegInstruction, ComboPriceLimitKind, CurrencyAmount,
+    ExecutionAlgorithmKind, ExecutionPlanRequest, ExecutionPlanResponse, ExecutionSide,
+    HealthRequest, HealthResponse, MarginAccountRequest, MarginAccountResponse, OmsOrderState,
+    OptionComboRequest, OptionComboResponse, OrderTimeInForceKind, PaperComboMarketObservation,
+    PaperOrderKind, PassiveRepricingRequest, PassiveRepricingResponse, PortfolioRiskRequest,
+    PortfolioRiskResponse, RiskMetrics, SubmitPaperComboRequest, SubmitPaperComboResponse,
+    SubmitPaperOrderRequest, SubmitPaperOrderResponse,
 };
 
 type PaperComboRoute = Arc<Mutex<PaperTradingService<PaperRouteAdapter>>>;
@@ -624,6 +626,99 @@ impl TradingOperatingSystem for OperatingSystemService {
         }))
     }
 
+    async fn submit_paper_order(
+        &self,
+        request: Request<SubmitPaperOrderRequest>,
+    ) -> Result<Response<SubmitPaperOrderResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let operator = self
+            .identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::PaperTrade,
+                now_epoch_seconds()?,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        let intent = paper_order_intent(&request)?;
+        let market = PaperMarketData {
+            instrument_id: request.instrument_id.clone(),
+            mark_price: decimal("mark_price", &request.mark_price)?,
+            observed_at: request.observed_at.clone(),
+        };
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition("PAPER Risk/OMS route is not configured; no order was sent")
+        })?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        let outcome = service
+            .submit_intent_as(intent, market, &request.decided_at, Some(&operator.user_id))
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(SubmitPaperOrderResponse {
+            decision_id: outcome.decision.decision_id,
+            approved: outcome.decision.approved,
+            reason_codes: outcome.decision.reason_codes,
+            policy_version: outcome.decision.policy_version,
+            order_id: outcome.order_id,
+            state: outcome
+                .state
+                .map(oms_order_state)
+                .unwrap_or(OmsOrderState::Unspecified) as i32,
+            submitted_by: operator.user_id,
+        }))
+    }
+
+    async fn cancel_paper_order(
+        &self,
+        request: Request<CancelPaperOrderRequest>,
+    ) -> Result<Response<CancelPaperOrderResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        let operator = self
+            .identity()?
+            .authorize(&token, &request.tenant_id, Permission::PaperTrade, now)
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        validate_canonical_id("account_id", &request.account_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        validate_canonical_id("order_id", &request.order_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER Risk/OMS route is not configured; no order was cancelled",
+            )
+        })?;
+        let operated_at = utc_timestamp(now)?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        if request.account_id != service.account_id() {
+            return Err(Status::permission_denied("access denied"));
+        }
+        service
+            .cancel_order_as(&request.order_id, &operator.user_id, &operated_at)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let state = service
+            .order(&request.order_id)
+            .map(|order| order.oms.state)
+            .or_else(|| {
+                service
+                    .combo_order(&request.order_id)
+                    .map(|order| order.oms.state)
+            })
+            .ok_or_else(|| Status::internal("cancelled order is missing from PAPER OMS"))?;
+        Ok(Response::new(CancelPaperOrderResponse {
+            order_id: request.order_id,
+            state: oms_order_state(state) as i32,
+            operated_by: operator.user_id,
+            operated_at,
+        }))
+    }
+
     async fn begin_operator_login(
         &self,
         request: Request<BeginOperatorLoginRequest>,
@@ -871,6 +966,49 @@ impl TradingOperatingSystem for OperatingSystemService {
                 .collect(),
         }))
     }
+}
+
+fn paper_order_intent(request: &SubmitPaperOrderRequest) -> Result<OrderIntent, Status> {
+    if request.environment != "PAPER" {
+        return Err(Status::invalid_argument(
+            "SubmitPaperOrder accepts the PAPER environment only",
+        ));
+    }
+    let order_type = match PaperOrderKind::try_from(request.order_kind) {
+        Ok(PaperOrderKind::Market) => OrderType::Market,
+        Ok(PaperOrderKind::Limit) => OrderType::Limit,
+        _ => return Err(Status::invalid_argument("order kind is required")),
+    };
+    let time_in_force = match OrderTimeInForceKind::try_from(request.time_in_force) {
+        Ok(OrderTimeInForceKind::Day) => TimeInForce::Day,
+        Ok(OrderTimeInForceKind::GoodTilCancelled) => TimeInForce::GoodTilCancelled,
+        _ => return Err(Status::invalid_argument("time in force is required")),
+    };
+    let intent = OrderIntent {
+        intent_id: request.intent_id.clone(),
+        account_id: request.account_id.clone(),
+        strategy_id: request.strategy_id.clone(),
+        instrument_id: request.instrument_id.clone(),
+        correlation_id: request.correlation_id.clone(),
+        side: side(request.side)?,
+        quantity: decimal("quantity", &request.quantity)?,
+        order_type,
+        limit_price: request
+            .limit_price
+            .as_deref()
+            .map(|value| decimal("limit_price", value))
+            .transpose()?,
+        time_in_force,
+        rationale: request.rationale.clone(),
+        created_at: request.created_at.clone(),
+        strategy_version: request.strategy_version.clone(),
+        configuration_version: request.configuration_version.clone(),
+        environment: request.environment.clone(),
+    };
+    intent
+        .validate()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(intent)
 }
 
 fn paper_combo_intent(request: &SubmitPaperComboRequest) -> Result<ComboIntent, Status> {
@@ -2366,6 +2504,38 @@ mod tests {
         }
     }
 
+    fn paper_order_request(intent_id: &str) -> SubmitPaperOrderRequest {
+        SubmitPaperOrderRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            intent_id: intent_id.to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            strategy_id: "strategy.grpc.test".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            correlation_id: format!("corr-{intent_id}"),
+            side: ExecutionSide::Buy as i32,
+            quantity: "2".to_owned(),
+            order_kind: PaperOrderKind::Limit as i32,
+            limit_price: Some("100".to_owned()),
+            time_in_force: OrderTimeInForceKind::Day as i32,
+            rationale: "gRPC single-order test".to_owned(),
+            created_at: "2026-01-02T14:30:00Z".to_owned(),
+            strategy_version: "strategy.grpc.v1".to_owned(),
+            configuration_version: "config.grpc.v1".to_owned(),
+            environment: "PAPER".to_owned(),
+            decided_at: "2026-01-02T14:30:02Z".to_owned(),
+            mark_price: "100".to_owned(),
+            observed_at: "2026-01-02T14:30:00Z".to_owned(),
+        }
+    }
+
+    fn paper_cancel_request(order_id: &str) -> CancelPaperOrderRequest {
+        CancelPaperOrderRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            order_id: order_id.to_owned(),
+        }
+    }
+
     #[test]
     fn execution_side_rejects_unspecified() {
         assert!(side(ExecutionSide::Unspecified as i32).is_err());
@@ -2626,6 +2796,313 @@ mod tests {
         drop(paper);
         drop(reopened);
         let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_submits_and_cancels_with_durable_operator_evidence() {
+        let (service, route, scratch) = configured_paper_service("single-order");
+        let token = trader_token(&service).await;
+        let request = paper_order_request("intent.grpc.paper.single.1");
+        let submitted = service
+            .submit_paper_order(authorized(request.clone(), &token))
+            .await
+            .expect("risk-gated single order")
+            .into_inner();
+        assert!(submitted.approved);
+        assert_eq!(submitted.submitted_by, "user.trader");
+        assert_eq!(submitted.state, OmsOrderState::Acknowledged as i32);
+        let order_id = submitted.order_id.expect("approved order id");
+        let repeated = service
+            .submit_paper_order(authorized(request, &token))
+            .await
+            .expect("idempotent retry")
+            .into_inner();
+        assert_eq!(repeated.order_id.as_deref(), Some(order_id.as_str()));
+        assert_eq!(repeated.decision_id, submitted.decision_id);
+        let cancelled = service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .expect("cancel request")
+            .into_inner();
+        assert_eq!(cancelled.order_id, order_id);
+        assert_eq!(cancelled.state, OmsOrderState::PendingCancel as i32);
+        assert_eq!(cancelled.operated_by, "user.trader");
+        assert!(!cancelled.operated_at.is_empty());
+        service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .expect("idempotent cancel retry");
+        {
+            let paper = route.lock().unwrap();
+            assert_eq!(paper.order_operations().len(), 1);
+            assert_eq!(paper.order_operations()[0].operator, "user.trader");
+            assert_eq!(
+                paper
+                    .risk_evidence(&submitted.decision_id)
+                    .unwrap()
+                    .submitted_by
+                    .as_deref(),
+                Some("user.trader")
+            );
+        }
+        drop(service);
+        drop(route);
+        let reopened = paper_combo_route_from_path(&scratch.join("route.json")).unwrap();
+        let paper = reopened.lock().unwrap();
+        assert_eq!(
+            paper.order(&order_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        assert_eq!(paper.order_operations().len(), 1);
+        drop(paper);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_checks_authentication_account_and_evidence() {
+        let (service, route, scratch) = configured_paper_service("single-auth");
+        let request = || paper_order_request("intent.grpc.paper.single.auth");
+        assert_eq!(
+            service
+                .submit_paper_order(Request::new(request()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let viewer = login(
+            &service,
+            "viewer@example.com",
+            &test_directory().viewer_secret,
+        )
+        .await;
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(request(), &viewer))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let trader = trader_token(&service).await;
+        let mut wrong_tenant = request();
+        wrong_tenant.tenant_id = "tenant.beta".to_owned();
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(wrong_tenant, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut no_limit = request();
+        no_limit.limit_price = None;
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(no_limit, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut stale = request();
+        stale.observed_at = "2026-01-02T14:00:00Z".to_owned();
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(stale, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let mut wrong_account = request();
+        wrong_account.account_id = "acct.other".to_owned();
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(wrong_account, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let mut cancel_other = paper_cancel_request("order.someone.else");
+        cancel_other.account_id = "acct.other".to_owned();
+        assert_eq!(
+            service
+                .cancel_paper_order(authorized(cancel_other, &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .cancel_paper_order(authorized(
+                    paper_cancel_request("order.someone.else"),
+                    &viewer
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert!(route
+            .lock()
+            .unwrap()
+            .risk_evidence("paper-risk-intent.grpc.paper.single.auth")
+            .is_none());
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_returns_a_risk_rejection_without_creating_an_order() {
+        let (service, route, scratch) = configured_paper_service("single-rejection");
+        let token = trader_token(&service).await;
+        let mut request = paper_order_request("intent.grpc.paper.single.rejected");
+        request.quantity = "101".to_owned();
+        let outcome = service
+            .submit_paper_order(authorized(request, &token))
+            .await
+            .expect("risk decision")
+            .into_inner();
+        assert!(!outcome.approved);
+        assert!(outcome
+            .reason_codes
+            .contains(&"MAX_ORDER_QUANTITY_EXCEEDED".to_owned()));
+        assert!(outcome.order_id.is_none());
+        assert_eq!(outcome.state, OmsOrderState::Unspecified as i32);
+        assert_eq!(outcome.submitted_by, "user.trader");
+        assert!(route
+            .lock()
+            .unwrap()
+            .risk_evidence(&outcome.decision_id)
+            .is_some());
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_cancel_rpc_cancels_a_combination_through_the_same_oms_boundary() {
+        let (service, route, scratch) = configured_paper_service("combo-cancel");
+        let token = trader_token(&service).await;
+        let submitted = service
+            .submit_paper_combo(authorized(
+                paper_combo_request("intent.grpc.paper.combo.cancel"),
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let order_id = submitted.order_id.unwrap();
+        let cancelled = service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(cancelled.state, OmsOrderState::PendingCancel as i32);
+        let paper = route.lock().unwrap();
+        assert_eq!(
+            paper.combo_order(&order_id).unwrap().oms.state,
+            OrderState::PendingCancel
+        );
+        assert_eq!(paper.order_operations().len(), 1);
+        assert_eq!(paper.order_operations()[0].operator, "user.trader");
+        drop(paper);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_rpc_reaches_the_bridge_only_for_supported_single_day_orders() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge route test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-single", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            document["ibkr_bridge"] = fake_bridge_section(&python);
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        let mut gtc = paper_order_request("intent.grpc.bridge.gtc");
+        gtc.time_in_force = OrderTimeInForceKind::GoodTilCancelled as i32;
+        let error = service
+            .submit_paper_order(authorized(gtc, &token))
+            .await
+            .expect_err("real bridge cannot carry GTC");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(route
+            .lock()
+            .unwrap()
+            .risk_evidence("paper-risk-intent.grpc.bridge.gtc")
+            .is_none());
+
+        let mut market = paper_order_request("intent.grpc.bridge.day");
+        market.order_kind = PaperOrderKind::Market as i32;
+        market.limit_price = None;
+        let submitted = service
+            .submit_paper_order(authorized(market, &token))
+            .await
+            .expect("fake bridge accepted a single DAY market order")
+            .into_inner();
+        assert!(submitted.approved);
+        assert_eq!(submitted.state, OmsOrderState::Acknowledged as i32);
+        let order_id = submitted.order_id.unwrap();
+        assert_eq!(
+            route
+                .lock()
+                .unwrap()
+                .order(&order_id)
+                .unwrap()
+                .broker_order_id
+                .as_deref(),
+            Some("ibkr.41")
+        );
+        let cancelled = service
+            .cancel_paper_order(authorized(paper_cancel_request(&order_id), &token))
+            .await
+            .expect("fake bridge accepted cancellation")
+            .into_inner();
+        assert_eq!(cancelled.state, OmsOrderState::PendingCancel as i32);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_order_and_cancel_rpc_fail_closed_without_a_route() {
+        let mut service = service();
+        service.identity = Some(operator_identity());
+        let token = trader_token(&service).await;
+        for code in [
+            service
+                .submit_paper_order(authorized(
+                    paper_order_request("intent.grpc.no.route"),
+                    &token,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            service
+                .cancel_paper_order(authorized(paper_cancel_request("order.no.route"), &token))
+                .await
+                .unwrap_err()
+                .code(),
+        ] {
+            assert_eq!(code, tonic::Code::FailedPrecondition);
+        }
     }
 
     #[tokio::test]
