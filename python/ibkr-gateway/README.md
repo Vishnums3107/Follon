@@ -5,6 +5,12 @@ with the Rust adapter through bounded JSON lines on private process pipes. It
 cannot accept live ports or a non-`PAPER` environment, and it accepts no broker
 credential. Authentication remains in TWS/IB Gateway.
 
+This is the Python half of the IBKR boundary. Its Rust counterpart, which spawns
+this bridge and implements the PAPER broker trait over it, is the
+`follon-ibkr-paper-adapter` crate in
+[`adapters/brokers/ibkr`](../../adapters/brokers/ibkr/README.md). The split is
+deliberate: only this process imports the official `ibapi` package.
+
 Install the official Python API from a pinned TWS API distribution, review the
 instrument map against IBKR contract details, enable socket clients in the PAPER
 session, and use either TWS port `7497` or IB Gateway port `4002`. Run the bridge
