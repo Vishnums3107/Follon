@@ -4721,6 +4721,41 @@ These are mandatory master-plan acceptance conditions and are currently open:
        strategy that keeps a snapshot; a strategy that keeps its own state in Python is told by its
        portfolio, not by an event. No external gate moved.
 
+114. Capsule replay takes an evaluation's corporate actions (2026-09-29, Reliability and quality
+     conformance, research-to-live parity; E8.4a, the capsule half of E8.4). Found by the source
+     review behind the revised assessment.
+     - **Gap.** `capsule-package` and `capsule-verify` replayed an evaluation with no corporate-action
+       input, so a capsule could seal only an evaluation that applied none. For one that did, the
+       replay could not reproduce the receipt, and the refusal, "capsule replay did not reproduce
+       the evaluation receipt", named no cause. The dataset's content hash already covered the
+       actions, so the receipt was bound to inputs the replay had no way to supply.
+     - **Behavior.**
+       - Both commands take an optional `--actions <csv>`, the file an evaluation takes, and the
+         replay applies it. Like the bars it is referenced by the dataset's content hash and never
+         carried in the capsule.
+       - `capsule-package` refuses an evaluation whose artifact records applied actions unless they
+         are supplied, and says so, before it replays anything and before any directory exists. The
+         sealed replay command names `--actions` when they were used.
+       - A `capsule-verify` replay that does not reproduce the receipt says, when no actions were
+         supplied, that an evaluation with corporate actions needs them. Supplying different actions
+         cannot reproduce the receipt either, because they change the dataset it is bound to.
+     - **Tests.** One test and three helper variants were added. A Python-worker evaluation applies
+       a split dated at the first bar, so that no order rests across it. Packaging without the
+       actions is refused with its reason and leaves no directory. Packaging with them succeeds and
+       the sealed command names the flag. Verification with them reproduces the receipt, with only
+       the bars it is refused and pointed at the flag, and with a different split it is refused.
+     - **Rule 5.** 9 of 9 injected defects were caught by the intended test: the actions not
+       applied by either replay, the packaging check removed, inverted or reading a count of zero,
+       the sealed command and the verification hint losing their words, and either command
+       refusing the flag.
+     - **Measured result.** The Rust workspace rose from 637 to 638 passed / 0 failed / 3 ignored.
+       The final `python tools/session_status.py` run measured all seven suites green, and the full
+       evidence pipeline exited 0.
+     - **Boundary.** PAPER and controlled LIVE still apply no corporate actions (E8.4b). A capsule
+       still packages only a Python-worker evaluation, and its market data and corporate actions are
+       still the caller's to supply. A split with an order resting across it is refused by the replay
+       (E8.2), so an evaluation that hit that refusal has no capsule. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

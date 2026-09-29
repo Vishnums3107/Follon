@@ -557,8 +557,9 @@ fn evaluate_backtest(
 /// recorded, and the completion manifest must hash-bind the artifact. The
 /// capsule's own copies are then replayed in a sandbox, and a manifest is
 /// sealed only if that replay reproduces the completion manifest byte for
-/// byte. The evaluation must have run without corporate actions, because the
-/// replay supplies none.
+/// byte. An evaluation that applied corporate actions is packaged with the same file,
+/// `--actions`, which the replay applies too. Like the bars it is referenced by the
+/// dataset's content hash, which covers the actions, and is never carried.
 fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (positional, flags) = parse_flag_values(
         arguments,
@@ -573,12 +574,13 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
             "--packaged-at",
             "--output",
         ],
-        &[],
+        &["--actions"],
     )?;
     if !positional.is_empty() {
-        return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> --python <interpreter> --packaged-at <utc> --output <dir>".into());
+        return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> [--actions <csv>] --python <interpreter> --packaged-at <utc> --output <dir>".into());
     }
     let flag = |name: &str| flags[name].as_str();
+    let actions = flags.get("--actions").map(Path::new);
 
     let lock_bytes = fs::read(flag("--lock"))?;
     let lock = follon_control_plane::StrategyBundleLock::parse(&lock_bytes)?;
@@ -627,15 +629,38 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("evaluation dataset has no {field}"))
     };
+    // An evaluation that applied corporate actions cannot be replayed without them, so
+    // say so here rather than let the replay fail to reproduce the receipt unexplained.
+    let applied = artifact
+        .get("performance")
+        .and_then(|performance| performance.get("corporate_action_count"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("evaluation artifact has no corporate action count")?;
+    if applied > 0 && actions.is_none() {
+        return Err(format!(
+            "the evaluation applied {applied} corporate action(s), which the replay needs: pass the same file with --actions"
+        )
+        .into());
+    }
+    let actions_hint = if actions.is_some() {
+        " --actions <the corporate actions of that dataset>"
+    } else {
+        ""
+    };
     let replay_command = format!(
-        "follon-backtest capsule-verify <capsule-dir> --bars <{} {} bars, dataset content hash {}> --python <{} interpreter>",
+        "follon-backtest capsule-verify <capsule-dir> --bars <{} {} bars, dataset content hash {}>{actions_hint} --python <{} interpreter>",
         dataset("dataset_id")?,
         dataset("dataset_version")?,
         dataset("content_hash")?,
         contents.lock.runtime,
     );
 
-    let reproduced = replay_capsule(&contents, Path::new(flag("--bars")), flag("--python"))?;
+    let reproduced = replay_capsule(
+        &contents,
+        Path::new(flag("--bars")),
+        actions,
+        flag("--python"),
+    )?;
     let manifest = contents.seal(
         flag("--packaged-at"),
         &replay_command,
@@ -664,14 +689,18 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
 /// capsule's own strategy and SDK are replayed in a sandbox. Success means the
 /// replay reproduced the sealed evaluation receipt byte for byte.
 fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (positional, flags) =
-        parse_flag_values(arguments, &["--bars", "--python"], &["--trusted-key"])?;
+    let (positional, flags) = parse_flag_values(
+        arguments,
+        &["--bars", "--python"],
+        &["--trusted-key", "--actions"],
+    )?;
     let [capsule_directory] = positional.as_slice() else {
         return Err(
-            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> --python <interpreter> [--trusted-key <key.json>]"
+            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> [--actions <csv>] --python <interpreter> [--trusted-key <key.json>]"
                 .into(),
         );
     };
+    let actions = flags.get("--actions").map(Path::new);
     let sealed = read_strategy_capsule(Path::new(capsule_directory))?;
     let signer = match (flags.get("--trusted-key"), &sealed.signature) {
         (Some(path), _) => {
@@ -688,10 +717,16 @@ fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
     let reproduced = replay_capsule(
         &sealed.contents,
         Path::new(&flags["--bars"]),
+        actions,
         &flags["--python"],
     )?;
     if reproduced.as_bytes() != sealed.contents.receipt() {
-        return Err("capsule replay did not reproduce its evaluation receipt".into());
+        return Err(if actions.is_none() {
+            "capsule replay did not reproduce its evaluation receipt (if the evaluation applied corporate actions, pass them with --actions)"
+        } else {
+            "capsule replay did not reproduce its evaluation receipt"
+        }
+        .into());
     }
     println!(
         "{} {}: replay reproduced {}; {signer}",
@@ -745,6 +780,7 @@ fn run_capsule_sign(arguments: &[String]) -> Result<(), Box<dyn std::error::Erro
 fn replay_capsule(
     contents: &CapsuleContents,
     bars: &Path,
+    actions: Option<&Path>,
     python: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !Path::new(python).is_absolute() {
@@ -781,7 +817,7 @@ fn replay_capsule(
     let outputs = evaluate_backtest(
         bars,
         &configuration_path,
-        None,
+        actions,
         StrategyMode::Python(Box::new(worker)),
     )?;
     Ok(outputs.completion_manifest)
