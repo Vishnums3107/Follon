@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T05:15:11Z  
+**Measured at:** 2026-09-29T05:25:19Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `8d3b053` -- docs(delivery): foundation CI passes on a clean runner -- E4.3 (2026-09-29T10:42:13+05:30)  
-**Uncommitted paths:** 3
+**HEAD:** `52b4823` -- fix(admin): a refused release-keygen leaves no private key behind -- E7.6 (2026-09-29T10:46:25+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 539 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 542 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -265,7 +265,8 @@ passes it for production.
 | E7.1 | E3.11's link guard for every durable writer it did not cover. The operations journal's reader reports a dangling link as a healthy empty journal. The replay `FileEventStore` and the backtest `FileExperimentStore` check `exists()` and then open with `create(true)`. `follon-news` output uses `File::create`, which truncates a link's target. `write_immutable` leaves its staging file behind on a dangling link. **Each now refuses any link without following it**; the experiment store checks again at every write, because it reopens its file each time (audit item 91). | **done** 2026-09-28 |
 | E7.2 | Strategy-worker frames. Each is one newline-terminated JSON line, read with an unbounded `read_line` and no deadline. They need a bound applied before allocation and a per-frame deadline, reusing the IBKR bridge's bounded reader. | open |
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
-| E7.4 | Portfolio-risk configuration. PAPER's fingerprint omits `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`, and the aggregate check is skipped outright when equity is not positive. LIVE's fingerprint needs the same check. | open |
+| E7.4a | Portfolio-risk configuration fingerprints. PAPER's and LIVE's both omitted `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`. **Now every field enters both**, through `PortfolioRiskPolicy::canonical_parts`, whose exhaustive destructuring makes a new field a compile error until it is rendered. The part is tagged `v2`, so a journal or LIVE approval made under the incomplete version-1 fingerprint is refused rather than trusted (audit item 98). | **done** 2026-09-29 |
+| E7.4b | The aggregate portfolio-risk check is skipped outright when equity is not positive. Failing closed would also refuse risk-reducing orders, such as closing positions, when an account is underwater, so the treatment is the operator's choice. | **decision** |
 | E7.5 | Aggregate portfolio risk in the order-submitting routes, the desktop gateway and the gRPC PAPER route. Only the read-only `follon-paper-status` composes it today. | open |
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |

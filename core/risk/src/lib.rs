@@ -342,6 +342,76 @@ pub struct PortfolioRiskPolicy {
 }
 
 impl PortfolioRiskPolicy {
+    /// Every field of the policy, rendered in a fixed order, for a
+    /// configuration fingerprint.
+    ///
+    /// The destructuring names every field and has no `..`, so a field added
+    /// later does not compile until it is rendered here too. PAPER and LIVE
+    /// each listed the fields by hand and both left out five limits, so a
+    /// journal reopened, and a LIVE approval stayed valid, under changed limits
+    /// (delivery state E7.4).
+    pub fn canonical_parts(&self) -> Vec<String> {
+        let PortfolioRiskPolicy {
+            version,
+            global_kill_switch,
+            max_gross_exposure,
+            max_abs_net_exposure,
+            max_leverage_bps,
+            max_concentration_bps,
+            max_daily_loss,
+            max_drawdown_bps,
+            max_margin_utilization_bps,
+            max_abs_delta,
+            max_abs_gamma,
+            max_open_orders,
+            max_order_rate,
+            allowed_instruments,
+            restricted_instruments,
+            sector_limits,
+            asset_class_limits,
+            currency_limits,
+            strategy_limits,
+            max_news_slippage_bps,
+            max_spread_multiplier_bps,
+        } = self;
+        let limits = |map: &BTreeMap<String, Decimal>| {
+            map.iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let set = |values: &BTreeSet<String>| values.iter().cloned().collect::<Vec<_>>().join("|");
+        let optional = |value: &Option<Decimal>| {
+            value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+        };
+        vec![
+            format!("version={version}"),
+            format!("global_kill_switch={global_kill_switch}"),
+            format!("max_gross_exposure={max_gross_exposure}"),
+            format!("max_abs_net_exposure={max_abs_net_exposure}"),
+            format!("max_leverage_bps={max_leverage_bps}"),
+            format!("max_concentration_bps={max_concentration_bps}"),
+            format!("max_daily_loss={max_daily_loss}"),
+            format!("max_drawdown_bps={max_drawdown_bps}"),
+            format!("max_margin_utilization_bps={max_margin_utilization_bps}"),
+            format!("max_abs_delta={max_abs_delta}"),
+            format!("max_abs_gamma={max_abs_gamma}"),
+            format!("max_open_orders={max_open_orders}"),
+            format!("max_order_rate={max_order_rate}"),
+            format!("allowed_instruments={}", set(allowed_instruments)),
+            format!("restricted_instruments={}", set(restricted_instruments)),
+            format!("sector_limits={}", limits(sector_limits)),
+            format!("asset_class_limits={}", limits(asset_class_limits)),
+            format!("currency_limits={}", limits(currency_limits)),
+            format!("strategy_limits={}", limits(strategy_limits)),
+            format!("max_news_slippage_bps={}", optional(max_news_slippage_bps)),
+            format!(
+                "max_spread_multiplier_bps={}",
+                optional(max_spread_multiplier_bps)
+            ),
+        ]
+    }
+
     /// Validates policy identity, ranges, and bucket keys.
     pub fn validate(&self) -> Result<(), RiskError> {
         validate_canonical_id("portfolio risk version", &self.version)?;
@@ -796,6 +866,122 @@ mod tests {
             strategy_limits: BTreeMap::new(),
             max_news_slippage_bps: None,
             max_spread_multiplier_bps: None,
+        }
+    }
+
+    #[test]
+    fn canonical_parts_change_with_every_field_of_the_policy() {
+        // Each change touches exactly one field; the exhaustive destructuring
+        // makes a new field a compile error, and this makes a dropped one a
+        // test failure (delivery state E7.4).
+        let base = policy().canonical_parts();
+        type Change = Box<dyn Fn(&mut PortfolioRiskPolicy)>;
+        let changes: Vec<(&str, Change)> = vec![
+            (
+                "version",
+                Box::new(|p| p.version = "portfolio.risk.v2".to_owned()),
+            ),
+            (
+                "global_kill_switch",
+                Box::new(|p| p.global_kill_switch = true),
+            ),
+            (
+                "max_gross_exposure",
+                Box::new(|p| p.max_gross_exposure = amount("99999")),
+            ),
+            (
+                "max_abs_net_exposure",
+                Box::new(|p| p.max_abs_net_exposure = amount("49999")),
+            ),
+            (
+                "max_leverage_bps",
+                Box::new(|p| p.max_leverage_bps = amount("19999")),
+            ),
+            (
+                "max_concentration_bps",
+                Box::new(|p| p.max_concentration_bps = amount("8999")),
+            ),
+            (
+                "max_daily_loss",
+                Box::new(|p| p.max_daily_loss = amount("4999")),
+            ),
+            (
+                "max_drawdown_bps",
+                Box::new(|p| p.max_drawdown_bps = amount("999")),
+            ),
+            (
+                "max_margin_utilization_bps",
+                Box::new(|p| p.max_margin_utilization_bps = amount("4999")),
+            ),
+            (
+                "max_abs_delta",
+                Box::new(|p| p.max_abs_delta = amount("999")),
+            ),
+            (
+                "max_abs_gamma",
+                Box::new(|p| p.max_abs_gamma = amount("99")),
+            ),
+            ("max_open_orders", Box::new(|p| p.max_open_orders = 9)),
+            ("max_order_rate", Box::new(|p| p.max_order_rate = 19)),
+            (
+                "allowed_instruments",
+                Box::new(|p| {
+                    p.allowed_instruments
+                        .insert("inst.us_equity.spy".to_owned());
+                }),
+            ),
+            (
+                "restricted_instruments",
+                Box::new(|p| {
+                    p.restricted_instruments
+                        .insert("inst.us_equity.spy".to_owned());
+                }),
+            ),
+            (
+                "sector_limits",
+                Box::new(|p| {
+                    p.sector_limits
+                        .insert("technology".to_owned(), amount("39999"));
+                }),
+            ),
+            (
+                "asset_class_limits",
+                Box::new(|p| {
+                    p.asset_class_limits
+                        .insert("equity".to_owned(), amount("1"));
+                }),
+            ),
+            (
+                "currency_limits",
+                Box::new(|p| {
+                    p.currency_limits.insert("USD".to_owned(), amount("99999"));
+                }),
+            ),
+            (
+                "strategy_limits",
+                Box::new(|p| {
+                    p.strategy_limits
+                        .insert("strategy.alpha".to_owned(), amount("1"));
+                }),
+            ),
+            (
+                "max_news_slippage_bps",
+                Box::new(|p| p.max_news_slippage_bps = Some(amount("10"))),
+            ),
+            (
+                "max_spread_multiplier_bps",
+                Box::new(|p| p.max_spread_multiplier_bps = Some(amount("10"))),
+            ),
+        ];
+        assert_eq!(changes.len(), 21, "one change per field");
+        for (field, change) in &changes {
+            let mut changed = policy();
+            change(&mut changed);
+            assert_ne!(
+                changed.canonical_parts(),
+                base,
+                "{field} is not in the canonical parts"
+            );
         }
     }
 

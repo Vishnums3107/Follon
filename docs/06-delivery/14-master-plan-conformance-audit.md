@@ -3928,6 +3928,39 @@ These are mandatory master-plan acceptance conditions and are currently open:
       item 83 recorded. A path created by another process between the check and the write is the E7.12
       race. No external gate moved.
 
+98. Every portfolio-risk limit enters the PAPER and LIVE configuration fingerprints (2026-09-29, rows 5.3 and
+    5.10; delivery state E7.4a). Found by the source review behind the revised assessment.
+    - **The gap.** Both environments listed the portfolio-risk policy's fields by hand for their
+      configuration fingerprint, and both left out `max_daily_loss`, `max_drawdown_bps`,
+      `max_margin_utilization_bps`, `strategy_limits` and the composition's `margin_rates`. The fingerprint
+      is what a journal reopens under and what a LIVE approval binds, so a journal reopened, and a LIVE
+      approval stayed valid, after any of those limits changed.
+    - **The fix.**
+      - `PortfolioRiskPolicy::canonical_parts` in `core/risk` renders all 21 fields in a fixed order. Its
+        destructuring names every field and has no `..`, so a field added later does not compile until
+        it is rendered.
+      - PAPER and LIVE each build their part from it, plus the composition's instrument buckets and
+        margin rates. Each environment keeps its own copy of that rendering, as each keeps its own risk
+        gate.
+      - The part's tag moves from `v1` to `v2` in both environments. A journal or LIVE approval made under
+        the incomplete fingerprint is refused, not trusted, because unchanged limits cannot be shown.
+      - A configuration without portfolio risk contributes no part, so its fingerprint is byte-for-byte
+        unchanged. The checked-in PAPER and LIVE journal fixtures, whose configurations have none, still
+        reopen.
+    - **Tests.** In `core/risk`, changing any one of the 21 fields changes the canonical parts. In PAPER
+      and LIVE, changing any of the five omitted limits changes the configuration fingerprint.
+    - **Rule 5.** 5 of 5 injected defects were caught: a field dropped from the canonical parts, either
+      environment never rendering its margin rates, and either environment keeping only the first six
+      policy parts.
+    - **Measured result.** The Rust workspace rose from 539 to 542 passed / 0 failed / 3
+      ignored. The final `python tools/session_status.py` run measured all seven suites green, after a
+      first run failed clippy's `type_complexity` on the new tests, which now use a type alias. The full
+      evidence pipeline exited 0 with the scan at 85 probes, 0 failed, and both checked-in journal
+      fixtures still reopen.
+    - **Bounded remainder.** The check is still skipped outright when equity is not positive. Whether to
+      fail closed, which would also refuse risk-reducing orders, is the operator's decision (E7.4b).
+      Neither order-submitting route composes portfolio risk at all (E7.5). No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
