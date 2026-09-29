@@ -3883,6 +3883,23 @@ These are mandatory master-plan acceptance conditions and are currently open:
       and third-party notices, which the assessment also named, are a review for the owner, not a
       metadata change. No external gate moved.
 
+96. Foundation CI passes on a clean runner (2026-09-29, Reliability and Security; delivery state E4.3). This
+    is the revised assessment's first completion criterion: every foundation job runs its required steps
+    and passes.
+    - **The run.** GitHub Actions run 36524632774, for pull request 31 at `0a2d380`, completed with all
+      six jobs successful: `rust`, `postgres-integration`, `security`, `sast`, `python-and-contracts` and
+      `desktop`. It is the first run of `Verify foundation` visible on GitHub to pass. Every earlier one,
+      back to at least 2026-09-05, failed.
+    - **What it verified that could not be verified locally.**
+      - The desktop job installed Tauri's Linux libraries (item 85), and clippy and the native tests then
+        ran and passed. This machine has no Linux environment.
+      - The `python-and-contracts` job installed the hash-pinned `ibapi` (item 94). Its storage-adapter
+        and server-contract steps ran on GitHub for the first time, and passed, including item 88's
+        socket tests on Linux.
+    - **Bounded remainder.** It is a pull-request run. The push run on `main` after merging confirms the
+      same on `main`. The dependency-review step stays skipped while its repository variable is off, as the
+      workflow intends. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

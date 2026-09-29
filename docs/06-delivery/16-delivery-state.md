@@ -193,7 +193,8 @@ cannot be closed in this repository.
 ### E4 — Foundation CI on a clean runner (assessment priority 1)
 
 GitHub's `Verify foundation` workflow has not passed on any run visible there,
-back to at least 2026-09-05. On main run 36334101143, for `4adb090`, three of
+back to at least 2026-09-05. **Since 2026-09-29 it passes:** run 36524632774, on PR 31,
+was green in all six jobs (E4.3). On main run 36334101143, for `4adb090`, three of
 the six jobs failed. Each was reproduced from its log:
 
 - `python-and-contracts`: six IBKR bridge tests import `ibapi`, which the
@@ -212,7 +213,7 @@ flagged a LIVE fixture's `credential_reference`.
 | --- | --- | --- |
 | E4.1 | The three failures with an obvious fix. Semgrep excludes the audit as a path, keeping the nginx rules on the real configuration. Gitleaks allowlists a `credential_reference` line holding a canonical secret reference, and nothing broader. The desktop job installs Tauri's documented Linux libraries. The bridge README's stale "without `ibapi`" instruction is corrected. Semgrep and gitleaks were verified both ways at CI's versions; the desktop fix is unverified until CI runs (audit item 85). | **done** 2026-09-28 |
 | E4.2 | An approved IBKR API distribution for the bridge's six official-backend tests. The only version they have run against is `ibapi` 9.81.1.post1 from PyPI, the one this machine has, published under IBKR's API licence. Current TWS API releases are 10.x, which reportedly rename `commission_report`, an import the bridge uses. **Decided 2026-09-29: pin 9.81.1.post1.** CI installs it from a hash-pinned `python/ibkr-gateway/requirements-ci.txt`, whose hash is PyPI's published digest; in a fresh environment it installs and all 14 bridge tests pass, and a wrong hash is refused (audit item 94). | **done** 2026-09-29 |
-| E4.3 | A green GitHub run of all six jobs on the reviewed commit. It needs a push, which the operator approved on 2026-09-29, and E4.1's desktop fix is unverified until it runs. | open |
+| E4.3 | A green GitHub run of all six jobs on the reviewed commit. It needs a push, which the operator approved on 2026-09-29, and E4.1's desktop fix is unverified until it runs. **Run 36524632774, for PR 31 at `0a2d380`, passed all six jobs**: the first passing run visible on GitHub. It verified the desktop libraries and ran the Python job's later steps for the first time. The push run on `main` after merging re-confirms it (audit item 96). | **done** 2026-09-29 |
 
 ### E5 — One integrated broker-PAPER workflow (assessment priority 2)
 
