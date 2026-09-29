@@ -56,18 +56,18 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T05:25:19Z  
+**Measured at:** 2026-09-29T05:48:27Z  
 **Branch:** `docs/project-status-assessment-2026-09-27`  
-**HEAD:** `52b4823` -- fix(admin): a refused release-keygen leaves no private key behind -- E7.6 (2026-09-29T10:46:25+05:30)  
-**Uncommitted paths:** 4
+**HEAD:** `fd688f9` -- fix(risk): every portfolio-risk limit enters both configuration fingerprints -- E7.4a (2026-09-29T10:57:00+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 542 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 548 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 74 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 75 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -223,18 +223,25 @@ recovery, reconnect and reconciliation; and a real PAPER-only adapter,
 official-API Python bridge. The bridge supports single MKT and LMT DAY orders,
 cancellation, polling, snapshots and reconnect.
 
-**What is missing.** No application composes the real adapter. No
-application crate depends on `follon-ibkr-paper-adapter`, and
-`IbkrPaperGatewayAdapter` is constructed nowhere, not even in a test. The
-desktop wraps the model in `ManualFillAdapter`, the gRPC route accepts only
-`adapter_kind: IBKR_PAPER_MODEL`, and `follon-paper-status` always builds
-`IbkrPaperAdapter`. The 30-session gate cannot begin until this epic lands
-(see the correction under the external gates).
+**What is missing.** When the revised assessment was checked, no
+application composed the real adapter, and `IbkrPaperGatewayAdapter` was
+constructed nowhere, not even in a test. E5.1's tests were the first to
+construct it. Since E5.2a (2026-09-29) the gRPC PAPER route composes it when
+its configuration says `adapter_kind: IBKR_PAPER_BRIDGE`. It still trades
+nothing through it, for two reasons:
+
+- the route's only order RPC submits combinations, which the bridge refuses
+  (E5.2b);
+- nothing synchronizes the bridge's fills or reconciles its account (E5.2c).
+
+The desktop wraps the model in `ManualFillAdapter`, and `follon-paper-status`
+always builds `IbkrPaperAdapter`. The 30-session gate cannot begin until this
+epic lands (see the correction under the external gates).
 
 | Slice | Scope | State |
 | --- | --- | --- |
 | E5.1 | The real adapter refuses, before transmitting and as a clean rejection, what its bridge cannot execute. That covers combinations: the Python dispatch has no `submit_combo`, and the Rust payload drops each leg's quantity and the debit or credit sign. It also covers any time in force other than DAY. Replacement is already refused by the trait default, but `core/paper` records that refusal as `UNKNOWN`. **Landed as `PaperBrokerCapabilities`**: every adapter declares what it carries, defaulting to single DAY orders, and the service refuses anything more before risk is evaluated or an order exists. The real adapter declares the default, and its transport no longer emits `submit_combo` (audit item 87). | **done** 2026-09-28 |
-| E5.2 | One order-submitting route composes the real bridge, selected by configuration, with the model as the default. Which route comes first was the decision: the authenticated gRPC PAPER route, the desktop gateway, or a CLI. **Decided 2026-09-29: the gRPC PAPER route.** That route's only order RPC is `SubmitPaperCombo`, which the real bridge cannot carry, so composing the bridge alone would give an operator nothing usable. The slice is therefore three: **E5.2a**, the route composes the bridge by configuration, with the model the default and the adapter bound into the journal fingerprint; **E5.2b**, an authenticated single-order submit and a cancel, journaled by operator; **E5.2c**, synchronize and reconcile, so fills arrive and discrepancies surface. | open |
+| E5.2 | One order-submitting route composes the real bridge, selected by configuration, with the model as the default. Which route comes first was the decision: the authenticated gRPC PAPER route, the desktop gateway, or a CLI. **Decided 2026-09-29: the gRPC PAPER route.** That route's only order RPC is `SubmitPaperCombo`, which the real bridge cannot carry, so composing the bridge alone would give an operator nothing usable. The slice is therefore three: **E5.2a**, the route composes the bridge by configuration, with the model the default and the adapter bound into the journal fingerprint; **E5.2b**, an authenticated single-order submit and a cancel, journaled by operator; **E5.2c**, synchronize and reconcile, so fills arrive and discrepancies surface. **E5.2a landed 2026-09-29** (audit item 99). An `ibkr_bridge` section starts the bridge with an argument list the route builds from fixed fields, and the route refuses what the bridge would refuse before any process starts. The route fingerprint binds the endpoint, the broker account, the client id, the TWS time zone and the instrument map's SHA-256. | E5.2a **done** 2026-09-29; E5.2b and E5.2c open |
 | E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
 | E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR (`REJECTED`), from transport ambiguity (`UNKNOWN`). Today every `ok: false` reply strands the order `UNKNOWN` and disconnects the session. IBKR error codes that are not rejections, such as 202 (order cancelled), need checking against a real TWS. | open |
 | E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
@@ -774,6 +781,56 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-28/29 — session 10
+
+- Asked to analyse the Revision 2 assessment, act on it, develop further, and
+  update the goals to match it. Baseline at `4adb090` on
+  `docs/project-status-assessment-2026-09-27`: all seven suites green (Rust
+  521 / 0 / 3, Tauri 30, Python 55), with the assessment's docs uncommitted.
+- Checked every source claim before acting on it. Three read-only reviews ran,
+  each CI failure was reproduced from its GitHub log, and Semgrep 1.177.0 and
+  gitleaks 8.24.3 were re-run locally. Every claim held. One claim of this
+  document's own was false: E1.3a's statement that the real bridge accepts
+  combinations. The reviews also found defects the assessment did not name.
+- Re-planned the backlog around the assessment's §15 as epics E4 to E8, and
+  corrected false claims in place (Settled direction item 4).
+- Landed 15 slices, each measured with all seven suites and the full
+  pipeline, with rule-5 injections throughout (audit items 85 to 99):
+  - E4.1: foundation CI's three fixable failures.
+  - E6.1: the pipeline had counted the assessment's synthetic customer, and
+    would have published it.
+  - E5.1: adapters declare capabilities, and the real bridge refuses
+    combinations, GTC and replacement before an order exists. Found along
+    the way: a fault-injection test that had passed for the wrong reason.
+  - E7.13: a dashboard reset that flaked scan probe H32.
+  - E6.2 and E6.3: rejection handling, and a promotion gate that recomputes
+    acceptance from the ledgers.
+  - E7.1, E7.3 and E8.1: link guards, a worker hash seed, and tax lots that
+    follow splits (reproduced first).
+  - E4.2, E7.11, E7.6 and E7.4a: CI's `ibapi`, the MIT licence, keygen
+    pre-validation, and complete risk fingerprints.
+  - E5.2a: the gRPC PAPER route composes the real IBKR bridge by
+    configuration. Found along the way: the gateway fingerprint alone would
+    have let a journal reopen against another IBKR broker account.
+- The operator decided four questions (Settled direction item 5):
+  - the gRPC route gets the real bridge first;
+  - CI pins `ibapi` 9.81.1.post1;
+  - the licence is MIT;
+  - the branch is pushed and a pull request opened. That is PR 31.
+- **Foundation CI is green on GitHub for the first time:** runs 36524632774
+  and 36525083347 passed all six jobs (E4.3, audit item 96).
+- Measured at the E5.2a commit: all seven suites green (Rust 548 / 0 / 3,
+  Tauri 31, Python 75). The full pipeline exited 0, with the scan at 85 of 85
+  probes.
+- **Next action:** E5.2b, a single-order submit and cancel on the gRPC
+  PAPER route, because its only order RPC submits combinations, which the
+  bridge cannot carry. Then E5.2c, synchronize and reconcile. After that comes the
+  operator's own PAPER session (E5.6). Still waiting on the operator:
+  - E7.4b: the equity-not-positive policy;
+  - E7.10: native desktop authentication;
+  - E6.5: session criteria and the customer threshold;
+  - E8.3: a corporate-action hook for the worker.
 
 ### 2026-09-27 — session 9
 

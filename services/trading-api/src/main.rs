@@ -35,14 +35,21 @@ use follon_execution::{
     ChildOrderKind as CoreChildOrderKind, ComboPriceLimit, ExecutionAlgorithm, OptionComboLeg,
     ParentOrder, PassiveMarketObservation, PassiveRepricePolicy,
 };
+use follon_ibkr_paper_adapter::{
+    IbkrPaperBridgeProcessConfiguration, IbkrPaperBridgeProcessTransport, IbkrPaperGatewayAdapter,
+    IbkrPaperGatewayConfiguration,
+};
 use follon_identity::{IdentityService, LoginOutcome, OperatorDirectory, Permission};
 use follon_live::{
     LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest,
     LiveBrokerSubmitResult, LiveConfiguration, LiveError, LiveKillSwitchScope, LiveTradingService,
 };
 use follon_paper::{
-    IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperComboMarketData,
-    PaperMarketData, PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
+    BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboRequest, BrokerEvent,
+    BrokerOrderRequest, BrokerReplaceRequest, BrokerSubmitResult, IbkrPaperAdapter,
+    KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerAdapter, PaperBrokerCapabilities,
+    PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy, PaperTradingService,
+    ShortExposurePolicy,
 };
 use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
@@ -51,6 +58,7 @@ use follon_risk::{
 };
 use follon_secrets::SecretMaterial;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::signal;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
@@ -77,7 +85,100 @@ use api::{
     SubmitPaperComboRequest, SubmitPaperComboResponse,
 };
 
-type PaperComboRoute = Arc<Mutex<PaperTradingService<IbkrPaperAdapter>>>;
+type PaperComboRoute = Arc<Mutex<PaperTradingService<PaperRouteAdapter>>>;
+
+/// The PAPER route's broker adapter, chosen by its document's `adapter_kind`
+/// (delivery state E5.2a).
+///
+/// The model stays the default and keeps its empty route fingerprint, so
+/// every existing route journal reopens exactly as before. The real bridge
+/// binds its endpoint and its IBKR session into the journal fingerprint, so a
+/// journal written under one adapter, broker account or instrument map is
+/// refused under another.
+enum PaperRouteAdapter {
+    /// The in-process deterministic model: it fills nothing on its own.
+    Model(IbkrPaperAdapter),
+    /// The official-API IBKR PAPER bridge process, which carries single
+    /// DAY orders only (E5.1).
+    Bridge {
+        adapter: Box<IbkrPaperGatewayAdapter<IbkrPaperBridgeProcessTransport>>,
+        /// What the gateway fingerprint leaves out: the IBKR broker account,
+        /// client id, TWS time zone and the instrument map's SHA-256.
+        session: String,
+    },
+}
+
+impl PaperRouteAdapter {
+    fn inner(&self) -> &dyn PaperBrokerAdapter {
+        match self {
+            Self::Model(adapter) => adapter,
+            Self::Bridge { adapter, .. } => adapter.as_ref(),
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn PaperBrokerAdapter {
+        match self {
+            Self::Model(adapter) => adapter,
+            Self::Bridge { adapter, .. } => adapter.as_mut(),
+        }
+    }
+}
+
+impl PaperBrokerAdapter for PaperRouteAdapter {
+    fn capabilities(&self, account_id: &str) -> Result<PaperBrokerCapabilities, PaperError> {
+        self.inner().capabilities(account_id)
+    }
+
+    fn adapter_configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        self.inner().adapter_configuration_fingerprint(account_id)
+    }
+
+    fn configuration_fingerprint(&self, account_id: &str) -> Result<String, PaperError> {
+        match self {
+            // Unchanged, so a model route's existing journal still reopens.
+            Self::Model(adapter) => adapter.configuration_fingerprint(account_id),
+            Self::Bridge { adapter, session } => Ok(format!(
+                "paper-route-ibkr-bridge-v1|{}|{session}",
+                adapter.adapter_configuration_fingerprint(account_id)?
+            )),
+        }
+    }
+
+    fn permits_empty_journal(&self, account_id: &str) -> bool {
+        self.inner().permits_empty_journal(account_id)
+    }
+
+    fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
+        self.inner_mut().submit(request)
+    }
+
+    fn submit_combo(
+        &mut self,
+        request: &BrokerComboRequest,
+    ) -> Result<BrokerSubmitResult, PaperError> {
+        self.inner_mut().submit_combo(request)
+    }
+
+    fn cancel(&mut self, request: &BrokerCancelRequest) -> Result<(), PaperError> {
+        self.inner_mut().cancel(request)
+    }
+
+    fn replace(&mut self, request: &BrokerReplaceRequest) -> Result<(), PaperError> {
+        self.inner_mut().replace(request)
+    }
+
+    fn poll(&mut self, account_id: &str) -> Result<Vec<BrokerEvent>, PaperError> {
+        self.inner_mut().poll(account_id)
+    }
+
+    fn snapshot(&mut self, account_id: &str) -> Result<BrokerAccountSnapshot, PaperError> {
+        self.inner_mut().snapshot(account_id)
+    }
+
+    fn reconnect(&mut self, account_id: &str) -> Result<(), PaperError> {
+        self.inner_mut().reconnect(account_id)
+    }
+}
 type LiveKillSwitchRoute = Arc<Mutex<LiveTradingService<KillSwitchOnlyLiveAdapter>>>;
 type OperatorIdentity = Arc<Mutex<IdentityService>>;
 
@@ -998,7 +1099,33 @@ struct PaperCommandRouteDocument {
     short_exposure: Option<PaperCommandShortExposureDocument>,
     kill_switch_version: String,
     adapter_kind: String,
+    /// Required when `adapter_kind` is `IBKR_PAPER_BRIDGE`, refused otherwise.
+    #[serde(default)]
+    ibkr_bridge: Option<IbkrBridgeDocument>,
     journal_path: String,
+}
+
+/// How the route starts the official-API IBKR PAPER bridge process. The
+/// route builds the bridge's argument list itself, so no free-form argument
+/// can reach the process (delivery state E5.2a).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IbkrBridgeDocument {
+    /// Absolute path of the approved interpreter; the process gets no PATH.
+    python_executable: String,
+    /// Absolute path of `python/ibkr-gateway/src/follon_ibkr_gateway.py`.
+    bridge_script: String,
+    host: String,
+    port: u16,
+    client_id: u32,
+    /// The IBKR paper account identifier: account metadata, not a credential.
+    broker_account: String,
+    instrument_map: String,
+    tws_timezone: String,
+    /// The route's deadline for each bridge request. The bridge's own IBKR
+    /// timeout is two seconds shorter, so it answers before the route gives up.
+    request_timeout_seconds: u64,
+    max_response_bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -1127,6 +1254,132 @@ impl RuntimeConfig {
     }
 }
 
+/// Everything the route needs to start the IBKR PAPER bridge.
+struct IbkrBridgeLaunch {
+    gateway: IbkrPaperGatewayConfiguration,
+    process: IbkrPaperBridgeProcessConfiguration,
+    session: String,
+}
+
+/// Validates a bridge section the way the bridge itself does, so a route the
+/// bridge would refuse to serve never opens, and builds the bridge's fixed
+/// argument list (delivery state E5.2a).
+fn ibkr_bridge_launch(
+    account_id: &str,
+    bridge: IbkrBridgeDocument,
+) -> Result<IbkrBridgeLaunch, String> {
+    let gateway = IbkrPaperGatewayConfiguration {
+        account_id: account_id.to_owned(),
+        host: bridge.host.clone(),
+        port: bridge.port,
+        environment: "PAPER".to_owned(),
+    };
+    gateway
+        .validate()
+        .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+    if !(3..=60).contains(&bridge.request_timeout_seconds) {
+        return Err(
+            "PAPER command-route IBKR bridge request_timeout_seconds must be from 3 to 60"
+                .to_owned(),
+        );
+    }
+    if bridge.client_id > 31 {
+        return Err("PAPER command-route IBKR bridge client_id must be from 0 to 31".to_owned());
+    }
+    if bridge.broker_account.is_empty()
+        || bridge.broker_account.chars().count() > 64
+        || bridge.broker_account.contains(['\r', '\n'])
+    {
+        return Err("PAPER command-route IBKR bridge broker_account is invalid".to_owned());
+    }
+    // The bridge refuses a linked or oversized map; so does the route, and it
+    // binds the map's exact bytes into the journal fingerprint.
+    let map = Path::new(&bridge.instrument_map);
+    let map_is_regular = std::fs::symlink_metadata(map)
+        .map(|metadata| metadata.file_type().is_file() && metadata.len() <= 1024 * 1024)
+        .unwrap_or(false);
+    let map_bytes = map_is_regular
+        .then(|| std::fs::read(map).ok())
+        .flatten()
+        .ok_or_else(|| {
+            "PAPER command-route IBKR bridge instrument_map is missing, linked or too large"
+                .to_owned()
+        })?;
+    let session = serde_json::to_string(&[
+        bridge.broker_account.as_str(),
+        &bridge.client_id.to_string(),
+        bridge.tws_timezone.as_str(),
+        &format!("{:x}", Sha256::digest(&map_bytes)),
+    ])
+    .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+    let process = IbkrPaperBridgeProcessConfiguration {
+        executable: PathBuf::from(&bridge.python_executable),
+        arguments: vec![
+            bridge.bridge_script,
+            "--host".to_owned(),
+            bridge.host,
+            "--port".to_owned(),
+            bridge.port.to_string(),
+            "--client-id".to_owned(),
+            bridge.client_id.to_string(),
+            "--account-id".to_owned(),
+            account_id.to_owned(),
+            "--broker-account".to_owned(),
+            bridge.broker_account,
+            "--instrument-map".to_owned(),
+            bridge.instrument_map,
+            "--tws-timezone".to_owned(),
+            bridge.tws_timezone,
+            "--environment".to_owned(),
+            "PAPER".to_owned(),
+            "--timeout-seconds".to_owned(),
+            (bridge.request_timeout_seconds - 2).to_string(),
+        ],
+        request_timeout: std::time::Duration::from_secs(bridge.request_timeout_seconds),
+        max_response_bytes: bridge.max_response_bytes,
+    };
+    process
+        .validate()
+        .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+    Ok(IbkrBridgeLaunch {
+        gateway,
+        process,
+        session,
+    })
+}
+
+/// Builds the route's adapter from its `adapter_kind`: the model, which stays
+/// the default, or the official-API IBKR PAPER bridge (delivery state E5.2a).
+fn paper_route_adapter(
+    account: &PaperAccount,
+    adapter_kind: &str,
+    bridge: Option<IbkrBridgeDocument>,
+) -> Result<PaperRouteAdapter, String> {
+    match (adapter_kind, bridge) {
+        ("IBKR_PAPER_MODEL", None) => IbkrPaperAdapter::new(account)
+            .map(PaperRouteAdapter::Model)
+            .map_err(|error| format!("PAPER command-route adapter: {error}")),
+        ("IBKR_PAPER_MODEL", Some(_)) => {
+            Err("a PAPER command route on the model takes no ibkr_bridge section".to_owned())
+        }
+        ("IBKR_PAPER_BRIDGE", None) => Err(
+            "a PAPER command route on the IBKR bridge requires an ibkr_bridge section".to_owned(),
+        ),
+        ("IBKR_PAPER_BRIDGE", Some(bridge)) => {
+            let launch = ibkr_bridge_launch(&account.account_id, bridge)?;
+            let transport = IbkrPaperBridgeProcessTransport::start(launch.process)
+                .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
+            IbkrPaperGatewayAdapter::new(launch.gateway, transport)
+                .map(|adapter| PaperRouteAdapter::Bridge {
+                    adapter: Box::new(adapter),
+                    session: launch.session,
+                })
+                .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))
+        }
+        _ => Err("unsupported PAPER command-route adapter kind".to_owned()),
+    }
+}
+
 fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read PAPER command-route config: {error}"))?;
@@ -1134,9 +1387,6 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
         .map_err(|error| format!("invalid PAPER command-route config: {error}"))?;
     if document.schema_version != 1 {
         return Err("unsupported PAPER command-route schema version".to_owned());
-    }
-    if document.adapter_kind != "IBKR_PAPER_MODEL" {
-        return Err("unsupported PAPER command-route adapter kind".to_owned());
     }
     let account = PaperAccount {
         account_id: document.account_id,
@@ -1195,8 +1445,8 @@ fn paper_combo_route_from_path(path: &Path) -> Result<PaperComboRoute, String> {
             })
             .collect::<Result<_, String>>()?,
     };
-    let broker = IbkrPaperAdapter::new(&account)
-        .map_err(|error| format!("PAPER command-route adapter: {error}"))?;
+    // Built before the journal is opened, so a refused adapter leaves no journal.
+    let broker = paper_route_adapter(&account, &document.adapter_kind, document.ibkr_bridge)?;
     let service = PaperTradingService::open_durable(
         account,
         policy,
@@ -1633,6 +1883,441 @@ mod tests {
         // Refused before its journal is touched (E3.10).
         assert!(!scratch.join("journal.ndjson").exists());
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// An absolute interpreter path, because the bridge process gets no PATH.
+    fn python_executable() -> Option<PathBuf> {
+        ["python", "python3"].into_iter().find_map(|candidate| {
+            std::process::Command::new(candidate)
+                .args([
+                    "-c",
+                    "import pathlib,sys;print(pathlib.Path(sys.executable).resolve())",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|output| PathBuf::from(output.trim()))
+                .filter(|path| path.is_absolute() && path.is_file())
+        })
+    }
+
+    fn repository_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+            .canonicalize()
+            .expect("repository path")
+    }
+
+    /// A bridge section that starts the repository's fake bridge fixture in
+    /// place of the official-API bridge. The fixture ignores its arguments.
+    fn fake_bridge_section(python: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "python_executable": python.to_string_lossy(),
+            "bridge_script": repository_path("tests/fixtures/ibkr/fake-paper-bridge.py")
+                .to_string_lossy(),
+            "host": "127.0.0.1",
+            "port": 7497,
+            "client_id": 7,
+            "broker_account": "DU_TEST_ACCOUNT",
+            "instrument_map": repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json")
+                .to_string_lossy(),
+            "tws_timezone": "America/New_York",
+            "request_timeout_seconds": 5,
+            "max_response_bytes": 65536,
+        })
+    }
+
+    fn refused_route(name: &str, adjust: impl FnOnce(&mut serde_json::Value)) -> String {
+        let (config, scratch) = write_route_config(name, adjust);
+        let refusal = paper_combo_route_from_path(&config)
+            .err()
+            .expect("the route must be refused");
+        // Every refusal happens before the journal is touched (E3.10).
+        assert!(
+            !scratch.join("journal.ndjson").exists(),
+            "{name} left a journal"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        refusal
+    }
+
+    /// A bridge route whose section differs from the fake bridge's in one way.
+    fn refused_bridge(name: &str, change: impl FnOnce(&mut serde_json::Value)) -> String {
+        let python = python_executable().unwrap_or_else(|| PathBuf::from("/unused"));
+        refused_route(name, |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            change(&mut bridge);
+            document["ibkr_bridge"] = bridge;
+        })
+    }
+
+    #[test]
+    fn a_route_refuses_an_adapter_it_cannot_build() {
+        // A bridge section that does not match the adapter kind.
+        assert_eq!(
+            refused_route("model-with-bridge", |document| {
+                document["ibkr_bridge"] = fake_bridge_section(Path::new("/unused"));
+            }),
+            "a PAPER command route on the model takes no ibkr_bridge section"
+        );
+        assert_eq!(
+            refused_route("bridge-without-section", |document| {
+                document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            }),
+            "a PAPER command route on the IBKR bridge requires an ibkr_bridge section"
+        );
+        assert_eq!(
+            refused_route("unknown-kind", |document| {
+                document["adapter_kind"] = "IBKR_LIVE".into();
+            }),
+            "unsupported PAPER command-route adapter kind"
+        );
+    }
+
+    #[test]
+    fn a_bridge_route_refuses_what_the_bridge_would_refuse() {
+        // The bridge only ever reaches a local PAPER port.
+        assert!(
+            refused_bridge("live-port", |bridge| bridge["port"] = 7496.into())
+                .contains("accepts only a local PAPER TWS (7497) or Gateway (4002) endpoint")
+        );
+        assert!(
+            refused_bridge("remote-host", |bridge| bridge["host"] = "10.0.0.5".into())
+                .contains("accepts only a local PAPER TWS (7497) or Gateway (4002) endpoint")
+        );
+        // The interpreter must be an absolute path to a real file.
+        assert!(refused_bridge("relative-interpreter", |bridge| {
+            bridge["python_executable"] = "python".into();
+        })
+        .contains("invalid IBKR paper bridge process configuration"));
+        // The bridge's own limits, refused here before a process starts.
+        let timeout =
+            "PAPER command-route IBKR bridge request_timeout_seconds must be from 3 to 60";
+        assert_eq!(
+            refused_bridge("short-timeout", |bridge| {
+                bridge["request_timeout_seconds"] = 2.into();
+            }),
+            timeout
+        );
+        assert_eq!(
+            refused_bridge("long-timeout", |bridge| {
+                bridge["request_timeout_seconds"] = 61.into();
+            }),
+            timeout
+        );
+        assert_eq!(
+            refused_bridge("client-id", |bridge| bridge["client_id"] = 32.into()),
+            "PAPER command-route IBKR bridge client_id must be from 0 to 31"
+        );
+        let account = "PAPER command-route IBKR bridge broker_account is invalid";
+        for (name, value) in [
+            ("empty-account", String::new()),
+            ("long-account", "D".repeat(65)),
+            ("split-account", "DU1\nDU2".to_owned()),
+        ] {
+            assert_eq!(
+                refused_bridge(name, |bridge| bridge["broker_account"] = value.into()),
+                account,
+                "{name}"
+            );
+        }
+        let map = "PAPER command-route IBKR bridge instrument_map is missing, linked or too large";
+        assert_eq!(
+            refused_bridge("missing-map", |bridge| {
+                bridge["instrument_map"] = "no-such-instrument-map.json".into();
+            }),
+            map
+        );
+        assert_eq!(
+            refused_bridge("directory-map", |bridge| {
+                bridge["instrument_map"] = repository_path("tests/fixtures/ibkr")
+                    .to_string_lossy()
+                    .into_owned()
+                    .into();
+            }),
+            map
+        );
+        let maps = std::env::temp_dir().join(format!(
+            "follon-trading-api-refused-maps-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&maps);
+        std::fs::create_dir_all(&maps).expect("map directory");
+        let oversized = maps.join("oversized.json");
+        std::fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).expect("oversized map");
+        assert_eq!(
+            refused_bridge("oversized-map", |bridge| {
+                bridge["instrument_map"] = oversized.to_string_lossy().into_owned().into();
+            }),
+            map
+        );
+        // A link to a valid map, as the bridge also refuses.
+        let link = maps.join("linked.json");
+        let target = repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        match linked {
+            Ok(()) => assert_eq!(
+                refused_bridge("linked-map", |bridge| {
+                    bridge["instrument_map"] = link.to_string_lossy().into_owned().into();
+                }),
+                map
+            ),
+            Err(error) => {
+                eprintln!("cannot create a symbolic link ({error}); the refusal was not exercised")
+            }
+        }
+        let _ = std::fs::remove_dir_all(&maps);
+    }
+
+    /// The argument list the route builds is one the real bridge parses to
+    /// the same configuration. It needs neither TWS nor `ibapi`.
+    #[test]
+    fn the_real_bridge_parses_the_arguments_the_route_builds() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge argument test was skipped");
+            return;
+        };
+        let mut section = fake_bridge_section(&python);
+        section["bridge_script"] =
+            repository_path("python/ibkr-gateway/src/follon_ibkr_gateway.py")
+                .to_string_lossy()
+                .into_owned()
+                .into();
+        section["port"] = 4002.into();
+        section["client_id"] = 31.into();
+        let bridge: IbkrBridgeDocument = serde_json::from_value(section).expect("bridge section");
+        let launch = ibkr_bridge_launch("acct.grpc.paper.test", bridge).expect("bridge launch");
+        let arguments = &launch.process.arguments;
+        assert!(arguments[0].ends_with("follon_ibkr_gateway.py"));
+        let parsed = std::process::Command::new(&launch.process.executable)
+            .arg("-c")
+            .arg(
+                "import json, sys\n\
+                 sys.path.insert(0, sys.argv[1])\n\
+                 from follon_ibkr_gateway import parse_arguments\n\
+                 parsed = vars(parse_arguments(sys.argv[2:]))\n\
+                 parsed['instrument_map'] = str(parsed['instrument_map'])\n\
+                 print(json.dumps(parsed, sort_keys=True))",
+            )
+            .arg(repository_path("python/ibkr-gateway/src"))
+            .args(&arguments[1..])
+            .output()
+            .expect("run the bridge's argument parser");
+        assert!(
+            parsed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&parsed.stdout).expect("parsed arguments");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "host": "127.0.0.1",
+                "port": 4002,
+                "client_id": 31,
+                "account_id": "acct.grpc.paper.test",
+                "broker_account": "DU_TEST_ACCOUNT",
+                "instrument_map": repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json")
+                    .to_string_lossy(),
+                "tws_timezone": "America/New_York",
+                "environment": "PAPER",
+                // Two seconds inside the route's own five-second deadline.
+                "timeout_seconds": 3.0,
+            })
+        );
+        assert_eq!(
+            launch.process.request_timeout,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(launch.process.max_response_bytes, 65536);
+    }
+
+    /// The service reads the checked-in fixtures its schema describes, so the
+    /// reader and the schema cannot drift apart unnoticed.
+    #[test]
+    fn the_checked_in_route_fixtures_are_documents_the_route_reads() {
+        for (fixture, kind, bridge) in [
+            ("paper-command-route-v1.json", "IBKR_PAPER_MODEL", false),
+            (
+                "paper-command-route-v1-bridge.json",
+                "IBKR_PAPER_BRIDGE",
+                true,
+            ),
+        ] {
+            let contents = std::fs::read_to_string(repository_path(&format!(
+                "tests/fixtures/config/{fixture}"
+            )))
+            .expect("route fixture");
+            let document: PaperCommandRouteDocument =
+                serde_json::from_str(&contents).expect(fixture);
+            assert_eq!(document.adapter_kind, kind, "{fixture}");
+            assert_eq!(document.ibkr_bridge.is_some(), bridge, "{fixture}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_route_refuses_a_combination_before_anything_is_recorded() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge route test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-combo", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            document["ibkr_bridge"] = fake_bridge_section(&python);
+        });
+        let route = paper_combo_route_from_path(&config).expect("bridge route opens");
+        assert_eq!(
+            route
+                .lock()
+                .expect("PAPER route")
+                .broker_mut()
+                .capabilities("acct.grpc.paper.test")
+                .expect("capabilities"),
+            PaperBrokerCapabilities::default()
+        );
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let token = trader_token(&service).await;
+        let status = service
+            .submit_paper_combo(authorized(
+                paper_combo_request("intent.grpc.bridge.1"),
+                &token,
+            ))
+            .await
+            .expect_err("the IBKR bridge cannot execute a combination");
+        assert!(
+            status.message().contains("cannot execute combinations"),
+            "{}",
+            status.message()
+        );
+        {
+            let paper = route.lock().expect("PAPER route");
+            assert!(paper
+                .combo_order("combo-order-intent.grpc.bridge.1")
+                .is_none());
+            assert!(paper
+                .combo_risk_evidence("paper-combo-risk-intent.grpc.bridge.1")
+                .is_none());
+            assert!(paper.dashboard().broker_connected);
+        }
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_journal_reopens_only_under_the_adapter_and_session_it_was_written_with() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the adapter-binding test was skipped");
+            return;
+        };
+        const MISMATCH: &str =
+            "paper journal configuration fingerprint does not match supplied configuration";
+        // The fingerprint binds the map's bytes, so the journal's map is a copy
+        // this test can change.
+        let map_directory = std::env::temp_dir().join(format!(
+            "follon-trading-api-instrument-map-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&map_directory).expect("map directory");
+        let map = map_directory.join("instruments.json");
+        std::fs::copy(
+            repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json"),
+            &map,
+        )
+        .expect("copy the instrument map");
+        let bridge_with = |document: &mut serde_json::Value,
+                           change: &dyn Fn(&mut serde_json::Value)| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["instrument_map"] = map.to_string_lossy().into_owned().into();
+            change(&mut bridge);
+            document["ibkr_bridge"] = bridge;
+        };
+        let reopen = |name: &str, journal: &Path, adjust: &dyn Fn(&mut serde_json::Value)| {
+            let (config, scratch) = write_route_config(name, |document| {
+                adjust(document);
+                document["journal_path"] = journal.to_string_lossy().into_owned().into();
+            });
+            let outcome = paper_combo_route_from_path(&config).map(drop);
+            let _ = std::fs::remove_dir_all(&scratch);
+            outcome
+        };
+        let refusal = |outcome: Result<(), String>| {
+            let error = outcome.expect_err("the journal must be refused");
+            assert!(error.contains(MISMATCH), "{error}");
+        };
+
+        // Written under the model, then offered to the bridge.
+        let (model_config, model_scratch) = write_route_config("binding-model", |_| {});
+        drop(paper_combo_route_from_path(&model_config).expect("model route opens"));
+        let model_journal = model_scratch.join("journal.ndjson");
+        refusal(reopen("model-to-bridge", &model_journal, &|document| {
+            bridge_with(document, &|_| {})
+        }));
+
+        // Written under the bridge, then offered to the model.
+        let (bridge_config, bridge_scratch) =
+            write_route_config("binding-bridge", |document| bridge_with(document, &|_| {}));
+        drop(paper_combo_route_from_path(&bridge_config).expect("bridge route opens"));
+        let bridge_journal = bridge_scratch.join("journal.ndjson");
+        refusal(reopen("bridge-to-model", &bridge_journal, &|_| {}));
+
+        // The same bridge endpoint with a different IBKR session.
+        type Change = Box<dyn Fn(&mut serde_json::Value)>;
+        let sessions: Vec<(&str, Change)> = vec![
+            (
+                "broker-account",
+                Box::new(|bridge| bridge["broker_account"] = "DU_OTHER".into()),
+            ),
+            (
+                "client-id",
+                Box::new(|bridge| bridge["client_id"] = 8.into()),
+            ),
+            (
+                "tws-timezone",
+                Box::new(|bridge| bridge["tws_timezone"] = "Europe/London".into()),
+            ),
+        ];
+        for (name, change) in &sessions {
+            refusal(reopen(name, &bridge_journal, &|document| {
+                bridge_with(document, change)
+            }));
+        }
+        // The bridge's timeouts and limits are not part of the session.
+        reopen("longer-timeout", &bridge_journal, &|document| {
+            bridge_with(document, &|bridge| {
+                bridge["request_timeout_seconds"] = 10.into()
+            })
+        })
+        .expect("a timeout change keeps the journal");
+
+        // The same map path with different contents.
+        let original = std::fs::read_to_string(&map).expect("map");
+        std::fs::write(&map, original.replace("123456", "654321")).expect("change the map");
+        refusal(reopen("map-contents", &bridge_journal, &|document| {
+            bridge_with(document, &|_| {})
+        }));
+        std::fs::write(&map, original).expect("restore the map");
+
+        // Each still reopens under its own adapter and session.
+        assert!(paper_combo_route_from_path(&model_config).is_ok());
+        assert!(paper_combo_route_from_path(&bridge_config).is_ok());
+        let _ = std::fs::remove_dir_all(&model_scratch);
+        let _ = std::fs::remove_dir_all(&bridge_scratch);
+        let _ = std::fs::remove_dir_all(&map_directory);
     }
 
     fn paper_combo_request(intent_id: &str) -> SubmitPaperComboRequest {

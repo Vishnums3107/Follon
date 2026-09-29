@@ -3961,6 +3961,70 @@ These are mandatory master-plan acceptance conditions and are currently open:
       fail closed, which would also refuse risk-reducing orders, is the operator's decision (E7.4b).
       Neither order-submitting route composes portfolio risk at all (E7.5). No external gate moved.
 
+99. The gRPC PAPER route composes the real IBKR PAPER bridge by configuration (2026-09-29, row 5.6 and
+    research-to-live parity; delivery state E5.2a). The operator chose this route first (Settled direction
+    item 5).
+    - **The gap.** No application composed `IbkrPaperGatewayAdapter`. The gRPC route accepted only
+      `adapter_kind: IBKR_PAPER_MODEL`, so the real bridge was reachable from no running service.
+    - **The fix.**
+      - `adapter_kind: IBKR_PAPER_BRIDGE`, with a required `ibkr_bridge` section, starts the official-API
+        bridge process. The model stays the default. A model route with the section is refused, and so is
+        a bridge route without it.
+      - The route builds the bridge's argument list itself, from fixed fields, so no free-form argument
+        reaches the process. The bridge's own timeout is two seconds inside the route's deadline, so the
+        bridge answers before the route gives up.
+      - Before any process starts, the route refuses what the bridge would refuse. That covers a
+        non-loopback host or a non-PAPER port, a relative interpreter, a timeout outside 3 to 60 seconds,
+        a client id above 31, and an empty, over-long or multi-line broker account. It also covers a
+        missing, linked, or over-1 MiB instrument map.
+      - The route fingerprint binds more than the gateway fingerprint, which covers only the account, host,
+        port and environment. It adds the broker account, client id, TWS time zone and the instrument
+        map's SHA-256, so a journal is refused under another IBKR session. The model's fingerprint is
+        byte-for-byte unchanged, so every existing model journal still reopens.
+      - The version-1 route schema describes the section and ties it to the adapter kind. A second
+        checked-in fixture, `paper-command-route-v1-bridge.json`, validates against it, and the service
+        parses both fixtures.
+    - **Found while building it.** The gateway fingerprint alone would have let a journal written against
+      one IBKR broker account, client id or instrument map reopen against another. The bridge also refuses
+      a client id above 31, which nothing on the Rust side checked. Neither the gateway adapter's
+      constructor nor `PaperTradingService::open_durable` contacts the bridge, so a client id the bridge
+      refuses would have opened a route whose bridge had already exited.
+    - **Tests.**
+      - The adapter kind and section must agree, and every bridge limit above is refused. None of these
+        refusals leaves a journal.
+      - The real bridge's own `parse_arguments` parses the route's argument list back to the same
+        configuration. That needs neither TWS nor `ibapi`.
+      - A bridge route over the fake bridge fixture declares single DAY orders only. `SubmitPaperCombo`
+        over the authenticated boundary is refused with no order and no risk evidence recorded, and the
+        broker session stays connected.
+      - A journal is refused across adapters, and under a changed broker account, client id, time zone or
+        instrument-map content. It still reopens after a timeout change.
+      - Both checked-in fixtures parse, and the schema refuses what the service refuses. The risk
+        contract test pins the schema's two adapter kinds.
+    - **Rule 5.** 28 of 28 injected defects were caught, each by the intended test.
+      - 18 were in the route:
+        - the fingerprint dropping the session, or equalling the model's;
+        - the session dropping the broker account, client id or time zone, or hashing the map's path
+          instead of its bytes;
+        - each of the six bridge limits loosened;
+        - the map check following a link or ignoring size;
+        - the bridge's timeout not two seconds shorter, `--environment PAPER` dropped, or a fixed route
+          deadline;
+        - the model accepting a bridge section.
+      - 10 were in the schema: the adapter kinds widened, the section's tie to the kind broken either
+        way, and a live port, any host, client id 32, a timeout of 2 or 61, a multi-line account or a
+        free-form field accepted.
+    - **Measured result.** The Rust workspace rose from 542 to 548 passed / 0 failed / 3 ignored, and
+      the Python suite from 74 to 75. The final `python tools/session_status.py` run measured all seven
+      suites green. A first run failed the Python suite: `test_risk_contracts` still pinned the schema's
+      old single adapter kind, and now pins the two. The full evidence pipeline exited 0, with the scan at
+      85 probes and 0 failed.
+    - **Bounded remainder.** A bridge route still trades nothing. Its only order RPC submits combinations,
+      which the bridge refuses (E5.2b), and nothing polls the bridge's fills or reconciles its account
+      (E5.2c). The route does not check the TWS time zone name; the bridge refuses one it cannot resolve, and
+      that surfaces at the first broker call. Nothing here was run against a real TWS or IB Gateway (E5.6).
+      No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
@@ -3971,6 +4035,8 @@ PAPER environment, retain 30 clean sessions, complete security/legal/deployment
 approvals, and record them through the tamper-evident acceptance ledger. As of
 2026-09-28 a configured environment is not enough on its own: no application
 composes the real IBKR PAPER bridge yet (delivery state E5), so that
-composition comes first. Broad
+composition comes first. As of 2026-09-29 the gRPC PAPER route composes it by
+configuration (item 99), but it cannot yet submit an order the bridge carries
+or synchronize its fills (delivery state E5.2b and E5.2c). Broad
 LIVE or commercial promotion before those gates would violate the plan's own
 evidence-gated sequence.

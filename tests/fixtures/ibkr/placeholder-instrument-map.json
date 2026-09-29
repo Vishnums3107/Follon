@@ -1,0 +1,10 @@
+{
+  "inst.us_equity.example": {
+    "con_id": 123456,
+    "symbol": "EXAMPLE",
+    "security_type": "STK",
+    "exchange": "SMART",
+    "primary_exchange": "NASDAQ",
+    "currency": "USD"
+  }
+}

@@ -61,6 +61,24 @@ may bind to loopback without TLS; a non-loopback bind additionally requires a
 server TLS identity and client CA, so the write method is not exposed on an
 unauthenticated remote socket.
 
+The route's `adapter_kind` chooses its broker adapter. `IBKR_PAPER_MODEL`, the
+in-process deterministic model, fills nothing on its own. `IBKR_PAPER_BRIDGE`
+starts the official-API IBKR PAPER bridge from the document's `ibkr_bridge`
+section. That section is required for the bridge and refused for the model.
+The route builds the bridge's argument list itself, from fixed fields: a
+loopback host, a PAPER port, the client id, the broker account, the
+instrument map, the TWS time zone and a timeout. So no free-form argument
+reaches the process. It refuses what the bridge would refuse before any
+process starts. The journal fingerprint binds the bridge endpoint, the broker
+account, the client id, the time zone and the instrument map's SHA-256, so a
+journal is refused under a different adapter or IBKR session.
+
+The bridge carries single DAY orders only, so `SubmitPaperCombo` on a bridge
+route is refused before risk is evaluated or an order exists. The route has
+no single-order RPC yet (delivery state E5.2b), and it does not yet
+synchronize fills from the bridge (E5.2c). A bridge route therefore trades
+nothing today.
+
 Every call also needs an authenticated operator. A configured route requires
 the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
 `BeginOperatorLogin` and `CompleteOperatorLogin` check a password and then a

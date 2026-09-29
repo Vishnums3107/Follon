@@ -20,7 +20,9 @@ operation, no replacement, no time in force other than DAY, and no market-data
 request. The Rust adapter, `IbkrPaperGatewayAdapter`, declares exactly this
 set, so the PAPER OMS refuses a combination, a GTC intent or a replacement
 before any order exists, rather than leaving it `UNKNOWN` (delivery state
-E5.1). No application composes the adapter yet (E5.2).
+E5.1). The gRPC PAPER route composes it when its configuration selects
+`adapter_kind: IBKR_PAPER_BRIDGE` (E5.2a). That route cannot yet submit a
+single order through it (E5.2b) or synchronize its fills (E5.2c).
 
 The fixed process arguments have this shape (values are illustrative):
 
@@ -31,6 +33,12 @@ C:\approved-python\python.exe C:\Follon\python\ibkr-gateway\src\follon_ibkr_gate
   --instrument-map C:\protected-config\ibkr-instruments.json \
   --tws-timezone America/New_York --environment PAPER --timeout-seconds 10
 ```
+
+The gRPC PAPER route builds exactly this list from its configuration's
+`ibkr_bridge` section, with `--timeout-seconds` two seconds inside the
+section's `request_timeout_seconds` (see
+`contracts/json-schema/v1/paper-command-route.schema.json` and
+`tests/fixtures/config/paper-command-route-v1-bridge.json`).
 
 Use absolute, ACL-protected paths in the Rust process configuration. Record the
 interpreter digest, official API version, bridge digest, TWS/Gateway build,

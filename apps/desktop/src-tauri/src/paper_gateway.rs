@@ -689,7 +689,8 @@ impl RiskOmsGateway for PaperOmsGateway {
 /// On-disk shape of the desktop's PAPER trading configuration.
 ///
 /// It is the flat version-1 `paper-command-route` document without that
-/// document's `schema_version` and `adapter_kind`. It is not the nested
+/// document's `schema_version`, `adapter_kind` and optional `ibkr_bridge`: the
+/// desktop always composes the model. It is not the nested
 /// document `follon-paper-status` reads (`apps/cli/src/paper.rs`). Both
 /// refuse unknown fields, so one file cannot serve both. This comment
 /// previously claimed that it could.
