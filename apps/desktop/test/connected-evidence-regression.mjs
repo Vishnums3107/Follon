@@ -333,6 +333,30 @@ const execPlanPanel = execCanvas.children.find((c) => c.id === "execution-planne
 assert.ok(execPlanPanel !== undefined, "Execution planner panel must exist in Execution Blotter");
 assert.ok(containsText(execPlanPanel, validPlanner.plan_id), "Execution planner must render its typed artifact");
 
+// The local risk-evaluator benchmark shows when it was measured and, apart from
+// that, the frozen scenario's own time (E7.9).
+mockSnapshot.execution_evidence = [
+  {
+    artifact: "follon-risk-benchmark.json",
+    data: {
+      benchmark_schema_version: 2,
+      measured_at: "2026-09-29T13:00:01Z",
+      scenario_observed_at: "2026-08-30T21:30:00Z",
+      policy_version: "risk.benchmark.v1",
+      measurement: { p99_micros: 34, threshold_micros: 5000, within_threshold: true },
+    },
+  },
+];
+const benchSummary = new MockElement("div");
+const benchCanvas = new MockElement("div");
+renderWorkspace(benchSummary, benchCanvas, "execution-blotter", mockSnapshot, mockContext);
+assert.ok(containsText(benchCanvas, "Measured at"), "The benchmark table must say when it was measured");
+assert.ok(containsText(benchCanvas, "2026-09-29T13:00:01Z"), "The benchmark table must show the measurement time");
+assert.ok(containsText(benchCanvas, "Scenario as of"), "The scenario time must have its own column");
+assert.ok(containsText(benchCanvas, "2026-08-30T21:30:00Z"), "The benchmark table must show the scenario time");
+assert.ok(!containsText(benchCanvas, "Observed at"), "No column may read the scenario time as the run time");
+mockSnapshot.execution_evidence = [];
+
 // Test Risk Cockpit additions (Experience 3)
 const riskSummary = new MockElement("div");
 const riskCanvas = new MockElement("div");

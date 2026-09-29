@@ -4281,6 +4281,42 @@ These are mandatory master-plan acceptance conditions and are currently open:
        and memory of its own. It only stops the host from being exhausted through its
        pipes. No external gate moved.
 
+106. The risk benchmark says when it was measured (2026-09-29, Reliability and
+     evidence integrity; E7.9). Found by the source review behind the revised
+     assessment.
+     - **Defect.** The artifact's `observed_at` was the benchmark fixture's configured
+       scenario time, `2026-08-30T21:30:00Z`, echoed unchanged. A run on 27 September
+       therefore read as an observation from 30 August, and the desktop's benchmark table
+       showed that as when the latency was observed. The evaluator itself takes no time,
+       so the field measured nothing about the run.
+     - **Behavior.** The artifact is schema 2. `measured_at` is the UTC second the run
+       began, from the wall clock. `scenario_observed_at` carries the fixture's as-of
+       time, and no field called `observed_at` remains, so nothing that reads as the run
+       time carries the scenario's. The input document is unchanged. The desktop's table
+       has a "Measured at" and a "Scenario as of" column.
+     - **Tests.** Two unit tests and the real-binary workflow test were changed or added:
+       - the rendered artifact carries both times under their names, has no
+         `observed_at`, and is schema 2;
+       - `utc_now` is a canonical timestamp within the second it was read, and the
+         workflow test runs the real command and requires `measured_at` to fall inside
+         the window of the run while the scenario time stays `2026-08-30T21:30:00Z`;
+       - a desktop regression renders the blotter with a benchmark artifact and requires
+         both columns and both values, and no "Observed at" header.
+     - **Rule 5.** 10 of 10 injected defects were caught by the intended tests: the
+       measurement time echoing the scenario's, the scenario time under `observed_at`
+       again, the schema version left at 1, a month off by one, minute and second
+       swapped, the hour dropped, and three desktop defects. One injection first
+       looked over-constrained because `cargo test` stops at the first failing target;
+       it was caught by both tests when run with `--no-fail-fast`.
+     - **Measured result.** The Rust workspace rose from 587 to 589 passed / 0 failed /
+       3 ignored. The final `python tools/session_status.py` run measured all seven
+       suites green. The full evidence pipeline exited 0, and its regenerated artifact
+       reads `measured_at` of the run's own time.
+     - **Boundary.** The artifact remains one local observation on one machine, as its
+       description says, and not an availability or load claim. The benchmark, like the
+       rest of the evidence set, is not reproducible byte for byte, because its
+       latencies vary by run. Neither is changed. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

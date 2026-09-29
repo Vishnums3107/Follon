@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T13:38:51Z  
+**Measured at:** 2026-09-29T13:44:26Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `1056d12` -- feat(live): controlled LIVE refuses what its adapter cannot carry before an approval is spent -- E5.7 (2026-09-29T18:46:50+05:30)  
-**Uncommitted paths:** 6
+**HEAD:** `bf0af3d` -- feat(control-plane): bound and time-limit every strategy-worker frame -- E7.2 (2026-09-29T19:10:07+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 587 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 589 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 31 | 0 | 0 |
@@ -277,7 +277,7 @@ passes it for production.
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE. The news tables have no tenant column and no row-level security. | open |
 | E7.8 | The SBOM covers the desktop's Cargo workspace and records first-party licences; E7.11, on which the licences depended, is decided (MIT). | open |
-| E7.9 | The risk benchmark records when it was measured; its `observed_at` is the fixture's scenario time. | open |
+| E7.9 | The risk benchmark records when it was measured; its `observed_at` was the fixture's scenario time. **Now** the artifact is schema 2: `measured_at` is the wall-clock UTC second the run began, `scenario_observed_at` is the fixture's own as-of time, and no field named `observed_at` remains. The desktop's benchmark table shows both. Audit item 106. | **done** 2026-09-29 |
 | E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |
 | E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open. | open |

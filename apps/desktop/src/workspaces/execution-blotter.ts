@@ -124,7 +124,7 @@ export function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLEleme
     if (measurement.p99_micros !== undefined) {
       benchmarkRows.push({
         artifact: evidence.artifact,
-        values: [evidence.artifact, field(evidence.data, "observed_at"), field(evidence.data, "policy_version"), field(measurement, "p99_micros"), field(measurement, "threshold_micros"), measurement.within_threshold === true ? "Within local threshold" : "Outside local threshold"],
+        values: [evidence.artifact, field(evidence.data, "measured_at"), field(evidence.data, "scenario_observed_at"), field(evidence.data, "policy_version"), field(measurement, "p99_micros"), field(measurement, "threshold_micros"), measurement.within_threshold === true ? "Within local threshold" : "Outside local threshold"],
       });
     }
   }
@@ -133,7 +133,7 @@ export function renderExecutionBlotter(summaryRoot: HTMLElement, root: HTMLEleme
   root.append(tca);
 
   const benchmark = createPanel("Local risk-evaluator benchmark", "Explicit-hardware local timing observation only; production availability and load evidence remain separate gates.");
-  appendTableOrEmpty(benchmark, ["Artifact", "Observed at", "Policy", "p99 (µs)", "Threshold (µs)", "Result"], benchmarkRows.map((row) => row.values), "No local risk benchmark artifact is indexed.", (index) => context.onOpenArtifact(benchmarkRows[index]?.artifact ?? ""));
+  appendTableOrEmpty(benchmark, ["Artifact", "Measured at", "Scenario as of", "Policy", "p99 (µs)", "Threshold (µs)", "Result"], benchmarkRows.map((row) => row.values), "No local risk benchmark artifact is indexed.", (index) => context.onOpenArtifact(benchmarkRows[index]?.artifact ?? ""));
   root.append(benchmark);
 
   const lifecycle = createPanel("Broker lifecycle condition coverage", "Explicit handling for the out-of-order and modification cases recorded in the system review.");
