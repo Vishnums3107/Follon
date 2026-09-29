@@ -2273,6 +2273,27 @@ impl BacktestRunner {
             {
                 let action = &actions[next_action];
                 ledger.apply_corporate_action(action)?;
+                if let CorporateAction::Split {
+                    action_id,
+                    instrument_id,
+                    ratio,
+                    ..
+                } = action
+                {
+                    // The ledger is one book and the engine's portfolio another. The
+                    // strategy's callbacks and the event stream project the engine's,
+                    // so it follows the split too (delivery state E8.2). A cash
+                    // dividend is income, which only the ledger holds.
+                    for event in self.engine.apply_split(
+                        &mut store,
+                        action_id,
+                        instrument_id,
+                        *ratio,
+                        &historical_bar.event_time,
+                    )? {
+                        canonical_events.push(event.canonical_json());
+                    }
+                }
                 applied_corporate_action_ids.push(action.action_id().to_owned());
                 next_action += 1;
             }

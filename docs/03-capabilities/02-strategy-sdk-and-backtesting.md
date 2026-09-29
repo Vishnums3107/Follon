@@ -85,6 +85,34 @@ Both report cash of 10,096.5, and both report a FIFO tax P&L of 96.5, because ea
 fees in its lot cost. `core/backtest/tests/pnl_conventions.rs` holds every one of these
 statements, and a change to either account that moves a fee to the other side fails it.
 
+## Corporate actions
+
+A stock split reaches a replay in two books, and both follow it. The ledger scales its
+position and its FIFO tax lots, and the replay engine scales the portfolio of its own that
+a strategy's execution callback and the event stream project. Both use the same
+arithmetic, quantity times the ratio and average cost divided by it, so the total cost
+and the realized P&L do not move and the two books cannot drift apart.
+
+The engine records each scaled position as a `portfolio.position_updated.v1` event of its
+own: actor `portfolio_engine`, source `corporate_action`, correlation
+`corr-corporate-action-<action id>`, and no cause, because no fill caused it. It is
+recorded when the replay applies the split, the first bar at or after the split's
+effective time, and before that bar's market event. A run with no split holds no such
+event and is unchanged. A split applies to every account that holds the instrument or to
+none, and each action applies once.
+
+A cash dividend is income, which only the ledger books. The engine's portfolio holds a
+position and its trading P&L and no cash.
+
+A venue's response to a split, which adjusts or cancels a resting order, is not modelled.
+An order resting in the instrument cannot be carried across the split, because its
+quantity and limit are in pre-split units, so the replay refuses the run rather than fill
+it at a price level it was not written for. That is the rule the replay already applies to
+a lot-size change. Three things still do not follow a split: the strategy worker's own
+position snapshot, which changes only at the next execution; the risk policy's
+share-denominated limits, which are the operator's configuration; and PAPER and controlled
+LIVE, which apply no corporate actions at all.
+
 ## Reproducibility record
 
 Every completed backtest records the strategy bundle hash, versioned and

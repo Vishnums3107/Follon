@@ -4591,6 +4591,75 @@ These are mandatory master-plan acceptance conditions and are currently open:
        hardware signer cannot yet supply a signature made elsewhere. The operational ledger
        root holds no record, so no external gate moved.
 
+112. The replay engine's portfolio follows a stock split (2026-09-29, Reliability and quality
+     conformance, research-to-live parity; E8.2). Found by the source review behind the revised
+     assessment, and reproduced before it was fixed.
+     - **Gap.** `BacktestRunner` applied each corporate action to `BacktestLedger` only. The replay
+       engine keeps a `Portfolio` of its own for each account and instrument, and that is the book a
+       strategy's execution callback and the fingerprinted stream's `Position` and `Pnl` events
+       project. Nothing told it of a split. With one share bought before a 2:1 split, a strategy
+       that then sold the two shares the ledger held aborted the whole run, "first slice does not
+       permit short positions", because the engine still believed it held one. A strategy that
+       sold the one share it remembered got no error at all: the engine was flat and the ledger
+       still held a share. It is the disagreement E8.1 closed between a ledger's position and its
+       tax lots, one book over.
+     - **Behavior.**
+       - `Portfolio::apply_split` multiplies the quantity by the ratio and divides the average
+         cost by it, the ledger's own two operations, so total cost and realized P&L do not move.
+         A flat position is unchanged and a short scales like a long. A ratio that is not positive
+         is refused, and so is a split that would round a held position down to nothing, because a
+         portfolio with a cost and no quantity is not one this type can represent.
+       - `ReplayEngine::apply_split` applies a split to every account's position in the
+         instrument, or to none. It scales a copy of every holding first, so a position the split
+         cannot scale refuses the action before any book, the clock or the stream has changed. It
+         then records one `portfolio.position_updated.v1` event per holder, in account order:
+         actor `portfolio_engine`, source `corporate_action`, correlation
+         `corr-corporate-action-<action id>`, and no cause. Each action applies once.
+       - An order resting in the instrument cannot be carried across a split: its quantity and
+         limit are in pre-split units, and a venue's response to a split is not modelled. The
+         engine refuses, before anything changes. That is E3.6g's decision for a lot-size change,
+         applied to splits.
+       - `BacktestRunner` forwards each split to the engine at the bar where it applies the
+         ledger's, and adds the events to the stream and its store. A cash dividend is income,
+         which only the ledger books. A run with no split has no new event and is unchanged.
+     - **Tests.** 19 tests were added.
+       - Engine and portfolio, 14 in `core/control-plane/tests/split_portfolio.rs`: exact scaling
+         with total cost, realized P&L and unrealized P&L held; a reverse split and its inverse;
+         flat and short positions; a ratio that is not positive, and a position rounded to
+         nothing, each leaving the position untouched; several holders scaled in a stable order
+         with a second instrument left alone; nothing recorded for an absent or flat holder;
+         once-only application; a resting order refusing the split without consuming its
+         identity, and one in another instrument not; a split one holder cannot take refused for
+         every holder; malformed inputs refused with the clock and stream unchanged; and a sink's
+         refusal reported.
+       - Runner, 5 in `core/backtest/tests/split_replay_parity.rs`: the reproduction above, the
+         `Position` event's fields and place in the stream, the engine and the ledger agreeing on
+         quantity, cost and realized P&L, an unchanged stream without a split, and a split that
+         finds nothing held.
+     - **Rule 5.** 35 of 35 injected defects were caught by the intended tests: the quantity or
+       cost not scaled, multiplied instead of divided, or a bad ratio accepted at either layer;
+       a position rounded to nothing kept, or a flat one refused; a position changed before its
+       refusal; an action applied twice, or consumed by a refused attempt; a resting order not
+       blocking, or any order blocking; the clock not advanced; another instrument scaled; a flat
+       holder recorded; the event carrying the pre-split position, a wrong actor, source,
+       account, instrument or correlation, or the holders reversed; a sink's failure swallowed; a
+       holder skipped instead of refused; and the runner ignoring or inverting the ratio, dating
+       the event wrongly, leaving it out of the stream, or never forwarding a split. One survived
+       the first run: an engine that skipped its own ratio check. A holder's scaling refused the
+       same ratio, so only an instrument nobody holds could tell them apart, and a test case for
+       that now holds it. The run crashed once on a transient Windows write error and left one
+       mutant in the source until it was reverted by hand and checked against `git diff`. The
+       runner now backs the original up first and retries.
+     - **Measured result.** The Rust workspace rose from 607 to 626 passed / 0 failed / 3 ignored.
+       The final `python tools/session_status.py` run measured all seven suites green, and the full
+       evidence pipeline exited 0.
+     - **Boundary.** A venue's response to a split, adjusting or cancelling a resting order, is
+       not modelled; the replay refuses instead. The strategy worker's own position snapshot and
+       cash do not follow a split or a dividend yet (E8.3). PAPER and controlled LIVE apply no
+       corporate actions and capsule replay has no corporate-action input (E8.4). The risk
+       policy's share-denominated limits are the operator's configuration and are not rescaled.
+       No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

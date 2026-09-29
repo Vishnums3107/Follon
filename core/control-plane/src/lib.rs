@@ -2371,6 +2371,32 @@ impl Portfolio {
         Ok(())
     }
 
+    /// Applies a stock split to the position, as `BacktestLedger` does.
+    ///
+    /// The quantity is multiplied by `ratio` and the average cost divided by it, so
+    /// the position's total cost is unchanged and its realized P&L is untouched. The
+    /// arithmetic is the ledger's own, operation for operation, so the replay's
+    /// position and the ledger's cannot drift apart. A flat position has nothing to
+    /// scale, and a short scales like a long: its quantity keeps its sign and its
+    /// per-unit proceeds are divided. A split that would round a held position down
+    /// to nothing is refused, because a portfolio holding no quantity at a cost is
+    /// not one this type can represent.
+    pub fn apply_split(&mut self, ratio: Decimal) -> Result<(), EngineError> {
+        if ratio <= Decimal::ZERO {
+            return Err(EngineError("split ratio must be positive".to_owned()));
+        }
+        let quantity = self.quantity.checked_mul(ratio)?;
+        let average_cost = self.average_cost.checked_div(ratio)?;
+        if quantity == Decimal::ZERO && self.quantity != Decimal::ZERO {
+            return Err(EngineError(
+                "split would round the held position down to nothing".to_owned(),
+            ));
+        }
+        self.quantity = quantity;
+        self.average_cost = average_cost;
+        Ok(())
+    }
+
     /// Returns a rebuildable position projection.
     pub fn position_snapshot(&self) -> PositionSnapshot {
         PositionSnapshot {
@@ -2432,6 +2458,7 @@ pub struct ReplayEngine {
     fill_model: DeterministicFillModel,
     portfolios: BTreeMap<(String, String), Portfolio>,
     working_orders: BTreeMap<String, SimulatedWorkingOrder>,
+    corporate_action_ids: BTreeSet<String>,
     news_headlines: BTreeMap<String, ReplayedNewsHeadline>,
     news_sentiment_event_ids: BTreeSet<String>,
 }
@@ -2471,6 +2498,7 @@ impl ReplayEngine {
             fill_model,
             portfolios: BTreeMap::new(),
             working_orders: BTreeMap::new(),
+            corporate_action_ids: BTreeSet::new(),
             news_headlines: BTreeMap::new(),
             news_sentiment_event_ids: BTreeSet::new(),
         })
@@ -3275,6 +3303,89 @@ impl ReplayEngine {
     ) -> Result<ReplayResult, EngineError> {
         let reference = market.validate(&bar, event_time)?;
         self.replay_bar(sink, strategy, account_id, event_time, bar, Some(reference))
+    }
+
+    /// Applies a stock split to every account's position in `instrument_id` and
+    /// records each scaled position as a `Position` event (E8.2).
+    ///
+    /// The backtest ledger applies a split to its own position and FIFO lots. This
+    /// engine's portfolio is a second book: it is what a strategy's execution
+    /// callbacks and the fingerprinted event stream project. Left alone it would keep
+    /// the pre-split quantity, so a strategy that sold what it now holds would be
+    /// refused, and one that sold the old quantity would leave the two books
+    /// disagreeing. `applied_at` is the replay time the split is applied, the first
+    /// bar at or after the time it took effect.
+    ///
+    /// An order resting in the instrument cannot be carried across a split. Its
+    /// quantity and limit are in pre-split units, and a venue's own response to a
+    /// split, which adjusts or cancels the order, is not modelled. It is refused
+    /// before anything changes, rather than filled at a price level it was not
+    /// written for. That is E3.6g's decision for a lot-size change, applied to splits.
+    /// A position the split cannot scale refuses it the same way, for every holder:
+    /// the action applies to all of them or to none.
+    ///
+    /// Each action applies once. A cash dividend needs no counterpart here: this
+    /// portfolio holds a position and its trading P&L, and income is the ledger's.
+    pub fn apply_split(
+        &mut self,
+        sink: &mut impl EventSink,
+        action_id: &str,
+        instrument_id: &str,
+        ratio: Decimal,
+        applied_at: &str,
+    ) -> Result<Vec<EventEnvelope>, EngineError> {
+        validate_canonical_id("corporate action id", action_id)?;
+        validate_canonical_id("corporate action instrument_id", instrument_id)?;
+        if ratio <= Decimal::ZERO {
+            return Err(EngineError("split ratio must be positive".to_owned()));
+        }
+        if self.corporate_action_ids.contains(action_id) {
+            return Err(EngineError(format!(
+                "corporate action {action_id} was already applied to the replay"
+            )));
+        }
+        if let Some((order_id, _)) = self
+            .working_orders
+            .iter()
+            .find(|(_, working)| working.order.intent.instrument_id == instrument_id)
+        {
+            return Err(EngineError(format!(
+                "working order {order_id} cannot rest across {instrument_id}'s split {action_id}"
+            )));
+        }
+        // Scale a copy of every holding first. A position the split cannot scale then
+        // refuses the whole action before any book, the clock or the stream has changed.
+        let mut scaled = Vec::new();
+        for ((account_id, held), portfolio) in &self.portfolios {
+            if held == instrument_id && portfolio.quantity != Decimal::ZERO {
+                let mut after = portfolio.clone();
+                after.apply_split(ratio)?;
+                scaled.push((account_id.clone(), after));
+            }
+        }
+        self.clock.advance_to(applied_at)?;
+        self.corporate_action_ids.insert(action_id.to_owned());
+        let correlation_id = format!("corr-corporate-action-{action_id}");
+        let mut events = Vec::with_capacity(scaled.len());
+        for (account_id, after) in scaled {
+            let position = after.position_snapshot();
+            self.portfolios
+                .insert((account_id.clone(), instrument_id.to_owned()), after);
+            let current_time = self.clock.now().to_owned();
+            events.push(self.emit(
+                sink,
+                EventPayload::Position(position),
+                &current_time,
+                &correlation_id,
+                None,
+                "portfolio_engine",
+                "corporate_action",
+                Some(account_id.as_str()),
+                None,
+                Some(instrument_id),
+            )?);
+        }
+        Ok(events)
     }
 
     fn emit_order_change(

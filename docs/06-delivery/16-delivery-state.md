@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T14:52:17Z  
+**Measured at:** 2026-09-29T15:11:09Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `e61c223` -- feat(paper): the order-submitting PAPER routes can enforce aggregate portfolio limits -- E7.5 (2026-09-29T19:52:50+05:30)  
-**Uncommitted paths:** 15
+**HEAD:** `79418c8` -- feat(evidence): acceptance records are signed, retained, release-bound and held to criteria -- E6.4, E6.5 (2026-09-29T20:23:42+05:30)  
+**Uncommitted paths:** 5
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 607 | 0 | 3 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 626 | 0 | 3 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
@@ -294,7 +294,7 @@ passes it for production.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E8.1 | FIFO tax lots follow a split exactly as the position does: each lot's quantity scaled by the ratio and its unit cost divided by it, so its total cost is unchanged. **Reproduced, then fixed** in both the primary ledger and the advanced account, long and short: before, a post-split partial sale realized -45 where +5 was due, and the rest was refused (audit item 93). | **done** 2026-09-28 |
-| E8.2 | The replay engine's own portfolio, and so the fingerprinted event stream, applies corporate actions as the ledger does. A working order across a split would apply E3.6g's decision, so the replay refuses to fill it. | open |
+| E8.2 | The replay engine's own portfolio, and so the fingerprinted event stream, applies corporate actions as the ledger does. **Reproduced, then fixed:** a strategy that held one share across a 2:1 split and sold the two it then held aborted the run (the engine still held one), and one that sold the one it remembered left the engine flat while the ledger held a share, with no error. **Now** `ReplayEngine::apply_split` scales every account's position in the instrument by the ledger's own arithmetic, or none of them, and records each as a `Position` event (actor `portfolio_engine`, source `corporate_action`) when the replay applies the split; `BacktestRunner` forwards every split to it. A working order across a split is refused, E3.6g's decision applied to splits. A run with no split is unchanged. Audit item 112. Not modelled: a venue's own response to a split. The worker's snapshot and cash are E8.3; PAPER, LIVE and capsule replay are E8.4. | **done** 2026-09-29 |
 | E8.3 | The worker's position snapshot and cash reflect splits and dividends. The SDK has no corporate-action hook, and adding one is a protocol change. | **decision** |
 | E8.4 | PAPER and controlled LIVE apply no corporate actions, and capsule replay has no corporate-action input. | open |
 | E8.5 | The two P&L conventions stated and tested. **Done 2026-09-29 (audit item 108):** the primary ledger puts fees in the cost basis, so its realized and unrealized P&L are net of fees. The advanced account reports trading P&L before separately attributed charges. Five tests hold both, and that the two agree on cash, equity and FIFO tax P&L, and differ by exactly the fees. The conventions table is in the backtesting capability doc. **Still open:** clean-install and recovery evidence. | conventions **done**; install evidence open |
@@ -819,8 +819,8 @@ short — detail belongs in the conformance audit.
   and decide for itself while the operator was away. Baseline at `4403b3f`: clean
   tree, all seven suites green (Rust 562 / 0 / 3, Tauri 31, Python 75), the full
   pipeline exit 0. Commits stay on `refactor/module-decomposition`, unpushed.
-- Landed nine slices, each with its rule-5 injections, all seven suites and the
-  full pipeline measured before its commit (audit items 103 to 111):
+- Landed ten slices, each with its rule-5 injections, all seven suites and the
+  full pipeline measured before its commit (audit items 103 to 112):
   - E5.4: a bridge refusal is a clean rejection, and IBKR notices no longer reject
     working orders. Found along the way: an injection that survived because it
     crashed into the failure the test expects, which was a bad injection and not a
@@ -845,8 +845,14 @@ short — detail belongs in the conformance audit.
     because its test refused a response equal to the group order, which the
     curve equation rejects by itself; the malleable case is the response plus the
     order.
-- Measured at the E6.4 and E6.5 slice: Rust 607 / 0 / 3, Tauri 33, Python 164,
-  both desktop suites green, the full pipeline exit 0.
+  - E8.2: the replay engine's own portfolio follows a stock split, as the ledger's
+    already did. The reproduction was a silent divergence as well as an abort: a
+    strategy that sold the pre-split quantity left the engine flat while the ledger
+    held shares. An injection run crashed on a transient Windows write error and
+    left a mutant in the source; it was reverted by hand against `git diff`, and the
+    runner now backs originals up and retries.
+- Measured at the E8.2 slice: Rust 626 / 0 / 3, Tauri 33, Python 164, both
+  desktop suites green, the full pipeline exit 0.
 - **Next action:** see the backlog. Still waiting on the operator: E7.10, E8.3.
 
 ### 2026-09-29 — session 12
