@@ -121,14 +121,23 @@ exactly `evidence_id`, `evidence_type`, `subject_id`, `occurred_at`,
 id, the signature, the chain link and the hash, and appends it with:
 
 ```powershell
-python tools/acceptance_evidence.py append <ledger>.acceptance.ndjson `
+python tools/acceptance_evidence.py append <ledger-root>/<ledger>.acceptance.ndjson `
+  --ledger-root <acceptance-ledger-root> `
+  --trusted-reviewers <trusted-reviewers.json> `
   --record <template.json> --artifact <source-artifact> `
   --artifact-root <acceptance-artifact-root> `
   --reviewer-key <reviewer-signing.pk8> --reviewer-key-id <key.id>
 ```
 
-It verifies the ledger so far, refuses a repeated `evidence_id`, retains the
-artifact, validates the finished record and only then writes it. The reviewer's
+It holds the ledger root's lock, `.append.lock`, for the whole append, so two
+appends cannot both chain to one head; if an append dies holding it, remove the
+file only once no append is running. It verifies the whole root first, every
+signature included, and refuses an `evidence_id` any ledger in the root already
+holds. It reads the artifact once, so the bytes retained are the bytes hashed,
+and retains it through a fresh temporary file. It validates the finished record,
+refuses it unless the key id is one the trusted set lists as `active` for the
+named reviewer and the key actually made the signature, and only then retains
+the artifact and writes the record. The reviewer's
 key is a PKCS#8 Ed25519 key, the kind `follon-admin release-keygen` writes, and
 its public half goes into the trusted reviewer set as
 `contracts/json-schema/v2/trusted-reviewers.schema.json` describes, version 2,

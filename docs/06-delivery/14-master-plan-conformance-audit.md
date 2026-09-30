@@ -5165,6 +5165,38 @@ These are mandatory master-plan acceptance conditions and are currently open:
        trusted time to say which came after they left. One artifact per subject is checked within one
        ledger root only. Findings (5), (7) and (8) and the promotion gate's wiring remain E6.6b.
 
+124. Acceptance appends cannot spoil the ledger root (2026-09-30, Security; finding (7)
+     in E6.6b). This hardens the operator write path; it does not authenticate the
+     underlying broker activity.
+     - **Gap.** Two append processes could read the same chain head and both append,
+       breaking the chain. A duplicate `evidence_id` in a different ledger broke the
+       root-wide audit. A wrong or revoked signing key could append a record that the
+       next audit refused. Reading an artifact to hash it, then again to retain it,
+       allowed its bytes to change between the two. The fixed `.partial` staging name
+       let a planted symbolic link overwrite its target.
+     - **Behavior.** Append takes an exclusive file lock on the ledger root for the
+       entire verification and write. It verifies all existing signatures and IDs,
+       then checks the proposed record against an active key for its named reviewer.
+       One read of the source artifact supplies both the digest and the retained
+       bytes. Retention uses an exclusive, unpredictable temporary name and cleans
+       that file if a write fails. The CLI requires the root and trusted reviewer
+       set explicitly. The runbook documents the lock and recovery procedure.
+     - **Tests.** `tests/security/test_acceptance_evidence.py` covers root-wide
+       duplicates, nested ledgers, unsigned existing records, a held and released
+       lock, revoked and mismatched signing keys, changed source bytes, a staged
+       symlink, a linked artifact root, write failure cleanup and CLI use. A refused
+       append leaves the ledger and previously retained artifacts unchanged.
+     - **Measured result.** The full evidence pipeline exited 0. The Python suite
+       passed 225 tests. `python tools/session_status.py` measured the Rust workspace
+       (658 passed), formatting, Clippy, Tauri host (33 passed), Python and both
+       desktop suites green. PostgreSQL integration was skipped because this
+       session had no disposable database configured.
+     - **Boundary.** The lock coordinates writers that use this tool; manual edits
+       to a ledger or an operator removing the lock from a running append remain
+       outside it. A failed final append can still leave an incomplete ledger line,
+       which the audit refuses rather than counting. Findings (5) and (8), and the
+       promotion-gate wiring part of (9), remain open.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
