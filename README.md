@@ -133,10 +133,12 @@ for the deployment and evidence sequence.
 - Native and gRPC PAPER routes omit the optional aggregate portfolio-risk
   composition. Native requests use operator-attested price/time and lack
   separate operator authentication; browser REST projections remain read-only.
-- Acceptance tools verify record structure, internal hashes, and declared
-  reviewer IDs, not reviewer authentication or underlying broker artifacts.
-  See the [current repository assessment](docs/analysis/project-status-2026-09-27.md)
-  for source-backed limits, CI status, and evidence requirements.
+- Acceptance tools verify canonical, signed reviewer records and re-hash
+  retained artifacts before counting them. That establishes what a listed
+  reviewer attested and what bytes were retained; an independent operator must
+  still validate the broker activity and the reviewer's authority. See the
+  [delivery state](docs/06-delivery/16-delivery-state.md) for current limits and
+  evidence requirements.
 - The checked-in operational adapter is IBKR PAPER-only. PAPER composition now
   uses an OMS-owned, account-isolated adapter registry; additional routes need
   their own reviewed adapter contract and reconciliation evidence.

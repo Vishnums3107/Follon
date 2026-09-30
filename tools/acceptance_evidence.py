@@ -28,7 +28,8 @@ is listed with its reason and is never counted. Whatever a ledger or a reviewer 
 holds, the audit refuses it with `EvidenceError` rather than raising anything else.
 
     acceptance_evidence.py audit LEDGER_ROOT --trusted-reviewers FILE --artifact-root DIR --release-id ID
-    acceptance_evidence.py append LEDGER --record TEMPLATE --artifact FILE --artifact-root DIR
+    acceptance_evidence.py append LEDGER --ledger-root DIR --trusted-reviewers FILE --record TEMPLATE
+                                          --artifact FILE --artifact-root DIR
                                           --reviewer-key KEY.pk8 --reviewer-key-id ID
 """
 
@@ -40,7 +41,10 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +66,8 @@ LEDGER_SUFFIX = ".acceptance.ndjson"
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_REVIEWER_SET_BYTES = 1024 * 1024
+MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+APPEND_LOCK_NAME = ".append.lock"
 MAX_NOTES_CHARACTERS = 1024
 OUTCOMES = ("accepted", "rejected")
 CANONICAL_ID = re.compile(r"^[a-z0-9._-]+$")
@@ -427,15 +433,22 @@ def is_disqualifying(record: dict[str, Any]) -> bool:
     return record["outcome"] == "rejected" or bool(criteria_shortfalls(record))
 
 
-def assess(
-    records: list[dict[str, Any]], trusted: TrustedReviewers, artifact_root: Path, release_id: str
-) -> list[Verdict]:
-    """Judges every record of a ledger root. Refuses a root holding a record no listed key signed."""
+def require_signed(records: list[dict[str, Any]], trusted: TrustedReviewers) -> dict[str, str]:
+    """The status of the listed key that signed each record, by evidence id. Refuses records
+    that no listed key signed, naming the first five and counting the rest."""
     signers = {record["evidence_id"]: trusted.signer_status(record) for record in records}
     unsigned = [evidence_id for evidence_id, status in signers.items() if status is None]
     if unsigned:
         shown = ", ".join(unsigned[:5]) + (f" and {len(unsigned) - 5} more" if len(unsigned) > 5 else "")
         raise EvidenceError(f"records that no listed reviewer key signed: {shown}")
+    return {evidence_id: status for evidence_id, status in signers.items() if status is not None}
+
+
+def assess(
+    records: list[dict[str, Any]], trusted: TrustedReviewers, artifact_root: Path, release_id: str
+) -> list[Verdict]:
+    """Judges every record of a ledger root. Refuses a root holding a record no listed key signed."""
+    signers = require_signed(records, trusted)
     disqualified = {subject_of(record) for record in records if is_disqualifying(record)}
     # What each accepted record cites, so a citation shared between subjects is visible.
     # Only acceptances are read: a rejection lowers a count however it is backed.
@@ -638,16 +651,21 @@ def audit(
     return status(verdicts, ledgers, release_id=release_id, trusted_reviewers_sha256=trusted.sha256)
 
 
-def artifact_digest(artifact: Path) -> str:
-    if artifact.is_symlink() or not artifact.is_file():
-        raise EvidenceError("the source artifact must be a regular file")
-    return hashlib.sha256(artifact.read_bytes()).hexdigest()
+def read_artifact(artifact: Path) -> bytes:
+    """The bytes of a source artifact, which must be a regular file and not a link."""
+    return read_regular_file(artifact, MAX_ARTIFACT_BYTES, "the source artifact")
 
 
-def retain_artifact(artifact: Path, artifact_root: Path) -> str:
-    """Stores `artifact` in the content-addressed root and returns its SHA-256."""
-    digest = artifact_digest(artifact)
-    content = artifact.read_bytes()
+def retain_artifact(content: bytes, artifact_root: Path) -> str:
+    """Stores `content` in the content-addressed root under its SHA-256, which it returns.
+
+    It is written to a temporary file of a fresh random name, created exclusively, and
+    then renamed into place. A fixed temporary name let a link planted under it make
+    retention write through the link and overwrite its target (E6.6b).
+    """
+    if artifact_root.is_symlink():
+        raise EvidenceError("the artifact root must not be a link")
+    digest = hashlib.sha256(content).hexdigest()
     artifact_root.mkdir(parents=True, exist_ok=True)
     target = artifact_root / digest
     if target.is_symlink():
@@ -656,10 +674,39 @@ def retain_artifact(artifact: Path, artifact_root: Path) -> str:
         if target.read_bytes() != content:
             raise EvidenceError("a different artifact already occupies this digest")
         return digest
-    temporary = artifact_root / f".{digest}.partial"
-    temporary.write_bytes(content)
-    temporary.replace(target)
+    descriptor, temporary = tempfile.mkstemp(dir=artifact_root, prefix=f".{digest}.", suffix=".partial")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
     return digest
+
+
+@contextmanager
+def exclusive_append(ledger_root: Path) -> Iterator[None]:
+    """Holds a ledger root's append lock, a file created exclusively, for one append.
+
+    Two appends that overlapped both chained to the same head, and the second broke the
+    chain. The lock is a file so that it works alike on every platform, and an append
+    that dies holding it leaves it visible rather than silently expired.
+    """
+    lock = ledger_root / APPEND_LOCK_NAME
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as error:
+        raise EvidenceError(
+            f"another append holds the ledger root's lock, {lock}; remove it only once no append is running"
+        ) from error
+    os.close(descriptor)
+    try:
+        yield
+    finally:
+        lock.unlink()
 
 
 TEMPLATE_KEYS = {
@@ -672,42 +719,68 @@ def append_record(
     ledger: Path,
     template: dict[str, Any],
     artifact: Path,
+    *,
+    ledger_root: Path,
     artifact_root: Path,
+    trusted: TrustedReviewers,
     seed: bytes,
     reviewer_key_id: str,
 ) -> dict[str, Any]:
-    """Signs and appends one record, and retains its artifact.
+    """Signs and appends one record to a ledger under `ledger_root`, and retains its artifact.
 
-    The record is validated whole before anything is written, and the existing
-    ledger is verified first, so a record is never appended to a broken chain.
+    The record is validated whole before anything is written, and under the root's append
+    lock (E6.6b):
+
+    * the whole root is verified first, every record signed by a listed key included, so a
+      record is never appended to a broken root;
+    * its `evidence_id` must be new to the root, not only to its own ledger, or the next
+      audit would refuse the root;
+    * it must be signed by a key `trusted` lists as active for the reviewer it names, so a
+      mistyped key id, another reviewer's key or a revoked one cannot append a record that
+      every later audit would refuse;
+    * the artifact is read once, and the bytes hashed into the record are the bytes retained.
     """
     if not ledger.name.endswith(LEDGER_SUFFIX):
         raise EvidenceError(f"a ledger file is named *{LEDGER_SUFFIX}")
     if set(template) != TEMPLATE_KEYS:
         raise EvidenceError(f"the record template must have exactly {sorted(TEMPLATE_KEYS)}")
-    previous = ZERO_HASH
-    if ledger.exists():
-        existing, _, previous = read_ledger(ledger)
-        if any(record["evidence_id"] == template["evidence_id"] for record in existing):
-            raise EvidenceError("this ledger already holds that evidence_id")
-    elif ledger.is_symlink():
-        raise EvidenceError("a ledger must not be a symbolic link")
-    record: dict[str, Any] = {
-        **template,
-        "acceptance_evidence_schema_version": SCHEMA_VERSION,
-        "source_artifact_sha256": artifact_digest(artifact),
-        "reviewer_key_id": reviewer_key_id,
-        "reviewer_signature": "0" * 128,
-        "prev_hash": previous,
-        "record_hash": ZERO_HASH,
-    }
-    record["reviewer_signature"] = sign_record(record, seed)
-    record["record_hash"] = record_hash(record)
-    validate_record(record, previous)
-    retain_artifact(artifact, artifact_root)
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    with ledger.open("ab") as stream:
-        stream.write(canonical_json(record) + b"\n")
+    root = ledger_root.resolve(strict=True)
+    if not root.is_dir():
+        raise EvidenceError("the ledger root must be a directory")
+    try:
+        ledger_path = ledger.resolve().relative_to(root).as_posix()
+    except ValueError as error:
+        raise EvidenceError("the ledger must lie inside the ledger root") from error
+    content = read_artifact(artifact)
+    with exclusive_append(root):
+        records, ledgers = load_ledger_files(root)
+        require_signed(records, trusted)
+        if any(record["evidence_id"] == template["evidence_id"] for record in records):
+            raise EvidenceError("the ledger root already holds that evidence_id")
+        previous = next((entry["head"] for entry in ledgers if entry["path"] == ledger_path), ZERO_HASH)
+        record: dict[str, Any] = {
+            **template,
+            "acceptance_evidence_schema_version": SCHEMA_VERSION,
+            "source_artifact_sha256": hashlib.sha256(content).hexdigest(),
+            "reviewer_key_id": reviewer_key_id,
+            "reviewer_signature": "0" * 128,
+            "prev_hash": previous,
+            "record_hash": ZERO_HASH,
+        }
+        record["reviewer_signature"] = sign_record(record, seed)
+        record["record_hash"] = record_hash(record)
+        validate_record(record, previous)
+        if trusted.signer_status(record) != "active":
+            raise EvidenceError(
+                f"the signing key is not {reviewer_key_id}, listed as active for {record['reviewed_by']}"
+            )
+        retain_artifact(content, artifact_root)
+        target = root / ledger_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("ab") as stream:
+            stream.write(canonical_json(record) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
     return record
 
 
@@ -730,6 +803,8 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--output", type=Path)
     append_parser = commands.add_parser("append", help="sign and append one record")
     append_parser.add_argument("ledger", type=Path)
+    append_parser.add_argument("--ledger-root", type=Path, required=True)
+    append_parser.add_argument("--trusted-reviewers", type=Path, required=True)
     append_parser.add_argument("--record", type=Path, required=True)
     append_parser.add_argument("--artifact", type=Path, required=True)
     append_parser.add_argument("--artifact-root", type=Path, required=True)
@@ -770,8 +845,14 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(template, dict):
             raise EvidenceError("the record template must be an object")
         record = append_record(
-            arguments.ledger, template, arguments.artifact, arguments.artifact_root, seed,
-            arguments.reviewer_key_id,
+            arguments.ledger,
+            template,
+            arguments.artifact,
+            ledger_root=arguments.ledger_root,
+            artifact_root=arguments.artifact_root,
+            trusted=load_trusted_reviewers(arguments.trusted_reviewers),
+            seed=seed,
+            reviewer_key_id=arguments.reviewer_key_id,
         )
         print(f"appended {record['evidence_id']} ({record['record_hash']})")
         return 0

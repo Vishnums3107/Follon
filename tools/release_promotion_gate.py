@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,12 +23,14 @@ class PromotionError(RuntimeError):
     """Raised when a release is not eligible for promotion."""
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+@dataclass(frozen=True)
+class VerifiedRelease:
+    """Release identity and digests from the exact files given to the verifier."""
+
+    release_id: str
+    manifest_sha256: str
+    signature_sha256: str
+    trusted_key_sha256: str
 
 
 def validate_approval(
@@ -50,32 +55,61 @@ def verify_release(
     signature: Path,
     trusted_key: Path,
     artifact_root: Path,
-) -> None:
-    command = [
-        "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-admin", "--",
-        "release-verify", str(manifest), str(signature), str(trusted_key),
-        "--artifacts-root", str(artifact_root),
-    ]
-    result = subprocess.run(
-        command,
-        cwd=repository_root,
-        shell=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+) -> VerifiedRelease:
+    """Verify snapshots from one read and bind the receipt to those same bytes.
+
+    The operator-owned paths can change after `release-verify` exits. Passing them
+    directly to the subprocess and later re-reading them let a different manifest's
+    release ID and digest enter an eligible receipt (E6.6b finding 5).
+    """
+    manifest_bytes = manifest.read_bytes()
+    signature_bytes = signature.read_bytes()
+    trusted_key_bytes = trusted_key.read_bytes()
+    with tempfile.TemporaryDirectory(prefix="follon-release-verify-") as directory:
+        snapshot_root = Path(directory)
+        snapshot_manifest = snapshot_root / "manifest.json"
+        snapshot_signature = snapshot_root / "signature.json"
+        snapshot_key = snapshot_root / "trusted-key.json"
+        snapshot_manifest.write_bytes(manifest_bytes)
+        snapshot_signature.write_bytes(signature_bytes)
+        snapshot_key.write_bytes(trusted_key_bytes)
+        command = [
+            "cargo", "run", "-q", "-p", "follon-cli", "--bin", "follon-admin", "--",
+            "release-verify", str(snapshot_manifest), str(snapshot_signature), str(snapshot_key),
+            "--artifacts-root", str(artifact_root),
+        ]
+        result = subprocess.run(
+            command,
+            cwd=repository_root,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if (
+            snapshot_manifest.read_bytes() != manifest_bytes
+            or snapshot_signature.read_bytes() != signature_bytes
+            or snapshot_key.read_bytes() != trusted_key_bytes
+        ):
+            raise PromotionError("release verification inputs changed during verification")
     if result.returncode != 0:
         reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "verification failed"
         raise PromotionError(f"signed release verification failed: {reason[:512]}")
+    return VerifiedRelease(
+        release_id=release_id_of(manifest_bytes),
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        signature_sha256=hashlib.sha256(signature_bytes).hexdigest(),
+        trusted_key_sha256=hashlib.sha256(trusted_key_bytes).hexdigest(),
+    )
 
 
-def release_id_of(manifest: Path) -> str:
+def release_id_of(manifest: bytes) -> str:
     """The release a manifest describes: the only release whose evidence may count for it."""
     try:
-        release_id = json.loads(manifest.read_text(encoding="utf-8")).get("release_id")
-    except (OSError, ValueError, AttributeError) as error:
+        release_id = json.loads(manifest).get("release_id")
+    except (ValueError, AttributeError) as error:
         raise PromotionError("the release manifest is unreadable") from error
     if not isinstance(release_id, str) or CANONICAL_ID.fullmatch(release_id) is None:
         raise PromotionError("the release manifest names no canonical release_id")
@@ -121,8 +155,21 @@ def acceptance_ready(
         status = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise PromotionError("acceptance tool returned malformed status") from error
-    if not isinstance(status, dict) or status.get("acceptance_status_schema_version") != 4:
+    if (
+        not isinstance(status, dict)
+        or type(status.get("acceptance_status_schema_version")) is not int
+        or status["acceptance_status_schema_version"] != 4
+    ):
         raise PromotionError("acceptance tool returned an unsupported status")
+    if status.get("release_id") != release_id:
+        raise PromotionError("acceptance tool reported a different release")
+    if (
+        not isinstance(status.get("trusted_reviewers_sha256"), str)
+        or re.fullmatch(r"[a-f0-9]{64}", status["trusted_reviewers_sha256"]) is None
+        or not isinstance(status.get("ledgers"), list)
+        or type(status.get("all_gates_eligible")) is not bool
+    ):
+        raise PromotionError("acceptance tool returned an incomplete status")
     if target_environment == "production" and status.get("all_gates_eligible") is not True:
         raise PromotionError("production promotion is blocked by open acceptance gates")
     return status, result.stdout
@@ -132,9 +179,7 @@ def promotion_receipt(
     *,
     source_environment: str,
     target_environment: str,
-    manifest: Path,
-    signature: Path,
-    trusted_key: Path,
+    release: VerifiedRelease,
     acceptance_status: dict[str, object],
     acceptance_status_bytes: bytes,
     requester: str,
@@ -145,15 +190,17 @@ def promotion_receipt(
     """The eligibility receipt. Version 2 bound the recomputed acceptance status and
     every ledger file it counted (E6.3). Version 3 also names the release the evidence
     was counted for and the reviewer key set it was authenticated against (E6.4)."""
+    if acceptance_status.get("release_id") != release.release_id:
+        raise PromotionError("acceptance status does not belong to the verified release")
     return {
         "release_promotion_receipt_schema_version": 3,
-        "release_id": acceptance_status["release_id"],
+        "release_id": release.release_id,
         "trusted_reviewers_sha256": acceptance_status["trusted_reviewers_sha256"],
         "source_environment": source_environment,
         "target_environment": target_environment,
-        "manifest_sha256": sha256_file(manifest),
-        "signature_sha256": sha256_file(signature),
-        "trusted_key_sha256": sha256_file(trusted_key),
+        "manifest_sha256": release.manifest_sha256,
+        "signature_sha256": release.signature_sha256,
+        "trusted_key_sha256": release.trusted_key_sha256,
         "acceptance_status_sha256": hashlib.sha256(acceptance_status_bytes).hexdigest(),
         "acceptance_ledgers": acceptance_status["ledgers"],
         "requester": requester,
@@ -165,12 +212,24 @@ def promotion_receipt(
 
 
 def write_receipt(path: Path, value: object) -> None:
+    """Publish one receipt atomically without following a staged link or replacing another."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise PromotionError("promotion receipt already exists")
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8", newline="\n")
-    temporary.replace(path)
+    encoded = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            # A hard link creates the final name only if absent, without a window
+            # between an existence check and an overwriting replace. Both names
+            # are in the same directory, so they remain on the same filesystem.
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise PromotionError("promotion receipt already exists") from error
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -198,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             arguments.change_ticket,
         )
         repository_root = Path(__file__).resolve().parents[1]
-        verify_release(
+        release = verify_release(
             repository_root,
             arguments.manifest.resolve(strict=True),
             arguments.signature.resolve(strict=True),
@@ -211,15 +270,13 @@ def main(argv: list[str] | None = None) -> int:
             arguments.target_environment,
             trusted_reviewers=arguments.acceptance_trusted_reviewers.resolve(strict=True),
             artifact_root=arguments.acceptance_artifact_root.resolve(strict=True),
-            release_id=release_id_of(arguments.manifest),
+            release_id=release.release_id,
         )
         promoted_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         write_receipt(arguments.receipt, promotion_receipt(
             source_environment=arguments.source_environment,
             target_environment=arguments.target_environment,
-            manifest=arguments.manifest,
-            signature=arguments.signature,
-            trusted_key=arguments.trusted_key,
+            release=release,
             acceptance_status=acceptance_status,
             acceptance_status_bytes=acceptance_status_bytes,
             requester=arguments.requester,

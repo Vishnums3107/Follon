@@ -7,6 +7,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from acceptance_fixtures import (
     OTHER_SEED,
@@ -19,6 +20,7 @@ from acceptance_fixtures import (
     artifact_for,
     artifact_sha256,
     attributes_for,
+    links_supported,
     make_chain,
     make_record,
     pkcs8,
@@ -26,8 +28,9 @@ from acceptance_fixtures import (
     reviewers_document,
     write_ledger,
 )
-from tools import ed25519, generate_pipeline_evidence
+from tools import acceptance_evidence, ed25519, generate_pipeline_evidence
 from tools.acceptance_evidence import (
+    APPEND_LOCK_NAME,
     ARTIFACT_SHARED,
     ARTIFACT_UNVERIFIED,
     CRITERIA_NOT_MET,
@@ -572,18 +575,25 @@ class ArtifactRetentionTests(unittest.TestCase):
     def test_retention_is_content_addressed_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "session.log"
-            source.write_bytes(artifact_for("session.paper.1"))
-            digest = retain_artifact(source, root / "store")
+            content = artifact_for("session.paper.1")
+            digest = retain_artifact(content, root / "store")
             self.assertEqual(digest, artifact_sha256("session.paper.1"))
             self.assertTrue(artifact_is_retained(root / "store", digest))
-            self.assertEqual(retain_artifact(source, root / "store"), digest)
+            self.assertEqual(retain_artifact(content, root / "store"), digest)
+            # Nothing but the artifact is left behind: no temporary file survives.
+            self.assertEqual([path.name for path in (root / "store").iterdir()], [digest])
             (root / "store" / digest).write_bytes(b"different")
             with self.assertRaisesRegex(EvidenceError, "different artifact"):
-                retain_artifact(source, root / "store")
-            with self.assertRaisesRegex(EvidenceError, "regular file"):
-                retain_artifact(root, root / "store")
+                retain_artifact(content, root / "store")
             self.assertFalse(artifact_is_retained(root / "store", "c" * 64))
+
+    def test_a_retention_that_fails_part_way_leaves_nothing_behind(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "store"
+            with mock.patch.object(acceptance_evidence.os, "replace", side_effect=OSError("the disk is full")):
+                with self.assertRaisesRegex(OSError, "the disk is full"):
+                    retain_artifact(artifact_for("session.paper.1"), store)
+            self.assertEqual(list(store.iterdir()), [])
 
 
 class ExclusiveBackingTests(unittest.TestCase):
@@ -869,7 +879,7 @@ class CustomerGateTests(unittest.TestCase):
 
 
 class AppendWorkflowTests(unittest.TestCase):
-    """A reviewer can sign and append a record, and the audit counts it (E6.4)."""
+    """A reviewer can sign and append a record, and the audit counts it (E6.4, E6.6b)."""
 
     def template(self, evidence_id: str = "evidence.paper.1", subject_id: str = "session.paper.1") -> dict:
         return {
@@ -891,80 +901,241 @@ class AppendWorkflowTests(unittest.TestCase):
         path.write_bytes(artifact_for(subject_id))
         return path
 
+    def append(
+        self,
+        workspace: Workspace,
+        template: dict,
+        artifact: Path,
+        ledger: Path | None = None,
+        seed: bytes = REVIEWER_SEED,
+        signing_key: str = REVIEWER_KEY_ID,
+    ) -> dict[str, object]:
+        return append_record(
+            ledger or workspace.ledgers / "paper.acceptance.ndjson",
+            template,
+            artifact,
+            ledger_root=workspace.ledgers,
+            artifact_root=workspace.artifacts,
+            trusted=load_trusted_reviewers(workspace.reviewers),
+            seed=seed,
+            reviewer_key_id=signing_key,
+        )
+
+    def lock_of(self, workspace: Workspace) -> Path:
+        return workspace.ledgers / APPEND_LOCK_NAME
+
     def test_an_appended_record_is_signed_chained_retained_and_counted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
-            ledger = workspace.ledgers / "paper.acceptance.ndjson"
-
-            first = append_record(
-                ledger, self.template(), self.artifact(directory), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID
-            )
-            second = append_record(
-                ledger, self.template("evidence.paper.2", "session.paper.2"),
-                self.artifact(directory, "session.paper.2"), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID,
+            first = self.append(workspace, self.template(), self.artifact(directory))
+            second = self.append(
+                workspace, self.template("evidence.paper.2", "session.paper.2"), self.artifact(directory, "session.paper.2")
             )
 
             self.assertEqual(first["prev_hash"], ZERO_HASH)
             self.assertEqual(second["prev_hash"], first["record_hash"])
             self.assertEqual(first["source_artifact_sha256"], artifact_sha256("session.paper.1"))
+            self.assertFalse(self.lock_of(workspace).exists())
             report = workspace.audit()
             self.assertEqual(report["gates"]["paper_session"]["observed"], 2)
             self.assertEqual(report["not_counted"], {})
+
+    def test_a_ledger_in_a_subdirectory_chains_on_its_own(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            self.append(workspace, self.template(), self.artifact(directory))
+            nested = workspace.ledgers / "partners" / "paper.acceptance.ndjson"
+            record = self.append(
+                workspace, self.template("evidence.paper.2", "session.paper.2"),
+                self.artifact(directory, "session.paper.2"), ledger=nested,
+            )
+            self.assertEqual(record["prev_hash"], ZERO_HASH)
+            self.assertEqual(workspace.audit()["gates"]["paper_session"]["observed"], 2)
 
     def test_an_append_is_refused_before_anything_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
             artifact = self.artifact(directory)
             ledger = workspace.ledgers / "paper.acceptance.ndjson"
-            append_record(ledger, self.template(), artifact, workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID)
+            self.append(workspace, self.template(), artifact)
             before = ledger.read_bytes()
+            retained = sorted(path.name for path in workspace.artifacts.iterdir())
+            other = self.artifact(directory, "session.paper.9")
 
-            def append(template, target=ledger, source=artifact):
-                return append_record(target, template, source, workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID)
+            def attempt(template, target=ledger, source=other, **keywords):
+                return lambda: self.append(workspace, template, source, ledger=target, **keywords)
 
+            outside = Path(directory) / "outside.acceptance.ndjson"
             refusals = {
-                "a repeated evidence id": (lambda: append(self.template()), "already holds"),
-                "an extra template field": (lambda: append({**self.template(), "extra": 1}), "exactly"),
+                "a repeated evidence id": (attempt(self.template()), "already holds"),
+                "an extra template field": (attempt({**self.template("evidence.paper.9"), "extra": 1}), "exactly"),
                 "a missing template field": (
-                    lambda: append({k: v for k, v in self.template("evidence.paper.9").items() if k != "notes"}),
+                    attempt({k: v for k, v in self.template("evidence.paper.9").items() if k != "notes"}),
                     "exactly",
                 ),
                 "attributes that miss the shape": (
-                    lambda: append({**self.template("evidence.paper.9"), "attributes": {"extra": 1}}),
+                    attempt({**self.template("evidence.paper.9"), "attributes": {"extra": 1}}),
                     "attributes",
                 ),
                 "a wrong environment": (
-                    lambda: append({**self.template("evidence.paper.9"), "environment": "LIVE"}),
+                    attempt({**self.template("evidence.paper.9"), "environment": "LIVE"}),
                     "environment",
                 ),
                 "a file that is not a ledger": (
-                    lambda: append(self.template("evidence.paper.9"), target=workspace.ledgers / "paper.ndjson"),
+                    attempt(self.template("evidence.paper.9"), target=workspace.ledgers / "paper.ndjson"),
                     "acceptance.ndjson",
                 ),
+                "a ledger outside the root": (attempt(self.template("evidence.paper.9"), target=outside), "inside the ledger root"),
                 "an artifact that is not a file": (
-                    lambda: append(self.template("evidence.paper.9"), source=Path(directory)),
+                    attempt(self.template("evidence.paper.9"), source=Path(directory)),
                     "regular file",
                 ),
+                # The review's finding (7): a mistyped key id appended a record every later
+                # audit refuses, and a rejection under it would have been inert.
+                "a key id the set does not list": (
+                    attempt(self.template("evidence.paper.9"), signing_key="reviewer.key.two.002"),
+                    "listed as active",
+                ),
+                "a seed that is not the listed key's": (
+                    attempt(self.template("evidence.paper.9"), seed=OTHER_SEED),
+                    "listed as active",
+                ),
+                "a key listed for another reviewer": (
+                    attempt({**self.template("evidence.paper.9"), "reviewed_by": SECOND_REVIEWER_ID}),
+                    "listed as active",
+                ),
             }
-            for name, (attempt, message) in refusals.items():
-                with self.subTest(name), self.assertRaisesRegex(EvidenceError, message):
-                    attempt()
-            self.assertEqual(ledger.read_bytes(), before)
+            for name, (append, message) in refusals.items():
+                with self.subTest(name):
+                    with self.assertRaisesRegex(EvidenceError, message):
+                        append()
+                    self.assertEqual(ledger.read_bytes(), before)
+                    self.assertEqual(sorted(path.name for path in workspace.artifacts.iterdir()), retained)
+                    self.assertFalse(self.lock_of(workspace).exists())
             self.assertFalse((workspace.ledgers / "paper.ndjson").exists())
+            self.assertFalse(outside.exists())
+
+    def test_a_revoked_key_cannot_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            workspace.trust((REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED, "revoked"))
+            with self.assertRaisesRegex(EvidenceError, "listed as active"):
+                self.append(workspace, self.template(), self.artifact(directory))
+            self.assertFalse((workspace.ledgers / "paper.acceptance.ndjson").exists())
+
+    def test_one_evidence_id_cannot_enter_two_ledgers(self) -> None:
+        # The review's finding (7): the check read only the target ledger, and the next
+        # audit refused the whole root for the duplicate.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            self.append(workspace, self.template(), self.artifact(directory))
+            other_ledger = workspace.ledgers / "other.acceptance.ndjson"
+            with self.assertRaisesRegex(EvidenceError, "the ledger root already holds that evidence_id"):
+                self.append(
+                    workspace, self.template(subject_id="session.paper.2"),
+                    self.artifact(directory, "session.paper.2"), ledger=other_ledger,
+                )
+            self.assertFalse(other_ledger.exists())
+            workspace.audit()
+
+    def test_a_root_holding_an_unsigned_record_takes_no_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            forged = make_record(ZERO_HASH, "evidence.forged.1", "session.forged.1", seed=OTHER_SEED)
+            write_ledger(workspace.ledgers / "forged.acceptance.ndjson", [forged])
+            with self.assertRaisesRegex(EvidenceError, "no listed reviewer key signed: evidence.forged.1"):
+                self.append(workspace, self.template(), self.artifact(directory))
+            self.assertFalse((workspace.ledgers / "paper.acceptance.ndjson").exists())
+
+    def test_an_append_refuses_while_another_holds_the_lock(self) -> None:
+        # Two appends that overlapped both chained to one head, and the second broke the
+        # chain (finding 7). The second now finds the lock and refuses.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            self.lock_of(workspace).write_bytes(b"")
+            with self.assertRaisesRegex(EvidenceError, "another append holds the ledger root's lock"):
+                self.append(workspace, self.template(), self.artifact(directory))
+            self.assertFalse((workspace.ledgers / "paper.acceptance.ndjson").exists())
+            self.assertTrue(self.lock_of(workspace).exists(), "a refused append must not take another's lock")
+            self.lock_of(workspace).unlink()
+            self.append(workspace, self.template(), self.artifact(directory))
+            self.assertFalse(self.lock_of(workspace).exists())
+
+    def test_the_lock_is_held_for_the_whole_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            seen: list[bool] = []
+            original = acceptance_evidence.retain_artifact
+
+            def retain_and_look(content: bytes, root: Path) -> str:
+                seen.append(self.lock_of(workspace).exists())
+                return original(content, root)
+
+            with mock.patch.object(acceptance_evidence, "retain_artifact", retain_and_look):
+                self.append(workspace, self.template(), self.artifact(directory))
+            self.assertEqual(seen, [True])
+
+    def test_the_bytes_retained_are_the_bytes_hashed(self) -> None:
+        # The review's finding (7): the artifact was read once to hash and again to retain,
+        # so one that grew in between was retained under a digest it did not have.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            growing = iter([artifact_for("session.paper.1"), artifact_for("session.paper.1") + b" and more"])
+            with mock.patch.object(acceptance_evidence, "read_artifact", lambda path: next(growing)):
+                record = self.append(workspace, self.template(), self.artifact(directory))
+            self.assertTrue(artifact_is_retained(workspace.artifacts, str(record["source_artifact_sha256"])))
+            self.assertEqual(workspace.audit()["gates"]["paper_session"]["observed"], 1)
+
+    @unittest.skipUnless(links_supported(), "cannot create a symbolic link here")
+    def test_a_link_planted_in_the_artifact_store_is_never_written_through(self) -> None:
+        # The review's finding (7): retention wrote a fixed `.partial` name, so a link
+        # planted there made it overwrite the link's target.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            victim = Path(directory) / "victim.txt"
+            victim.write_bytes(b"must survive")
+            digest = artifact_sha256("session.paper.1")
+            (workspace.artifacts / f".{digest}.partial").symlink_to(victim)
+            self.append(workspace, self.template(), self.artifact(directory))
+            self.assertEqual(victim.read_bytes(), b"must survive")
+            self.assertTrue(artifact_is_retained(workspace.artifacts, digest))
+            (workspace.artifacts / digest).unlink()
+            (workspace.artifacts / digest).symlink_to(victim)
+            with self.assertRaisesRegex(EvidenceError, "holds a link where an artifact belongs"):
+                retain_artifact(artifact_for("session.paper.1"), workspace.artifacts)
+            self.assertEqual(victim.read_bytes(), b"must survive")
+
+    @unittest.skipUnless(links_supported(), "cannot create a symbolic link here")
+    def test_a_linked_artifact_root_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            elsewhere = Path(directory) / "elsewhere"
+            elsewhere.mkdir()
+            linked = Path(directory) / "linked-store"
+            linked.symlink_to(elsewhere, target_is_directory=True)
+            with self.assertRaisesRegex(EvidenceError, "must not be a link"):
+                retain_artifact(b"content", linked)
+            self.assertEqual(list(elsewhere.iterdir()), [])
 
     def test_a_tampered_ledger_refuses_further_appends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
             ledger = workspace.ledgers / "paper.acceptance.ndjson"
-            append_record(
-                ledger, self.template(), self.artifact(directory), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID
-            )
+            self.append(workspace, self.template(), self.artifact(directory))
             ledger.write_text(ledger.read_text(encoding="utf-8").replace("Independently", "Casually"), encoding="utf-8")
             with self.assertRaisesRegex(EvidenceError, "hash does not match"):
-                append_record(
-                    ledger, self.template("evidence.paper.2", "session.paper.2"),
-                    self.artifact(directory, "session.paper.2"), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID,
+                self.append(
+                    workspace, self.template("evidence.paper.2", "session.paper.2"),
+                    self.artifact(directory, "session.paper.2"),
                 )
+            self.assertFalse(self.lock_of(workspace).exists())
+
+    def command(self, workspace: Workspace, ledger: Path, template: Path, artifact: Path, key: Path) -> list[str]:
+        return [
+            "append", str(ledger), "--ledger-root", str(workspace.ledgers),
+            "--trusted-reviewers", str(workspace.reviewers), "--record", str(template),
+            "--artifact", str(artifact), "--artifact-root", str(workspace.artifacts),
+            "--reviewer-key", str(key), "--reviewer-key-id", REVIEWER_KEY_ID,
+        ]
 
     def test_the_command_line_signs_appends_and_audits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -979,11 +1150,7 @@ class AppendWorkflowTests(unittest.TestCase):
 
             output = StringIO()
             with redirect_stdout(output):
-                code = main([
-                    "append", str(ledger), "--record", str(template), "--artifact", str(artifact),
-                    "--artifact-root", str(workspace.artifacts), "--reviewer-key", str(key),
-                    "--reviewer-key-id", REVIEWER_KEY_ID,
-                ])
+                code = main(self.command(workspace, ledger, template, artifact, key))
             self.assertEqual(code, 0)
             self.assertIn("appended evidence.paper.1", output.getvalue())
 
@@ -1002,14 +1169,7 @@ class AppendWorkflowTests(unittest.TestCase):
             # A key that is not an Ed25519 PKCS#8 document is refused, and a failure exits 2.
             key.write_bytes(b"not a key")
             with redirect_stderr(StringIO()):
-                self.assertEqual(
-                    main([
-                        "append", str(ledger), "--record", str(template), "--artifact", str(artifact),
-                        "--artifact-root", str(workspace.artifacts), "--reviewer-key", str(key),
-                        "--reviewer-key-id", REVIEWER_KEY_ID,
-                    ]),
-                    2,
-                )
+                self.assertEqual(main(self.command(workspace, ledger, template, artifact, key)), 2)
 
     def test_the_command_line_refuses_a_bad_key_or_template_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1025,11 +1185,7 @@ class AppendWorkflowTests(unittest.TestCase):
             def append(key_path: Path, template_path: Path) -> tuple[int, str]:
                 errors = StringIO()
                 with redirect_stderr(errors):
-                    code = main([
-                        "append", str(ledger), "--record", str(template_path), "--artifact", str(artifact),
-                        "--artifact-root", str(workspace.artifacts), "--reviewer-key", str(key_path),
-                        "--reviewer-key-id", REVIEWER_KEY_ID,
-                    ])
+                    code = main(self.command(workspace, ledger, template_path, artifact, key_path))
                 return code, errors.getvalue()
 
             not_json = root / "not-json.json"
@@ -1062,6 +1218,15 @@ class AppendWorkflowTests(unittest.TestCase):
             # was about its input and not about the harness.
             self.assertEqual(append(key, template), (0, ""))
             self.assertTrue(ledger.exists())
+
+    def test_the_command_line_requires_the_ledger_root_and_the_reviewer_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory, retain=False)
+            full = self.command(workspace, workspace.ledgers / "x.acceptance.ndjson", Path("t"), Path("a"), Path("k"))
+            for option in ("--ledger-root", "--trusted-reviewers"):
+                index = full.index(option)
+                with self.subTest(option), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                    main(full[:index] + full[index + 2:])
 
 
 class PipelineAcceptanceRootTests(unittest.TestCase):

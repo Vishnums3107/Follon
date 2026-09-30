@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 
 from tools import ed25519
@@ -142,6 +143,18 @@ def reviewers_document(*entries: tuple[str, ...]) -> dict[str, object]:
             "status": status,
         })
     return {"trusted_reviewers_schema_version": 2, "reviewers": reviewers}
+
+
+def links_supported() -> bool:
+    """Whether this platform and account can create a symbolic link."""
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "target"
+        target.write_bytes(b"")
+        try:
+            (Path(directory) / "link").symlink_to(target)
+        except (OSError, NotImplementedError):
+            return False
+        return True
 
 
 def pkcs8(seed: bytes) -> bytes:

@@ -23,6 +23,7 @@ from acceptance_fixtures import (
     REVIEWER_SEED,
     Workspace,
     attributes_for,
+    links_supported,
     make_chain,
     make_record,
     reviewers_document,
@@ -73,17 +74,6 @@ def signed_record(**changes: object) -> dict[str, object]:
     evidence_id = changes.pop("evidence_id", "evidence.x.1")
     subject_id = changes.pop("subject_id", "subject.x.1")
     return make_record(ZERO_HASH, evidence_id, subject_id, **changes)
-
-
-def links_supported() -> bool:
-    with tempfile.TemporaryDirectory() as directory:
-        target = Path(directory) / "target"
-        target.write_bytes(b"")
-        try:
-            (Path(directory) / "link").symlink_to(target)
-        except (OSError, NotImplementedError):
-            return False
-        return True
 
 
 class LedgerHarness(unittest.TestCase):
@@ -217,7 +207,8 @@ class NothingEscapesTests(LedgerHarness):
         errors = StringIO()
         with redirect_stderr(errors):
             code = main([
-                "append", str(workspace.ledgers / "y.acceptance.ndjson"), "--record", str(template),
+                "append", str(workspace.ledgers / "y.acceptance.ndjson"), "--ledger-root", str(workspace.ledgers),
+                "--trusted-reviewers", str(workspace.reviewers), "--record", str(template),
                 "--artifact", str(artifact), "--artifact-root", str(workspace.artifacts),
                 "--reviewer-key", str(key), "--reviewer-key-id", REVIEWER_KEY_ID,
             ])
