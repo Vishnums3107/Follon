@@ -573,7 +573,10 @@ mod tests {
             "BEFORE UPDATE OR DELETE",
             "BEFORE TRUNCATE",
             "news_sentiments_tenant_news_fkey",
-            "news rows exist without a tenant",
+            "news rows exist that predate tenant ownership",
+            "ENABLE ALWAYS TRIGGER refuse_mutation",
+            "ENABLE ALWAYS TRIGGER refuse_truncate",
+            "'infinity'::timestamptz",
         ] {
             assert!(migration_sql.contains(required), "missing {required}");
         }
@@ -805,11 +808,45 @@ mod tests {
         format!("{name}-{}-{nanos}", std::process::id())
     }
 
-    fn connected_store() -> PostgresStore {
+    /// One database test at a time. `TRUNCATE ... CASCADE`, which a test here runs on purpose
+    /// to see it refused, takes an exclusive lock on every table it reaches, so it deadlocks
+    /// with a test that is writing to any of them at that moment. A review saw it fail about
+    /// one run in four when the tests ran in parallel, as `cargo test` does by default.
+    static DATABASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A connected, migrated store that holds the database for as long as it lives.
+    struct LockedStore {
+        store: PostgresStore,
+        _exclusive: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl std::ops::Deref for LockedStore {
+        type Target = PostgresStore;
+
+        fn deref(&self) -> &PostgresStore {
+            &self.store
+        }
+    }
+
+    impl std::ops::DerefMut for LockedStore {
+        fn deref_mut(&mut self) -> &mut PostgresStore {
+            &mut self.store
+        }
+    }
+
+    fn connected_store() -> LockedStore {
+        // A test that panicked while holding the database poisons the lock, and the tests
+        // after it are no less able to run.
+        let exclusive = DATABASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
         let mut store = PostgresStore::connect_development(&uri).unwrap();
         store.migrate().unwrap();
-        store
+        LockedStore {
+            store,
+            _exclusive: exclusive,
+        }
     }
 
     /// Runs `sql` as `tenant` and commits it.
@@ -903,24 +940,76 @@ mod tests {
     fn every_evidence_table_carries_both_guards() {
         let mut store = connected_store();
         for table in APPEND_ONLY.iter().chain(VERSIONED.iter()) {
-            let names: Vec<String> = store
+            let triggers: Vec<(String, String)> = store
                 .client
                 .query(
-                    "SELECT tgname FROM pg_trigger \
+                    "SELECT tgname, tgenabled::text FROM pg_trigger \
                      WHERE tgrelid = $1::text::regclass AND NOT tgisinternal ORDER BY tgname",
                     &[table],
                 )
                 .unwrap()
                 .iter()
-                .map(|row| row.get(0))
+                .map(|row| (row.get(0), row.get(1)))
                 .collect();
             for guard in ["refuse_mutation", "refuse_truncate"] {
-                assert!(
-                    names.iter().any(|name| name == guard),
-                    "{table} has no {guard} trigger: {names:?}"
+                let state = triggers
+                    .iter()
+                    .find(|(name, _)| name == guard)
+                    .unwrap_or_else(|| panic!("{table} has no {guard} trigger: {triggers:?}"));
+                // 'A' fires in every session role. The default, 'O', is switched off by
+                // `SET session_replication_role = replica`, which is no DDL and no log line.
+                assert_eq!(
+                    state.1, "A",
+                    "{table}'s {guard} can be switched off by a SET"
                 );
             }
         }
+    }
+
+    /// The guards must survive a session that says it is a replica, which is what a bulk
+    /// loader does and what turns off an ordinary trigger. Only a superuser, or a role
+    /// granted the setting, can say it, so where the connection is neither, the state check
+    /// in `every_evidence_table_carries_both_guards` is the whole proof.
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn the_guards_hold_in_a_session_that_says_it_is_a_replica() {
+        let mut store = connected_store();
+        let tag = run_tag("replica");
+        let event = sample_event_for(&tag);
+        store.provision_tenant(&event.tenant_id, "Replica").unwrap();
+        store.append_event(&event).unwrap();
+        let mut said_it = false;
+        for statement in [
+            format!(
+                "UPDATE domain_events SET payload = '{{}}' WHERE tenant_id = '{}'",
+                event.tenant_id
+            ),
+            format!(
+                "DELETE FROM domain_events WHERE tenant_id = '{}'",
+                event.tenant_id
+            ),
+            "TRUNCATE domain_events CASCADE".to_owned(),
+        ] {
+            let mut transaction = store.client.transaction().unwrap();
+            if transaction
+                .batch_execute("SET LOCAL session_replication_role = replica")
+                .is_err()
+            {
+                return;
+            }
+            said_it = true;
+            set_tenant(&mut transaction, &event.tenant_id).unwrap();
+            let error = transaction
+                .batch_execute(&statement)
+                .err()
+                .map(|error| PersistenceError::from(error).0)
+                .unwrap_or_else(|| panic!("{statement} was accepted as a replica"));
+            assert!(
+                error.contains("[23001]") && error.contains("retained evidence is append-only"),
+                "{statement}: {error}"
+            );
+        }
+        assert!(said_it);
     }
 
     #[test]
@@ -993,17 +1082,20 @@ mod tests {
                 "instrument_reference_versions",
                 format!(
                     "INSERT INTO instrument_reference_versions (tenant_id, instrument_id, version, document, document_sha256, effective_from) \
-                     VALUES ('{tenant}', 'inst.{tag}', 1, '{{}}', {SHA256_ZERO}, NOW() - INTERVAL '1 day')"
+                     VALUES ('{tenant}', 'inst.{tag}', 1, '{{\"tick\": 0.10}}', {SHA256_ZERO}, NOW() - INTERVAL '1 day')"
                 ),
                 "document = '{\"changed\": true}'",
+                // The same number, written with another scale: equal to jsonb, not the same document.
+                "document = '{\"tick\": 0.1}'",
             ),
             (
                 "fx_instrument_economics_versions",
                 format!(
                     "INSERT INTO fx_instrument_economics_versions (tenant_id, instrument_id, version, product, base_currency, quote_currency, terms, document_sha256, effective_from) \
-                     VALUES ('{tenant}', 'inst.{tag}', 1, 'FX_SPOT', 'EUR', 'USD', '{{}}', {SHA256_ZERO}, NOW() - INTERVAL '1 day')"
+                     VALUES ('{tenant}', 'inst.{tag}', 1, 'FX_SPOT', 'EUR', 'USD', '{{\"lot\": 1.000}}', {SHA256_ZERO}, NOW() - INTERVAL '1 day')"
                 ),
                 "terms = '{\"changed\": true}'",
+                "terms = '{\"lot\": 1.0}'",
             ),
         ];
         // Every statement is scoped to this run's tenant, so it is this run's version that is
@@ -1011,7 +1103,7 @@ mod tests {
         let mine = format!("WHERE tenant_id = '{tenant}'");
         let version_message = "a version may only be closed, once";
         let evidence_message = "retained evidence is append-only";
-        for (table, insert, rewrite) in cases {
+        for (table, insert, rewrite, rescale) in cases {
             commit_as_tenant(&mut store, &tenant, &insert);
             let close = format!("UPDATE {table} SET effective_to = NOW() {mine}");
             let refused = |store: &mut PostgresStore, statement: &str, message: &str| {
@@ -1024,10 +1116,14 @@ mod tests {
             };
 
             // While it is open, rewriting a version, alone or as it is closed, and
-            // deleting it are refused. So is truncating the table.
+            // deleting it are refused, and so is closing it with no end, which would spend
+            // the one close. Rewriting only the scale of a number as it is closed is a
+            // rewrite too. Truncating the table is refused as well.
             for statement in [
                 format!("UPDATE {table} SET {rewrite} {mine}"),
                 format!("UPDATE {table} SET effective_to = NOW(), {rewrite} {mine}"),
+                format!("UPDATE {table} SET effective_to = NOW(), {rescale} {mine}"),
+                format!("UPDATE {table} SET effective_to = 'infinity' {mine}"),
                 format!("DELETE FROM {table} {mine}"),
             ] {
                 refused(&mut store, &statement, version_message);
@@ -1167,14 +1263,23 @@ mod tests {
                 .client
                 .batch_execute(
                     "INSERT INTO news_headlines (news_id, source, headline, raw_body_hash, sequence_number, event_time_ns, receive_time_ns) \
-                     VALUES ('news.unowned-1', 'wire', 'headline', repeat('a', 64), 1, 1, 2)",
+                     VALUES ('news.unowned-1', 'wire', 'headline', repeat('a', 64), 1, 1, 2); \
+                     INSERT INTO news_sentiments (event_id, causation_news_id, instrument_id, taxonomy, sentiment_polarity_bps, confidence_bps, novelty_score_bps, surprise_magnitude_bps, event_time_ns) \
+                     VALUES ('sentiment.unowned-1', 'news.unowned-1', 'inst.us_equity.spy', 'taxonomy.one', 0, 0, 0, 0, 1)",
                 )
                 .unwrap();
 
-            // The upgrade refuses to guess an owner, and leaves nothing half done.
+            // The upgrade refuses to guess an owner, leaves nothing half done, and says what
+            // the operator can do, which is the one thing that is possible before the
+            // migration has given the tables a tenant to assign.
             let error = store.migrate().unwrap_err();
             assert!(
-                error.0.contains("news rows exist without a tenant"),
+                error
+                    .0
+                    .contains("news rows exist that predate tenant ownership")
+                    && error
+                        .0
+                        .contains("empty news_sentiments and then news_headlines"),
                 "{}",
                 error.0
             );
@@ -1198,10 +1303,11 @@ mod tests {
                 .get(0);
             assert_eq!(columns, 0, "the refused upgrade still added the column");
 
-            // Once the owner clears the row, the same upgrade goes through.
+            // Once the operator has done what the message says, in the order it says, the same
+            // upgrade goes through. The sentiment goes first because it names the headline.
             store
                 .client
-                .batch_execute("DELETE FROM news_headlines")
+                .batch_execute("DELETE FROM news_sentiments; DELETE FROM news_headlines")
                 .unwrap();
             store.migrate().unwrap();
             let columns: i64 = store

@@ -50,9 +50,13 @@ broker commands and receipts, the audit index, news, FX pricing and the executio
 evidence) carry triggers that refuse UPDATE, DELETE and TRUNCATE, and two versioned
 reference tables may only be closed once. News is tenant-owned and under the same
 forced RLS. The triggers protect against the application's role and a careless
-statement. They do not protect against the database's owner, who can disable one with
-a DDL statement, so the owner role, its credentials and DDL logging remain
-deployment obligations.
+statement. They fire in every session role, so a session that sets
+`session_replication_role` to `replica`, as a bulk loader does, does not switch them
+off. They do not protect against the database's owner, who can disable one with a DDL
+statement, so the owner role, its credentials and DDL logging remain deployment
+obligations. Append-only means a row cannot change, not that a parent cannot gain
+children later: a line can still be inserted into a journal transaction that is already
+committed, and a route decision into an execution plan, which is delivery state E7.15.
 
 These mechanisms do not provide a production vault/keychain, certificate
 issuance/rotation, HSM/KMS signing custody, out-of-band MFA enrollment or

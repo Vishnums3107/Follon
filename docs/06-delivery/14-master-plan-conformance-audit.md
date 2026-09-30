@@ -4957,6 +4957,52 @@ These are mandatory master-plan acceptance conditions and are currently open:
      - **Boundary.** The advanced account takes the lot fix through the same book. PAPER and controlled
        LIVE still apply no corporate actions (E8.4b). No external gate moved.
 
+120. The PostgreSQL guards hold against a replica session, and the database tests no longer deadlock
+     (2026-09-30, Security and isolation; defects in item 115, E7.7). Found by an independent review of
+     the migration, and reproduced against a throwaway server here.
+     - **Gap.** Four faults.
+       - The guard triggers were ordinary triggers, which fire only when a session's
+         `session_replication_role` is `origin`. A superuser, or a role granted the setting, could set it
+         to `replica` with one SET, which is no DDL and shows in no log, and then update, delete or
+         truncate every retained table.
+       - A version was closed once by comparing the rest of its row as jsonb. Two jsonb values that
+         differ only in a number's scale, `0.10` and `0.1`, are equal to jsonb and are not the same
+         document, so a version could be rewritten as it was closed. An end of `infinity` was accepted,
+         which is no end and spent the one close.
+       - The guard over unowned news rows said to give each an owner before migrating, when the tables
+         had no owner column to give. An operator who added the column by hand then made the migration
+         fail on it.
+       - The database tests deadlocked about one run in four in parallel: `TRUNCATE ... CASCADE`, which
+         a test runs to see it refused, takes an exclusive lock on every table it reaches, and another
+         test writing to any of them at that moment closed the cycle.
+     - **Behavior.** Migration 0006 was amended in place, since nothing outside a scratch database had
+       applied it, and any database that applied the earlier text refuses the amended one by checksum.
+       - Every guard trigger is `ENABLE ALWAYS`, so it fires in every session role.
+       - A version's rest is compared as text and an end of `infinity` is refused.
+       - The guard names what an operator can do: back the rows up, empty `news_sentiments` and then
+         `news_headlines`, which are not append-only until the migration runs, and migrate again.
+       - The database tests hold the database one at a time.
+     - **Tests.** One test was added, that the guards hold in a session that says it is a replica,
+       where the connection may say so. The guard test now reads each trigger's enablement, which needs
+       no privilege. The versions test rewrites a number's scale as it closes each version and closes
+       one with no end. The upgrade test now has a sentiment as well as a headline, asserts the message
+       names the remedy, and follows it in the order it gives.
+     - **Rule 5.** 7 of 7 injected defects were caught: the tests run at the same time, which failed
+       within 12 seconds of a 40-run loop; the append-only guards, the versioned guards or only the
+       truncate guards switchable by a SET; a version compared as jsonb; an end of infinity allowed; and
+       the guard message naming an owner that cannot be given.
+     - **Measured result.** The database suite ran 25 times in a row over one database with no failure,
+       where it had failed in about a quarter of the review's runs. The Rust workspace stayed at 658
+       passed / 0 failed and now reports 9 ignored instead of 8, and the database suite 9 of 9. The final
+       `python tools/session_status.py` run measured all eight suites green, and the full evidence
+       pipeline exited 0.
+     - **Boundary.** The triggers still do not bind the database's owner, whose DDL shows in the logs,
+       and a role granted `session_replication_role` no longer switches them off but can still be
+       granted much else. Append-only stops a row changing and not a parent gaining children: a line can
+       be inserted into a committed journal transaction and a route decision into an existing plan
+       (E7.15, open). The tests ran against PostgreSQL 17 and CI runs 16, which the migration uses
+       nothing newer than, and that job has not run. No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

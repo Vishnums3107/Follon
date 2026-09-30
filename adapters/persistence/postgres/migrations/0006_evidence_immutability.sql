@@ -5,7 +5,9 @@
 -- database stopped a role holding UPDATE, DELETE or TRUNCATE from doing either. The
 -- triggers below make the refusal the database's own, beneath the application. They
 -- are the application's boundary and not a defence against the database's owner, who
--- can disable a trigger, but that takes a DDL statement that shows in the logs.
+-- can disable a trigger, but that takes a DDL statement that shows in the logs. They
+-- are ENABLE ALWAYS, so a session that sets session_replication_role to replica, as a
+-- bulk loader does, does not switch them off with a SET that shows in no log.
 --
 -- The news tables also had no tenant column and no row-level security, so one
 -- tenant's feed was visible to every other. They now carry the same isolation as
@@ -19,13 +21,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- A reference version is closed by giving it an end, once, and is otherwise fixed.
+-- A reference version is closed by giving it an end, once, and is otherwise fixed. The
+-- rest of the row is compared as text, since two jsonb values that differ only in a
+-- number's scale (0.10 and 0.1) are equal to jsonb and are not the same document. An
+-- end of infinity is no end at all and would spend the one close.
 CREATE OR REPLACE FUNCTION refuse_version_rewrite() RETURNS TRIGGER AS $$
 BEGIN
     IF TG_OP = 'UPDATE' THEN
         IF OLD.effective_to IS NULL
            AND NEW.effective_to IS NOT NULL
-           AND to_jsonb(NEW) - 'effective_to' = to_jsonb(OLD) - 'effective_to' THEN
+           AND NEW.effective_to <> 'infinity'::timestamptz
+           AND (to_jsonb(NEW) - 'effective_to')::text = (to_jsonb(OLD) - 'effective_to')::text THEN
             RETURN NEW;
         END IF;
     END IF;
@@ -37,7 +43,7 @@ $$ LANGUAGE plpgsql;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM news_headlines) OR EXISTS (SELECT 1 FROM news_sentiments) THEN
-        RAISE EXCEPTION 'news rows exist without a tenant; give each an owner before migrating'
+        RAISE EXCEPTION 'news rows exist that predate tenant ownership, so this migration cannot know whose they are; back them up, empty news_sentiments and then news_headlines, which are not append-only until it runs, and migrate again'
             USING ERRCODE = 'restrict_violation';
     END IF;
 END;
@@ -110,6 +116,8 @@ BEGIN
             'CREATE TRIGGER refuse_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION refuse_evidence_mutation()',
             table_name
         );
+        EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER refuse_mutation', table_name);
+        EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER refuse_truncate', table_name);
     END LOOP;
 
     FOREACH table_name IN ARRAY ARRAY[
@@ -126,6 +134,8 @@ BEGIN
             'CREATE TRIGGER refuse_truncate BEFORE TRUNCATE ON %I FOR EACH STATEMENT EXECUTE FUNCTION refuse_evidence_mutation()',
             table_name
         );
+        EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER refuse_mutation', table_name);
+        EXECUTE format('ALTER TABLE %I ENABLE ALWAYS TRIGGER refuse_truncate', table_name);
     END LOOP;
 END;
 $$;
