@@ -311,7 +311,10 @@ mod tests {
     #[test]
     fn sending_to_a_worker_that_has_gone_is_refused() {
         // The test binary itself, asked to list its tests, is a child that
-        // exits at once and needs no interpreter.
+        // exits at once and needs no interpreter. Semgrep's `current-exe` rule
+        // warns against trusting the path for a security decision, and this
+        // test only wants a process that ends.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--list")
             .stdin(std::process::Stdio::piped())
