@@ -5197,6 +5197,40 @@ These are mandatory master-plan acceptance conditions and are currently open:
        which the audit refuses rather than counting. Findings (5) and (8), and the
        promotion-gate wiring part of (9), remain open.
 
+125. A promotion receipt binds what the release verifier actually read (2026-09-30,
+     Security; E6.6b finding (5) and the promotion-gate checks in finding (9)).
+     - **Gap.** The gate passed caller-owned paths to `release-verify`, then opened
+       the manifest again for the acceptance release ID and again for the receipt
+       digest. Replacing it between these reads let a receipt claim that a different
+       release had been verified. The signature and trusted-key digests had the same
+       read-after-verify race. Receipt publication used a predictable `.tmp` name
+       and an overwriting rename after a separate existence check.
+     - **Behavior.** The gate reads the manifest, signature and trusted key once,
+       writes temporary snapshots, verifies those copies, and checks they still
+       hold the original bytes before using them. The release ID and all three
+       receipt digests come from those verified bytes. The acceptance subprocess
+       must report that same release, schema 4, a canonical reviewer-set digest,
+       a ledger list and boolean eligibility. The receipt checks release identity
+       again, then publishes via a fresh exclusive temporary file and a hard link
+       that cannot replace an existing final name. A filesystem that cannot make
+       the hard link refuses publication.
+     - **Tests.** `test_release_promotion_gate.py` swaps all three original files
+       immediately after simulated verification and checks that the acceptance
+       request and receipt still name the original release and hashes. It changes
+       a verification snapshot, supplies a response for another release and
+       incomplete or mistyped responses, races another receipt writer, plants a
+       fixed-name temporary symlink, and checks that an existing receipt survives.
+     - **Measured result.** The Python suite passed 232 tests. The full measured
+       status showed Rust workspace 658 passed, Tauri host 33 passed, and all seven
+       available suites green; PostgreSQL integration was skipped without a
+       disposable database. The real staging gate accepted the pipeline's signed
+       release and zero-record acceptance status. A deliberately invalid signature
+       exited 2 and left no receipt. No production gate moved.
+     - **Boundary.** This is a release-input and receipt binding fix. It does not
+       freeze the artifact directory or ledger root against later operator edits,
+       and it cannot prove broker evidence or approver identity. A durable external
+       ledger-head anchor remains E6.6b finding (8).
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

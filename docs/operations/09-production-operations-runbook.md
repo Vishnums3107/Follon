@@ -29,8 +29,13 @@ eligible. Production promotion fails while any external acceptance target is
 below its required count. The receipt (schema 3) is an eligibility decision: it
 binds the release, the SHA-256 of the trusted reviewer set the audit used, the
 recomputed status's SHA-256, and each ledger file counted, by path, SHA-256,
-record count, and chain head. The deployment system must separately retain
-image-digest rollout, smoke, rollback, and approver evidence. To inspect the
+record count, and chain head. The gate verifies temporary snapshots of the release
+manifest, signature, and trusted key, and uses those same bytes for the release
+ID and receipt digests, so a later change at an input path cannot alter what the
+receipt claims was verified. The receipt is created under a fresh temporary name
+and published only if the final name is still absent. The deployment system
+must separately retain image-digest rollout, smoke, rollback, and approver
+evidence. To inspect the
 status without promoting, run:
 
 ```powershell
