@@ -5038,6 +5038,133 @@ These are mandatory master-plan acceptance conditions and are currently open:
        E6.5, including that a rejection that fails to authenticate is silently ignored, are listed there,
        open and reproduced.
 
+122. The acceptance audit refuses what it cannot read, and never raises anything else (2026-09-30,
+     Security; defects in item 111, E6.4). Findings (6) and (9) of the review recorded as E6.6b.
+     - **Gap.** A record no reviewer's tooling would write escaped the audit as a traceback instead of
+       a refusal. An `evidence_type` or `outcome` that was a list or an object is unhashable, and
+       looking one up in a dict or a set raised `TypeError`; so did sorting an options list that mixed
+       strings with numbers. `json` raises a plain `ValueError` for a number longer than Python's
+       4,300-digit limit and `RecursionError` for deep nesting, and the audit caught only
+       `JSONDecodeError`. The same held for the trusted reviewer set and the `append` template. Beyond
+       the crashes: a line was any JSON that parsed to a valid record, so one record could be spelled
+       many ways and a line holding two `outcome` keys read as a rejection and counted as the
+       acceptance JSON keeps; `bytes.splitlines` split on a carriage return, so a CRLF ledger passed;
+       the root was searched with a glob that followed a linked directory, matched the suffix without
+       regard to case on Windows and with it on Linux, and ordered ledgers by platform path
+       comparison, so one root could bind different ledgers, in a different order, on the two. And
+       about half of the reviewer's mutants survived, among them every identifier's canonical-ID
+       check, the notes, digest and signature formats, the size limits and the link refusals.
+     - **Behavior.**
+       - A value is type-checked before it is looked up or sorted, and the outcomes are a tuple, whose
+         membership test compares rather than hashes. `parse_json` turns every exception `json` can
+         raise into `EvidenceError`, for ledgers, the reviewer set and the template.
+       - `parse_ledger` verifies a ledger's bytes and `read_ledger` reads a regular file at most one
+         byte past its limit, so a file that grows after it is opened is refused, not read whole.
+         Each line must be exactly its record's canonical JSON, and lines are split on the newline
+         alone.
+       - The root is walked without following links. A symbolic link or junction anywhere under it,
+         of any name, fails the audit. A ledger is a file named exactly `*.acceptance.ndjson`, and
+         ledgers are bound in order of their relative path as a string, the same on every platform.
+       - The reviewer set has its own 1 MiB limit, `MAX_REVIEWER_SET_BYTES`, where it borrowed the
+         line limit.
+     - **Tests.** `tests/security/test_acceptance_refusals.py`, 20 tests. Seventeen hostile values of
+       every JSON type put in every field of every evidence type, and in every attribute, which may be
+       refused but never raise anything else; the reviewer's own crashing shapes, each a refusal; lines
+       `json` cannot parse, values that are not records, and the same for the reviewer set and on the
+       command line. Each identifier, digest and the signature refused by its own message, so no check
+       can be removed while another hides it; notes of exactly 1,024 characters accepted and 1,025
+       refused; each size limit accepted at its value and refused one byte under it; five other
+       spellings of a canonical line refused, among them the duplicate key; links of three kinds
+       refused under the root, and a linked ledger or reviewer set refused when read directly; and the
+       exact suffix and platform-independent order.
+     - **Rule 5.** 32 of 32 injected defects were caught by the intended tests: each crash restored
+       (`JSONDecodeError` only, `RecursionError` escaping, the unchecked type lookup, the outcomes as a
+       set, the options unchecked); the canonical check removed and `splitlines` restored; the line and
+       file limits off by one, the line limit doubled and the reviewer set read under the ledger's
+       limit; the link refusal removed from the walk, from a direct read and from the artifact check;
+       the platform path order and a case-blind suffix; each of the six identifiers dropped from its
+       check and the canonical pattern widened to uppercase; the notes limit off by one, doubled and
+       its newline check dropped; each of the three digests dropped and the digest and signature
+       patterns loosened. Two guards first written into this slice were removed instead, because
+       their mutants were equivalent: a tuple's membership test never hashes, so an `isinstance`
+       before one changed nothing.
+     - **Measured result.** The Python suite rose from 176 to 196 passed, and `unittest discover` over
+       `tests/security`, as CI runs it, passed 133. The final `python tools/session_status.py` run
+       measured all eight suites green, and the full evidence pipeline exited 0.
+     - **Boundary.** Findings (1) to (5), (7) and (8) are unchanged by this item, and the promotion
+       gate's wiring, the rest of finding (9), is untested still. All remain E6.6b.
+
+123. Every acceptance record must be signed by a listed key, and what a subject is backed by is its
+     own (2026-09-30, Security; defects in items 111 and 121, E6.4 and E6.5). Findings (1) to (4) of the
+     review recorded as E6.6b, each reproduced against the committed code first.
+     - **Gap.**
+       - A record that did not authenticate was listed as `UNAUTHENTICATED` and ignored, and E6.4 had
+         reasoned that an untrusted rejection could only lower a count. It could also be the only trace of
+         a real rejection. Anyone who could write the ledger could edit a trusted rejection into an
+         acceptance and rehash it, and the session counted again; the runbook's own instruction, to
+         remove a reviewer who leaves from the set, made every rejection they signed inert the same way.
+         The review proposed failing the audit on an unsigned negative record, which would not have
+         closed it, because the edit makes the record positive.
+       - The set enrolled any 64 hex characters. Since item 121 a key of small order verifies nothing,
+         so a set holding the all-zero placeholder quietly trusted no one it seemed to.
+       - One artifact could back any number of subjects, so thirty sessions could be one session log,
+         and one subscription any number of customers, so ten paying professionals could be one
+         subscription. A customer recorded as a professional and as an organisation counted in both.
+       - An acceptance whose own attributes failed the criteria only failed to count, and a clean
+         acceptance of the same session, before or after it, counted the subject.
+     - **Behavior.**
+       - Every record in the root must be signed by a key the trusted set lists for the reviewer the
+         record names; otherwise the audit fails, naming the first five such records and how many more.
+         An empty set passes only an empty root.
+       - Trusted reviewer set version 2 gives each key a status, `active` or `revoked`, and a key is
+         never removed. A revoked key still verifies what it signed, so an edit to one of its records is
+         caught; its acceptances stop counting (`REVIEWER_REVOKED`) and its rejections still disqualify,
+         so revoking cannot requalify anyone. Version 1 sets, which the pipeline wrote before, are read
+         with every key active, and the pipeline now writes version 2.
+       - Enrolment refuses a key that is not an Ed25519 point of the prime-order subgroup other than
+         the neutral element (`ed25519.is_valid_public_key`), and one public key under two entries,
+         which would let one key holder sign as two reviewers.
+       - A rejection, or an acceptance whose attributes fail the criteria, disqualifies its subject in
+         its gate, in every release, whatever its artifact (`DISQUALIFIED` on each acceptance of it).
+       - Among accepted records, in every gate and release, an artifact cited for two subjects counts
+         for neither (`ARTIFACT_SHARED`); one id in two gates names two subjects. A subscription cited
+         for two customers counts for neither (`SUBSCRIPTION_SHARED`), and a customer recorded as two
+         kinds counts as neither (`CUSTOMER_KIND_CONFLICT`). A rejection's citation shares nothing.
+       - Status schema 4: `counted_records` counts only acceptances that count, where a clean rejection
+         counted before; `disqualified_subjects` counts every disqualified subject, where it counted only
+         those that also had an acceptance; `not_counted` lists acceptances only. The promotion gate
+         requires schema 4. The reviewer-set JSON Schema describes version 2, and the runbook no longer
+         says to remove a reviewer.
+     - **Tests.** The acceptance fixtures gave every subject one artifact and one subscription, the very
+       defect, so each subject now has its own. `test_acceptance_evidence.py` gained a signature class
+       (another key, an unlisted key, a key bound to another reviewer, an edited, moved or forged record,
+       the rejection edited into an acceptance, the dropped reviewer, the empty set, the failure's
+       message), a revocation class, a reviewer-set class (every small-order and tainted key refused,
+       one public key twice, version 1 read as active, an unknown status), a disqualification class
+       (the failing acceptance before and after a clean one, in another release, a lone rejection) and
+       an exclusive-backing class (thirty sessions on one artifact, one artifact across gates, releases
+       and one id in two gates, a rejection's citation, ten customers on one subscription, one customer
+       of two kinds). The promotion gate's tests now expect a set that lists no key to fail
+       verification for staging as well as production.
+     - **Rule 5.** 23 of 23 injected defects were caught by the intended tests: unsigned records
+       ignored, the failure naming three; a key not bound to its reviewer; the signature unverified; a
+       revoked acceptance counted and a revoked rejection ignored; a failing acceptance not
+       disqualifying, the `DISQUALIFIED` reason dropped, and the disqualified count ignoring failing
+       acceptances; a shared artifact counted, keyed by id alone, or shared by a rejection; a shared
+       subscription and a two-kind customer counted; a small-order key and one public key twice
+       enrolled; any status accepted, version 1 requiring one, version 3 accepted; rejections counted as
+       records; status schema 3 left in the tool or the gate; and the pipeline writing a version 1 set.
+       One first survived: an unknown set version was refused for its entries rather than its version,
+       so that case now holds no entries, and it was then caught.
+     - **Measured result.** The Python suite rose from 196 to 214 passed, and `unittest discover` over
+       `tests/security` passed 151. The final `python tools/session_status.py` run measured all eight
+       suites green, and the full evidence pipeline exited 0: its audit read this machine's version 1
+       reviewer set, which the pipeline had written before, and published status schema 4.
+     - **Boundary.** A leaving reviewer who keeps their key can still sign; revoking is the operator's
+       only remedy, and it withdraws every acceptance the key made, which is the cost of having no
+       trusted time to say which came after they left. One artifact per subject is checked within one
+       ledger root only. Findings (5), (7) and (8) and the promotion gate's wiring remain E6.6b.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

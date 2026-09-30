@@ -19,7 +19,14 @@ from acceptance_fixtures import (
     make_record,
     reviewers_document,
 )
-from tools.acceptance_evidence import BASE_KEYS, GATES, SCHEMA_VERSION, ZERO_HASH
+from tools.acceptance_evidence import (
+    BASE_KEYS,
+    GATES,
+    KEY_STATUSES,
+    SCHEMA_VERSION,
+    TRUSTED_REVIEWERS_SCHEMA_VERSIONS,
+    ZERO_HASH,
+)
 
 SCHEMA_ROOT = Path(__file__).resolve().parents[2] / "contracts" / "json-schema" / "v2"
 
@@ -40,8 +47,13 @@ class AcceptanceContractTests(unittest.TestCase):
     def test_the_reviewer_set_schema_declares_what_the_tool_reads(self) -> None:
         schema = load("trusted-reviewers.schema.json")
         self.assertEqual(set(schema["required"]), {"trusted_reviewers_schema_version", "reviewers"})
+        self.assertEqual(
+            schema["properties"]["trusted_reviewers_schema_version"], {"const": max(TRUSTED_REVIEWERS_SCHEMA_VERSIONS)}
+        )
         entry = schema["properties"]["reviewers"]["items"]
-        self.assertEqual(set(entry["required"]), {"key_id", "reviewer_id", "public_key_hex"})
+        self.assertEqual(set(entry["required"]), {"key_id", "reviewer_id", "public_key_hex", "status"})
+        self.assertEqual(set(entry["properties"]), set(entry["required"]))
+        self.assertEqual(tuple(entry["properties"]["status"]["enum"]), KEY_STATUSES)
         self.assertIs(entry["additionalProperties"], False)
 
     @unittest.skipUnless(importlib.util.find_spec("jsonschema"), "full validation needs jsonschema")
@@ -87,7 +99,9 @@ class AcceptanceContractTests(unittest.TestCase):
         entry = valid["reviewers"][0]
         for name, document in {
             "an unknown field": {**valid, "extra": 1},
-            "another version": {**valid, "trusted_reviewers_schema_version": 2},
+            "another version": {**valid, "trusted_reviewers_schema_version": 1},
+            "an unknown status": {**valid, "reviewers": [{**entry, "status": "retired"}]},
+            "no status": {**valid, "reviewers": [{k: v for k, v in entry.items() if k != "status"}]},
             "an entry field too many": {**valid, "reviewers": [{**entry, "extra": 1}]},
             "a short key": {**valid, "reviewers": [{**entry, "public_key_hex": "abcd"}]},
         }.items():

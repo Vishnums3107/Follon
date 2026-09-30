@@ -45,18 +45,25 @@ Never generate fictional sessions or customer facts. A record counts only when
 every one of these holds; a record that fails one is kept in the ledger, listed
 with its reason, and never counted.
 
-- **A trusted reviewer signed it.** Each `*.acceptance.ndjson` line is strict
-  schema v2 and carries the reviewer's Ed25519 signature over a
-  domain-separated canonical body: every field except the signature and the
-  record hash, so the previous record's hash, the release, the attributes and
-  the notes are all covered. It counts only under a trusted reviewer set the
-  operator controls, and only when the key belongs to the reviewer the record
-  names (`UNAUTHENTICATED` otherwise). An empty set, which is what the pipeline
-  writes when there is none, trusts no one. Removing a reviewer is writing a new
-  set, and every audit and receipt names the set's SHA-256.
-- **Its artifact is retained.** `source_artifact_sha256` is re-hashed against a
-  content-addressed file in the artifact root. A missing, altered or linked
-  artifact is a record nobody can check (`ARTIFACT_UNVERIFIED`).
+- **A listed reviewer signed it, and the key is not revoked.** Each
+  `*.acceptance.ndjson` line is strict schema v2 and carries the reviewer's
+  Ed25519 signature over a domain-separated canonical body: every field except
+  the signature and the record hash, so the previous record's hash, the release,
+  the attributes and the notes are all covered. The trusted reviewer set the
+  operator controls lists each key for one reviewer. **Every record in the root
+  must be signed by a key the set lists for the reviewer it names, or the audit
+  fails.** A record that was edited, moved in the chain or forged is caught that
+  way, and so is a rejection whose reviewer was dropped from the set; before,
+  each of those was silently ignored, which requalified a rejected session. An
+  empty set, which is what the pipeline writes when there is none, passes only
+  an empty root. An acceptance signed by a revoked key does not count
+  (`REVIEWER_REVOKED`).
+- **Its artifact is retained, and backs this subject alone.**
+  `source_artifact_sha256` is re-hashed against a content-addressed file in the
+  artifact root. A missing, altered or linked artifact is a record nobody can
+  check (`ARTIFACT_UNVERIFIED`). An artifact that accepted records cite for two
+  subjects, in any gate or release, counts for neither (`ARTIFACT_SHARED`), so
+  thirty sessions cannot be one session log.
 - **It is about this release.** `release_id` must be the release being audited
   or promoted (`OTHER_RELEASE` otherwise). A PAPER or LIVE session also names the
   environment it ran in, and no other record type has one.
@@ -70,16 +77,36 @@ with its reason, and never counted.
   - *The options acceptance* reconciled one broker export across BACKTEST,
     PAPER and LIVE.
   - *A paying customer* names a professional or an organisation and a
-    subscription.
+    subscription. A subscription that two customers cite counts for neither
+    (`SUBSCRIPTION_SHARED`), and a customer recorded as both kinds counts as
+    neither (`CUSTOMER_KIND_CONFLICT`).
 
 The ledger itself must be intact. A record that is malformed, out of chain or
 mis-hashed makes the audit fail rather than count fewer records, because a
-tampered ledger cannot say which of its records are still true.
+tampered ledger cannot say which of its records are still true. Each line must be
+exactly its record's canonical JSON, the bytes `append` writes: keys sorted, no
+whitespace, non-ASCII escaped, and one newline. Any other spelling of a record
+fails the audit, because JSON keeps the last of two duplicate keys and a line
+could then read one way and count another. So does a symbolic link or junction
+anywhere under the ledger root, and anything the JSON parser cannot read. A
+ledger is a file named exactly `*.acceptance.ndjson`, in lowercase, on every
+platform.
 
-Counting is by distinct subject. A rejection from a trusted reviewer disqualifies
-its subject in that gate whether it was recorded before or after an acceptance,
-because the ledger has no correction record. A rejection nobody trusted
-disqualifies no one, so a forged one cannot sink a real subject.
+Counting is by distinct subject. A rejection disqualifies its subject in that
+gate whether it was recorded before or after an acceptance, because the ledger
+has no correction record, and so does an acceptance whose own attributes fail
+the criteria: a clean acceptance of the same session does not outweigh it. Both
+disqualify in every release, whatever their artifact, and whether or not their
+key was later revoked (`DISQUALIFIED`). A session wrongly rejected is run again
+under a new subject id.
+
+**Reviewers are never removed from the set.** A reviewer who leaves stays
+listed, so what they signed stays verifiable. A key that is lost, compromised or
+no longer trusted is marked `revoked`: it still verifies what it signed, every
+acceptance it signed stops counting, and every rejection it signed still
+disqualifies, because revoking must never be a way to requalify a subject.
+Re-review what a revoked key accepted under an active key. A reviewer whose key
+changes gets a new entry with a new key id.
 
 The gates are 30 PAPER sessions, 60 controlled-LIVE sessions, five design
 partners, one broker-backed options acceptance, and **ten paying professionals
@@ -104,8 +131,11 @@ It verifies the ledger so far, refuses a repeated `evidence_id`, retains the
 artifact, validates the finished record and only then writes it. The reviewer's
 key is a PKCS#8 Ed25519 key, the kind `follon-admin release-keygen` writes, and
 its public half goes into the trusted reviewer set as
-`contracts/json-schema/v2/trusted-reviewers.schema.json` describes. Use a key of
-the reviewer's own, never the release-signing key.
+`contracts/json-schema/v2/trusted-reviewers.schema.json` describes, version 2,
+with a `status` of `active`. The audit refuses a set holding a key that is not an
+honest Ed25519 public key, such as the all-zero placeholder, or one public key
+under two entries. Use a key of the reviewer's own, never the release-signing
+key.
 
 The evidence pipeline (step 23) audits only `var/acceptance/`, the operational
 ledger root, for the release the pipeline's own manifest names, and every

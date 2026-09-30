@@ -121,7 +121,7 @@ def acceptance_ready(
         status = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise PromotionError("acceptance tool returned malformed status") from error
-    if not isinstance(status, dict) or status.get("acceptance_status_schema_version") != 3:
+    if not isinstance(status, dict) or status.get("acceptance_status_schema_version") != 4:
         raise PromotionError("acceptance tool returned an unsupported status")
     if target_environment == "production" and status.get("all_gates_eligible") is not True:
         raise PromotionError("production promotion is blocked by open acceptance gates")

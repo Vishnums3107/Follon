@@ -4,19 +4,28 @@
 Schema 2 (delivery state E6.4 and E6.5) makes a record something a reviewer signed,
 about a release, backed by an artifact, against criteria fixed before it counts:
 
-* A record carries the reviewer's Ed25519 signature. It counts only under a trusted
-  reviewer key set, and only if the key belongs to the reviewer the record names.
+* A record carries the reviewer's Ed25519 signature, under a key the trusted reviewer
+  set lists for the reviewer the record names. Every record must be signed so: one
+  that is not makes the audit fail, because a rejection edited into an acceptance, or
+  a rejection whose reviewer was dropped from the set, would otherwise stop counting
+  and quietly requalify its subject (E6.6b). A key is never removed from the set. One
+  that may no longer be trusted is marked revoked: its acceptances stop counting and
+  its rejections still disqualify.
 * Its source artifact is re-hashed against a retained artifact root. An artifact that
-  is missing or differs is a record that cannot be checked, so it does not count.
+  is missing or differs is a record that cannot be checked, so it does not count. One
+  artifact backs one subject, and one subscription one customer: an artifact or a
+  subscription that accepted records cite for two subjects counts for neither.
 * It names the release and the environment it exercised, and counts only toward that
   release's gates.
 * Its `attributes` state what the session, partner or customer actually was, and an
   acceptance counts only if they meet the criteria: what a "clean" session means, and
-  how a reconnect, an unresolved `UNKNOWN` order or a discrepancy is treated.
+  how a reconnect, an unresolved `UNKNOWN` order or a discrepancy is treated. An
+  acceptance that fails them disqualifies its subject, as a rejection does.
 
-A record that is malformed, mis-chained or mis-hashed makes the whole ledger
+A record that is malformed, mis-chained, mis-hashed or unsigned makes the whole ledger
 untrustworthy, so the audit fails. A record that is well formed but does not qualify
-is listed with its reason and is never counted.
+is listed with its reason and is never counted. Whatever a ledger or a reviewer set
+holds, the audit refuses it with `EvidenceError` rather than raising anything else.
 
     acceptance_evidence.py audit LEDGER_ROOT --trusted-reviewers FILE --artifact-root DIR --release-id ID
     acceptance_evidence.py append LEDGER --record TEMPLATE --artifact FILE --artifact-root DIR
@@ -28,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import defaultdict
@@ -42,11 +52,18 @@ except ImportError:  # run as a script: the tools directory itself is on sys.pat
     import ed25519  # type: ignore[no-redef]
 
 SCHEMA_VERSION = 2
-STATUS_SCHEMA_VERSION = 3
+STATUS_SCHEMA_VERSION = 4
+# Version 1 sets had no key status, and every key they list is read as active.
+TRUSTED_REVIEWERS_SCHEMA_VERSIONS = (1, 2)
+KEY_STATUSES = ("active", "revoked")
 SIGNATURE_DOMAIN = b"follon-acceptance-evidence-v2\n"
 ZERO_HASH = "0" * 64
+LEDGER_SUFFIX = ".acceptance.ndjson"
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
+MAX_REVIEWER_SET_BYTES = 1024 * 1024
+MAX_NOTES_CHARACTERS = 1024
+OUTCOMES = ("accepted", "rejected")
 CANONICAL_ID = re.compile(r"^[a-z0-9._-]+$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
 SIGNATURE = re.compile(r"^[a-f0-9]{128}$")
@@ -108,11 +125,16 @@ SESSION_ATTRIBUTES = (
     "planned_reconnect_drills",
 )
 
-# Why a well-formed record is not counted, in the order they are decided.
-UNAUTHENTICATED = "UNAUTHENTICATED"
+# Why an accepted record does not count, in the order they are decided. A record no
+# listed key signed is not among them: it fails the audit.
+REVIEWER_REVOKED = "REVIEWER_REVOKED"
 ARTIFACT_UNVERIFIED = "ARTIFACT_UNVERIFIED"
 OTHER_RELEASE = "OTHER_RELEASE"
 CRITERIA_NOT_MET = "CRITERIA_NOT_MET"
+DISQUALIFIED = "DISQUALIFIED"
+ARTIFACT_SHARED = "ARTIFACT_SHARED"
+SUBSCRIPTION_SHARED = "SUBSCRIPTION_SHARED"
+CUSTOMER_KIND_CONFLICT = "CUSTOMER_KIND_CONFLICT"
 
 
 class EvidenceError(ValueError):
@@ -121,6 +143,34 @@ class EvidenceError(ValueError):
 
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def parse_json(data: bytes, refusal: str) -> Any:
+    """The JSON value `data` holds, or `EvidenceError(refusal)`.
+
+    `json` raises more than `JSONDecodeError`: a digit string longer than Python's
+    integer limit raises a plain `ValueError`, and deep nesting a `RecursionError`.
+    Each of those escaped the audit as a traceback.
+    """
+    try:
+        return json.loads(data)
+    except (ValueError, RecursionError) as error:
+        raise EvidenceError(refusal) from error
+
+
+def read_regular_file(path: Path, limit: int, what: str) -> bytes:
+    """The bytes of `path`, which must be a regular file and not a link, of at most `limit` bytes.
+
+    It reads at most one byte past the limit, so a file that grows after it is opened
+    is refused rather than read whole.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f"{what} is missing, linked or not a regular file")
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise EvidenceError(f"{what} is larger than {limit} bytes")
+    return data
 
 
 def unsigned_body(record: dict[str, Any]) -> bytes:
@@ -180,8 +230,11 @@ def validate_attributes(evidence_type: str, attributes: object) -> None:
             raise EvidenceError("design partner attributes are malformed")
     elif evidence_type == "broker_options":
         environments = attributes["reconciled_environments"]
+        # Every item is checked to be a string first: sorting a list that mixes types,
+        # or making a set of one that holds a list, raised `TypeError`.
         if (
             not isinstance(environments, list)
+            or not all(isinstance(environment, str) for environment in environments)
             or environments != sorted(set(environments))
             or not set(environments) <= set(BROKER_OPTIONS_ENVIRONMENTS)
         ):
@@ -238,11 +291,15 @@ def validate_record(record: object, expected_previous: str) -> dict[str, Any]:
     if record["observed_by"] == record["reviewed_by"]:
         raise EvidenceError("observed_by and reviewed_by must be distinct")
     evidence_type = record["evidence_type"]
-    if evidence_type not in GATES:
+    # A list or an object is unhashable, and looking one up in a dict or a set raised
+    # `TypeError`. The type is checked before the dict lookup, and the outcomes are a
+    # tuple, whose membership test compares rather than hashes.
+    if not isinstance(evidence_type, str) or evidence_type not in GATES:
         raise EvidenceError("unknown evidence_type")
-    if record["outcome"] not in {"accepted", "rejected"}:
+    if record["outcome"] not in OUTCOMES:
         raise EvidenceError("outcome must be accepted or rejected")
-    if not isinstance(record["notes"], str) or len(record["notes"]) > 1024 or "\n" in record["notes"]:
+    notes = record["notes"]
+    if not isinstance(notes, str) or len(notes) > MAX_NOTES_CHARACTERS or "\n" in notes:
         raise EvidenceError("notes must be a concise single line")
     if record["environment"] != SESSION_ENVIRONMENTS.get(evidence_type):
         raise EvidenceError("environment must be PAPER or LIVE for a session and null for any other evidence")
@@ -261,40 +318,60 @@ def validate_record(record: object, expected_previous: str) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class ReviewerKey:
+    reviewer_id: str
+    public_key: bytes
+    status: str
+
+
+@dataclass(frozen=True)
 class TrustedReviewers:
     """The reviewer key set that decides whose signature counts."""
 
-    keys: dict[str, tuple[str, bytes]]  # key_id -> (reviewer_id, public key)
+    keys: dict[str, ReviewerKey]  # by key id
     sha256: str
 
-    def authenticates(self, record: dict[str, Any]) -> bool:
-        entry = self.keys.get(record["reviewer_key_id"])
-        if entry is None or entry[0] != record["reviewed_by"]:
-            return False
-        return ed25519.verify(entry[1], signature_message(record), bytes.fromhex(record["reviewer_signature"]))
+    def signer_status(self, record: dict[str, Any]) -> str | None:
+        """The status of the listed key that signed `record`, or None when no listed key did:
+        the key id is not listed, is bound to another reviewer, or did not make the signature."""
+        key = self.keys.get(record["reviewer_key_id"])
+        if key is None or key.reviewer_id != record["reviewed_by"]:
+            return None
+        signature = bytes.fromhex(record["reviewer_signature"])
+        if not ed25519.verify(key.public_key, signature_message(record), signature):
+            return None
+        return key.status
 
 
 def load_trusted_reviewers(path: Path) -> TrustedReviewers:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_LINE_BYTES:
-        raise EvidenceError("trusted reviewer file is missing, linked or too large")
-    data = path.read_bytes()
-    try:
-        document = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise EvidenceError("trusted reviewer file is not JSON") from error
+    """Reads a trusted reviewer set, refusing any key that is not an honest Ed25519 public key.
+
+    A key of small order, the all-zero placeholder among them, lets anyone sign anything
+    under RFC 8032 alone. Verification refuses one since audit item 121, and enrolling
+    one is refused here, so a set that holds one fails loudly instead of trusting no one
+    it seems to (E6.6b). One public key under two entries is refused too: it would let
+    one key holder sign as two reviewers.
+    """
+    data = read_regular_file(path, MAX_REVIEWER_SET_BYTES, "the trusted reviewer file")
+    document = parse_json(data, "trusted reviewer file is not JSON")
     if (
         not isinstance(document, dict)
         or set(document) != {"trusted_reviewers_schema_version", "reviewers"}
         or type(document["trusted_reviewers_schema_version"]) is not int
-        or document["trusted_reviewers_schema_version"] != 1
+        or document["trusted_reviewers_schema_version"] not in TRUSTED_REVIEWERS_SCHEMA_VERSIONS
         or not isinstance(document["reviewers"], list)
     ):
         raise EvidenceError("trusted reviewer file does not match its contract")
-    keys: dict[str, tuple[str, bytes]] = {}
+    entry_keys = {"key_id", "reviewer_id", "public_key_hex"}
+    if document["trusted_reviewers_schema_version"] == 2:
+        entry_keys.add("status")
+    keys: dict[str, ReviewerKey] = {}
+    enrolled: set[bytes] = set()
     for entry in document["reviewers"]:
-        if not isinstance(entry, dict) or set(entry) != {"key_id", "reviewer_id", "public_key_hex"}:
+        if not isinstance(entry, dict) or set(entry) != entry_keys:
             raise EvidenceError("a trusted reviewer entry does not match its contract")
         key_id, reviewer_id, public_hex = entry["key_id"], entry["reviewer_id"], entry["public_key_hex"]
+        status = entry.get("status", "active")
         if (
             not isinstance(key_id, str)
             or CANONICAL_ID.fullmatch(key_id) is None
@@ -302,11 +379,18 @@ def load_trusted_reviewers(path: Path) -> TrustedReviewers:
             or CANONICAL_ID.fullmatch(reviewer_id) is None
             or not isinstance(public_hex, str)
             or SHA256.fullmatch(public_hex) is None
+            or status not in KEY_STATUSES
         ):
             raise EvidenceError("a trusted reviewer entry is malformed")
         if key_id in keys:
             raise EvidenceError(f"duplicate trusted reviewer key: {key_id}")
-        keys[key_id] = (reviewer_id, bytes.fromhex(public_hex))
+        public_key = bytes.fromhex(public_hex)
+        if not ed25519.is_valid_public_key(public_key):
+            raise EvidenceError(f"trusted reviewer key {key_id} is not a valid Ed25519 public key")
+        if public_key in enrolled:
+            raise EvidenceError(f"trusted reviewer key {key_id} repeats the public key of another entry")
+        enrolled.add(public_key)
+        keys[key_id] = ReviewerKey(reviewer_id, public_key, status)
     return TrustedReviewers(keys=keys, sha256=hashlib.sha256(data).hexdigest())
 
 
@@ -320,47 +404,124 @@ def artifact_is_retained(artifact_root: Path, digest: str) -> bool:
 
 @dataclass(frozen=True)
 class Verdict:
-    """A well-formed record and the reasons, if any, it does not count."""
+    """A signed record and, for an acceptance, the reasons it does not count. A rejection
+    never counts toward a gate, so it has no reasons: it disqualifies its subject."""
 
     record: dict[str, Any]
     reasons: tuple[str, ...]
 
 
-def judge(
-    record: dict[str, Any], trusted: TrustedReviewers, artifact_root: Path, release_id: str
-) -> Verdict:
-    reasons: list[str] = []
-    if not trusted.authenticates(record):
-        reasons.append(UNAUTHENTICATED)
-    if not artifact_is_retained(artifact_root, record["source_artifact_sha256"]):
-        reasons.append(ARTIFACT_UNVERIFIED)
-    if record["release_id"] != release_id:
-        reasons.append(OTHER_RELEASE)
-    if record["outcome"] == "accepted" and criteria_shortfalls(record):
-        reasons.append(CRITERIA_NOT_MET)
-    return Verdict(record, tuple(reasons))
+def subject_of(record: dict[str, Any]) -> tuple[str, str]:
+    """A subject is one session, partner, export or customer, within its evidence type."""
+    return record["evidence_type"], record["subject_id"]
+
+
+def is_disqualifying(record: dict[str, Any]) -> bool:
+    """A rejection, or an acceptance whose own attributes fail the criteria.
+
+    Either is a signed statement that the subject did not qualify, so it disqualifies the
+    subject whatever else is recorded of it, in any release and whether or not its artifact
+    is retained. Before E6.6b a failing acceptance only failed to count, and a clean one
+    after it counted the subject.
+    """
+    return record["outcome"] == "rejected" or bool(criteria_shortfalls(record))
+
+
+def assess(
+    records: list[dict[str, Any]], trusted: TrustedReviewers, artifact_root: Path, release_id: str
+) -> list[Verdict]:
+    """Judges every record of a ledger root. Refuses a root holding a record no listed key signed."""
+    signers = {record["evidence_id"]: trusted.signer_status(record) for record in records}
+    unsigned = [evidence_id for evidence_id, status in signers.items() if status is None]
+    if unsigned:
+        shown = ", ".join(unsigned[:5]) + (f" and {len(unsigned) - 5} more" if len(unsigned) > 5 else "")
+        raise EvidenceError(f"records that no listed reviewer key signed: {shown}")
+    disqualified = {subject_of(record) for record in records if is_disqualifying(record)}
+    # What each accepted record cites, so a citation shared between subjects is visible.
+    # Only acceptances are read: a rejection lowers a count however it is backed.
+    artifact_subjects: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    subscription_subjects: dict[str, set[str]] = defaultdict(set)
+    customer_kinds: dict[str, set[str]] = defaultdict(set)
+    accepted = [record for record in records if record["outcome"] == "accepted"]
+    for record in accepted:
+        artifact_subjects[record["source_artifact_sha256"]].add(subject_of(record))
+        if record["evidence_type"] == "paying_customer":
+            subscription_subjects[record["attributes"]["subscription_id"]].add(record["subject_id"])
+            customer_kinds[record["subject_id"]].add(record["attributes"]["customer_kind"])
+    verdicts = []
+    for record in records:
+        reasons: list[str] = []
+        if record["outcome"] == "accepted":
+            if signers[record["evidence_id"]] == "revoked":
+                reasons.append(REVIEWER_REVOKED)
+            if not artifact_is_retained(artifact_root, record["source_artifact_sha256"]):
+                reasons.append(ARTIFACT_UNVERIFIED)
+            if record["release_id"] != release_id:
+                reasons.append(OTHER_RELEASE)
+            if criteria_shortfalls(record):
+                reasons.append(CRITERIA_NOT_MET)
+            if subject_of(record) in disqualified:
+                reasons.append(DISQUALIFIED)
+            if len(artifact_subjects[record["source_artifact_sha256"]]) > 1:
+                reasons.append(ARTIFACT_SHARED)
+            if record["evidence_type"] == "paying_customer":
+                if len(subscription_subjects[record["attributes"]["subscription_id"]]) > 1:
+                    reasons.append(SUBSCRIPTION_SHARED)
+                if len(customer_kinds[record["subject_id"]]) > 1:
+                    reasons.append(CUSTOMER_KIND_CONFLICT)
+        verdicts.append(Verdict(record, tuple(reasons)))
+    return verdicts
+
+
+def parse_ledger(data: bytes, name: str) -> tuple[list[dict[str, Any]], str]:
+    """Verifies one ledger's bytes, every record's shape, chain and hash, and returns
+    its records and its chain head. `name` only labels a refusal.
+
+    Each line must be exactly its record's canonical JSON, the bytes `append` writes.
+    Otherwise one record could be written many ways, and a line whose raw bytes say
+    one thing could parse to another: JSON keeps the last of two duplicate keys.
+    """
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(f"ledger must end with a complete newline: {name}")
+    previous = ZERO_HASH
+    records: list[dict[str, Any]] = []
+    # Split on the newline alone. `bytes.splitlines` also splits on a carriage return.
+    lines = data[:-1].split(b"\n") if data else []
+    for line_number, line in enumerate(lines, start=1):
+        if not line or len(line) > MAX_LINE_BYTES:
+            raise EvidenceError(f"invalid evidence line {name}:{line_number}")
+        candidate = parse_json(line, f"invalid JSON at {name}:{line_number}")
+        record = validate_record(candidate, previous)
+        if canonical_json(record) != line:
+            raise EvidenceError(f"evidence line {name}:{line_number} is not its record's canonical JSON")
+        previous = record["record_hash"]
+        records.append(record)
+    return records, previous
 
 
 def read_ledger(path: Path) -> tuple[list[dict[str, Any]], bytes, str]:
-    """Reads one ledger, verifying every record's shape, chain and hash."""
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_LEDGER_BYTES:
-        raise EvidenceError(f"unsafe or oversized evidence ledger: {path.name}")
-    data = path.read_bytes()
-    if data and not data.endswith(b"\n"):
-        raise EvidenceError(f"ledger must end with a complete newline: {path.name}")
-    previous = ZERO_HASH
-    records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(data.splitlines(), start=1):
-        if not line or len(line) > MAX_LINE_BYTES:
-            raise EvidenceError(f"invalid evidence line {path.name}:{line_number}")
-        try:
-            candidate = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise EvidenceError(f"invalid JSON at {path.name}:{line_number}") from error
-        record = validate_record(candidate, previous)
-        previous = record["record_hash"]
-        records.append(record)
-    return records, data, previous
+    """Reads and verifies one ledger file: its records, its exact bytes and its chain head."""
+    data = read_regular_file(path, MAX_LEDGER_BYTES, f"evidence ledger {path.name}")
+    records, head = parse_ledger(data, path.name)
+    return records, data, head
+
+
+def ledger_paths(root: Path) -> list[Path]:
+    """Every ledger file under `root`, ordered by its relative path the same way on every platform.
+
+    A link or junction anywhere under the root is refused. Followed, a linked directory
+    would count ledgers kept outside the root, and nothing a link points at can be
+    held to the root's own custody. The suffix is matched exactly: a glob matched it
+    case-insensitively on Windows and not on Linux.
+    """
+    found: list[Path] = []
+    for directory, subdirectories, files in os.walk(root, followlinks=False):
+        for name in (*subdirectories, *files):
+            candidate = Path(directory) / name
+            if candidate.is_symlink() or candidate.is_junction():
+                raise EvidenceError(f"the ledger root holds a link: {candidate.relative_to(root).as_posix()}")
+        found.extend(Path(directory) / name for name in files if name.endswith(LEDGER_SUFFIX))
+    return sorted(found, key=lambda path: path.relative_to(root).as_posix())
 
 
 def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -373,7 +534,7 @@ def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     records: list[dict[str, Any]] = []
     ledgers: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for path in sorted(root.rglob("*.acceptance.ndjson")):
+    for path in ledger_paths(root):
         ledger_records, data, head = read_ledger(path)
         for record in ledger_records:
             if record["evidence_id"] in seen_ids:
@@ -404,8 +565,11 @@ def status(
     release_id: str,
     trusted_reviewers_sha256: str,
 ) -> dict[str, Any]:
-    accepted_kinds: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    rejected_subjects: dict[str, set[str]] = defaultdict(set)
+    """Gate counts from the verdicts. Schema 4 (E6.6b): `counted_records` counts only
+    acceptances that count, `disqualified_subjects` every subject a rejection or a failing
+    acceptance disqualified, and `not_counted` lists acceptances only."""
+    by_kind_of: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    disqualified: dict[str, set[str]] = defaultdict(set)
     rejected = defaultdict(int)
     not_counted: dict[str, list[str]] = defaultdict(list)
     for verdict in verdicts:
@@ -413,30 +577,18 @@ def status(
         evidence_type = record["evidence_type"]
         for reason in verdict.reasons:
             not_counted[reason].append(record["evidence_id"])
+        # A disqualification holds within its gate whichever record came first. The
+        # ledger has no correction record, so an acceptance can neither outlive a
+        # later rejection nor overturn an earlier one (E6.2).
+        if is_disqualifying(record):
+            disqualified[evidence_type].add(record["subject_id"])
         if record["outcome"] == "rejected":
-            # A rejection only ever lowers a count, so a forged one is the only
-            # harm it can do: it counts only if its reviewer is trusted, and then
-            # for its subject in any release, because a subject is one session.
-            if UNAUTHENTICATED not in verdict.reasons:
-                rejected_subjects[evidence_type].add(record["subject_id"])
-                rejected[evidence_type] += 1
+            rejected[evidence_type] += 1
         elif not verdict.reasons:
-            accepted_kinds[evidence_type][customer_kind(record) or ""].add(record["subject_id"])
+            by_kind_of[evidence_type][customer_kind(record) or ""].add(record["subject_id"])
     gates = {}
     for evidence_type, alternatives in GATES.items():
-        # A rejection disqualifies its subject within its gate, whichever
-        # record came first. The ledger has no correction record, so an
-        # acceptance can neither outlive a later rejection nor overturn an
-        # earlier one (E6.2).
-        by_kind = {
-            kind: subjects - rejected_subjects[evidence_type]
-            for kind, subjects in accepted_kinds[evidence_type].items()
-        }
-        disqualified = {
-            subject
-            for subjects in accepted_kinds[evidence_type].values()
-            for subject in subjects & rejected_subjects[evidence_type]
-        }
+        by_kind = by_kind_of[evidence_type]
         rows = []
         for kind, required in alternatives:
             observed = len(by_kind.get(kind or "", set()))
@@ -455,14 +607,16 @@ def status(
             "eligible": any(row["eligible"] for row in rows),
             "alternatives": rows,
             "rejected_records": rejected[evidence_type],
-            "disqualified_subjects": len(disqualified),
+            "disqualified_subjects": len(disqualified[evidence_type]),
         }
     return {
         "acceptance_status_schema_version": STATUS_SCHEMA_VERSION,
         "release_id": release_id,
         "trusted_reviewers_sha256": trusted_reviewers_sha256,
         "verified_records": len(verdicts),
-        "counted_records": sum(1 for verdict in verdicts if not verdict.reasons),
+        "counted_records": sum(
+            1 for verdict in verdicts if verdict.record["outcome"] == "accepted" and not verdict.reasons
+        ),
         "not_counted": {reason: sorted(ids) for reason, ids in sorted(not_counted.items())},
         "all_gates_eligible": all(gate["eligible"] for gate in gates.values()),
         "gates": gates,
@@ -480,7 +634,7 @@ def audit(
     if not artifact_root.is_dir():
         raise EvidenceError("artifact root must be a directory")
     records, ledgers = load_ledger_files(ledger_root)
-    verdicts = [judge(record, trusted, artifact_root, release_id) for record in records]
+    verdicts = assess(records, trusted, artifact_root, release_id)
     return status(verdicts, ledgers, release_id=release_id, trusted_reviewers_sha256=trusted.sha256)
 
 
@@ -527,8 +681,8 @@ def append_record(
     The record is validated whole before anything is written, and the existing
     ledger is verified first, so a record is never appended to a broken chain.
     """
-    if not ledger.name.endswith(".acceptance.ndjson"):
-        raise EvidenceError("a ledger file is named *.acceptance.ndjson")
+    if not ledger.name.endswith(LEDGER_SUFFIX):
+        raise EvidenceError(f"a ledger file is named *{LEDGER_SUFFIX}")
     if set(template) != TEMPLATE_KEYS:
         raise EvidenceError(f"the record template must have exactly {sorted(TEMPLATE_KEYS)}")
     previous = ZERO_HASH
@@ -609,9 +763,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         seed = read_reviewer_seed(arguments.reviewer_key)
         try:
-            template = json.loads(arguments.record.read_text(encoding="utf-8"))
-        except (ValueError, OSError) as error:
+            template_bytes = arguments.record.read_bytes()
+        except OSError as error:
             raise EvidenceError(f"cannot read the record template: {error}") from error
+        template = parse_json(template_bytes, "cannot read the record template: it is not JSON")
         if not isinstance(template, dict):
             raise EvidenceError("the record template must be an object")
         record = append_record(
