@@ -5038,6 +5038,62 @@ These are mandatory master-plan acceptance conditions and are currently open:
        E6.5, including that a rejection that fails to authenticate is silently ignored, are listed there,
        open and reproduced.
 
+122. The acceptance audit refuses what it cannot read, and never raises anything else (2026-09-30,
+     Security; defects in item 111, E6.4). Findings (6) and (9) of the review recorded as E6.6b.
+     - **Gap.** A record no reviewer's tooling would write escaped the audit as a traceback instead of
+       a refusal. An `evidence_type` or `outcome` that was a list or an object is unhashable, and
+       looking one up in a dict or a set raised `TypeError`; so did sorting an options list that mixed
+       strings with numbers. `json` raises a plain `ValueError` for a number longer than Python's
+       4,300-digit limit and `RecursionError` for deep nesting, and the audit caught only
+       `JSONDecodeError`. The same held for the trusted reviewer set and the `append` template. Beyond
+       the crashes: a line was any JSON that parsed to a valid record, so one record could be spelled
+       many ways and a line holding two `outcome` keys read as a rejection and counted as the
+       acceptance JSON keeps; `bytes.splitlines` split on a carriage return, so a CRLF ledger passed;
+       the root was searched with a glob that followed a linked directory, matched the suffix without
+       regard to case on Windows and with it on Linux, and ordered ledgers by platform path
+       comparison, so one root could bind different ledgers, in a different order, on the two. And
+       about half of the reviewer's mutants survived, among them every identifier's canonical-ID
+       check, the notes, digest and signature formats, the size limits and the link refusals.
+     - **Behavior.**
+       - A value is type-checked before it is looked up or sorted, and the outcomes are a tuple, whose
+         membership test compares rather than hashes. `parse_json` turns every exception `json` can
+         raise into `EvidenceError`, for ledgers, the reviewer set and the template.
+       - `parse_ledger` verifies a ledger's bytes and `read_ledger` reads a regular file at most one
+         byte past its limit, so a file that grows after it is opened is refused, not read whole.
+         Each line must be exactly its record's canonical JSON, and lines are split on the newline
+         alone.
+       - The root is walked without following links. A symbolic link or junction anywhere under it,
+         of any name, fails the audit. A ledger is a file named exactly `*.acceptance.ndjson`, and
+         ledgers are bound in order of their relative path as a string, the same on every platform.
+       - The reviewer set has its own 1 MiB limit, `MAX_REVIEWER_SET_BYTES`, where it borrowed the
+         line limit.
+     - **Tests.** `tests/security/test_acceptance_refusals.py`, 20 tests. Seventeen hostile values of
+       every JSON type put in every field of every evidence type, and in every attribute, which may be
+       refused but never raise anything else; the reviewer's own crashing shapes, each a refusal; lines
+       `json` cannot parse, values that are not records, and the same for the reviewer set and on the
+       command line. Each identifier, digest and the signature refused by its own message, so no check
+       can be removed while another hides it; notes of exactly 1,024 characters accepted and 1,025
+       refused; each size limit accepted at its value and refused one byte under it; five other
+       spellings of a canonical line refused, among them the duplicate key; links of three kinds
+       refused under the root, and a linked ledger or reviewer set refused when read directly; and the
+       exact suffix and platform-independent order.
+     - **Rule 5.** 32 of 32 injected defects were caught by the intended tests: each crash restored
+       (`JSONDecodeError` only, `RecursionError` escaping, the unchecked type lookup, the outcomes as a
+       set, the options unchecked); the canonical check removed and `splitlines` restored; the line and
+       file limits off by one, the line limit doubled and the reviewer set read under the ledger's
+       limit; the link refusal removed from the walk, from a direct read and from the artifact check;
+       the platform path order and a case-blind suffix; each of the six identifiers dropped from its
+       check and the canonical pattern widened to uppercase; the notes limit off by one, doubled and
+       its newline check dropped; each of the three digests dropped and the digest and signature
+       patterns loosened. Two guards first written into this slice were removed instead, because
+       their mutants were equivalent: a tuple's membership test never hashes, so an `isinstance`
+       before one changed nothing.
+     - **Measured result.** The Python suite rose from 176 to 196 passed, and `unittest discover` over
+       `tests/security`, as CI runs it, passed 133. The final `python tools/session_status.py` run
+       measured all eight suites green, and the full evidence pipeline exited 0.
+     - **Boundary.** Findings (1) to (5), (7) and (8) are unchanged by this item, and the promotion
+       gate's wiring, the rest of finding (9), is untested still. All remain E6.6b.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

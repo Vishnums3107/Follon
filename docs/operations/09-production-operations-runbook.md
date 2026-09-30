@@ -74,7 +74,14 @@ with its reason, and never counted.
 
 The ledger itself must be intact. A record that is malformed, out of chain or
 mis-hashed makes the audit fail rather than count fewer records, because a
-tampered ledger cannot say which of its records are still true.
+tampered ledger cannot say which of its records are still true. Each line must be
+exactly its record's canonical JSON, the bytes `append` writes: keys sorted, no
+whitespace, non-ASCII escaped, and one newline. Any other spelling of a record
+fails the audit, because JSON keeps the last of two duplicate keys and a line
+could then read one way and count another. So does a symbolic link or junction
+anywhere under the ledger root, and anything the JSON parser cannot read. A
+ledger is a file named exactly `*.acceptance.ndjson`, in lowercase, on every
+platform.
 
 Counting is by distinct subject. A rejection from a trusted reviewer disqualifies
 its subject in that gate whether it was recorded before or after an acceptance,

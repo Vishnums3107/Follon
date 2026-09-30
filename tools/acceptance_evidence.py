@@ -16,7 +16,8 @@ about a release, backed by an artifact, against criteria fixed before it counts:
 
 A record that is malformed, mis-chained or mis-hashed makes the whole ledger
 untrustworthy, so the audit fails. A record that is well formed but does not qualify
-is listed with its reason and is never counted.
+is listed with its reason and is never counted. Whatever a ledger or a reviewer set
+holds, the audit refuses it with `EvidenceError` rather than raising anything else.
 
     acceptance_evidence.py audit LEDGER_ROOT --trusted-reviewers FILE --artifact-root DIR --release-id ID
     acceptance_evidence.py append LEDGER --record TEMPLATE --artifact FILE --artifact-root DIR
@@ -28,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import defaultdict
@@ -45,8 +47,12 @@ SCHEMA_VERSION = 2
 STATUS_SCHEMA_VERSION = 3
 SIGNATURE_DOMAIN = b"follon-acceptance-evidence-v2\n"
 ZERO_HASH = "0" * 64
+LEDGER_SUFFIX = ".acceptance.ndjson"
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
+MAX_REVIEWER_SET_BYTES = 1024 * 1024
+MAX_NOTES_CHARACTERS = 1024
+OUTCOMES = ("accepted", "rejected")
 CANONICAL_ID = re.compile(r"^[a-z0-9._-]+$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
 SIGNATURE = re.compile(r"^[a-f0-9]{128}$")
@@ -123,6 +129,34 @@ def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
+def parse_json(data: bytes, refusal: str) -> Any:
+    """The JSON value `data` holds, or `EvidenceError(refusal)`.
+
+    `json` raises more than `JSONDecodeError`: a digit string longer than Python's
+    integer limit raises a plain `ValueError`, and deep nesting a `RecursionError`.
+    Each of those escaped the audit as a traceback.
+    """
+    try:
+        return json.loads(data)
+    except (ValueError, RecursionError) as error:
+        raise EvidenceError(refusal) from error
+
+
+def read_regular_file(path: Path, limit: int, what: str) -> bytes:
+    """The bytes of `path`, which must be a regular file and not a link, of at most `limit` bytes.
+
+    It reads at most one byte past the limit, so a file that grows after it is opened
+    is refused rather than read whole.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f"{what} is missing, linked or not a regular file")
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise EvidenceError(f"{what} is larger than {limit} bytes")
+    return data
+
+
 def unsigned_body(record: dict[str, Any]) -> bytes:
     """What the reviewer signs: every field but the signature and the hash of both."""
     return canonical_json(
@@ -180,8 +214,11 @@ def validate_attributes(evidence_type: str, attributes: object) -> None:
             raise EvidenceError("design partner attributes are malformed")
     elif evidence_type == "broker_options":
         environments = attributes["reconciled_environments"]
+        # Every item is checked to be a string first: sorting a list that mixes types,
+        # or making a set of one that holds a list, raised `TypeError`.
         if (
             not isinstance(environments, list)
+            or not all(isinstance(environment, str) for environment in environments)
             or environments != sorted(set(environments))
             or not set(environments) <= set(BROKER_OPTIONS_ENVIRONMENTS)
         ):
@@ -238,11 +275,15 @@ def validate_record(record: object, expected_previous: str) -> dict[str, Any]:
     if record["observed_by"] == record["reviewed_by"]:
         raise EvidenceError("observed_by and reviewed_by must be distinct")
     evidence_type = record["evidence_type"]
-    if evidence_type not in GATES:
+    # A list or an object is unhashable, and looking one up in a dict or a set raised
+    # `TypeError`. The type is checked before the dict lookup, and the outcomes are a
+    # tuple, whose membership test compares rather than hashes.
+    if not isinstance(evidence_type, str) or evidence_type not in GATES:
         raise EvidenceError("unknown evidence_type")
-    if record["outcome"] not in {"accepted", "rejected"}:
+    if record["outcome"] not in OUTCOMES:
         raise EvidenceError("outcome must be accepted or rejected")
-    if not isinstance(record["notes"], str) or len(record["notes"]) > 1024 or "\n" in record["notes"]:
+    notes = record["notes"]
+    if not isinstance(notes, str) or len(notes) > MAX_NOTES_CHARACTERS or "\n" in notes:
         raise EvidenceError("notes must be a concise single line")
     if record["environment"] != SESSION_ENVIRONMENTS.get(evidence_type):
         raise EvidenceError("environment must be PAPER or LIVE for a session and null for any other evidence")
@@ -275,13 +316,8 @@ class TrustedReviewers:
 
 
 def load_trusted_reviewers(path: Path) -> TrustedReviewers:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_LINE_BYTES:
-        raise EvidenceError("trusted reviewer file is missing, linked or too large")
-    data = path.read_bytes()
-    try:
-        document = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise EvidenceError("trusted reviewer file is not JSON") from error
+    data = read_regular_file(path, MAX_REVIEWER_SET_BYTES, "the trusted reviewer file")
+    document = parse_json(data, "trusted reviewer file is not JSON")
     if (
         not isinstance(document, dict)
         or set(document) != {"trusted_reviewers_schema_version", "reviewers"}
@@ -341,26 +377,55 @@ def judge(
     return Verdict(record, tuple(reasons))
 
 
-def read_ledger(path: Path) -> tuple[list[dict[str, Any]], bytes, str]:
-    """Reads one ledger, verifying every record's shape, chain and hash."""
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_LEDGER_BYTES:
-        raise EvidenceError(f"unsafe or oversized evidence ledger: {path.name}")
-    data = path.read_bytes()
+def parse_ledger(data: bytes, name: str) -> tuple[list[dict[str, Any]], str]:
+    """Verifies one ledger's bytes, every record's shape, chain and hash, and returns
+    its records and its chain head. `name` only labels a refusal.
+
+    Each line must be exactly its record's canonical JSON, the bytes `append` writes.
+    Otherwise one record could be written many ways, and a line whose raw bytes say
+    one thing could parse to another: JSON keeps the last of two duplicate keys.
+    """
     if data and not data.endswith(b"\n"):
-        raise EvidenceError(f"ledger must end with a complete newline: {path.name}")
+        raise EvidenceError(f"ledger must end with a complete newline: {name}")
     previous = ZERO_HASH
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(data.splitlines(), start=1):
+    # Split on the newline alone. `bytes.splitlines` also splits on a carriage return.
+    lines = data[:-1].split(b"\n") if data else []
+    for line_number, line in enumerate(lines, start=1):
         if not line or len(line) > MAX_LINE_BYTES:
-            raise EvidenceError(f"invalid evidence line {path.name}:{line_number}")
-        try:
-            candidate = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise EvidenceError(f"invalid JSON at {path.name}:{line_number}") from error
+            raise EvidenceError(f"invalid evidence line {name}:{line_number}")
+        candidate = parse_json(line, f"invalid JSON at {name}:{line_number}")
         record = validate_record(candidate, previous)
+        if canonical_json(record) != line:
+            raise EvidenceError(f"evidence line {name}:{line_number} is not its record's canonical JSON")
         previous = record["record_hash"]
         records.append(record)
-    return records, data, previous
+    return records, previous
+
+
+def read_ledger(path: Path) -> tuple[list[dict[str, Any]], bytes, str]:
+    """Reads and verifies one ledger file: its records, its exact bytes and its chain head."""
+    data = read_regular_file(path, MAX_LEDGER_BYTES, f"evidence ledger {path.name}")
+    records, head = parse_ledger(data, path.name)
+    return records, data, head
+
+
+def ledger_paths(root: Path) -> list[Path]:
+    """Every ledger file under `root`, ordered by its relative path the same way on every platform.
+
+    A link or junction anywhere under the root is refused. Followed, a linked directory
+    would count ledgers kept outside the root, and nothing a link points at can be
+    held to the root's own custody. The suffix is matched exactly: a glob matched it
+    case-insensitively on Windows and not on Linux.
+    """
+    found: list[Path] = []
+    for directory, subdirectories, files in os.walk(root, followlinks=False):
+        for name in (*subdirectories, *files):
+            candidate = Path(directory) / name
+            if candidate.is_symlink() or candidate.is_junction():
+                raise EvidenceError(f"the ledger root holds a link: {candidate.relative_to(root).as_posix()}")
+        found.extend(Path(directory) / name for name in files if name.endswith(LEDGER_SUFFIX))
+    return sorted(found, key=lambda path: path.relative_to(root).as_posix())
 
 
 def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -373,7 +438,7 @@ def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     records: list[dict[str, Any]] = []
     ledgers: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for path in sorted(root.rglob("*.acceptance.ndjson")):
+    for path in ledger_paths(root):
         ledger_records, data, head = read_ledger(path)
         for record in ledger_records:
             if record["evidence_id"] in seen_ids:
@@ -527,8 +592,8 @@ def append_record(
     The record is validated whole before anything is written, and the existing
     ledger is verified first, so a record is never appended to a broken chain.
     """
-    if not ledger.name.endswith(".acceptance.ndjson"):
-        raise EvidenceError("a ledger file is named *.acceptance.ndjson")
+    if not ledger.name.endswith(LEDGER_SUFFIX):
+        raise EvidenceError(f"a ledger file is named *{LEDGER_SUFFIX}")
     if set(template) != TEMPLATE_KEYS:
         raise EvidenceError(f"the record template must have exactly {sorted(TEMPLATE_KEYS)}")
     previous = ZERO_HASH
@@ -609,9 +674,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         seed = read_reviewer_seed(arguments.reviewer_key)
         try:
-            template = json.loads(arguments.record.read_text(encoding="utf-8"))
-        except (ValueError, OSError) as error:
+            template_bytes = arguments.record.read_bytes()
+        except OSError as error:
             raise EvidenceError(f"cannot read the record template: {error}") from error
+        template = parse_json(template_bytes, "cannot read the record template: it is not JSON")
         if not isinstance(template, dict):
             raise EvidenceError("the record template must be an object")
         record = append_record(
