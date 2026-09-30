@@ -56,23 +56,23 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-30T09:55:28Z  
-**Branch:** `feat/working-order-exposure`  
-**HEAD:** `7f2cd73` -- Merge pull request #35 from Vishnums3107/feat/acceptance-append-hardening (2026-09-30T14:40:01+05:30)  
-**Uncommitted paths:** 17
+**Measured at:** 2026-09-30T10:42:01Z  
+**Branch:** `feat/evidence-parent-transaction-guard`  
+**HEAD:** `dae3c6f` -- Merge pull request #36 from Vishnums3107/feat/working-order-exposure (2026-09-30T15:32:48+05:30)  
+**Uncommitted paths:** 4
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 668 | 0 | 9 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 668 | 0 | 11 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
-| PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) -- `FOLLON_TEST_DATABASE_URL` is not set, so there is no disposable database to run against | **SKIPPED** | -- | -- | -- | -- |
+| PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 11 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
 | Python suite (`pytest`) | **PASS** | 0 | 232 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
-**All 7 executed suite(s) green; 1 skipped.**
+**All 8 executed suite(s) green.**
 
 <!-- END GENERATED STATUS -- tools/session_status.py -->
 
@@ -296,7 +296,7 @@ for independent broker and reviewer evidence.
 | E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open: `O_NOFOLLOW` on Unix, and on Windows `FILE_FLAG_OPEN_REPARSE_POINT` followed by a check of the handle's own file type. **Deferred 2026-09-29, not attempted:** the Unix half cannot be compiled or tested on this Windows host (no Linux toolchain, no target, and Docker and WSL are stopped), and half a no-follow open would be worse than none. The guard sites, ten across eight crates, each check and then open; converting them means removing the check so the open itself is the guard. | open, needs a Linux environment |
 | E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
 | E7.14 | Position limits and aggregate exposure now count the unfilled quantity of working plain orders and combination legs, at their current marks. `projected_position` still means filled plus candidate; `working_position_delta` and `committed_position` make the position-limit check explicit. Aggregate metrics report the all-fill projection, while separate possible-absolute-net, concentration, delta and gamma bounds check every subset of working fills, so an order that may never fill cannot hide a breach. Gross, leverage and bucket limits count every working contribution. Cash, equity and margin remain observed, not prospective. Evidence names the exposure basis and bound values. Both PAPER and controlled LIVE paths use this rule. Audit item 126. | **done** 2026-09-30 |
-| E7.15 | Append-only stops a row changing and not a parent gaining children. A journal line can still be inserted into a transaction that is already committed, and a route decision or benchmark into an execution plan that already exists, so a posted transaction's meaning can change without an UPDATE. **Found in review 2026-09-30 and left open:** a guard would let a child in only within the transaction that created its parent, which is a rule about transaction identity and needs the adapter's writers checked first. Not every child table qualifies: sentiments, receipts and the rest arrive later by design. | open |
+| E7.15 | Migration 0007 stops an append-only parent gaining children after its creation transaction commits. A journal line belongs to its journal transaction; route decisions and benchmarks belong to their execution plan. Parent insert triggers record the full PostgreSQL transaction ID, and child insert triggers require that ID and the parent's tuple insertion ID to be current. Older parents have no creation ID and cannot gain children. `ENABLE ALWAYS` keeps both guards active under replica mode. The adapter's only writers for these tables create parent and children in one transaction; no later-arriving receipt or sentiment is covered. A parent created inside a subtransaction and a child inserted outside it is conservatively refused. Audit item 127. | **done** 2026-09-30 |
 
 ### E8 — Accounting and state parity (assessment priority 5)
 
@@ -845,6 +845,23 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-30 — session 17
+
+- E7.15 is implemented in additive migration 0007. The database refuses
+  journal lines, execution route decisions and benchmarks added after their
+  parent commits. The parent's full transaction ID and tuple insertion ID
+  are both checked, including after a logical restore. Older parents cannot
+  gain children. The adapter's checked-in writers insert parent and children
+  together, and a legitimate savepoint remains accepted (audit item 127).
+- The red database test accepted a late balanced journal pair before the
+  migration. After it, all 11 integration tests passed on a disposable
+  PostgreSQL 17 database. The measured status passed all eight suites: Rust
+  workspace 668 / 0 / 11 ignored, Tauri 33, Python 232, formatting, Clippy,
+  both desktop suites and PostgreSQL 11. The evidence pipeline passed with
+  46 intended local artifacts. No external gate moved.
+- **Next action:** inspect the remaining E7.12 no-follow file opens on a
+  Linux environment, then E8.4b's PAPER and LIVE corporate-action design.
 
 ### 2026-09-30 — session 16
 

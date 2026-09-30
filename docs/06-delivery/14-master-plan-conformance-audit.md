@@ -5267,6 +5267,39 @@ These are mandatory master-plan acceptance conditions and are currently open:
        than prospective working-order margin. This does not substitute for
        broker reconciliation or the external PAPER release gates.
 
+127. A committed evidence parent cannot gain new children (2026-09-30,
+     Storage; E7.15).
+     - **Gap.** Migration 0006 refused updates and deletes but still permitted
+       new journal lines for a committed journal transaction and new route
+       decisions or benchmarks for a committed execution plan. A balanced
+       pair of later journal lines changed a posted transaction without
+       updating any old row. A database test accepted that pair before 0007.
+     - **Behavior.** Migration 0007 records the parent's full creation
+       transaction ID on insert. Each qualifying child can be inserted only
+       while that transaction is current and the parent's tuple insertion ID
+       is current. The second check prevents a logical restore from reusing a
+       stored transaction ID on a new cluster. Parents predating the migration
+       have no ID, so they cannot gain children. All five insert triggers are
+       `ENABLE ALWAYS`, including in replica mode. The database adapter's
+       writers for these tables create parents and children in one transaction.
+     - **Tests.** The new test accepted a balanced pair after commit before
+       the migration and refuses it now; it also checks both execution child
+       tables, a legitimate savepoint, and replica mode. An upgrade test
+       creates parents under migration 0006, applies 0007, and proves those
+       parents cannot gain children. All 11 database integration tests passed
+       against a disposable PostgreSQL 17 database.
+     - **Measured result.** The full status gate passed all eight suites:
+       Rust workspace 668 passed / 0 failed / 11 ignored, PostgreSQL 11,
+       Tauri 33, Python 232, formatting, strict Clippy and both desktop suites.
+       The evidence pipeline passed with 46 local artifacts after its scratch
+       PostgreSQL log was moved out of the artifact directory.
+     - **Boundary.** A parent created inside a subtransaction and a child
+       outside it is refused even if both are in one top-level transaction.
+       This is safe for the checked-in writer. The database owner can disable
+       triggers with DDL; the same operational boundary applies as in 0006.
+       Broker receipts and news sentiments arrive after their sources and are
+       intentionally outside this rule.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

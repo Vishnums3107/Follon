@@ -44,6 +44,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         6,
         include_str!("../migrations/0006_evidence_immutability.sql"),
     ),
+    (
+        7,
+        include_str!("../migrations/0007_evidence_child_commit_guard.sql"),
+    ),
 ];
 
 /// Durable persistence failure.
@@ -577,10 +581,13 @@ mod tests {
             "ENABLE ALWAYS TRIGGER refuse_mutation",
             "ENABLE ALWAYS TRIGGER refuse_truncate",
             "'infinity'::timestamptz",
+            "capture_evidence_parent_xact",
+            "refuse_late_evidence_child",
+            "ENABLE ALWAYS TRIGGER guard_parent_commit",
         ] {
             assert!(migration_sql.contains(required), "missing {required}");
         }
-        assert_eq!(MIGRATIONS.len(), 6);
+        assert_eq!(MIGRATIONS.len(), 7);
         // Versions are consecutive, so a migration can be neither skipped nor reordered.
         for (index, (version, _)) in MIGRATIONS.iter().enumerate() {
             assert_eq!(*version, i64::try_from(index).unwrap() + 1);
@@ -933,6 +940,138 @@ mod tests {
              INSERT INTO execution_benchmark_evidence (tenant_id, benchmark_id, evidence_id, parent_order_id, arrival_price, target_price, source, benchmark_sha256) \
                VALUES ('{tenant}', 'benchmark.{tag}', 'plan.{tag}', 'order.{tag}', '100', '101', 'source.one', {SHA256_ZERO});"
         )
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn evidence_children_must_be_inserted_in_their_parents_transaction() {
+        let mut store = connected_store();
+        let tag = run_tag("child-transaction");
+        let tenant = format!("tenant.{tag}");
+        store
+            .provision_tenant(&tenant, "Child transaction test")
+            .unwrap();
+
+        // The legitimate writer creates each parent and its complete child set
+        // in one transaction. A savepoint still belongs to that transaction.
+        commit_as_tenant(
+            &mut store,
+            &tenant,
+            &format!(
+                "INSERT INTO journal_transactions (transaction_id, tenant_id, reference_id, occurred_at, idempotency_key) \
+                   VALUES ('journal.{tag}', '{tenant}', 'reference.{tag}', NOW(), 'idempotency.{tag}'); \
+                 SAVEPOINT child_insert; \
+                 INSERT INTO journal_lines (transaction_id, line_number, tenant_id, account_id, currency, debit, credit) \
+                   VALUES ('journal.{tag}', 1, '{tenant}', 'cash', 'USD', 10, 0), \
+                          ('journal.{tag}', 2, '{tenant}', 'equity', 'USD', 0, 10); \
+                 RELEASE SAVEPOINT child_insert; \
+                 INSERT INTO execution_plan_evidence (tenant_id, evidence_id, parent_order_id, account_id, instrument_id, side, parent_quantity, algorithm, children, unallocated_quantity, plan_sha256) \
+                   VALUES ('{tenant}', 'plan.{tag}', 'order.{tag}', 'account.{tag}', 'inst.us_equity.spy', 'BUY', '10', 'twap', '[]', '0', {SHA256_ZERO}); \
+                 INSERT INTO execution_route_decisions (tenant_id, decision_id, evidence_id, parent_order_id, venue, capability_version, allocated_quantity, all_in_price, fee_per_unit, latency_rank, decision_sha256) \
+                   VALUES ('{tenant}', 'decision.{tag}', 'plan.{tag}', 'order.{tag}', 'venue.one', 'v1', '10', '100', '0.01', 0, {SHA256_ZERO}); \
+                 INSERT INTO execution_benchmark_evidence (tenant_id, benchmark_id, evidence_id, parent_order_id, arrival_price, target_price, source, benchmark_sha256) \
+                   VALUES ('{tenant}', 'benchmark.{tag}', 'plan.{tag}', 'order.{tag}', '100', '101', 'source.one', {SHA256_ZERO});"
+            ),
+        );
+
+        for (table, sql) in [
+            (
+                "journal_lines",
+                format!(
+                    "INSERT INTO journal_lines (transaction_id, line_number, tenant_id, account_id, currency, debit, credit) \
+                     VALUES ('journal.{tag}', 3, '{tenant}', 'cash', 'USD', 5, 0), \
+                            ('journal.{tag}', 4, '{tenant}', 'equity', 'USD', 0, 5)"
+                ),
+            ),
+            (
+                "execution_route_decisions",
+                format!(
+                    "INSERT INTO execution_route_decisions (tenant_id, decision_id, evidence_id, parent_order_id, venue, capability_version, allocated_quantity, all_in_price, fee_per_unit, latency_rank, decision_sha256) \
+                     VALUES ('{tenant}', 'late.decision.{tag}', 'plan.{tag}', 'order.{tag}', 'venue.two', 'v1', '1', '100', '0.01', 0, {SHA256_ZERO})"
+                ),
+            ),
+            (
+                "execution_benchmark_evidence",
+                format!(
+                    "INSERT INTO execution_benchmark_evidence (tenant_id, benchmark_id, evidence_id, parent_order_id, arrival_price, target_price, source, benchmark_sha256) \
+                     VALUES ('{tenant}', 'late.benchmark.{tag}', 'plan.{tag}', 'other.order.{tag}', '100', '101', 'source.one', {SHA256_ZERO})"
+                ),
+            ),
+        ] {
+            let error = refusal(&mut store, &tenant, None, &sql)
+                .unwrap_or_else(|| panic!("{table} gained a child after its parent committed"));
+            assert!(error.contains("must be inserted with its parent"), "{error}");
+        }
+
+        let bypass = format!(
+            "SET LOCAL session_replication_role = replica; \
+             INSERT INTO journal_lines (transaction_id, line_number, tenant_id, account_id, currency, debit, credit) \
+             VALUES ('journal.{tag}', 3, '{tenant}', 'cash', 'USD', 5, 0), \
+                    ('journal.{tag}', 4, '{tenant}', 'equity', 'USD', 0, 5)"
+        );
+        let error = refusal(&mut store, &tenant, None, &bypass)
+            .expect("replica mode bypassed the child guard");
+        assert!(
+            error.contains("must be inserted with its parent"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn preexisting_parents_cannot_gain_children_after_migration() {
+        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
+        let config: postgres::Config = uri.parse().expect("the database URL parses");
+        let scratch = format!("follon_upgrade_{}", run_tag("children").replace('-', "_"));
+        let mut admin = {
+            let mut config = config.clone();
+            config.dbname("postgres");
+            config.connect(NoTls).unwrap()
+        };
+        admin
+            .batch_execute(&format!("CREATE DATABASE {scratch}"))
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scratch_config = config.clone();
+            scratch_config.dbname(&scratch);
+            let mut store = PostgresStore {
+                client: scratch_config.connect(NoTls).unwrap(),
+            };
+            store.migrate_through(6).unwrap();
+            store
+                .provision_tenant("tenant.upgrade", "Upgrade test")
+                .unwrap();
+            commit_as_tenant(
+                &mut store,
+                "tenant.upgrade",
+                &format!(
+                    "INSERT INTO journal_transactions (transaction_id, tenant_id, reference_id, occurred_at, idempotency_key) \
+                     VALUES ('journal.upgrade', 'tenant.upgrade', 'reference.upgrade', NOW(), 'idempotency.upgrade'); \
+                     INSERT INTO execution_plan_evidence (tenant_id, evidence_id, parent_order_id, account_id, instrument_id, side, parent_quantity, algorithm, children, unallocated_quantity, plan_sha256) \
+                     VALUES ('tenant.upgrade', 'plan.upgrade', 'order.upgrade', 'account.upgrade', 'inst.us_equity.spy', 'BUY', '10', 'twap', '[]', '0', {SHA256_ZERO})"
+                ),
+            );
+            store.migrate().unwrap();
+            for sql in [
+                "INSERT INTO journal_lines (transaction_id, line_number, tenant_id, account_id, currency, debit, credit) \
+                 VALUES ('journal.upgrade', 1, 'tenant.upgrade', 'cash', 'USD', 10, 0), \
+                        ('journal.upgrade', 2, 'tenant.upgrade', 'equity', 'USD', 0, 10)".to_owned(),
+                format!(
+                    "INSERT INTO execution_route_decisions (tenant_id, decision_id, evidence_id, parent_order_id, venue, capability_version, allocated_quantity, all_in_price, fee_per_unit, latency_rank, decision_sha256) \
+                     VALUES ('tenant.upgrade', 'decision.upgrade', 'plan.upgrade', 'order.upgrade', 'venue.one', 'v1', '10', '100', '0.01', 0, {SHA256_ZERO})"
+                ),
+            ] {
+                let error = refusal(&mut store, "tenant.upgrade", None, &sql)
+                    .expect("a pre-migration parent gained a child");
+                assert!(error.contains("must be inserted with its parent"), "{error}");
+            }
+        }));
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
+            .unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
