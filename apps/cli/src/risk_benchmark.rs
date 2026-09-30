@@ -14,10 +14,11 @@ use std::time::Instant;
 use follon_cli::{sha256_text, write_immutable};
 use follon_domain::{validate_utc_timestamp, Decimal, Side};
 use follon_risk::{
-    evaluate_portfolio_risk, CandidateOrder, PortfolioRiskPolicy, PortfolioRiskSnapshot,
-    RestingOrder, RiskPosition,
+    evaluate_portfolio_risk, CandidateOrder, PortfolioRiskDecision, PortfolioRiskPolicy,
+    PortfolioRiskSnapshot, RestingOrder, RiskPosition,
 };
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,7 +113,9 @@ struct CandidateDocument {
 }
 
 struct BenchmarkInput {
-    observed_at: String,
+    /// The frozen scenario's own as-of time, echoed from the input document. It
+    /// is not when the benchmark ran.
+    scenario_observed_at: String,
     warmup_iterations: u32,
     measured_iterations: u32,
     threshold_micros: u64,
@@ -136,6 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let document: BenchmarkDocument = serde_json::from_slice(&source)?;
     let input = parse_document(document)?;
     let expected = evaluate_portfolio_risk(&input.policy, &input.snapshot, Some(&input.candidate))?;
+    // When this run began measuring. The scenario's own time is a separate
+    // field, because a frozen scenario stays the same however often it is run.
+    let measured_at = utc_now();
     for _ in 0..input.warmup_iterations {
         let decision =
             evaluate_portfolio_risk(&input.policy, &input.snapshot, Some(&input.candidate))?;
@@ -155,29 +161,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     samples.sort_unstable();
     let p99_index = ((samples.len() * 99).div_ceil(100)).saturating_sub(1);
-    let p99_micros = samples[p99_index];
-    let max_micros = *samples.last().expect("validated non-empty measurement set");
-    let min_micros = samples[0];
-    let artifact = format!(
-        "{{\"benchmark_schema_version\":1,\"candidate_id\":{},\"input_sha256\":{},\"measured_iterations\":{},\"measurement\":{{\"max_micros\":{},\"min_micros\":{},\"p99_micros\":{},\"threshold_micros\":{},\"within_threshold\":{}}},\"observed_at\":{},\"policy_version\":{},\"risk_decision\":{{\"approved\":{},\"reason_codes\":{}}},\"warmup_iterations\":{}}}",
-        json_string(&input.candidate.intent_id),
-        json_string(&sha256_text(&String::from_utf8(source)?)),
-        input.measured_iterations,
-        max_micros,
-        min_micros,
-        p99_micros,
-        input.threshold_micros,
-        p99_micros <= u128::from(input.threshold_micros),
-        json_string(&input.observed_at),
-        json_string(&input.policy.version),
-        expected.approved,
-        serde_json::to_string(&expected.reason_codes)?,
-        input.warmup_iterations,
-    );
+    let measurement = Measurement {
+        min_micros: samples[0],
+        p99_micros: samples[p99_index],
+        max_micros: *samples.last().expect("validated non-empty measurement set"),
+    };
+    let artifact = render_artifact(
+        &input,
+        &sha256_text(&String::from_utf8(source)?),
+        &measured_at,
+        &measurement,
+        &expected,
+    )?;
     publish(&output_path, &artifact)?;
     println!("{artifact}");
     eprintln!("risk benchmark: {}", output_path.display());
     Ok(())
+}
+
+/// Latencies of the measured iterations, in microseconds.
+struct Measurement {
+    min_micros: u128,
+    p99_micros: u128,
+    max_micros: u128,
+}
+
+/// Renders the benchmark artifact, schema version 2.
+///
+/// Version 1 named the scenario's own time `observed_at`, which read as when the
+/// benchmark ran (delivery state E7.9). Version 2 records `measured_at`, when
+/// the run began, and keeps the scenario's time as `scenario_observed_at`.
+fn render_artifact(
+    input: &BenchmarkInput,
+    input_sha256: &str,
+    measured_at: &str,
+    measurement: &Measurement,
+    decision: &PortfolioRiskDecision,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(format!(
+        "{{\"benchmark_schema_version\":2,\"candidate_id\":{},\"input_sha256\":{},\"measured_at\":{},\"measured_iterations\":{},\"measurement\":{{\"max_micros\":{},\"min_micros\":{},\"p99_micros\":{},\"threshold_micros\":{},\"within_threshold\":{}}},\"policy_version\":{},\"risk_decision\":{{\"approved\":{},\"reason_codes\":{}}},\"scenario_observed_at\":{},\"warmup_iterations\":{}}}",
+        json_string(&input.candidate.intent_id),
+        json_string(input_sha256),
+        json_string(measured_at),
+        input.measured_iterations,
+        measurement.max_micros,
+        measurement.min_micros,
+        measurement.p99_micros,
+        input.threshold_micros,
+        measurement.p99_micros <= u128::from(input.threshold_micros),
+        json_string(&input.policy.version),
+        decision.approved,
+        serde_json::to_string(&decision.reason_codes)?,
+        json_string(&input.scenario_observed_at),
+        input.warmup_iterations,
+    ))
+}
+
+/// The current UTC time to the second, as `YYYY-MM-DDTHH:MM:SSZ`.
+fn utc_now() -> String {
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
 }
 
 fn parse_arguments(
@@ -206,7 +257,7 @@ fn parse_document(
         return Err("invalid risk benchmark iteration or threshold bounds".into());
     }
     Ok(BenchmarkInput {
-        observed_at: document.observed_at,
+        scenario_observed_at: document.observed_at,
         warmup_iterations: document.warmup_iterations,
         measured_iterations: document.measured_iterations,
         threshold_micros: document.threshold_micros,
@@ -460,6 +511,61 @@ mod tests {
             },
         })
         .is_err());
+    }
+
+    fn fixture_input() -> BenchmarkInput {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/risk-benchmark-v1.json");
+        parse_document(serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap()).unwrap()
+    }
+
+    /// The artifact says when it was measured and keeps the frozen scenario's
+    /// own time apart, under a name that cannot be read as the run time
+    /// (delivery state E7.9).
+    #[test]
+    fn the_artifact_records_when_it_was_measured_apart_from_the_scenario_time() {
+        let input = fixture_input();
+        let decision =
+            evaluate_portfolio_risk(&input.policy, &input.snapshot, Some(&input.candidate))
+                .unwrap();
+        let artifact = render_artifact(
+            &input,
+            &"a".repeat(64),
+            "2026-09-29T13:00:01Z",
+            &Measurement {
+                min_micros: 15,
+                p99_micros: 34,
+                max_micros: 62,
+            },
+            &decision,
+        )
+        .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&artifact).unwrap();
+        assert_eq!(document["benchmark_schema_version"], 2);
+        assert_eq!(document["measured_at"], "2026-09-29T13:00:01Z");
+        assert_eq!(document["scenario_observed_at"], "2026-08-30T21:30:00Z");
+        assert!(
+            document.get("observed_at").is_none(),
+            "a field that reads as the run time must not carry the scenario time"
+        );
+        assert_eq!(document["measurement"]["p99_micros"], 34);
+        assert_eq!(document["measurement"]["within_threshold"], true);
+    }
+
+    #[test]
+    fn the_measurement_time_is_the_current_utc_second() {
+        let before = OffsetDateTime::now_utc().unix_timestamp();
+        let stamp = utc_now();
+        let after = OffsetDateTime::now_utc().unix_timestamp();
+        validate_utc_timestamp("measured_at", &stamp).unwrap();
+        let measured =
+            OffsetDateTime::parse(&stamp, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp();
+        assert!(
+            (before..=after).contains(&measured),
+            "{stamp} is outside [{before}, {after}]"
+        );
     }
 
     #[test]

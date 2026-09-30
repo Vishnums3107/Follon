@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://follon.local/contracts/v1/external-acceptance-evidence.schema.json",
   "title": "Follon external acceptance evidence record",
+  "description": "Superseded by ../v2/external-acceptance-evidence.schema.json (delivery state E6.4). A version 1 record names no release, carries no reviewer signature and states no attributes, so nothing can prove who attested it or that it met any criterion. The audit refuses a ledger that holds one. No version 1 ledger was ever retained.",
+  "deprecated": true,
   "type": "object",
   "additionalProperties": false,
   "required": [

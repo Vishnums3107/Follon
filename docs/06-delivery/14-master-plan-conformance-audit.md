@@ -4132,6 +4132,912 @@ These are mandatory master-plan acceptance conditions and are currently open:
        account and time but does not retain which authenticated risk manager
        requested it. No external gate moved.
 
+103. A bridge refusal is now a clean rejection, and IBKR's notices no longer
+     reject working orders (2026-09-29, rows 5.5 and 5.10; E5.4).
+     - **Defect.** Every `ok: false` reply from the bridge reached `core/paper`
+       as an adapter error, which records `UNKNOWN` and disconnects the session.
+       That included a refusal made before anything reached IBKR, such as an
+       unmapped instrument. The order was then stranded, and every later order
+       was refused until reconciliation. Separately, the bridge recorded any IBKR
+       message code on a tracked order as a rejection. 202 (order cancelled), 399
+       (an order warning such as "will not be placed until the market opens") and
+       the 2100–2169 system warnings are not rejections, and a false `REJECTED`
+       records as terminal an order IBKR still holds.
+     - **Behavior.**
+       - `BridgeRefusal` marks a failure raised before `placeOrder`.
+         `validate_submit`, importable without `ibapi`, carries every submit check
+         and gives each refusal a stable code. `BridgeProtocol` answers a refused
+         submission `ok: true` with `REJECTED` and `IBKR_BRIDGE_REFUSED_<CODE>`.
+         Only a refusal is mapped: any other failure stays `ok: false`, and so
+         `UNKNOWN`.
+       - The gateway-connected check follows the lookup of a known client order
+         ID, so the retry of an order the bridge may already have placed is never
+         refused as a new one.
+       - A cancellation refused before anything was sent (an unknown client order
+         ID, a disconnected gateway) returns `{}` and queues a `CANCEL_REJECTED`
+         event. The OMS restores the working state from it, as it does for IBKR's
+         own cancel failures. The Rust adapter normalizes the new event type.
+       - The bridge remembers which cancellations it requested and reports a
+         cancel-failure code (135, 136, 161, 10147, 10148) once, only for those.
+         Codes 202 and 399 and 2100–2169 leave the order's state alone. Any other
+         code on a tracked order remains a rejection.
+     - **Tests.** 20 bridge tests and 3 Rust tests were added.
+       - The protocol layer maps a refusal to a rejection and nothing else. Each
+         submit check carries its own code, and none of them reaches `placeOrder`
+         or consumes an order ID. A disconnected gateway does not reject a known
+         order's retry.
+       - The cancel refusals become events. Each code class, and the exact edges
+         of the warning band, are pinned.
+       - A fixture runs the bridge's real dispatcher with a refusing backend
+         under the Rust process transport. The transport returns `Rejected` and
+         stays healthy, and the `CANCEL_REJECTED` event normalizes. Through the
+         gRPC route, two refused orders in a row are both `REJECTED`; before, the
+         second would have been refused because the first disconnected the route.
+     - **Rule 5.** 26 of 26 injected defects were caught by the intended tests
+       on the final files. One first attempt survived because the injection
+       crashed into the same failure result the test expects. It was a bad
+       injection, not a weak test: a working version of it was caught.
+     - **Measured result.** The Rust workspace rose from 562 to 565 passed /
+       0 failed / 3 ignored, and the Python suite from 75 to 95. The final
+       `python tools/session_status.py` run measured all seven suites green. The
+       full evidence pipeline exited 0.
+     - **Boundary.** The code table is IBKR's documentation, not a retained
+       Gateway session. The tests build the bridge's real `OfficialBackend` over
+       a mocked `ibapi` connection, so they are protocol evidence, not TWS
+       evidence. The bridge still keeps its order map in memory, so a retry of an
+       order placed by an earlier bridge process is not recognised. Neither is
+       closed by this item (E5.5 and E5.6). No external gate moved.
+
+104. Controlled LIVE refuses what its broker adapter cannot carry before an
+     approval is spent (2026-09-29, rows 5.6 and 5.7; E5.7). This is E5.1's
+     analogue for LIVE, under LIVE's own configuration and review.
+     - **Defect.** `LiveBrokerAdapter::submit_combo` and `replace` refuse by
+       default, and the service recorded that refusal as a transport failure. A
+       combination on such an adapter became `UNKNOWN`, the session was marked
+       disconnected, and the approval and a canary slot stayed consumed; a
+       replacement left the order `PENDING_REPLACE` and then `UNKNOWN`. The broker
+       request also carries no time in force, so a GTC intent could not reach the
+       venue as such. It was latent, because no application composes a LIVE
+       adapter that can trade.
+     - **Behavior.**
+       - `LiveBrokerCapabilities` (`combinations`, `good_til_cancelled`,
+         `replacement`) defaults to single DAY orders, and every adapter may
+         declare more through `LiveBrokerAdapter::capabilities`. It is a separate
+         type from `follon_paper::PaperBrokerCapabilities`: PAPER's declaration can
+         never widen what LIVE attempts.
+       - `submit_canary_intent` and `submit_canary_combo_intent` check it after the
+         idempotent-retry answer and before the approval is looked at.
+         `replace_order` checks it before the order moves to `PENDING_REPLACE`. A
+         refusal changes nothing: no order, no consumed approval, no canary slot, no
+         disconnect.
+       - `IbkrControlledLiveAdapter` declares replacement only, since its transport
+         contract carries `replace_live` and nothing else.
+     - **Tests.** Four service tests and one adapter test were added. An adapter that
+       declares nothing carries single DAY orders only. An undeclared combination,
+       GTC intent and replacement are each refused with the approval unspent, the
+       canary count at zero, no order, no `UNKNOWN` and the session connected, and the
+       same approval then works once the adapter declares it. The existing transport
+       failure test, which keeps a spent approval, now covers a declared adapter, the
+       only kind that can reach the broker call.
+     - **Rule 5.** 12 of 12 injected defects were caught by the intended tests on the
+       final files, including both checks moved to after the approval is spent.
+     - **Measured result.** The Rust workspace rose from 565 to 570 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+       seven suites green. The full evidence pipeline exited 0.
+     - **Boundary.** The IBKR LIVE adapter's own envelope checks, such as a market order
+       without a limit or a quantity over the canary ceiling, still return an error and
+       so `UNKNOWN`, although nothing was sent. That is a separate LIVE decision and is
+       not changed here. Nothing composes a LIVE adapter that can trade, and no
+       external gate moved.
+
+105. A strategy worker can no longer exhaust the host's memory or hang a replay
+     (2026-09-29, Security and Reliability; E7.2). Found by the source review behind
+     the revised assessment (item 92's review).
+     - **Defect.** `ProcessStrategyWorker` read each frame with an unbounded
+       `read_line`, waited for it with no deadline, and wrote requests with a
+       blocking `write_all`. A worker that printed one endless line grew the host's
+       memory without limit. One that never answered, or stopped reading its input
+       while a large request was being written, hung the replay forever.
+     - **Behavior.**
+       - `core/control-plane/src/worker_io.rs` moves each pipe direction to its own
+         thread. The reader buffers at most `max_frame_bytes + 1` bytes per frame, so
+         the bound applies before the allocation, and it counts the newline: a frame
+         of exactly the limit is accepted and one byte more is not. Every round trip
+         waits at most `frame_deadline` for its answer, and that wait covers the
+         write of the request.
+       - `StrategyWorkerLimits` defaults to 16 MiB frames and a 60-second deadline.
+         The four existing constructors use it, and `spawn_bounded` sets it
+         explicitly. A limit below 4 KiB or a zero deadline is refused before a
+         process starts.
+       - A transport fault kills the worker's process and marks it ended. It is never
+         asked again, because after a fault nothing says which request a later answer
+         belongs to. A line that is not JSON is still a protocol error, not a
+         transport fault.
+       - `ProcessStrategyWorker` keeps no `stdin` or `stdout` of its own any more. The
+         built-in strategy's bundle hash changed because it covers
+         `core/control-plane/src/lib.rs`, which this slice edits.
+     - **Tests.** 17 tests and a fixture were added. `tests/fixtures/worker/misbehaving-worker.py`
+       is a worker that stays silent, stops reading, streams a frame with no end, sends
+       an oversized, cut-off, non-JSON or exactly-sized frame, or behaves.
+       - Six unit tests hold the reader: the newline counts, frames come one at a time,
+         and an endless reader that errors after 64 KiB shows the reader buffers only
+         the limit. A seventh shows a send to a worker that has gone is refused.
+       - Process tests: a silent worker ends at the deadline, and a worker that stops
+         reading cannot hang the write of a 4 MiB request. An endless, oversized or
+         cut-off frame is refused, and an exactly-limit frame is accepted. An ended
+         worker answers nothing further, and a worker within its limits keeps answering.
+         Each failing round trip runs behind a 30-second watchdog, so a missing bound or
+         deadline fails the test instead of hanging it.
+     - **Rule 5.** 15 of 15 injected defects were caught by the intended tests on the
+       final files, including the read bound removed, off-by-one on either side of the
+       limit, the deadline replaced by an hour, and a fault that no longer ends the
+       process. One run showed why the fixture's stalls are now bounded: an unended
+       worker holds the test's pipes open and hung the runner for ten minutes.
+     - **Measured result.** The Rust workspace rose from 570 to 587 passed /
+       0 failed / 3 ignored. The final `python tools/session_status.py` run measured all
+       seven suites green. The full evidence pipeline exited 0.
+     - **Boundary.** The limits are not yet exposed on the `follon-backtest` command
+       line, and a worker is still not an operating-system sandbox: it can consume CPU
+       and memory of its own. It only stops the host from being exhausted through its
+       pipes. No external gate moved.
+
+106. The risk benchmark says when it was measured (2026-09-29, Reliability and
+     evidence integrity; E7.9). Found by the source review behind the revised
+     assessment.
+     - **Defect.** The artifact's `observed_at` was the benchmark fixture's configured
+       scenario time, `2026-08-30T21:30:00Z`, echoed unchanged. A run on 27 September
+       therefore read as an observation from 30 August, and the desktop's benchmark table
+       showed that as when the latency was observed. The evaluator itself takes no time,
+       so the field measured nothing about the run.
+     - **Behavior.** The artifact is schema 2. `measured_at` is the UTC second the run
+       began, from the wall clock. `scenario_observed_at` carries the fixture's as-of
+       time, and no field called `observed_at` remains, so nothing that reads as the run
+       time carries the scenario's. The input document is unchanged. The desktop's table
+       has a "Measured at" and a "Scenario as of" column.
+     - **Tests.** Two unit tests and the real-binary workflow test were changed or added:
+       - the rendered artifact carries both times under their names, has no
+         `observed_at`, and is schema 2;
+       - `utc_now` is a canonical timestamp within the second it was read, and the
+         workflow test runs the real command and requires `measured_at` to fall inside
+         the window of the run while the scenario time stays `2026-08-30T21:30:00Z`;
+       - a desktop regression renders the blotter with a benchmark artifact and requires
+         both columns and both values, and no "Observed at" header.
+     - **Rule 5.** 10 of 10 injected defects were caught by the intended tests: the
+       measurement time echoing the scenario's, the scenario time under `observed_at`
+       again, the schema version left at 1, a month off by one, minute and second
+       swapped, the hour dropped, and three desktop defects. One injection first
+       looked over-constrained because `cargo test` stops at the first failing target;
+       it was caught by both tests when run with `--no-fail-fast`.
+     - **Measured result.** The Rust workspace rose from 587 to 589 passed / 0 failed /
+       3 ignored. The final `python tools/session_status.py` run measured all seven
+       suites green. The full evidence pipeline exited 0, and its regenerated artifact
+       reads `measured_at` of the run's own time.
+     - **Boundary.** The artifact remains one local observation on one machine, as its
+       description says, and not an availability or load claim. The benchmark, like the
+       rest of the evidence set, is not reproducible byte for byte, because its
+       latencies vary by run. Neither is changed. No external gate moved.
+
+107. An account with no positive equity may only reduce risk, not skip its aggregate
+     limits (2026-09-29, rows 5.5 and 5.7; E7.4b). The treatment was left to the
+     operator, and the agent chose it under the blanket delegation recorded as Settled
+     direction item 6.
+     - **Defect.** All four risk gates, PAPER and controlled LIVE for a single order and a
+       combination, returned no aggregate decision when equity was zero or negative, and
+       added no reason. Every aggregate limit was therefore skipped for an underwater
+       account, the state in which they matter most, because the kernel's ratios are
+       meaningless against non-positive equity. An underwater account could add exposure
+       past all of them.
+     - **Decision.** Reduce-only. The alternatives were to keep skipping (fail open) or to
+       refuse everything (an account could not close a losing position). Reduce-only lets
+       exposure be closed and nothing else. It is reversible on an explicit instruction.
+     - **Behavior.**
+       - `follon_domain::reduces_position(current, projected)` is the single definition: a
+         trade reduces a position only if it moves it strictly toward flat without passing
+         through it. Opening, adding, reversing and doing nothing do not.
+       - With aggregate risk configured and equity not positive, a single order that does
+         not reduce its instrument's position is refused with `PORTFOLIO_EQUITY_NOT_POSITIVE`.
+         A combination is refused unless every leg reduces its own position, because the
+         group is atomic. A reducing order passes as before, and the kernel's own limits are
+         still not reported, because it did not run.
+       - PAPER and LIVE each apply it in their own gate. They share only the arithmetic
+         predicate, not policy.
+       - An account with no aggregate composition is unchanged, since it has no aggregate
+         limits to skip.
+     - **Tests.** Five tests were added and one strengthened.
+       - The predicate is held on both sides of flat, on an unchanged position and on
+         opening from flat.
+       - An underwater PAPER account holding a short of 100 refuses adding to it and
+         reversing it, and passes buying 50 back. An underwater PAPER account holding the
+         filled vertical refuses a combination that adds to both legs, one that closes a
+         leg and adds to the other in either order, and passes closing one unit.
+       - The two LIVE tests hold the same cases through its own gate, seeded with recorded
+         fills.
+       - The existing zero-equity test now requires the refusal as well.
+     - **Rule 5.** 20 of 20 injected defects were caught by the intended tests: each side of
+       the predicate, an underwater order never refused or always refused, the position
+       arguments swapped, the reason renamed, and the per-leg accumulation replaced by
+       `any`, by the last leg only, and by never or always refusing, in PAPER and in LIVE.
+     - **Measured result.** The Rust workspace rose from 589 to 594 passed / 0 failed /
+       3 ignored. The final `python tools/session_status.py` run measured all seven suites
+       green. The full evidence pipeline exited 0.
+     - **Boundary.** "Reduces risk" is judged per instrument on position quantity, not on
+       margin or notional: a reduction that swaps into a more volatile instrument is not a
+       concept the gate has. The reducing order must still pass every other check, including
+       cash, so an account that cannot afford to buy back its short can only reduce partly.
+       No external gate moved.
+
+108. The backtest's two P&L conventions are stated and held by tests (2026-09-29,
+     research-to-live parity; E8.5). A characterization slice: no production behavior
+     changed.
+     - **Gap.** `BacktestLedger` and `AdvancedBacktestAccount` show fees in different
+       places, and nothing stated or tested which. The primary ledger puts the buy fee
+       in the cost basis and deducts the sell fee, so its realized and unrealized P&L are
+       net of fees. The advanced account reports trading P&L before charges, with charges
+       beside it. A reader comparing the two figures, or a future change to either
+       account, could move a fee across that line without any test noticing.
+     - **What is now stated.** The backtesting capability doc has a conventions table.
+       The two accounts agree on all money: the same fills leave the same cash and
+       equity, and each realized or unrealized figure differs by exactly the fees. Each
+       also keeps a FIFO tax-lot book that includes fees, and the two tax P&Ls are equal.
+     - **Tests.** Five integration tests in `core/backtest/tests/pnl_conventions.rs`,
+       using only the public API. The worked example is a trading gain of 100 and fees of
+       3.5: the ledger's realized P&L is 96.5, the advanced account's is 100 with charges
+       of 3.5, cash is 10,096.5 in both, and both tax P&Ls are 96.5. An open position
+       shows the same split in unrealized P&L (48.5 against 50), and the same equity.
+     - **Rule 5.** 8 of 8 injected defects were caught by the intended tests: the buy fee
+       left out of the basis, the sell fee not deducted, total fees not accumulated, the
+       advanced account's realized P&L charged the fee, its charges not recorded, its
+       average price including the fee, its tax lot leaving the fee out, and the sell fee
+       leaving its cash.
+     - **Measured result.** The Rust workspace rose from 594 to 599 passed / 0 failed /
+       3 ignored. The final `python tools/session_status.py` run measured all seven
+       suites green. The full evidence pipeline exited 0.
+     - **Boundary.** Clean-install and recovery evidence, which E8.5 also names, is not
+       addressed: it needs a clean machine, not code. The conventions cover one currency
+       and one instrument, the case the doc states; FX conversion and multipliers are
+       covered by the advanced account's own tests. No external gate moved.
+
+109. The release SBOM covers the desktop's Cargo workspace and records first-party
+     licences (2026-09-29, Release supply chain; E7.8). Found by the source review behind
+     the revised assessment, and unblocked by E7.11's decision on the licence.
+     - **Gap.** `tools/generate_sbom.py` read the root `Cargo.lock`, the desktop's npm
+       lockfile and the Python `pyproject.toml` files. The desktop host is a separate Cargo
+       workspace with its own lockfile, so Tauri and its whole dependency tree were absent
+       from the bill of a build that ships them. No component recorded a first-party
+       licence, and the desktop npm package, a first-party component, had none to record.
+     - **Behavior.**
+       - The desktop host's `Cargo.lock` is read and hashed as an input, and each
+         component names the lockfile that declares it: Tauri only the desktop's, a shared
+         crate such as `follon-domain` both.
+       - First-party Cargo licences come from each workspace member's manifest and the
+         desktop's, resolving `license.workspace = true`. A package with no registry or git
+         source is first-party. Its licence is recorded, as `follon:license` and as
+         CycloneDX's native `licenses`, and it carries `follon:first-party`.
+       - Python packages carry their PEP 639 licence expression, and the desktop npm
+         package is now a first-party component. The bill's own component carries the
+         repository's licence. A licence that is an SPDX expression is written as an
+         expression, not as an identifier.
+       - Every manifest read is hashed into the bill's inputs, so a licence change changes
+         the bill's own evidence.
+       - The generator refuses a first-party crate that declares no licence, a path package
+         it has no manifest for, a Python package without a licence, and an npm package
+         without a name, version and licence.
+       - `apps/desktop/package.json` and the lockfile's root entry declare MIT, and the
+         licence-declaration test now covers them.
+     - **Tests.** Nine SBOM tests and one licence test were added. Tauri is present, and
+       only under the desktop lockfile. A crate in both workspaces names both. Every
+       first-party component is exactly the set the manifests declare, each with its licence,
+       and no registry component claims to be first-party. The refusals are each held with a
+       synthetic tree, and inheritance resolves.
+     - **Rule 5.** 15 of 15 injected defects were caught: the desktop lock left out, not
+       hashed, or mis-attributed; a wrong licence; no path package treated as first-party,
+       or a registry crate claiming to be; the bill naming no licence for itself; every
+       licence written as an identifier; each refusal removed; and the desktop package losing
+       its licence.
+     - **Measured result.** The Python suite rose from 95 to 105 passed. The final
+       `python tools/session_status.py` run measured all seven suites green. The full
+       evidence pipeline exited 0, and the SBOM it publishes now has 639 components.
+     - **Boundary.** Third-party Cargo licences are still not recorded: a lockfile does not
+       carry them, and reading them needs each crate's registry metadata. That remains a
+       part of the SBOM review the deployment runbook already requires. The bill is a
+       machine-readable record, not a licence-compatibility clearance. No external gate
+       moved.
+
+110. The order-submitting PAPER routes can enforce aggregate portfolio limits
+     (2026-09-29, rows 5.5 and 5.7; E7.5). Found by the source review behind the revised
+     assessment.
+     - **Gap.** `core/paper` composes `core/risk`'s aggregate kernel into its order gate
+       when a policy carries a `portfolio_risk` composition, but the two applications that
+       submit orders, the gRPC PAPER route and the desktop gateway, built every policy
+       with `portfolio_risk: None`. Their configuration documents had nowhere to state a
+       limit, so only the read-only `follon-paper-status` could apply one. An operator who
+       configured gross exposure, leverage, drawdown or a bucket limit found it enforced in
+       the status report and not on the orders that mattered.
+     - **Behavior.**
+       - The `portfolio_risk` document moved out of `apps/cli` into `core/paper` as
+         `PortfolioRiskDocument`, with its conversion, so the CLI, the route and the
+         gateway read one strict document and no limit can mean two things.
+       - The route's version-1 configuration and the desktop gateway's file each take it as
+         an optional block. Absent, nothing changes. Present, it gates every order and
+         combination they accept, and it is part of the journal's configuration
+         fingerprint, so a journal reopens only under the limits it was written with. A
+         block that does not parse refuses the route or disables the gateway before its
+         journal is touched.
+       - The route's JSON schema publishes the block with definitions tested equal to the
+         version-2 paper schema's, and a checked-in route fixture carries one.
+     - **Tests.** 12 tests and one fixture were added.
+       - The shared document: an absent optional limit is a limit that can never trip,
+         every configured limit reaches the composition, an unknown field is refused, and a
+         malformed limit names its field.
+       - The route: none, wide and tight limits approve, approve and reject the same order
+         with `MAX_GROSS_EXPOSURE_EXCEEDED`; a bad block refuses the route before its
+         journal; the journal reopens under its own limits and not under a changed one; and
+         the route opens the checked-in fixture.
+       - The gateway: a tight limit rejects an order and a wide one does not, and a bad
+         block disables it before its journal.
+       - The schema: the block's definitions equal the paper schema's, and five malformed
+         blocks are refused.
+     - **Rule 5.** 15 of 15 injected defects were caught by the intended tests: the block
+       ignored by the route and by the gateway, a malformed limit swallowed or reported
+       under another name, an absent limit that could trip, sector limits read from the
+       wrong field, strategy limits dropped, an unknown field ignored, an empty margin table
+       kept, the composed kernel duplicating the open-order limit, a limit that lost its
+       name, and two schema drifts.
+     - **Measured result.** The Rust workspace rose from 599 to 607 passed / 0 failed /
+       3 ignored, the Tauri host from 31 to 33, and the Python suite from 105 to 107. The
+       final `python tools/session_status.py` run measured all seven suites green. The
+       full evidence pipeline exited 0.
+     - **Boundary.** The route and gateway still take operator-attested marks, so the
+       aggregate limits are only as good as those marks (E5.3). Controlled LIVE already
+       composes aggregate risk through `LiveConfiguration` and is unchanged. The routes
+       still lack the authenticated write boundary of E7.10 on the desktop. No external
+       gate moved.
+
+111. Acceptance evidence is signed by a trusted reviewer, backed by a retained artifact, bound
+     to a release and held to fixed criteria (2026-09-29, External and business gates;
+     E6.4 and E6.5). Found by the source review behind the revised assessment, and the last
+     part of its priority 3.
+     - **Gap.** After E6.1 to E6.3 the audit still counted a record on its say-so.
+       `observed_by` and `reviewed_by` were two strings checked for inequality, and the
+       per-file hash chain is unkeyed: it exposes an edit but cannot say who wrote a record,
+       and anyone able to write the ledger could append a valid chain naming any reviewer.
+       `source_artifact_sha256` was never compared with anything, a record named no release,
+       so evidence about one build counted toward another, and "clean" was undefined: a PAPER
+       session was a subject and an outcome. The customer gate asked for one customer where
+       the roadmap asks for ten professionals or three organisations.
+     - **Behavior.**
+       - A record is schema 2. It carries the reviewer's Ed25519 signature over
+         `follon-acceptance-evidence-v2\n` and a canonical body of every field except the
+         signature and the hash, so the previous record's hash, the release, the attributes
+         and the notes are all signed. It counts only under a trusted reviewer set, only if
+         the key belongs to the reviewer the record names (`UNAUTHENTICATED`). The set is a
+         strict operator-controlled file, an empty one trusts no one, and its SHA-256 is in
+         every status and receipt.
+       - The record's artifact is re-hashed against a content-addressed artifact root. One that
+         is missing, linked or altered is `ARTIFACT_UNVERIFIED`. The record names its release
+         and counts only toward that release (`OTHER_RELEASE`), and a PAPER or LIVE session
+         names its environment, which nothing else has.
+       - The criteria are fixed (`CRITERIA_NOT_MET`, delivery state Settled direction item 6). A
+         clean session lasts at least 23,400 s, submits and reconciles an order, and closes with
+         no `UNKNOWN` order, discrepancy or unexplained incident. An unplanned reconnect
+         disqualifies it and a planned drill never does. A design partner completed a workflow
+         unaided, the options acceptance reconciled BACKTEST, PAPER and LIVE, and a customer
+         names its kind and subscription. The customer gate is ten professionals or three
+         organisations, each alternative reported.
+       - A rejection from a trusted reviewer disqualifies its subject in that gate whatever
+         its release or artifact. A rejection nobody trusted disqualifies no one. There is
+         still no correction record, which item 89 left to this policy: a session wrongly
+         rejected is re-run under a new subject id, because a rejection only lowers a count
+         and a withdrawal would be a way to raise one.
+       - A malformed, out-of-chain or mis-hashed record still fails the whole audit, as does a
+         version 1 record. A well-formed record that does not qualify is listed with its
+         reason and not counted. The status is schema 3 and the promotion receipt schema 3,
+         which add the release and the reviewer set's hash.
+       - `tools/acceptance_evidence.py` gained `audit` and `append`. `append` verifies the
+         ledger so far, refuses a repeated `evidence_id`, signs, chains, validates the whole
+         record, retains the artifact and only then writes. The promotion gate audits for the
+         release its manifest names, and the pipeline's step 23 for the release its own
+         manifest names, from `var/acceptance-trusted-reviewers.json` and
+         `var/acceptance-artifacts/`. The step writes an empty set if none exists and never
+         overwrites one.
+       - `tools/ed25519.py` is RFC 8032 in pure Python, so the audit runs anywhere with
+         nothing installed. `verify` never raises and requires a canonical response. A
+         PKCS#8 reader accepts the version 0 and version 1 keys `follon-admin release-keygen`
+         writes, and refuses a version 1 key whose public half disagrees with its seed.
+       - The version 1 schema is marked superseded and the version 2 record and reviewer-set
+         schemas are published. No version 1 ledger was ever retained.
+     - **Tests.** 57 tests were added, 19 becoming 76 across four files: 52 for the audit,
+       12 for the promotion gate, 8 for Ed25519 and 4 for the schemas.
+       - The RFC 8032 vectors are reproduced, and the module agrees with the `cryptography`
+         package where it is installed. The release key the Rust tool writes is read here.
+       - A signature from another key, another reviewer's key, an unknown key, an edited field
+         or a record moved elsewhere in the chain does not count, and the signed message is
+         rebuilt independently of the code that builds it.
+       - Each of the criteria disqualifies on its own, a planned drill never does, and the gate
+         targets and the 23,400-second floor are pinned.
+       - A missing, altered or linked artifact, another release's record and a session in the
+         wrong environment do not count. A forged rejection does not sink a subject.
+       - Ten professionals or three organisations open the customer gate, and kinds are not
+         pooled. `append` is idempotent for an artifact and refuses before it writes. The
+         command line signs, appends and audits, and refuses a missing, directory, linked or
+         malformed key or template, each by its own message, before anything is written.
+       - The promotion gate refuses another release's evidence, and its receipt binds the
+         release, the reviewer set and every ledger it counted.
+     - **Rule 5.** 55 of 55 injected defects were caught by the intended tests. Among them: the
+       signature never checked, the reviewer's name not compared, an unknown key accepted, the
+       signature leaving out the chain link, the notes or the domain, a forged rejection
+       counting, an artifact not re-hashed, a missing one counted or a link followed, another
+       release counted, each criterion removed, the gate targets lowered, customer kinds
+       pooled, each of the promotion gate's and the pipeline's bindings, and the command
+       line's key and template refusals. One survived the
+       first run: accepting an over-range Ed25519 response. The test used a response equal to
+       the group order, which the verification equation rejects by itself, so the range check
+       was never exercised. The malleable case is a valid response plus the order, which
+       satisfies the equation, and `test_a_signature_is_canonical_or_it_is_refused` now holds
+       it. A mutant that changes the range check's `>=` to `>` is equivalent, because a
+       response equal to the order fails the equation anyway, and is not counted.
+     - **Measured result.** The Python suite rose from 107 to 164 passed. The Rust workspace
+       (607 passed / 0 failed / 3 ignored) and the Tauri host (33) were untouched by this
+       slice. The final `python tools/session_status.py` run measured all seven suites green.
+       The full evidence pipeline exited 0 and published the acceptance status as schema 3,
+       bound to the manifest's release, with zero verified records and every gate open.
+     - **Boundary.** A signature says who attested, not that the attestation is true. Whoever
+       controls the trusted reviewer set controls what counts, and the tool cannot tell whether
+       two keys belong to two independent people, so `observed_by` differing from `reviewed_by`
+       is still a declared distinction. The attributes are what a reviewer attests, not values
+       read from a journal, and E5.6's retained Gateway evidence is what a record's artifact
+       should carry. The pure-Python signer is not constant-time and is for a reviewer's own
+       machine. `append` signs with the key it is given, so a reviewer with a hardened or
+       hardware signer cannot yet supply a signature made elsewhere. The operational ledger
+       root holds no record, so no external gate moved.
+
+112. The replay engine's portfolio follows a stock split (2026-09-29, Reliability and quality
+     conformance, research-to-live parity; E8.2). Found by the source review behind the revised
+     assessment, and reproduced before it was fixed.
+     - **Gap.** `BacktestRunner` applied each corporate action to `BacktestLedger` only. The replay
+       engine keeps a `Portfolio` of its own for each account and instrument, and that is the book a
+       strategy's execution callback and the fingerprinted stream's `Position` and `Pnl` events
+       project. Nothing told it of a split. With one share bought before a 2:1 split, a strategy
+       that then sold the two shares the ledger held aborted the whole run, "first slice does not
+       permit short positions", because the engine still believed it held one. A strategy that
+       sold the one share it remembered got no error at all: the engine was flat and the ledger
+       still held a share. It is the disagreement E8.1 closed between a ledger's position and its
+       tax lots, one book over.
+     - **Behavior.**
+       - `Portfolio::apply_split` multiplies the quantity by the ratio and divides the average
+         cost by it, the ledger's own two operations, so total cost and realized P&L do not move.
+         A flat position is unchanged and a short scales like a long. A ratio that is not positive
+         is refused, and so is a split that would round a held position down to nothing, because a
+         portfolio with a cost and no quantity is not one this type can represent.
+       - `ReplayEngine::apply_split` applies a split to every account's position in the
+         instrument, or to none. It scales a copy of every holding first, so a position the split
+         cannot scale refuses the action before any book, the clock or the stream has changed. It
+         then records one `portfolio.position_updated.v1` event per holder, in account order:
+         actor `portfolio_engine`, source `corporate_action`, correlation
+         `corr-corporate-action-<action id>`, and no cause. Each action applies once.
+       - An order resting in the instrument cannot be carried across a split: its quantity and
+         limit are in pre-split units, and a venue's response to a split is not modelled. The
+         engine refuses, before anything changes. That is E3.6g's decision for a lot-size change,
+         applied to splits.
+       - `BacktestRunner` forwards each split to the engine at the bar where it applies the
+         ledger's, and adds the events to the stream and its store. A cash dividend is income,
+         which only the ledger books. A run with no split has no new event and is unchanged.
+     - **Tests.** 19 tests were added.
+       - Engine and portfolio, 14 in `core/control-plane/tests/split_portfolio.rs`: exact scaling
+         with total cost, realized P&L and unrealized P&L held; a reverse split and its inverse;
+         flat and short positions; a ratio that is not positive, and a position rounded to
+         nothing, each leaving the position untouched; several holders scaled in a stable order
+         with a second instrument left alone; nothing recorded for an absent or flat holder;
+         once-only application; a resting order refusing the split without consuming its
+         identity, and one in another instrument not; a split one holder cannot take refused for
+         every holder; malformed inputs refused with the clock and stream unchanged; and a sink's
+         refusal reported.
+       - Runner, 5 in `core/backtest/tests/split_replay_parity.rs`: the reproduction above, the
+         `Position` event's fields and place in the stream, the engine and the ledger agreeing on
+         quantity, cost and realized P&L, an unchanged stream without a split, and a split that
+         finds nothing held.
+     - **Rule 5.** 35 of 35 injected defects were caught by the intended tests: the quantity or
+       cost not scaled, multiplied instead of divided, or a bad ratio accepted at either layer;
+       a position rounded to nothing kept, or a flat one refused; a position changed before its
+       refusal; an action applied twice, or consumed by a refused attempt; a resting order not
+       blocking, or any order blocking; the clock not advanced; another instrument scaled; a flat
+       holder recorded; the event carrying the pre-split position, a wrong actor, source,
+       account, instrument or correlation, or the holders reversed; a sink's failure swallowed; a
+       holder skipped instead of refused; and the runner ignoring or inverting the ratio, dating
+       the event wrongly, leaving it out of the stream, or never forwarding a split. One survived
+       the first run: an engine that skipped its own ratio check. A holder's scaling refused the
+       same ratio, so only an instrument nobody holds could tell them apart, and a test case for
+       that now holds it. The run crashed once on a transient Windows write error and left one
+       mutant in the source until it was reverted by hand and checked against `git diff`. The
+       runner now backs the original up first and retries.
+     - **Measured result.** The Rust workspace rose from 607 to 626 passed / 0 failed / 3 ignored.
+       The final `python tools/session_status.py` run measured all seven suites green, and the full
+       evidence pipeline exited 0.
+     - **Boundary.** A venue's response to a split, adjusting or cancelling a resting order, is
+       not modelled; the replay refuses instead. The strategy worker's own position snapshot and
+       cash do not follow a split or a dividend yet (E8.3). PAPER and controlled LIVE apply no
+       corporate actions and capsule replay has no corporate-action input (E8.4). The risk
+       policy's share-denominated limits are the operator's configuration and are not rescaled.
+       No external gate moved.
+
+113. A strategy worker's portfolio snapshot follows splits and dividends (2026-09-29, Reliability
+     and quality conformance, research-to-live parity; E8.3). Found by the source review behind the
+     revised assessment, and decided by the agent under the operator's blanket delegation.
+     - **Gap.** The host builds the portfolio and cash a worker is handed for every callback, from
+       `WorkerRuntimeServices`, and only fills updated it. A split left the worker's quantity, cost
+       and mark at their pre-split values until the next fill, and a dividend never reached its
+       cash at all. A worker that sized an exit from the snapshot it was shown sold a quantity the
+       account no longer held, and its cash drifted from the ledger's by every dividend. The item
+       had been held for the operator on the belief that a corporate-action hook is a worker
+       protocol change. It is not: the snapshot is the host's to build, so keeping it true needs a
+       trait method and no new frame.
+     - **Behavior.**
+       - `CorporateActionEffect` says what an action did to an account: a split with its ratio and
+         the position the engine now holds, or a dividend with the cash the ledger credited. Each
+         is validated, and a split effect must describe a held position.
+       - `Strategy::on_corporate_action` receives it. The default does nothing, so no existing
+         strategy changes. `BacktestRunner` delivers an effect after the ledger and the engine have
+         applied the action, and only when the account changed: a split that finds nothing held, a
+         dividend on no shares and a dividend that rounds to no cash are not delivered. A strategy's
+         refusal stops the run.
+       - `ProcessStrategyWorker` refuses an effect for another account and applies the rest to the
+         services its snapshot is built from. A split takes the engine's quantity and cost and
+         divides the mark, so the mark follows the shares, and a dividend adds the ledger's credit
+         to cash. Everything is checked before anything changes, and a mark the split would round
+         to nothing is refused rather than left for the SDK to reject.
+       - The worker protocol and the Python SDK are unchanged. A strategy sees a corporate action
+         as a correct portfolio.
+     - **Tests.** 11 tests and one fixture worker were added.
+       - Inline, 3: the snapshot after a split (quantity, cost, mark, cash) and after a dividend;
+         ten refusals, each leaving the snapshot untouched, the last a mark rounded to nothing;
+         and the effect's action, account and instrument.
+       - `core/backtest/tests/corporate_action_delivery.rs`, 8: a split's effect, a dividend
+         credited on the two shares the split left, no effect for an action that changed nothing,
+         none for a dividend that rounds to no cash, a strategy's refusal stopping the run, and
+         three with a real worker process (`tests/fixtures/worker/portfolio-following-worker.py`).
+         That worker sells whatever its snapshot says it holds. It sells the post-split quantity,
+         it is shown the dividend's cash, and what it last saw equals the ledger's quantity and
+         cash. It refuses an effect for another account, a dividend of nothing, a split of what it
+         does not hold and a split with no ratio.
+       - The shared runner fixtures moved to `core/backtest/tests/common/mod.rs`, which the split
+         tests now use too.
+     - **Rule 5.** 26 of 26 injected defects were caught by the intended tests: the effect not
+       validated or its ids unchecked; a split keeping the old quantity or cost, leaving the mark
+       alone or multiplying it, or keeping a mark rounded to nothing; a split creating a position
+       the worker never held; a dividend crediting nothing or debiting; a flat, zero-ratio or
+       zero-dividend effect accepted; the effect naming the wrong account or instrument; the
+       worker accepting another account's effect or ignoring every effect; and the runner never
+       delivering, swallowing a refusal, crediting something other than the ledger's cash,
+       delivering a credit that rounds to nothing, looking up the wrong ledger entry, naming
+       another account or passing the wrong ratio. One injection did not compile and proved
+       nothing; it was rewritten and caught. The runner's filter on the engine's events by account
+       is defensive and has no observable effect in a single-account replay, so it is not
+       counted.
+     - **Measured result.** The Rust workspace rose from 626 to 637 passed / 0 failed / 3 ignored.
+       The final `python tools/session_status.py` run measured all seven suites green, and the full
+       evidence pipeline exited 0.
+     - **Boundary.** PAPER and controlled LIVE apply no corporate actions, and capsule replay has
+       no corporate-action input (E8.4). The hook reaches `ProcessStrategyWorker`, the only
+       strategy that keeps a snapshot; a strategy that keeps its own state in Python is told by its
+       portfolio, not by an event. No external gate moved.
+
+114. Capsule replay takes an evaluation's corporate actions (2026-09-29, Reliability and quality
+     conformance, research-to-live parity; E8.4a, the capsule half of E8.4). Found by the source
+     review behind the revised assessment.
+     - **Gap.** `capsule-package` and `capsule-verify` replayed an evaluation with no corporate-action
+       input, so a capsule could seal only an evaluation that applied none. For one that did, the
+       replay could not reproduce the receipt, and the refusal, "capsule replay did not reproduce
+       the evaluation receipt", named no cause. The dataset's content hash already covered the
+       actions, so the receipt was bound to inputs the replay had no way to supply.
+     - **Behavior.**
+       - Both commands take an optional `--actions <csv>`, the file an evaluation takes, and the
+         replay applies it. Like the bars it is referenced by the dataset's content hash and never
+         carried in the capsule.
+       - `capsule-package` refuses an evaluation whose artifact records applied actions unless they
+         are supplied, and says so, before it replays anything and before any directory exists. The
+         sealed replay command names `--actions` when they were used.
+       - A `capsule-verify` replay that does not reproduce the receipt says, when no actions were
+         supplied, that an evaluation with corporate actions needs them. Supplying different actions
+         cannot reproduce the receipt either, because they change the dataset it is bound to.
+     - **Tests.** One test and three helper variants were added. A Python-worker evaluation applies
+       a split dated at the first bar, so that no order rests across it. Packaging without the
+       actions is refused with its reason and leaves no directory. Packaging with them succeeds and
+       the sealed command names the flag. Verification with them reproduces the receipt, with only
+       the bars it is refused and pointed at the flag, and with a different split it is refused.
+     - **Rule 5.** 9 of 9 injected defects were caught by the intended test: the actions not
+       applied by either replay, the packaging check removed, inverted or reading a count of zero,
+       the sealed command and the verification hint losing their words, and either command
+       refusing the flag.
+     - **Measured result.** The Rust workspace rose from 637 to 638 passed / 0 failed / 3 ignored.
+       The final `python tools/session_status.py` run measured all seven suites green, and the full
+       evidence pipeline exited 0.
+     - **Boundary.** PAPER and controlled LIVE still apply no corporate actions (E8.4b). A capsule
+       still packages only a Python-worker evaluation, and its market data and corporate actions are
+       still the caller's to supply. A split with an order resting across it is refused by the replay
+       (E8.2), so an evaluation that hit that refusal has no capsule. No external gate moved.
+
+115. PostgreSQL evidence is append-only and news is tenant-owned (2026-09-29, Security and
+     isolation; E7.7). Found by the source review behind the revised assessment, and the first
+     database change in this repository verified against a real PostgreSQL server here.
+     - **Gap.** Migrations 0004 and 0005 promise that a rollback "never deletes or rewrites"
+       retained evidence, and the adapter only ever inserts it, but nothing in the database
+       stopped a role holding UPDATE, DELETE or TRUNCATE from doing either. The news tables had no
+       tenant column and no row-level security, so one tenant's feed was visible to all.
+     - **Behavior.** Migration 0006:
+       - attaches a `BEFORE UPDATE OR DELETE` row trigger and a `BEFORE TRUNCATE` statement trigger
+         to 16 tables, which raise `restrict_violation` naming the operation and the table:
+         domain events, the journal's transactions and lines, risk policy, strategy and
+         configuration versions, broker commands and receipts, the audit index, news headlines and
+         sentiments, FX pricing snapshots, venue capabilities, and the execution plan, route and
+         benchmark evidence;
+       - lets instrument reference and FX economics versions be closed, once, by setting
+         `effective_to` from nothing to a value, and refuses every other change, deletion and
+         truncation of them;
+       - gives the news tables a tenant, keys and foreign keys that name it, and the same
+         row-level security policy the other tables have, so another tenant sees nothing, cannot
+         write a row for the owner and cannot cause a sentiment with the owner's headline;
+       - refuses to run over news rows that exist without a tenant, and leaves nothing half done,
+         rather than guess an owner.
+       The triggers are the application's boundary and not a defence against the database's owner,
+       who can disable one, which takes a DDL statement that shows in the logs.
+     - **Tests.** Five database tests were added and three made rerunnable. Evidence cannot be
+       deleted, so a database is never reset by deleting rows, and the original three used fixed
+       identifiers that assumed an empty one. Each test now owns a tag.
+       - Every guarded table carries both triggers.
+       - A row in each append-only table refuses an update, a delete and a truncate, and survives.
+       - A version closes once and is otherwise fixed, in both versioned tables.
+       - News is owned by one tenant, isolated under a role that does not bypass row-level
+         security, keyed per tenant, and tied to a tenant that exists.
+       - An upgrade from the schema an earlier release left, built in a scratch database, refuses
+         an unowned headline, records nothing, and succeeds once the row is cleared.
+       - The always-run test now checks that migration versions are consecutive and lists the
+         guards. Six tests hold that `tools/session_status.py` reports a suite it cannot run as
+         skipped and names the variable, never as a pass and never left out.
+     - **Rule 5.** 29 of 29 injected defects were caught by the intended tests, 22 in the
+       migration and the adapter and 7 in the status tool: a guard that returns instead of
+       raising, or raises the wrong class; a table, a truncate guard or the update-and-delete guard
+       missing; a version that can be closed again, rewritten as it is closed, or not closed at
+       all; a guard list that omits the versioned tables; the migration running over unowned rows
+       or checking only one table; either news table without row-level security, or a policy that
+       lets any tenant write; global news identifiers, a foreign key that ignores the tenant or is
+       missing, and a tenant that need not exist; and the adapter not registering the migration or
+       applying the wrong number of them. The suite found two gaps in its own tests on the way,
+       sentiment isolation and the link to `tenants`, and closed them before the run.
+     - **Measured result.** A throwaway PostgreSQL 17 server, on a loopback port with its own data
+       directory, ran the eight database tests, and ran them a second time against the same
+       database. The repository's own `tools/postgres_recovery.py` took a backup of a database
+       full of guarded evidence and restored it in a drill, which reported schema migration 6.
+       The Rust workspace stayed at 638 passed / 0 failed and now reports 8 ignored instead of 3.
+       The Python suite rose from 164 to 170 passed. The final `python tools/session_status.py`
+       run measured all eight suites green, the database suite among them, and the full evidence
+       pipeline exited 0.
+     - **Boundary.** The tests ran against PostgreSQL 17 and CI runs 16, which the migration uses
+       nothing newer than, but that job has not run yet. The append-only guard holds against the
+       application's role and against a careless statement, not against the database's owner. The
+       install and upgrade path was exercised on empty tables, because no writer in this repository
+       inserts news. Nothing was pushed, so no GitHub run has seen it. No external gate moved.
+
+116. The reduce-only rule counts what is already working (2026-09-30, Financial risk controls; a
+     defect in item 107's rule, E7.4b). Found by an independent review of the slice.
+     - **Gap.** With aggregate risk configured and equity not positive, PAPER and controlled LIVE
+       let an order through only if it moved its position toward flat. Each order was judged
+       against the filled position alone, so two working orders that each sold the whole of a long
+       were each a reduction, both were approved, and together they reversed it into a short: the
+       one thing the rule exists to stop, in an account that was already underwater.
+     - **Behavior.** `reduces_position_with_working` in `core/domain` is `reduces_position` plus a
+       claim: the trade must fit inside the position beside what is already working. PAPER and
+       LIVE each total the unfilled quantity of every working order, and of every leg of a working
+       combination (by the combination units unfilled and the leg's ratio), that trades in the
+       reducing direction on that instrument, and pass it in. Working orders that add exposure
+       claim nothing, since one that never fills would otherwise refuse a reduction for something
+       that did not happen. A cancelled or filled order claims nothing.
+     - **Tests.** Seven were added: one domain table of boundary cases, and for each of PAPER and
+       LIVE a test that two working reductions cannot reverse the position, one that only the
+       unfilled part of a partly filled order is claimed and a cancellation releases it, and one
+       for the legs of a working combination, whose ratio multiplies the units. Each account is
+       asserted to be underwater first: the review's own scenario was not, and only looked as if
+       it were.
+     - **Rule 5.** 19 of 19 injected defects were caught by the intended tests: the trade's own
+       quantity, or what is working, left out; an inclusive boundary made exclusive; the wrong
+       side claimed; fills not taken off a working order; finished orders claiming and working ones
+       not; combinations skipped or their ratio ignored; and either gate, single or combination, in
+       either environment, passing nothing that is working. Two survived the first run, both
+       "fills not taken off a working order", because the part-filled cases refused the next order
+       whichever number was used. The cases were changed so that only the unfilled quantity lets
+       the last order through, and both were then caught.
+     - **Measured result.** The Rust workspace rose from 638 to 645 passed / 0 failed / 8 ignored
+       for this item, and the final run below measured all eight suites green with the full
+       evidence pipeline exiting 0.
+     - **Boundary.** Position limits and the aggregate composition still judge an order against
+       the filled position and ignore working orders (E7.14, open). This item makes the
+       equity-not-positive rule count them, and no other rule.
+
+117. A strategy worker's frame limit is bounded at both ends (2026-09-30, Security and
+     reliability; a defect in item 105, E7.2). Found by an independent review of the slice.
+     - **Gap.** `StrategyWorkerLimits::validate` refused a frame limit below 4 KiB and accepted
+       anything above it, `usize::MAX` included, and the reader added one to the limit to see a
+       frame that was a byte too long. At the top of the range that overflowed: a panic in a debug
+       build, and a limit of zero in a release build, where every frame would then be refused as
+       oversized.
+     - **Behavior.** The limit must lie between 4 KiB and 256 MiB (`MAX_FRAME_BYTES`), since a
+       bound no machine could honour bounds nothing. The reader's arithmetic saturates, so it is
+       correct wherever the limit came from. The defaults are unchanged.
+     - **Tests.** One test was added, that the reader still reads a frame with a limit of
+       `usize::MAX`, and the limits test now refuses a limit one byte over the maximum and
+       `usize::MAX`, accepts both ends, and holds `spawn_bounded` to the message.
+     - **Rule 5.** 4 of 4 injected defects were caught: no upper bound, an exclusive upper bound, no
+       lower bound, and the reader's addition left to overflow.
+     - **Measured result.** The Rust workspace rose by one passed test for this item.
+     - **Boundary.** Only the Rust caller can set the limits. No command-line option does, so an
+       operator can not yet tune them.
+
+118. The IBKR bridge no longer rejects a held order or reopens a finished one (2026-09-30,
+     Reliability; a defect in item 103, E5.4). Found by an independent review of the slice.
+     - **Gap.** Two documented IBKR warnings still rejected the order they concerned: 404, that the
+       order is held while shares are located for a short sale, and 131, that an attribute is
+       ignored. IBKR reports either before the status that says the order works, so a held order
+       was reported rejected, then acknowledged, and left `ACKNOWLEDGED` in the bridge after the
+       core had been told it was over. The same hole opened for any status that arrived after a
+       terminal one: IBKR delivers callbacks from its own thread and can repeat or reorder them,
+       and a later `PreSubmitted` reopened a rejected, cancelled or filled order.
+     - **Behavior.** 404 and 131 join 202 and 399 as notices, which leave an order's state alone. A
+       finished order (`FILLED`, `CANCELLED`, `REJECTED`) is final: a later status that differs is
+       ignored, and a later error neither rejects it nor reports a second rejection. Any other
+       code on a tracked order still rejects it, as before, and the code list is IBKR's documented
+       one and still not measured against a real session (E5.6).
+     - **Tests.** Three were added, and the notices test now covers 131 and 404: a held or
+       amended order is acknowledged and its only event is the acknowledgement, a finished order
+       stays finished through three later statuses for each of the three ways it can finish, and
+       a late error changes nothing on any finished order.
+     - **Rule 5.** 7 of 7 injected defects were caught: either code missing from the notices, the
+       status guard or the error guard removed, and each of the three states missing from the
+       finished set.
+     - **Measured result.** The Python suite rose from 170 to 173 passed.
+     - **Boundary.** The list of codes that reject is still IBKR's documentation and not a
+       retained Gateway session, so a warning this repository has not met can still reject its
+       order until E5.6 shows it, and that is recorded rather than guessed.
+
+119. A split no longer moves equity, and split lots total the position (2026-09-30, Reliability and
+     quality conformance, research-to-live parity; defects in items 93 and 112, E8.1 and E8.2, and in
+     the refusal of item 114). Found by an independent review of the replay changes.
+     - **Gap.** Three faults, each reproduced before it was fixed.
+       - The runner marks a position at the last bar of its instrument, and a split multiplied the
+         position and left the mark. A split is applied at the first bar at or after its time, whichever
+         instrument that bar belongs to, so when another instrument's bar came first an equity point
+         counted the added shares at the old price: 1,099.90 where 999.90 was due, and 949.90 for a
+         reverse split. The spike fed the equity curve and the maximum drawdown, and where the
+         instrument printed no later bar it was the ending equity. The CLI's advanced-account
+         projection, which replays the same events into a margin-aware account for the artifact's
+         "Advanced account" section, had the same fault, so its margin, financing and report valued
+         the added shares at the old price too.
+       - The ledger scaled each FIFO lot and rounded it down, and scaled the position once. With ratios
+         that do not scale exactly the lots could total less than the position: two lots of one, split
+         by a third and then by one and a half, held 0.99999998 against a position of 0.99999999, so a
+         sale of the whole position was refused. The reviewer's random walk found this in about a tenth
+         of 20,000 sequences.
+       - `capsule-package` refused an evaluation whose corporate actions all fell outside its bars with
+         "capsule replay did not reproduce the evaluation receipt", because the dataset's content hash
+         covers a file of actions that applied none, and the applied-count check saw nothing to ask for.
+     - **Behavior.**
+       - The runner, and the advanced-account projection likewise, divide the instrument's mark by the
+         ratio when they apply a split, so equity is what it was until the next bar, and a reverse
+         split works the same way. Only the split instrument's mark is touched. These are the only two
+         production callers of `apply_corporate_action`.
+       - `TaxLotBook::apply_split` puts the shortfall on the newest lot, so the lots always total exactly
+         what the position becomes, long and short. A lot that scales to nothing is dropped, as a
+         disposal drops an empty one, and an instrument whose lots all vanish leaves no bucket, which a
+         snapshot would refuse to restore. A split that would round a lot's unit cost to nothing is
+         refused and changes nothing.
+       - The packaging refusal now says to package with the same `--actions` file.
+       - The replay's remaining limits, found in the same review and kept as choices, are written into
+         the backtesting capability doc: a fractional position a whole-lot instrument cannot sell, a
+         reverse split that would round a position away ending the run, two same-time actions applied
+         in action-id order, and a sink that fails part-way ending the run with the split applied.
+     - **Tests.** Twelve were added. Five for the lots: the reviewer's case, its short-side twin, a lot
+       that scales to nothing and a position that does, a unit cost that rounds away, and a fixed-seed
+       walk of 400 sequences of purchases and inexact splits that holds the lots to the position after
+       every split. Five for the runner and the ledger, in `core/backtest/tests/split_valuation.rs`:
+       equity flat through a forward and a reverse split when another instrument's bar is processed
+       first, the ending equity with no later bar, a split that revalues only its own instrument, and
+       the sale of the whole position after two inexact splits. One for the capsule refusal, and one for
+       the advanced-account projection, which holds one instrument, splits it and then another, and reads
+       the margin valuation and unrealized P&L.
+     - **Rule 5.** 15 of 15 injected defects were caught by the intended tests: the mark not rebased,
+       multiplied instead of divided, or rebased for every instrument, in the runner and in the
+       advanced-account projection; the shortfall dropped, put on the
+       oldest lot, or computed against the lots themselves; a lot that scales to nothing kept, an emptied
+       bucket left behind, a unit cost that rounds away accepted; and the packaging hint removed,
+       inverted or losing its instruction. One survived the first run, the mark rebased for every
+       instrument, because the split had been applied on the held instrument's own bar, which refreshed
+       the wrong mark before equity was read. The test now holds one instrument and splits another
+       whose bar comes first, and it was then caught.
+     - **Measured result.** The Rust workspace rose from 646 to 658 passed / 0 failed / 8 ignored. The
+       final `python tools/session_status.py` run measured all eight suites green, and the full evidence
+       pipeline exited 0.
+     - **Boundary.** The advanced account takes the lot fix through the same book. PAPER and controlled
+       LIVE still apply no corporate actions (E8.4b). No external gate moved.
+
+120. The PostgreSQL guards hold against a replica session, and the database tests no longer deadlock
+     (2026-09-30, Security and isolation; defects in item 115, E7.7). Found by an independent review of
+     the migration, and reproduced against a throwaway server here.
+     - **Gap.** Four faults.
+       - The guard triggers were ordinary triggers, which fire only when a session's
+         `session_replication_role` is `origin`. A superuser, or a role granted the setting, could set it
+         to `replica` with one SET, which is no DDL and shows in no log, and then update, delete or
+         truncate every retained table.
+       - A version was closed once by comparing the rest of its row as jsonb. Two jsonb values that
+         differ only in a number's scale, `0.10` and `0.1`, are equal to jsonb and are not the same
+         document, so a version could be rewritten as it was closed. An end of `infinity` was accepted,
+         which is no end and spent the one close.
+       - The guard over unowned news rows said to give each an owner before migrating, when the tables
+         had no owner column to give. An operator who added the column by hand then made the migration
+         fail on it.
+       - The database tests deadlocked about one run in four in parallel: `TRUNCATE ... CASCADE`, which
+         a test runs to see it refused, takes an exclusive lock on every table it reaches, and another
+         test writing to any of them at that moment closed the cycle.
+     - **Behavior.** Migration 0006 was amended in place, since nothing outside a scratch database had
+       applied it, and any database that applied the earlier text refuses the amended one by checksum.
+       - Every guard trigger is `ENABLE ALWAYS`, so it fires in every session role.
+       - A version's rest is compared as text and an end of `infinity` is refused.
+       - The guard names what an operator can do: back the rows up, empty `news_sentiments` and then
+         `news_headlines`, which are not append-only until the migration runs, and migrate again.
+       - The database tests hold the database one at a time.
+     - **Tests.** One test was added, that the guards hold in a session that says it is a replica,
+       where the connection may say so. The guard test now reads each trigger's enablement, which needs
+       no privilege. The versions test rewrites a number's scale as it closes each version and closes
+       one with no end. The upgrade test now has a sentiment as well as a headline, asserts the message
+       names the remedy, and follows it in the order it gives.
+     - **Rule 5.** 7 of 7 injected defects were caught: the tests run at the same time, which failed
+       within 12 seconds of a 40-run loop; the append-only guards, the versioned guards or only the
+       truncate guards switchable by a SET; a version compared as jsonb; an end of infinity allowed; and
+       the guard message naming an owner that cannot be given.
+     - **Measured result.** The database suite ran 25 times in a row over one database with no failure,
+       where it had failed in about a quarter of the review's runs. The Rust workspace stayed at 658
+       passed / 0 failed and now reports 9 ignored instead of 8, and the database suite 9 of 9. The final
+       `python tools/session_status.py` run measured all eight suites green, and the full evidence
+       pipeline exited 0.
+     - **Boundary.** The triggers still do not bind the database's owner, whose DDL shows in the logs,
+       and a role granted `session_replication_role` no longer switches them off but can still be
+       granted much else. Append-only stops a row changing and not a parent gaining children: a line can
+       be inserted into a committed journal transaction and a route decision into an existing plan
+       (E7.15, open). The tests ran against PostgreSQL 17 and CI runs 16, which the migration uses
+       nothing newer than, and that job has not run. No external gate moved.
+
+121. Ed25519 verification refuses points of small order (2026-09-30, Security; a defect in item 111,
+     E6.4). Found by an independent review of the acceptance evidence, and reproduced here from the
+     probes it left.
+     - **Gap.** RFC 8032 lets a verifier accept a signature under a public key of small order, meaning a
+       point whose order divides eight. Under the neutral element, the commitment `[S]B` satisfies the
+       verification equation for every message and every `S`; under the other small-order points, a
+       matching commitment and a response of zero does. The trusted reviewer set checked only that a key
+       was 64 lowercase hex characters, so a set holding the neutral element, or the all-zero string a
+       template might leave as a placeholder and which decodes to a point of order four, counted a
+       ledger nobody signed. The reviewer forged 106 records that way and the promotion gate found every
+       gate eligible for production.
+     - **Behavior.** `ed25519.verify` refuses a key or a commitment of small order, as libsodium does.
+       `ed25519.is_valid_public_key` says whether 32 bytes encode a point of the prime-order subgroup
+       other than the neutral element, which is what an honest key is. Honest signatures are unchanged:
+       the RFC vectors and the cross-check against the `cryptography` package still hold.
+     - **Tests.** Three were added: the eight small-order points, as key and as commitment, with three
+       responses each, and the neutral element's forgery with a commitment that is not small; an honest
+       key, and one with a torsion component added, and inputs that are not keys; and a commitment of
+       small order under an honest key with the response that makes the equation true, which the
+       holder of a seed can compute and RFC 8032 accepts.
+     - **Rule 5.** 8 of 8 injected defects were caught: the key check, the commitment check or both
+       removed; the small-order test multiplying by four or by two instead of eight; the neutral element
+       accepted as a key; the subgroup check dropped; and the subgroup checked against the wrong order.
+       The commitment check changes no verdict for an honest signer, whose commitment has large order,
+       so it is defence in depth, and only the third test, which builds the one input where it alone
+       decides, holds it.
+     - **Measured result.** The Python suite rose from 173 to 176 passed. The final
+       `python tools/session_status.py` run measured all eight suites green and the full evidence pipeline
+       exited 0. The CI Python job's own steps, run by hand, passed: the JSON contract syntax check,
+       `unittest discover` over `tests/security`, and the SDK, bridge and storage adapter suites.
+     - **Boundary.** Enrolment does not yet refuse such a key: the set still loads one, which now
+       verifies nothing, and refusing it loudly is E6.6b. The rest of the review's findings on E6.4 and
+       E6.5, including that a rejection that fails to authenticate is silently ignored, are listed there,
+       open and reproduced.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

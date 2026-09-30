@@ -15,7 +15,8 @@ use follon_accounting::{
     TaxLotBook, TaxLotSelection,
 };
 use follon_control_plane::{
-    EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions, ReplayEngine, Strategy,
+    CorporateActionEffect, EngineError, HistoricalBar, InMemoryEventStore, MarketPreconditions,
+    ReplayEngine, Strategy,
 };
 use follon_domain::{
     validate_canonical_id, validate_utc_timestamp, Bar, Decimal, DecimalError, DomainError,
@@ -2259,7 +2260,7 @@ impl BacktestRunner {
                 .then_with(|| left.action_id().cmp(right.action_id()))
         });
         let mut ledger = BacktestLedger::new(&input.currency, input.initial_cash)?;
-        let mut marks = BTreeMap::new();
+        let mut marks: BTreeMap<String, Decimal> = BTreeMap::new();
         let mut store = InMemoryEventStore::default();
         let mut canonical_events = Vec::new();
         let mut applied_corporate_action_ids = Vec::new();
@@ -2272,7 +2273,70 @@ impl BacktestRunner {
                 .is_some_and(|action| action.effective_at() <= historical_bar.event_time.as_str())
             {
                 let action = &actions[next_action];
+                let entries_before = ledger.entries().len();
                 ledger.apply_corporate_action(action)?;
+                // What the strategy is told: what the action did to this account, and
+                // nothing when it changed nothing (E8.3).
+                let effect = match action {
+                    CorporateAction::Split {
+                        action_id,
+                        instrument_id,
+                        ratio,
+                        ..
+                    } => {
+                        // The instrument's last mark is a price before the split and its
+                        // position is now after it, so until its next bar an equity point
+                        // would count the shares the split added at the old price: a jump
+                        // at the split that nothing in the market caused, and an ending
+                        // equity that is wrong when no bar follows (delivery state E8.6).
+                        if let Some(mark) = marks.get_mut(instrument_id.as_str()) {
+                            *mark = mark.checked_div(*ratio)?;
+                        }
+                        // The ledger is one book and the engine's portfolio another. The
+                        // strategy's callbacks and the event stream project the engine's,
+                        // so it follows the split too (delivery state E8.2).
+                        let mut position = None;
+                        for event in self.engine.apply_split(
+                            &mut store,
+                            action_id,
+                            instrument_id,
+                            *ratio,
+                            &historical_bar.event_time,
+                        )? {
+                            if let EventPayload::Position(snapshot) = &event.payload {
+                                if snapshot.account_id == input.account_id {
+                                    position = Some(snapshot.clone());
+                                }
+                            }
+                            canonical_events.push(event.canonical_json());
+                        }
+                        position.map(|position| CorporateActionEffect::Split {
+                            action_id: action_id.clone(),
+                            ratio: *ratio,
+                            position,
+                        })
+                    }
+                    // A cash dividend is income, which only the ledger holds. It booked
+                    // the dividend, or nothing when the account held no shares, and the
+                    // strategy is told exactly the cash it credited.
+                    CorporateAction::CashDividend {
+                        action_id,
+                        instrument_id,
+                        ..
+                    } => ledger
+                        .entries()
+                        .get(entries_before)
+                        .filter(|entry| entry.cash_delta > Decimal::ZERO)
+                        .map(|entry| CorporateActionEffect::CashDividend {
+                            action_id: action_id.clone(),
+                            account_id: input.account_id.clone(),
+                            instrument_id: instrument_id.clone(),
+                            cash_credited: entry.cash_delta,
+                        }),
+                };
+                if let Some(effect) = effect {
+                    strategy.on_corporate_action(&effect)?;
+                }
                 applied_corporate_action_ids.push(action.action_id().to_owned());
                 next_action += 1;
             }

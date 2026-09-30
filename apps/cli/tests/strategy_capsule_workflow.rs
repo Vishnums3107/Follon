@@ -111,12 +111,29 @@ fn lock(python: &Path, bundle: &Path, strategy_file: &Path, output: &Path) -> St
 }
 
 fn evaluate(python: &Path, bundle: &Path, strategy_file: &Path, hash: &str, artifact: &Path) {
-    let result = Command::new(env!("CARGO_BIN_EXE_follon-backtest"))
+    evaluate_with(python, bundle, strategy_file, hash, artifact, None);
+}
+
+/// As `evaluate`, applying the corporate actions in `actions` when they are given.
+fn evaluate_with(
+    python: &Path,
+    bundle: &Path,
+    strategy_file: &Path,
+    hash: &str,
+    artifact: &Path,
+    actions: Option<&Path>,
+) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_follon-backtest"));
+    command
         .current_dir(repository_root())
         .arg(bars())
         .arg(artifact)
         .arg("--config")
-        .arg(configuration())
+        .arg(configuration());
+    if let Some(actions) = actions {
+        command.arg("--actions").arg(actions);
+    }
+    let result = command
         .arg("--python-worker")
         .arg(python)
         .arg(strategy_file)
@@ -155,7 +172,21 @@ fn package(
     output: &Path,
     hostile: &Path,
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_follon-backtest"))
+    package_with(python, bundle, lock, artifact, output, hostile, None)
+}
+
+/// As `package`, replaying with the corporate actions in `actions` when they are given.
+fn package_with(
+    python: &Path,
+    bundle: &Path,
+    lock: &Path,
+    artifact: &Path,
+    output: &Path,
+    hostile: &Path,
+    actions: Option<&Path>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_follon-backtest"));
+    command
         .current_dir(hostile)
         .env("FOLLON_STRATEGY_SDK_PATH", hostile)
         .arg("capsule-package")
@@ -170,7 +201,11 @@ fn package(
         .arg("--evaluation")
         .arg(artifact)
         .arg("--bars")
-        .arg(bars())
+        .arg(bars());
+    if let Some(actions) = actions {
+        command.arg("--actions").arg(actions);
+    }
+    command
         .arg("--python")
         .arg(python)
         .args(["--packaged-at", "2026-09-07T12:00:00Z", "--output"])
@@ -186,6 +221,18 @@ fn verify(
     hostile: &Path,
     trusted_key: Option<&Path>,
 ) -> Output {
+    verify_with(python, capsule, bars, hostile, trusted_key, None)
+}
+
+/// As `verify`, replaying with the corporate actions in `actions` when they are given.
+fn verify_with(
+    python: &Path,
+    capsule: &Path,
+    bars: &Path,
+    hostile: &Path,
+    trusted_key: Option<&Path>,
+    actions: Option<&Path>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_follon-backtest"));
     command
         .current_dir(hostile)
@@ -193,9 +240,11 @@ fn verify(
         .arg("capsule-verify")
         .arg(capsule)
         .arg("--bars")
-        .arg(bars)
-        .arg("--python")
-        .arg(python);
+        .arg(bars);
+    if let Some(actions) = actions {
+        command.arg("--actions").arg(actions);
+    }
+    command.arg("--python").arg(python);
     if let Some(trusted_key) = trusted_key {
         command.arg("--trusted-key").arg(trusted_key);
     }
@@ -462,5 +511,193 @@ fn a_signed_capsule_verifies_only_under_its_trusted_key() {
                 .contains("capsule signature verification failed"),
         "a capsule verified under another key with the same identity\n{}",
         describe(&impostor)
+    );
+}
+
+/// A corporate-action file with one split, dated at the first bar so that no order rests
+/// across it. The dataset content hash covers it, and the replay applies it.
+fn write_actions(path: &Path, ratio: &str) {
+    write_actions_at(path, "2026-01-02T14:31:00Z", ratio);
+}
+
+fn write_actions_at(path: &Path, effective_at: &str, ratio: &str) {
+    fs::write(
+        path,
+        format!(
+            "action_id,instrument_id,action_type,effective_at,value\naction-split-001,inst.us_equity.spy,SPLIT,{effective_at},{ratio}\n"
+        ),
+    )
+    .expect("actions are writable");
+}
+
+#[test]
+fn a_capsule_of_an_evaluation_with_corporate_actions_reproduces_only_with_them() {
+    let Some(python) = python_executable() else {
+        eprintln!("Python is unavailable; the capsule workflow was skipped");
+        return;
+    };
+    let workspace = Workspace::new("actions");
+    let bundle = workspace.0.join("bundle");
+    let strategy_file = write_bundle(&bundle, "");
+    let lock_path = workspace.0.join("dependency.lock");
+    let hash = lock(&python, &bundle, &strategy_file, &lock_path);
+    let actions = workspace.0.join("actions.csv");
+    write_actions(&actions, "2.00000000");
+    let artifact = workspace.0.join("evaluation/python-backtest.json");
+    evaluate_with(
+        &python,
+        &bundle,
+        &strategy_file,
+        &hash,
+        &artifact,
+        Some(&actions),
+    );
+    let evaluation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&artifact).expect("artifact exists"))
+            .expect("artifact is JSON");
+    assert_eq!(
+        evaluation["performance"]["corporate_action_count"], 1,
+        "the split must have been applied for this test to mean anything"
+    );
+    let hostile = hostile_directory(&workspace.0);
+
+    // Without the actions the evaluation cannot be replayed, and packaging says why.
+    let without = package(
+        &python,
+        &bundle,
+        &lock_path,
+        &artifact,
+        &workspace.0.join("without"),
+        &hostile,
+    );
+    assert!(
+        !succeeded(&without)
+            && String::from_utf8_lossy(&without.stderr)
+                .contains("applied 1 corporate action(s), which the replay needs"),
+        "a capsule of an evaluation with corporate actions was packaged without them\n{}",
+        describe(&without)
+    );
+    assert!(!workspace.0.join("without").exists());
+
+    let capsule = workspace.0.join("capsule");
+    let packaged = package_with(
+        &python,
+        &bundle,
+        &lock_path,
+        &artifact,
+        &capsule,
+        &hostile,
+        Some(&actions),
+    );
+    assert!(
+        succeeded(&packaged),
+        "packaging failed\n{}",
+        describe(&packaged)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(capsule.join("capsule-manifest.json")).expect("manifest exists"),
+    )
+    .expect("manifest is JSON");
+    assert_eq!(manifest["export_disposition"], "VERIFIED_PORTABLE");
+    assert!(manifest["replay_instruction_command"]
+        .as_str()
+        .expect("replay command is text")
+        .contains("--actions"));
+
+    let verified = verify_with(&python, &capsule, &bars(), &hostile, None, Some(&actions));
+    assert!(
+        succeeded(&verified),
+        "verification failed\n{}",
+        describe(&verified)
+    );
+
+    // The bars alone pass every static check but cannot reproduce the receipt, and the
+    // refusal points at the missing input.
+    let bare = verify(&python, &capsule, &bars(), &hostile, None);
+    assert!(
+        !succeeded(&bare)
+            && String::from_utf8_lossy(&bare.stderr).contains("pass them with --actions"),
+        "a replay without the corporate actions was accepted\n{}",
+        describe(&bare)
+    );
+
+    // A different action changes the dataset the receipt is bound to.
+    let other = workspace.0.join("other-actions.csv");
+    write_actions(&other, "3.00000000");
+    let different = verify_with(&python, &capsule, &bars(), &hostile, None, Some(&other));
+    assert!(
+        !succeeded(&different)
+            && String::from_utf8_lossy(&different.stderr).contains("did not reproduce"),
+        "a replay with different corporate actions was accepted\n{}",
+        describe(&different)
+    );
+}
+
+/// A file whose only action falls after the last bar applies nothing, yet the dataset's
+/// content hash covers it. Packaging such an evaluation without the file passed the applied
+/// count check and then failed to reproduce the receipt without naming the cause
+/// (delivery state E8.6, found in review).
+#[test]
+fn packaging_an_evaluation_whose_actions_applied_nothing_still_points_at_the_actions() {
+    let Some(python) = python_executable() else {
+        eprintln!("Python is unavailable; the capsule workflow was skipped");
+        return;
+    };
+    let workspace = Workspace::new("late-actions");
+    let bundle = workspace.0.join("bundle");
+    let strategy_file = write_bundle(&bundle, "");
+    let lock_path = workspace.0.join("dependency.lock");
+    let hash = lock(&python, &bundle, &strategy_file, &lock_path);
+    let actions = workspace.0.join("actions.csv");
+    write_actions_at(&actions, "2030-01-01T00:00:00Z", "2.00000000");
+    let artifact = workspace.0.join("evaluation/python-backtest.json");
+    evaluate_with(
+        &python,
+        &bundle,
+        &strategy_file,
+        &hash,
+        &artifact,
+        Some(&actions),
+    );
+    let evaluation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&artifact).expect("artifact exists"))
+            .expect("artifact is JSON");
+    assert_eq!(
+        evaluation["performance"]["corporate_action_count"], 0,
+        "the split must fall outside the bars for this test to mean anything"
+    );
+    let hostile = hostile_directory(&workspace.0);
+
+    let without = package(
+        &python,
+        &bundle,
+        &lock_path,
+        &artifact,
+        &workspace.0.join("without"),
+        &hostile,
+    );
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(
+        !succeeded(&without)
+            && stderr.contains("did not reproduce")
+            && stderr.contains("package it with the same file"),
+        "the refusal did not name the missing actions\n{}",
+        describe(&without)
+    );
+    assert!(!workspace.0.join("without").exists());
+
+    let packaged = package_with(
+        &python,
+        &bundle,
+        &lock_path,
+        &artifact,
+        &workspace.0.join("with"),
+        &hostile,
+        Some(&actions),
+    );
+    assert!(
+        succeeded(&packaged),
+        "packaging with the actions failed\n{}",
+        describe(&packaged)
     );
 }

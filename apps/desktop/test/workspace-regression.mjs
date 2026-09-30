@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { sentimentSignalPower, strategyIdentityRows } from "../dist/workspaces.js";
+import { sentimentSignalPower, strategyIdentityRows } from "../dist/workspaces/index.js";
 
 assert.equal(sentimentSignalPower(8500, 9200), "7820 bps");
 assert.equal(sentimentSignalPower(-8500, 9200), "7820 bps");

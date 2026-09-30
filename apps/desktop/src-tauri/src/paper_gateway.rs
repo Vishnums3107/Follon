@@ -40,7 +40,7 @@ use follon_paper::{
     BrokerCancelRequest, BrokerComboExecution, BrokerComboExecutionLeg, BrokerComboRequest,
     BrokerOrderRequest, BrokerSubmitResult, IbkrPaperAdapter, KillSwitchRegistry, PaperAccount,
     PaperBrokerAdapter, PaperBrokerCapabilities, PaperComboMarketData, PaperError, PaperMarketData,
-    PaperRiskPolicy, PaperTradingService, ShortExposurePolicy,
+    PaperRiskPolicy, PaperTradingService, PortfolioRiskDocument, ShortExposurePolicy,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -726,6 +726,12 @@ struct DesktopPaperConfiguration {
     /// is refused, exactly as before this field existed.
     #[serde(default)]
     short_exposure: Option<DesktopShortExposure>,
+    /// Optional aggregate portfolio limits, the same document
+    /// `follon-paper-status` and the gRPC PAPER route read. Absent, no
+    /// aggregate limit applies. Present, it gates every order and combination
+    /// this gateway submits (delivery state E7.5).
+    #[serde(default)]
+    portfolio_risk: Option<PortfolioRiskDocument>,
     kill_switch_version: String,
     journal_path: String,
 }
@@ -792,12 +798,11 @@ fn bootstrap_from_path(path: &std::path::Path) -> Result<PaperOmsGateway, String
         max_market_data_age_seconds: document.max_market_data_age_seconds,
         max_order_rate: document.max_order_rate,
         order_rate_window_seconds: document.order_rate_window_seconds,
-        // The desktop's flat, `deny_unknown_fields` configuration document
-        // does not yet expose Slice-1 aggregate portfolio-risk composition;
-        // `core/paper::evaluate_risk` still gains it for every caller once an
-        // operator adopts the CLI/journal configuration path (see
-        // `follon_paper::PortfolioRiskComposition`).
-        portfolio_risk: None,
+        portfolio_risk: document
+            .portfolio_risk
+            .map(PortfolioRiskDocument::into_composition)
+            .transpose()
+            .map_err(|error| format!("invalid portfolio_risk: {error}"))?,
         // Net short exposure is refused unless the operator-authored
         // configuration file states a bound. The desktop UI never grants it:
         // it has no operator-authenticated surface on which to take that
@@ -887,6 +892,14 @@ mod tests {
     /// `extra` is spliced verbatim into the configuration document, e.g. an
     /// optional `"short_exposure": {...},` entry.
     fn test_gateway_with(name: &str, extra: &str) -> (PaperOmsGateway, PathBuf, PathBuf) {
+        let (config_path, scratch, journal_path) = write_test_configuration(name, extra);
+        let gateway = bootstrap_from_path(&config_path).expect("valid test configuration");
+        (gateway, scratch, journal_path)
+    }
+
+    /// Writes the test configuration with `extra` spliced in, and returns the
+    /// configuration's path, its scratch directory and its journal's path.
+    fn write_test_configuration(name: &str, extra: &str) -> (PathBuf, PathBuf, PathBuf) {
         let scratch = std::env::temp_dir().join(format!(
             "follon-desktop-paper-gateway-{}-{name}",
             std::process::id()
@@ -931,8 +944,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let gateway = bootstrap_from_path(&config_path).expect("valid test configuration");
-        (gateway, scratch, journal_path)
+        (config_path, scratch, journal_path)
     }
 
     fn cleanup(scratch: PathBuf) {
@@ -1045,6 +1057,74 @@ mod tests {
         assert_eq!(receipt.status, CommandStatus::RiskRejected);
         assert!(receipt.order_id.is_none());
         assert!(receipt.message.contains("PRICE_COLLAR_EXCEEDED"));
+        cleanup(scratch);
+    }
+
+    /// The aggregate limits a gateway is configured with gate its orders, and a
+    /// gateway with none applies none (delivery state E7.5). The standard order
+    /// is 10 shares at a reference of 150, a gross exposure of 1,500.
+    fn portfolio_risk_fragment(max_gross_exposure: &str) -> String {
+        format!(
+            r#""portfolio_risk": {{
+                "policy_version": "portfolio-risk.desktop.v1",
+                "max_gross_exposure": "{max_gross_exposure}",
+                "max_abs_net_exposure": "1000000",
+                "max_leverage_bps": "10000",
+                "max_concentration_bps": "10000"
+            }},"#
+        )
+    }
+
+    #[test]
+    fn a_gateway_configured_with_portfolio_risk_gates_its_orders_by_it() {
+        let (gateway, scratch, _journal) =
+            test_gateway_with("aggregate-wide", &portfolio_risk_fragment("1000000"));
+        let receipt = gateway
+            .submit_order(order_intent(
+                "intent.desktop.aggregate.001",
+                OrderType::Market,
+                None,
+            ))
+            .expect("an order within the aggregate limit is accepted");
+        assert_ne!(
+            receipt.status,
+            CommandStatus::RiskRejected,
+            "{}",
+            receipt.message
+        );
+        cleanup(scratch);
+
+        let (gateway, scratch, _journal) =
+            test_gateway_with("aggregate-tight", &portfolio_risk_fragment("1000"));
+        let receipt = gateway
+            .submit_order(order_intent(
+                "intent.desktop.aggregate.002",
+                OrderType::Market,
+                None,
+            ))
+            .expect("a risk rejection is a normal, successful outcome");
+        assert_eq!(receipt.status, CommandStatus::RiskRejected);
+        assert!(receipt.order_id.is_none());
+        assert!(
+            receipt.message.contains("MAX_GROSS_EXPOSURE_EXCEEDED"),
+            "{}",
+            receipt.message
+        );
+        cleanup(scratch);
+    }
+
+    #[test]
+    fn an_invalid_portfolio_risk_block_disables_the_gateway_before_its_journal() {
+        let (config, scratch, journal) =
+            write_test_configuration("aggregate-invalid", &portfolio_risk_fragment("lots"));
+        let error = bootstrap_from_path(&config)
+            .err()
+            .expect("an unparseable limit must not start a gateway");
+        assert!(
+            error.contains("invalid portfolio_risk: invalid max_gross_exposure"),
+            "{error}"
+        );
+        assert!(!journal.exists());
         cleanup(scratch);
     }
 

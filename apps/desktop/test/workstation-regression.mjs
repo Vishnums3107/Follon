@@ -11,7 +11,7 @@ import {
   workspaceHash,
   workspacePath,
 } from "../dist/routes.js";
-import { renderWorkspace } from "../dist/workspaces.js";
+import { renderWorkspace } from "../dist/workspaces/index.js";
 import { CommandPalette } from "../dist/command-palette.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));

@@ -34,7 +34,7 @@ os.environ["FOLLON_DASHBOARD_MODE"] = "development"
 MODULE_PATH = Path(__file__).resolve().parents[1] / "server.py"
 INDEX_PATH = Path(__file__).resolve().parents[1] / "index.html"
 MAIN_SOURCE_PATH = Path(__file__).resolve().parents[1] / "src" / "main.ts"
-WORKSPACE_SOURCE_PATH = Path(__file__).resolve().parents[1] / "src" / "workspaces.ts"
+WORKSPACE_SOURCE_DIR = Path(__file__).resolve().parents[1] / "src" / "workspaces"
 APP_SHELL_SOURCE_PATH = Path(__file__).resolve().parents[1] / "src" / "app-shell.tsx"
 SPEC = importlib.util.spec_from_file_location("follon_dashboard_server", MODULE_PATH)
 if SPEC is None or SPEC.loader is None:
@@ -782,11 +782,14 @@ class DashboardServerContract(unittest.TestCase):
         self.assertIn('const pathPrefix = "/workspace/"', runtime_source)
         self.assertIn('`#workspace/${encodeURIComponent(workspace.id)}`', runtime_source)
         self.assertIn('fetch(apiUrl("/api/v1/workspaces")', runtime_source)
-        self.assertIn('from "./evidence.js"', runtime_source)
+        self.assertIn('from "./evidence/index.js"', runtime_source)
         self.assertIn('from "./catalog.js"', runtime_source)
-        self.assertIn('from "./workspaces.js"', runtime_source)
+        self.assertIn('from "./workspaces/index.js"', runtime_source)
 
-        workspace_source = WORKSPACE_SOURCE_PATH.read_text(encoding="utf-8")
+        # The workspaces feature folder is one logical module: check the renderers across all its files.
+        workspace_source = "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted(WORKSPACE_SOURCE_DIR.glob("*.ts"))
+        )
         for renderer in (
             "renderCommandCenter", "renderResearchLab", "renderStrategyStudio",
             "renderBacktestExplorer", "renderExecutionBlotter", "renderRiskCockpit",

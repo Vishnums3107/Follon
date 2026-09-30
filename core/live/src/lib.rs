@@ -18,8 +18,9 @@ use follon_accounting::{
 };
 use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
-    price_deviation_bps, validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill,
-    OrderIntent, OrderState, RiskDecision, Side, TimeInForce,
+    price_deviation_bps, reduces_position_with_working, validate_canonical_id,
+    validate_utc_timestamp, ComboIntent, Decimal, Fill, OrderIntent, OrderState, RiskDecision,
+    Side, TimeInForce,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 
@@ -965,8 +966,41 @@ pub struct LiveBrokerAccountSnapshot {
     pub cash: Decimal,
 }
 
+/// What one controlled-LIVE broker adapter can carry to its venue.
+///
+/// The service consults this before it consumes an approval, spends a canary
+/// slot or creates an order, so a request the adapter cannot carry is refused
+/// with nothing recorded, nothing consumed and nothing transmitted. Without it
+/// the refusal came back as a transport failure: the order became `UNKNOWN`,
+/// the session disconnected, and the approval and the canary slot stayed spent
+/// (delivery state E5.7).
+///
+/// The derived default is the narrowest set, single DAY orders. An adapter
+/// declares anything more. It is a separate type from
+/// `follon_paper::PaperBrokerCapabilities`: the environments are configured and
+/// reviewed independently, and what PAPER may carry must never widen what
+/// controlled LIVE is willing to attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveBrokerCapabilities {
+    /// Executes an atomic multi-leg combination as one order.
+    pub combinations: bool,
+    /// Carries a good-til-cancelled time in force to the venue as such,
+    /// rather than dropping or rewriting it.
+    pub good_til_cancelled: bool,
+    /// Replaces a working order's limit price.
+    pub replacement: bool,
+}
+
 /// Audited live broker interface. Implementations must be deployment-edge code.
 pub trait LiveBrokerAdapter {
+    /// Declares what this adapter can carry.
+    ///
+    /// The default is [`LiveBrokerCapabilities::default`], single DAY orders,
+    /// so an adapter that declares nothing is never handed a combination, a
+    /// GTC order or a replacement it would refuse, drop or rewrite.
+    fn capabilities(&self) -> LiveBrokerCapabilities {
+        LiveBrokerCapabilities::default()
+    }
     /// Establishes a live session using secret bytes only at the adapter boundary.
     fn connect(&mut self, account_id: &str, credential: &SecretMaterial) -> Result<(), LiveError>;
     /// Submits one OMS-generated idempotent live order.
@@ -976,7 +1010,8 @@ pub trait LiveBrokerAdapter {
     ) -> Result<LiveBrokerSubmitResult, LiveError>;
     /// Submits an atomic multi-leg combination.
     ///
-    /// The default refuses. An adapter that cannot execute a combination
+    /// Only reached when [`Self::capabilities`] declares combinations. The
+    /// default refuses. An adapter that cannot execute a combination
     /// atomically must reject the whole request *before* transmitting any leg:
     /// there is no acceptable partial outcome for a group whose legs only make
     /// sense together, and the OMS never works around this by splitting it.
@@ -991,6 +1026,8 @@ pub trait LiveBrokerAdapter {
     /// Requests cancellation by client idempotency identity.
     fn cancel(&mut self, client_order_id: &str) -> Result<(), LiveError>;
     /// Requests a price-only replacement. The result arrives through [`LiveBrokerEvent`].
+    ///
+    /// Only reached when [`Self::capabilities`] declares replacement.
     fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
         request.validate()?;
         Err(LiveError(
@@ -2254,6 +2291,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 state: existing.oms.state,
             });
         }
+        // Before the approval is looked at, let alone consumed: a refusal here
+        // leaves the approval, the canary budget and the session untouched.
+        self.ensure_route_carries(intent.time_in_force, false)?;
         let registered = self.approvals.get(approval_id).ok_or_else(|| {
             LiveError("live canary submission lacks a registered approval".to_owned())
         })?;
@@ -2396,6 +2436,29 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
     }
 
+    /// Refuses what the configured adapter cannot carry, before anything is
+    /// recorded, consumed or transmitted (delivery state E5.7).
+    fn ensure_route_carries(
+        &self,
+        time_in_force: TimeInForce,
+        combination: bool,
+    ) -> Result<(), LiveError> {
+        let capabilities = self.broker.capabilities();
+        if combination && !capabilities.combinations {
+            return Err(LiveError(
+                "the configured live broker adapter cannot execute combinations; nothing was recorded, consumed or transmitted"
+                    .to_owned(),
+            ));
+        }
+        if time_in_force == TimeInForce::GoodTilCancelled && !capabilities.good_til_cancelled {
+            return Err(LiveError(
+                "the configured live broker adapter carries only DAY orders; the GTC intent was refused before anything was recorded, consumed or transmitted"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Requests cancellation; a transport failure remains explicitly `UNKNOWN`.
     pub fn cancel_order(
         &mut self,
@@ -2451,6 +2514,15 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if !self.broker_connected {
             return Err(LiveError(
                 "live canary broker session is not connected; reconcile before replacement"
+                    .to_owned(),
+            ));
+        }
+        // Before the order moves to `PENDING_REPLACE`: an adapter that cannot
+        // replace would otherwise leave it `UNKNOWN` and the session
+        // disconnected (delivery state E5.7).
+        if !self.broker.capabilities().replacement {
+            return Err(LiveError(
+                "the configured live broker adapter cannot replace orders; the order was left unchanged"
                     .to_owned(),
             ));
         }
@@ -3187,19 +3259,18 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         }
         let mut portfolio_risk_limits = String::new();
         if let Some(composition) = self.policy.portfolio_risk.as_ref() {
-            if let Some((decision, margin_used)) =
-                self.portfolio_risk_decision(composition, intent, market, decided_at)?
-            {
-                reasons.extend(
-                    decision
-                        .reason_codes
-                        .into_iter()
-                        // `SELF_TRADE_RISK` is already independently detected above from
-                        // the same working-order state; every other reason this composed
-                        // kernel can produce is new coverage (see `PortfolioRiskComposition`).
-                        .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
-                );
-                portfolio_risk_limits = format!(
+            match self.portfolio_risk_decision(composition, intent, market, decided_at)? {
+                Some((decision, margin_used)) => {
+                    reasons.extend(
+                        decision
+                            .reason_codes
+                            .into_iter()
+                            // `SELF_TRADE_RISK` is already independently detected above from
+                            // the same working-order state; every other reason this composed
+                            // kernel can produce is new coverage (see `PortfolioRiskComposition`).
+                            .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
+                    );
+                    portfolio_risk_limits = format!(
                     ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
@@ -3217,6 +3288,22 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     render_bucket_map(&decision.metrics.currency_gross),
                     render_bucket_map(&decision.metrics.strategy_gross),
                 );
+                }
+                // Equity is not positive, so no aggregate ratio exists to check.
+                // Skipping the check outright would let an underwater account
+                // open more exposure past every aggregate limit exactly when
+                // they matter, so only a trade that moves this position toward
+                // flat may pass, counting what working orders already claim of
+                // it. The rest is refused (delivery state E7.4b).
+                None => {
+                    if !self.reduces_open_position(
+                        &intent.instrument_id,
+                        current_position,
+                        projected_position,
+                    )? {
+                        reasons.push("PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned());
+                    }
+                }
             }
         }
         let approved = reasons.is_empty();
@@ -3290,8 +3377,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
 
     /// Builds the aggregate-risk snapshot/candidate from real service state
     /// and calls the composed `core/risk` kernel. Returns `Ok(None)` when
-    /// computed equity is not yet positive -- a benign boundary condition,
-    /// not an error; the existing per-order checks still apply on their own.
+    /// computed equity is not positive: the kernel's ratios (leverage,
+    /// drawdown, concentration) mean nothing against zero or negative equity.
+    /// That is not permission to skip the limits. The caller refuses every
+    /// order that does not reduce a position (`PORTFOLIO_EQUITY_NOT_POSITIVE`,
+    /// delivery state E7.4b), and the per-order checks apply as always.
     /// On `Some`, the second tuple element is the real margin requirement
     /// computed for the decision (`Decimal::ZERO` when `margin_rates` is not
     /// configured), returned alongside the decision because
@@ -5537,9 +5627,12 @@ mod tests {
         connected: bool,
         submitted: u32,
         cancelled: u32,
+        replaced: u32,
         fail_cancel: bool,
-        /// Models an adapter with no native atomic combination support.
+        /// Models a transport failure on a combination the adapter declared.
         reject_combos: bool,
+        /// What this adapter declares it can carry.
+        capabilities: LiveBrokerCapabilities,
         events: Vec<LiveBrokerEvent>,
         snapshot: LiveBrokerAccountSnapshot,
     }
@@ -5550,8 +5643,13 @@ mod tests {
                 connected: false,
                 submitted: 0,
                 cancelled: 0,
+                replaced: 0,
                 fail_cancel: false,
                 reject_combos: false,
+                capabilities: LiveBrokerCapabilities {
+                    combinations: true,
+                    ..LiveBrokerCapabilities::default()
+                },
                 events: Vec::new(),
                 snapshot: LiveBrokerAccountSnapshot {
                     orders: Vec::new(),
@@ -5613,6 +5711,10 @@ mod tests {
     }
 
     impl LiveBrokerAdapter for TestBroker {
+        fn capabilities(&self) -> LiveBrokerCapabilities {
+            self.capabilities
+        }
+
         fn connect(
             &mut self,
             account_id: &str,
@@ -5666,6 +5768,12 @@ mod tests {
             if self.fail_cancel {
                 return Err(LiveError("test live cancel transport failed".to_owned()));
             }
+            Ok(())
+        }
+
+        fn replace(&mut self, request: &LiveBrokerReplaceRequest) -> Result<(), LiveError> {
+            request.validate()?;
+            self.replaced += 1;
             Ok(())
         }
 
@@ -6708,8 +6816,10 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// An adapter that cannot execute an atomic combination refuses the whole
-    /// request, and the attempt is recorded rather than erased.
+    /// A declared adapter whose combination submission fails is a transport
+    /// outcome, so the attempt is recorded rather than erased. An adapter that
+    /// declares nothing never gets that far (see
+    /// `live_combo_on_an_adapter_that_cannot_execute_combinations_is_refused_before_anything_is_spent`).
     #[test]
     fn live_combo_transport_failure_leaves_the_group_unknown_and_keeps_the_approval_spent() {
         let path = journal_path("combo-transport");
@@ -6734,6 +6844,666 @@ mod tests {
         assert!(service.approvals["approval.live.001"].consumed);
         assert_eq!(service.canary_submissions, 1);
         assert!(service.has_unknown_order());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A LIVE service whose aggregate composition is configured and whose
+    /// policy permits shorts, holding a short of 2 sold at 10, plus a marks
+    /// helper for what it would take to put it underwater.
+    fn service_holding_a_short_under_aggregate_risk(label: &str) -> LiveTradingService<TestBroker> {
+        let path = journal_path(label);
+        let mut risk_policy = policy_permitting_shorts();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        service
+            .apply_accounted_fill(
+                &Fill {
+                    execution_id: "execution.live.underwater.short".to_owned(),
+                    order_id: "order.live.underwater.short".to_owned(),
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    side: Side::Sell,
+                    quantity: amount("2"),
+                    price: amount("10"),
+                    fee: Decimal::ZERO,
+                    executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                },
+                "strategy.live.001",
+            )
+            .expect("a short position");
+        service
+    }
+
+    /// With equity not positive no aggregate ratio can be computed. Skipping
+    /// the limits then would let an underwater account open exposure past every
+    /// one of them, so only a trade that moves a position toward flat passes
+    /// (delivery state E7.4b).
+    #[test]
+    fn an_underwater_live_account_may_only_reduce_a_position() {
+        let mut service = service_holding_a_short_under_aggregate_risk("underwater-single");
+        // Cash is 1,020 against a short of 2. A mark of 600 takes equity to
+        // 1,020 - 2 * 600 = -180.
+        let mut assess = |id: &str, side: Side, quantity: &str| {
+            let mut order = intent("LIVE", id);
+            order.side = side;
+            order.quantity = amount(quantity);
+            let market = LiveMarketData {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                mark_price: amount("600"),
+                observed_at: "2026-01-02T14:32:00Z".to_owned(),
+            };
+            service
+                .evaluate_risk(&order, &market, "2026-01-02T14:32:00Z", true)
+                .expect("a risk decision")
+        };
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+        let adding = assess("intent.live.underwater.add", Side::Sell, "1");
+        assert!(adding.reason_codes.contains(&refused));
+        // The kernel that cannot run is not reported as having run.
+        assert!(!adding.evaluated_limits.contains("portfolio_gross_exposure"));
+        let reversing = assess("intent.live.underwater.flip", Side::Buy, "3");
+        assert!(reversing.reason_codes.contains(&refused));
+        // Buying the short back, in part or entirely, moves it toward flat.
+        for (id, quantity) in [
+            ("intent.live.underwater.part", "1"),
+            ("intent.live.underwater.all", "2"),
+        ] {
+            let reducing = assess(id, Side::Buy, quantity);
+            assert!(!reducing.reason_codes.contains(&refused), "{id}");
+        }
+    }
+
+    /// A combination is one atomic group, so it reduces risk only if every leg
+    /// moves its own position toward flat.
+    #[test]
+    fn an_underwater_live_account_may_only_close_every_leg_of_a_combination() {
+        let path = journal_path("underwater-combo");
+        let mut risk_policy = policy_permitting_shorts();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        for (instrument, side, price) in [
+            ("inst.us_option.spy.near", Side::Buy, "7.50"),
+            ("inst.us_option.spy.far", Side::Sell, "5"),
+        ] {
+            service
+                .apply_accounted_fill(
+                    &Fill {
+                        execution_id: format!("execution.live.underwater.{instrument}"),
+                        order_id: "order.live.underwater.vertical".to_owned(),
+                        instrument_id: instrument.to_owned(),
+                        side,
+                        quantity: amount("4"),
+                        price: amount(price),
+                        fee: Decimal::ZERO,
+                        executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                    },
+                    "strategy.live.001",
+                )
+                .expect("a leg of the vertical");
+        }
+        // Long 4 near, short 4 far. The short leg's mark rising to 30,000
+        // takes equity far below zero.
+        let market = LiveComboMarketData {
+            marks: vec![
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    mark_price: amount("7.50"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    mark_price: amount("30000"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+            ],
+        };
+        let mut assess =
+            |id: &str, near: Side, far: Side, limit: follon_domain::ComboPriceLimit| {
+                let mut structure = combo_intent(id);
+                structure.combo_quantity = amount("1");
+                structure.legs[0].side = near;
+                structure.legs[0].limit_price = amount("7.50");
+                structure.legs[1].side = far;
+                structure.legs[1].limit_price = amount("30000");
+                structure.price_limit = limit;
+                service
+                    .evaluate_combo_risk(&structure, &market, "2026-01-02T14:32:00Z", true)
+                    .expect("a combination decision")
+            };
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+        // Adding to both legs, and closing one leg while adding to the other,
+        // are refused.
+        let adding = assess(
+            "intent.live.underwater.add",
+            Side::Buy,
+            Side::Sell,
+            follon_domain::ComboPriceLimit::MinimumCredit(amount("29992.50")),
+        );
+        assert!(adding.reason_codes.contains(&refused));
+        let mixed = assess(
+            "intent.live.underwater.mixed",
+            Side::Sell,
+            Side::Sell,
+            follon_domain::ComboPriceLimit::MinimumCredit(amount("30007.50")),
+        );
+        assert!(mixed.reason_codes.contains(&refused));
+        // Order does not matter: the leg that adds may come first or last.
+        let mixed_the_other_way = assess(
+            "intent.live.underwater.mixed-reversed",
+            Side::Buy,
+            Side::Buy,
+            follon_domain::ComboPriceLimit::MaximumDebit(amount("30007.50")),
+        );
+        assert!(mixed_the_other_way.reason_codes.contains(&refused));
+        // Closing one unit of both legs is not refused for the equity.
+        let closing = assess(
+            "intent.live.underwater.close",
+            Side::Sell,
+            Side::Buy,
+            follon_domain::ComboPriceLimit::MaximumDebit(amount("29992.50")),
+        );
+        assert!(!closing.reason_codes.contains(&refused));
+    }
+
+    /// Puts an order that is still working into the service, as a canary submission would,
+    /// without spending an approval or a canary slot.
+    fn rest_order(
+        service: &mut LiveTradingService<TestBroker>,
+        id: &str,
+        side: Side,
+        quantity: &str,
+        filled: &str,
+    ) {
+        let mut order = intent("LIVE", id);
+        order.side = side;
+        order.quantity = amount(quantity);
+        let market = market();
+        let policy_version = service.policy.version.clone();
+        let decision = LiveRiskDecision {
+            decision_id: format!("live-risk-{id}"),
+            approved: true,
+            reason_codes: vec!["APPROVED".to_owned()],
+            policy_version: policy_version.clone(),
+            decided_at: "2026-01-02T14:31:00Z".to_owned(),
+            market_fingerprint: market_fingerprint(&market),
+            evaluated_limits: String::new(),
+        };
+        let core_decision = RiskDecision {
+            decision_id: decision.decision_id.clone(),
+            intent_id: id.to_owned(),
+            approved: true,
+            reason_codes: decision.reason_codes.clone(),
+            policy_version,
+            decided_at: decision.decided_at.clone(),
+            correlation_id: order.correlation_id.clone(),
+            actor: "live_risk_engine".to_owned(),
+            evaluated_limits: String::new(),
+        };
+        let mut oms = OmsOrder::from_approved_intent(order, &core_decision).expect("an order");
+        oms.transition(OrderState::Approved, "LIVE_RISK_APPROVED")
+            .expect("approved");
+        oms.transition(
+            OrderState::PendingSubmit,
+            "LIVE_CANARY_SUBMISSION_REQUESTED",
+        )
+        .expect("pending");
+        service.orders.insert(
+            oms.order_id.clone(),
+            LiveOrder {
+                oms,
+                approval_id: "approval.live.rest".to_owned(),
+                market,
+                decision,
+                broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                replace_return_state: None,
+                filled_quantity: amount(filled),
+            },
+        );
+    }
+
+    /// Two orders that each close the whole short are each a reduction alone and would
+    /// together reverse it into a long, so an underwater account is refused the second
+    /// (delivery state E7.4b, found in review): what is already working claims part of the
+    /// position first.
+    #[test]
+    fn an_underwater_live_account_cannot_reverse_a_position_with_two_working_reductions() {
+        let mut service = service_holding_a_short_under_aggregate_risk("underwater-working");
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+        let assess =
+            |service: &mut LiveTradingService<TestBroker>, id: &str, side: Side, quantity: &str| {
+                let mut order = intent("LIVE", id);
+                order.side = side;
+                order.quantity = amount(quantity);
+                let market = LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("600"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                };
+                service
+                    .evaluate_risk(&order, &market, "2026-01-02T14:32:00Z", true)
+                    .expect("a risk decision")
+            };
+        // Short 2 at a mark of 600 is underwater, and buying it all back alone is a reduction.
+        assert!(
+            !assess(&mut service, "intent.live.claims.alone", Side::Buy, "2")
+                .reason_codes
+                .contains(&refused)
+        );
+
+        // A sale that is working adds to the short and claims nothing of it.
+        rest_order(
+            &mut service,
+            "intent.live.claims.sale",
+            Side::Sell,
+            "5",
+            "0",
+        );
+        assert!(
+            !assess(&mut service, "intent.live.claims.opposite", Side::Buy, "2")
+                .reason_codes
+                .contains(&refused)
+        );
+
+        // A purchase of the whole short that is working claims all of it.
+        rest_order(
+            &mut service,
+            "intent.live.claims.cover",
+            Side::Buy,
+            "2",
+            "0",
+        );
+        for (id, quantity) in [
+            ("intent.live.claims.second", "2"),
+            ("intent.live.claims.one", "1"),
+        ] {
+            assert!(
+                assess(&mut service, id, Side::Buy, quantity)
+                    .reason_codes
+                    .contains(&refused),
+                "{id}"
+            );
+        }
+    }
+
+    /// A part-filled order claims only what it has left.
+    #[test]
+    fn an_underwater_live_account_counts_only_the_unfilled_part_of_a_working_reduction() {
+        let mut service = service_holding_a_short_under_aggregate_risk("underwater-part-filled");
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+        let fill = |id: &str, side: Side, price: &str| Fill {
+            execution_id: format!("execution.live.claims.{id}"),
+            order_id: format!("order.live.claims.{id}"),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side,
+            quantity: amount(if side == Side::Sell { "2" } else { "1" }),
+            price: amount(price),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:30Z".to_owned(),
+        };
+        // Short 4 in all, then a purchase of 2 of which 1 has filled, at the mark of 600:
+        // the short is 3, equity is 1,040 - 600 - 3 * 600 = -1,360, and the 1 still working
+        // claims 1 of the 3.
+        service
+            .apply_accounted_fill(&fill("more", Side::Sell, "10"), "strategy.live.001")
+            .expect("a larger short");
+        service
+            .apply_accounted_fill(&fill("part", Side::Buy, "600"), "strategy.live.001")
+            .expect("the part that filled");
+        rest_order(&mut service, "intent.live.claims.part", Side::Buy, "2", "1");
+        let mut assess = |id: &str, quantity: &str| {
+            let mut order = intent("LIVE", id);
+            order.side = Side::Buy;
+            order.quantity = amount(quantity);
+            let market = LiveMarketData {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                mark_price: amount("600"),
+                observed_at: "2026-01-02T14:32:00Z".to_owned(),
+            };
+            service
+                .evaluate_risk(&order, &market, "2026-01-02T14:32:00Z", true)
+                .expect("a risk decision")
+        };
+        // The other 2 may be bought back and not one more.
+        assert!(!assess("intent.live.claims.rest", "2")
+            .reason_codes
+            .contains(&refused));
+        assert!(assess("intent.live.claims.over", "3")
+            .reason_codes
+            .contains(&refused));
+    }
+
+    /// A combination's legs claim their instruments as plain orders do, by the units unfilled.
+    #[test]
+    fn an_underwater_live_account_counts_the_legs_of_a_working_combination() {
+        let path = journal_path("underwater-combo-working");
+        let mut risk_policy = policy_permitting_shorts();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        for (instrument, side, price) in [
+            ("inst.us_option.spy.near", Side::Buy, "7.50"),
+            ("inst.us_option.spy.far", Side::Sell, "5"),
+        ] {
+            service
+                .apply_accounted_fill(
+                    &Fill {
+                        execution_id: format!("execution.live.claims.{instrument}"),
+                        order_id: "order.live.claims.vertical".to_owned(),
+                        instrument_id: instrument.to_owned(),
+                        side,
+                        quantity: amount("4"),
+                        price: amount(price),
+                        fee: Decimal::ZERO,
+                        executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                    },
+                    "strategy.live.001",
+                )
+                .expect("a leg of the vertical");
+        }
+        let market = LiveComboMarketData {
+            marks: vec![
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    mark_price: amount("7.50"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    mark_price: amount("30000"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+            ],
+        };
+        // Long 4 near, short 4 far: closing sells the near and buys the far.
+        // A leg's ratio multiplies the units, so one unit at a ratio of three closes three
+        // contracts.
+        let closing = |id: &str, units: &str, ratio: u32| {
+            let mut structure = combo_intent(id);
+            structure.combo_quantity = amount(units);
+            structure.legs[0].side = Side::Sell;
+            structure.legs[0].ratio = ratio;
+            structure.legs[0].limit_price = amount("7.50");
+            structure.legs[1].side = Side::Buy;
+            structure.legs[1].ratio = ratio;
+            structure.legs[1].limit_price = amount("30000");
+            structure.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount("90000"));
+            structure
+        };
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+        // Three contracts of the closing are working, so of the four held one more fits and
+        // two more would reverse the position.
+        let resting = closing("intent.live.claims.combo.resting", "1", 3);
+        let resting_decision = LiveRiskDecision {
+            decision_id: "live-risk-resting".to_owned(),
+            approved: true,
+            reason_codes: vec!["APPROVED".to_owned()],
+            policy_version: service.policy.version.clone(),
+            decided_at: "2026-01-02T14:31:00Z".to_owned(),
+            market_fingerprint: String::new(),
+            evaluated_limits: String::new(),
+        };
+        let core_decision = RiskDecision {
+            decision_id: resting_decision.decision_id.clone(),
+            intent_id: resting.intent_id.clone(),
+            approved: true,
+            reason_codes: resting_decision.reason_codes.clone(),
+            policy_version: resting_decision.policy_version.clone(),
+            decided_at: resting_decision.decided_at.clone(),
+            correlation_id: resting.correlation_id.clone(),
+            actor: "live_risk_engine".to_owned(),
+            evaluated_limits: String::new(),
+        };
+        let mut oms =
+            OmsComboOrder::from_approved_intent(resting, &core_decision).expect("a combination");
+        oms.transition(OrderState::Approved, "LIVE_COMBO_RISK_APPROVED")
+            .expect("approved");
+        oms.transition(
+            OrderState::PendingSubmit,
+            "LIVE_CANARY_COMBO_SUBMISSION_REQUESTED",
+        )
+        .expect("pending");
+        service.combo_orders.insert(
+            oms.order_id.clone(),
+            LiveComboOrder {
+                oms,
+                approval_id: "approval.live.rest".to_owned(),
+                market: market.clone(),
+                decision: resting_decision,
+                broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                filled_quantity: Decimal::ZERO,
+                executions: BTreeMap::new(),
+            },
+        );
+        let one = service
+            .evaluate_combo_risk(
+                &closing("intent.live.claims.combo.one", "1", 1),
+                &market,
+                "2026-01-02T14:32:00Z",
+                true,
+            )
+            .expect("a combination decision");
+        assert!(!one.reason_codes.contains(&refused));
+        let two = service
+            .evaluate_combo_risk(
+                &closing("intent.live.claims.combo.two", "2", 1),
+                &market,
+                "2026-01-02T14:32:00Z",
+                true,
+            )
+            .expect("a combination decision");
+        assert!(two.reason_codes.contains(&refused));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An adapter that declares nothing is never handed a combination, a GTC
+    /// order or a replacement.
+    #[test]
+    fn an_adapter_that_declares_nothing_carries_only_single_day_orders() {
+        struct Silent;
+
+        impl LiveBrokerAdapter for Silent {
+            fn connect(&mut self, _: &str, _: &SecretMaterial) -> Result<(), LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn submit(
+                &mut self,
+                _: &LiveBrokerOrderRequest,
+            ) -> Result<LiveBrokerSubmitResult, LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn cancel(&mut self, _: &str) -> Result<(), LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn poll(&mut self) -> Result<Vec<LiveBrokerEvent>, LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn snapshot(&mut self, _: &str) -> Result<LiveBrokerAccountSnapshot, LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+            fn reconnect(&mut self, _: &str, _: &SecretMaterial) -> Result<(), LiveError> {
+                Err(LiveError("silent".to_owned()))
+            }
+        }
+
+        assert_eq!(
+            Silent.capabilities(),
+            LiveBrokerCapabilities {
+                combinations: false,
+                good_til_cancelled: false,
+                replacement: false,
+            }
+        );
+    }
+
+    /// A combination the adapter did not declare is refused before anything is
+    /// spent: the approval stays usable, the canary budget is intact, the
+    /// session stays connected and nothing is left `UNKNOWN`. The same approval
+    /// then works once the adapter can carry it (delivery state E5.7).
+    #[test]
+    fn live_combo_on_an_adapter_that_cannot_execute_combinations_is_refused_before_anything_is_spent(
+    ) {
+        let path = journal_path("combo-undeclared");
+        let intent = combo_intent("intent.live.combo.107");
+        let mut service = canary_ready(&path, &intent);
+        service.broker_mut().capabilities = LiveBrokerCapabilities::default();
+        let submit = |service: &mut LiveTradingService<TestBroker>| {
+            service.submit_canary_combo_intent(
+                intent.clone(),
+                combo_market(),
+                "approval.live.001",
+                "2026-01-02T14:30:02Z",
+                "operator.requester.001",
+            )
+        };
+        let error = submit(&mut service).expect_err("an undeclared combination is refused");
+        assert!(
+            error.0.contains("cannot execute combinations"),
+            "{}",
+            error.0
+        );
+        assert!(service
+            .combo_order("combo-order-intent.live.combo.107")
+            .is_none());
+        assert!(!service.approvals["approval.live.001"].consumed);
+        assert_eq!(service.canary_submissions, 0);
+        assert!(!service.has_unknown_order());
+        assert!(service.broker_connected);
+        assert_eq!(service.broker_mut().submitted, 0);
+
+        service.broker_mut().capabilities.combinations = true;
+        assert!(matches!(
+            submit(&mut service).expect("the same approval works once declared"),
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        assert_eq!(service.canary_submissions, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The broker request carries no time in force, so a GTC intent would
+    /// silently become whatever the adapter places. A DAY-only adapter refuses
+    /// it before the approval is spent.
+    #[test]
+    fn live_gtc_intent_on_a_day_only_adapter_is_refused_before_anything_is_spent() {
+        let path = journal_path("gtc-undeclared");
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        let mut gtc = intent("LIVE", "intent.live.gtc.001");
+        gtc.time_in_force = TimeInForce::GoodTilCancelled;
+        let approval = approval_for(&service, &gtc);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        let submit = |service: &mut LiveTradingService<TestBroker>| {
+            service.submit_canary_intent(
+                gtc.clone(),
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+        };
+        let error = submit(&mut service).expect_err("a GTC intent is refused");
+        assert!(error.0.contains("carries only DAY orders"), "{}", error.0);
+        assert!(service.orders.is_empty());
+        assert!(!service.approvals["approval.live.001"].consumed);
+        assert_eq!(service.canary_submissions, 0);
+        assert!(service.broker_connected);
+        assert_eq!(service.broker_mut().submitted, 0);
+
+        service.broker_mut().capabilities.good_til_cancelled = true;
+        assert!(matches!(
+            submit(&mut service).expect("the same approval works once declared"),
+            LiveSubmitOutcome::CanaryOrder {
+                state: OrderState::Acknowledged,
+                ..
+            }
+        ));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A replacement the adapter cannot carry leaves the order working instead
+    /// of `UNKNOWN` with the session disconnected.
+    #[test]
+    fn live_replacement_on_an_adapter_that_cannot_replace_leaves_the_order_working() {
+        let path = journal_path("replace-undeclared");
+        let mut service = test_service(LiveRunMode::Canary, &path);
+        let mut limit = intent("LIVE", "intent.live.replace.001");
+        limit.order_type = OrderType::Limit;
+        limit.limit_price = Some(amount("10"));
+        let approval = approval_for(&service, &limit);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        service
+            .submit_canary_intent(
+                limit,
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("bounded submission");
+        let order_id = "order-intent.live.replace.001";
+
+        let error = service
+            .replace_order(
+                order_id,
+                amount("9"),
+                "operator.requester.001",
+                "2026-01-02T14:31:00Z",
+            )
+            .expect_err("an undeclared replacement is refused");
+        assert!(error.0.contains("cannot replace orders"), "{}", error.0);
+        assert_eq!(service.orders[order_id].oms.state, OrderState::Acknowledged);
+        assert!(!service.has_unknown_order());
+        assert!(service.broker_connected);
+        assert_eq!(service.broker_mut().replaced, 0);
+
+        service.broker_mut().capabilities.replacement = true;
+        service
+            .replace_order(
+                order_id,
+                amount("9"),
+                "operator.requester.001",
+                "2026-01-02T14:31:00Z",
+            )
+            .expect("a declared replacement is sent");
+        assert_eq!(service.broker_mut().replaced, 1);
+        assert_eq!(
+            service.orders[order_id].oms.state,
+            OrderState::PendingReplace
+        );
         let _ = fs::remove_file(&path);
     }
 

@@ -16,12 +16,18 @@ Usage::
     python tools/session_status.py            # run every suite, rewrite the block
     python tools/session_status.py --fast     # skip the slow suites
     python tools/session_status.py --check    # fail if the block is stale
+
+The PostgreSQL integration suite runs only when ``FOLLON_TEST_DATABASE_URL`` names
+a disposable database, and the block reports it skipped otherwise. Retained evidence
+is append-only there, so such a database is never cleaned by deleting rows: drop and
+recreate it when you want it empty.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -57,6 +63,10 @@ class Suite:
     # A suite whose binary is absent reports SKIPPED, not FAILED, so a machine
     # without Node still produces an honest status line instead of a false red.
     requires: str | None = None
+    # Likewise for a suite that needs an environment variable, such as the
+    # database tests, which run only against a disposable PostgreSQL. It is
+    # reported as skipped, never omitted, so the block says what was not run.
+    requires_environment: str | None = None
 
 
 @dataclass
@@ -109,6 +119,14 @@ def suites() -> list[Suite]:
             working_directory=REPOSITORY_ROOT,
             slow=True,
             requires="cargo",
+        ),
+        Suite(
+            key="postgres_integration",
+            title="PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`)",
+            command=["cargo", "test", "-p", "follon-postgres", "--", "--ignored"],
+            working_directory=REPOSITORY_ROOT,
+            requires="cargo",
+            requires_environment="FOLLON_TEST_DATABASE_URL",
         ),
         Suite(
             key="tauri_workspace",
@@ -166,6 +184,15 @@ def run_suite(suite: Suite, *, fast: bool) -> SuiteOutcome:
             status="SKIPPED",
             exit_code=None,
             detail=f"`{suite.requires}` is not on PATH on this machine",
+        )
+    if suite.requires_environment and not os.environ.get(suite.requires_environment):
+        return SuiteOutcome(
+            key=suite.key,
+            title=suite.title,
+            command=printable,
+            status="SKIPPED",
+            exit_code=None,
+            detail=f"`{suite.requires_environment}` is not set, so there is no disposable database to run against",
         )
     if fast and suite.slow:
         return SuiteOutcome(

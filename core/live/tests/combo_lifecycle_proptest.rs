@@ -28,7 +28,7 @@ use follon_domain::{
 };
 use follon_live::{
     combo_intent_fingerprint, LiveAccount, LiveActivation, LiveActivationRequest, LiveApproval,
-    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerComboExecution,
+    LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerCapabilities, LiveBrokerComboExecution,
     LiveBrokerComboExecutionLeg, LiveBrokerComboRequest, LiveBrokerEvent, LiveBrokerOrderRequest,
     LiveBrokerOrderSnapshot, LiveBrokerPositionSnapshot, LiveBrokerSubmitResult,
     LiveComboMarketData, LiveError, LiveKillSwitchRegistry, LiveMarketData, LiveRiskPolicy,
@@ -122,6 +122,12 @@ impl ModelBroker {
 }
 
 impl LiveBrokerAdapter for ModelBroker {
+    fn capabilities(&self) -> LiveBrokerCapabilities {
+        LiveBrokerCapabilities {
+            combinations: true,
+            ..LiveBrokerCapabilities::default()
+        }
+    }
     fn connect(
         &mut self,
         _account_id: &str,

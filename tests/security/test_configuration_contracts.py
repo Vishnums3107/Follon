@@ -32,6 +32,7 @@ CONFIGURATION_CONTRACTS = {
     "live-v1-portfolio-risk.json": "v1/live-configuration.schema.json",
     "paper-command-route-v1.json": "v1/paper-command-route.schema.json",
     "paper-command-route-v1-bridge.json": "v1/paper-command-route.schema.json",
+    "paper-command-route-v1-portfolio-risk.json": "v1/paper-command-route.schema.json",
     "operations-v1.json": "v1/operations-configuration.schema.json",
     "options-v1.json": "v1/options-configuration.schema.json",
     "commercial-data-inventory-v1.json": "v1/commercial-data-inventory.schema.json",
@@ -95,6 +96,20 @@ class ConfigurationContractTests(unittest.TestCase):
                 with self.subTest(definition=name):
                     self.assertEqual(version_2["$defs"].get(name), definition)
 
+    def test_the_route_reads_the_same_portfolio_risk_document_as_paper_status(self) -> None:
+        # The gRPC route, the desktop gateway and `follon-paper-status` share one
+        # `portfolio_risk` document (delivery state E7.5), so the two schemas that
+        # publish it must not drift apart.
+        route = load(SCHEMA_ROOT / "v1" / "paper-command-route.schema.json")
+        paper = load(SCHEMA_ROOT / "v2" / "paper-configuration.schema.json")
+        for name in ("portfolioRisk", "instrumentBucket", "marginRate"):
+            with self.subTest(definition=name):
+                self.assertEqual(route["$defs"].get(name), paper["$defs"].get(name))
+        self.assertEqual(
+            route["properties"]["portfolio_risk"]["$ref"], "#/$defs/portfolioRisk"
+        )
+        self.assertNotIn("portfolio_risk", route["required"])
+
     @unittest.skipUnless(
         importlib.util.find_spec("jsonschema"), "full validation needs jsonschema"
     )
@@ -141,6 +156,31 @@ class ConfigurationContractTests(unittest.TestCase):
         for name, document in {"model": model, "bridge": bridge}.items():
             with self.subTest(accepted=name):
                 self.assertTrue(validator.is_valid(document))
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jsonschema"), "full validation needs jsonschema"
+    )
+    def test_the_route_schema_refuses_a_malformed_portfolio_risk_block(self) -> None:
+        import jsonschema
+
+        schema = load(SCHEMA_ROOT / "v1" / "paper-command-route.schema.json")
+        validator = jsonschema.validators.validator_for(schema)(schema)
+        route = load(FIXTURE_ROOT / "paper-command-route-v1-portfolio-risk.json")
+        block = route["portfolio_risk"]
+        self.assertTrue(validator.is_valid(route))
+        refused = {
+            "unknown limit": {**route, "portfolio_risk": {**block, "max_gross_expsure": "1"}},
+            "zero gross exposure": {**route, "portfolio_risk": {**block, "max_gross_exposure": "0"}},
+            "missing concentration": {
+                **route,
+                "portfolio_risk": {k: v for k, v in block.items() if k != "max_concentration_bps"},
+            },
+            "text limit": {**route, "portfolio_risk": {**block, "max_daily_loss": "lots"}},
+            "not an object": {**route, "portfolio_risk": "wide"},
+        }
+        for name, document in refused.items():
+            with self.subTest(refused=name):
+                self.assertFalse(validator.is_valid(document))
 
 
 if __name__ == "__main__":

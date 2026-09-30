@@ -18,6 +18,10 @@ SCHEMA_VERSION = 1
 GENERATOR_VERSION = "follon-sbom-generator-v1"
 SOURCE_REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 PYTHON_REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+SPDX_IDENTIFIER = re.compile(r"^[A-Za-z0-9.+-]+$")
+# The desktop host is a separate Cargo workspace, with its own manifest and lockfile.
+DESKTOP_CARGO_MANIFEST = "apps/desktop/src-tauri/Cargo.toml"
+DESKTOP_CARGO_LOCK = "apps/desktop/src-tauri/Cargo.lock"
 
 
 def sha256_file(path: Path) -> str:
@@ -32,23 +36,60 @@ def normalized_component(component: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in component.items() if value not in (None, "", [], {})}
 
 
-def cargo_components(lock_path: Path) -> list[dict[str, Any]]:
+def first_party_cargo_licences(repository_root: Path) -> dict[str, str]:
+    """The declared licence of every first-party Cargo package.
+
+    A lockfile records a package's name and version but not its licence, and a
+    first-party package has no registry to ask, so the licence is read from its own
+    manifest: each member of the root workspace, and the desktop host, which is a
+    separate Cargo workspace. A package that declares none is refused rather than
+    left out of the bill (delivery state E7.8).
+    """
+    root = tomllib.loads((repository_root / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace_licence = root["workspace"]["package"].get("license")
+    manifests = [repository_root / member / "Cargo.toml" for member in root["workspace"]["members"]]
+    manifests.append(repository_root / DESKTOP_CARGO_MANIFEST)
+    licences: dict[str, str] = {}
+    for path in manifests:
+        package = tomllib.loads(path.read_text(encoding="utf-8"))["package"]
+        declared = package.get("license")
+        if declared == {"workspace": True}:
+            declared = workspace_licence
+        if not isinstance(declared, str) or not declared:
+            raise ValueError(f"first-party crate {package['name']} declares no licence")
+        licences[package["name"]] = declared
+    return licences
+
+
+def cargo_components(
+    lock_path: Path, declared_in: str, first_party_licences: dict[str, str]
+) -> list[dict[str, Any]]:
     document = tomllib.loads(lock_path.read_text(encoding="utf-8"))
     components = []
     for package in document.get("package", []):
         if not isinstance(package, dict):
-            raise ValueError("Cargo.lock contains a malformed package record")
+            raise ValueError(f"{declared_in} contains a malformed package record")
         name = package.get("name")
         version = package.get("version")
         if not isinstance(name, str) or not isinstance(version, str):
-            raise ValueError("Cargo.lock package identity is incomplete")
+            raise ValueError(f"{declared_in} package identity is incomplete")
+        licence = None
+        first_party = package.get("source") is None
+        if first_party:
+            # A package with no registry or git source is a path dependency, so it is
+            # ours. One this repository has no manifest for cannot be attributed.
+            licence = first_party_licences.get(name)
+            if licence is None:
+                raise ValueError(f"first-party crate {name} in {declared_in} has no manifest here")
         components.append(normalized_component({
             "ecosystem": "cargo",
             "name": name,
             "version": version,
             "source": package.get("source"),
             "checksum": package.get("checksum"),
-            "declared_in": ["Cargo.lock"],
+            "license": licence,
+            "first_party": first_party or None,
+            "declared_in": [declared_in],
         }))
     return components
 
@@ -83,6 +124,22 @@ def npm_components(lock_path: Path) -> list[dict[str, Any]]:
     return components
 
 
+def npm_first_party_component(package_json_path: Path, declared_in: str) -> dict[str, Any]:
+    package = json.loads(package_json_path.read_text(encoding="utf-8"))
+    name, version, licence = package.get("name"), package.get("version"), package.get("license")
+    if not all(isinstance(value, str) and value for value in (name, version, licence)):
+        raise ValueError(f"{declared_in} must declare a name, a version and a licence")
+    return {
+        "ecosystem": "npm",
+        "name": name,
+        "version": version,
+        "role": "application",
+        "license": licence,
+        "first_party": True,
+        "declared_in": [declared_in],
+    }
+
+
 def python_components(pyproject_paths: list[Path], repository_root: Path) -> list[dict[str, Any]]:
     components: list[dict[str, Any]] = []
     for path in pyproject_paths:
@@ -95,11 +152,16 @@ def python_components(pyproject_paths: list[Path], repository_root: Path) -> lis
         project_version = project.get("version")
         if not isinstance(project_name, str) or not isinstance(project_version, str):
             raise ValueError(f"{relative} lacks project name/version")
+        project_licence = project.get("license")
+        if not isinstance(project_licence, str) or not project_licence:
+            raise ValueError(f"{relative} must declare its licence as an SPDX expression")
         components.append({
             "ecosystem": "python",
             "name": project_name,
             "version": project_version,
             "role": "application",
+            "license": project_licence,
+            "first_party": True,
             "declared_in": [relative],
         })
         dependency_groups = [
@@ -142,13 +204,20 @@ def merge_components(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
         existing["declared_in"] = sorted(
             set(existing.get("declared_in", [])) | set(component.get("declared_in", []))
         )
-        for field in ("source", "checksum", "integrity", "license"):
+        for field in ("source", "checksum", "integrity", "license", "first_party"):
             candidate = component.get(field)
             if candidate not in (None, "") and existing.get(field) not in (None, "", candidate):
                 raise ValueError(f"conflicting {field} for {key[0]} component {key[1]}")
             if candidate not in (None, ""):
                 existing[field] = candidate
     return [merged[key] for key in sorted(merged)]
+
+
+def cyclonedx_licences(declared: str) -> list[dict[str, Any]]:
+    """A declared licence as CycloneDX's native field: an identifier, or an SPDX expression."""
+    if SPDX_IDENTIFIER.fullmatch(declared):
+        return [{"license": {"id": declared}}]
+    return [{"expression": declared}]
 
 
 def cyclonedx_component(component: dict[str, Any]) -> dict[str, Any]:
@@ -178,6 +247,9 @@ def cyclonedx_component(component: dict[str, Any]) -> dict[str, Any]:
         value = component.get(field)
         if value not in (None, ""):
             result["properties"].append({"name": f"follon:{field.replace('_', '-')}", "value": str(value)})
+    if component.get("first_party"):
+        result["properties"].append({"name": "follon:first-party", "value": "true"})
+        result["licenses"] = cyclonedx_licences(component["license"])
     checksum = component.get("checksum")
     if isinstance(checksum, str) and re.fullmatch(r"[a-fA-F0-9]{64}", checksum):
         result["hashes"] = [{"alg": "SHA-256", "content": checksum.lower()}]
@@ -191,15 +263,34 @@ def build_sbom(repository_root: Path, source_revision: str) -> dict[str, Any]:
     if SOURCE_REVISION.fullmatch(source_revision) is None:
         raise ValueError("source revision must be a bounded printable revision identifier")
     cargo_lock = repository_root / "Cargo.lock"
+    desktop_cargo_lock = repository_root / DESKTOP_CARGO_LOCK
     npm_lock = repository_root / "apps" / "desktop" / "package-lock.json"
+    npm_manifest = repository_root / "apps" / "desktop" / "package.json"
     pyprojects = sorted((repository_root / "python").glob("*/pyproject.toml"))
-    required_inputs = [cargo_lock, npm_lock, *pyprojects]
+    root_manifest = repository_root / "Cargo.toml"
+    members = tomllib.loads(root_manifest.read_text(encoding="utf-8"))["workspace"]["members"]
+    cargo_manifests = [
+        root_manifest,
+        *(repository_root / member / "Cargo.toml" for member in members),
+        repository_root / DESKTOP_CARGO_MANIFEST,
+    ]
+    required_inputs = [
+        cargo_lock,
+        desktop_cargo_lock,
+        npm_lock,
+        npm_manifest,
+        *pyprojects,
+        *cargo_manifests,
+    ]
     missing = [str(path) for path in required_inputs if not path.is_file() or path.is_symlink()]
     if missing:
         raise ValueError(f"required dependency inputs are missing or unsafe: {missing}")
+    first_party_licences = first_party_cargo_licences(repository_root)
     inventory = merge_components([
-        *cargo_components(cargo_lock),
+        *cargo_components(cargo_lock, "Cargo.lock", first_party_licences),
+        *cargo_components(desktop_cargo_lock, DESKTOP_CARGO_LOCK, first_party_licences),
         *npm_components(npm_lock),
+        npm_first_party_component(npm_manifest, "apps/desktop/package.json"),
         *python_components(pyprojects, repository_root),
     ])
     inputs = [
@@ -222,6 +313,11 @@ def build_sbom(repository_root: Path, source_revision: str) -> dict[str, Any]:
                 "bom-ref": f"urn:follon:source:{hashlib.sha256(source_revision.encode('utf-8')).hexdigest()}",
                 "name": "follon",
                 "version": source_revision,
+                "licenses": cyclonedx_licences(
+                    tomllib.loads(root_manifest.read_text(encoding="utf-8"))["workspace"][
+                        "package"
+                    ]["license"]
+                ),
             },
             "tools": {
                 "components": [

@@ -6,7 +6,7 @@
  */
 
 import { WORKSPACES, WorkspaceId, getWorkspaceDefinition } from "./routes.js";
-import { EvidenceArtifact } from "./workspaces.js";
+import { EvidenceArtifact } from "./workspaces/index.js";
 
 export type PaletteAction = Readonly<{
   id: string;

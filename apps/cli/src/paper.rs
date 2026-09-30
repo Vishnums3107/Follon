@@ -9,9 +9,8 @@ use std::str::FromStr;
 use follon_cli::write_immutable;
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal};
 use follon_paper::{
-    IbkrPaperAdapter, InstrumentBucket, KillSwitchRegistry, KillSwitchScope, PaperAccount,
-    PaperBrokerRegistry, PaperBrokerRoute, PaperRiskPolicy, PaperTradingService,
-    PortfolioRiskComposition,
+    IbkrPaperAdapter, KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerRegistry,
+    PaperBrokerRoute, PaperRiskPolicy, PaperTradingService, PortfolioRiskDocument,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -74,69 +73,6 @@ struct PaperRiskDocument {
     instrument_lot_sizes: BTreeMap<String, String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PortfolioRiskDocument {
-    policy_version: String,
-    max_gross_exposure: String,
-    max_abs_net_exposure: String,
-    max_leverage_bps: String,
-    max_concentration_bps: String,
-    /// Absent means "no real drawdown limit" (`10000` bps = 100%, which the
-    /// aggregate kernel's ratio can never reach or exceed).
-    #[serde(default)]
-    max_drawdown_bps: Option<String>,
-    /// Absent means "no real daily-loss limit" (`i64::MAX` currency units,
-    /// which no real account's session P&L can ever reach).
-    #[serde(default)]
-    max_daily_loss: Option<String>,
-    /// Absent means "no real margin-utilization limit" (`10000` bps = 100%).
-    /// Safe only because `core/paper`'s `Portfolio` is fully-paid and
-    /// long-only: with a per-position rate at or under 100% and no cash
-    /// borrowed against a position, margin utilization cannot reach exactly
-    /// 100% unless the operator sets a 100% rate and the account carries zero
-    /// spare cash -- an edge case the operator controls directly via
-    /// `margin_rates`, not one this sentinel silently hides.
-    #[serde(default)]
-    max_margin_utilization_bps: Option<String>,
-    #[serde(default)]
-    allowed_instruments: Vec<String>,
-    #[serde(default)]
-    restricted_instruments: Vec<String>,
-    #[serde(default)]
-    sector_limits: BTreeMap<String, String>,
-    #[serde(default)]
-    asset_class_limits: BTreeMap<String, String>,
-    #[serde(default)]
-    currency_limits: BTreeMap<String, String>,
-    /// Real once `core/paper`'s per-strategy attribution ledger is populated
-    /// (Slice 2d); absent or empty means no strategy ever trips this check.
-    #[serde(default)]
-    strategy_limits: BTreeMap<String, String>,
-    #[serde(default)]
-    instrument_buckets: BTreeMap<String, InstrumentBucketDocument>,
-    /// Slice-2c margin-utilization composition (see
-    /// `follon_paper::PortfolioRiskComposition::margin_rates`). Absent or
-    /// empty means margin utilization stays fixed at zero, exactly as before.
-    #[serde(default)]
-    margin_rates: BTreeMap<String, MarginRateDocument>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstrumentBucketDocument {
-    asset_class: String,
-    currency: String,
-    sector: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MarginRateDocument {
-    initial_bps: u32,
-    maintenance_bps: u32,
-}
-
 fn decimal_map(
     values: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, Decimal>, Box<dyn std::error::Error>> {
@@ -144,100 +80,6 @@ fn decimal_map(
         .into_iter()
         .map(|(bucket, limit)| Ok((bucket, decimal(&limit)?)))
         .collect()
-}
-
-fn portfolio_risk_composition(
-    document: PortfolioRiskDocument,
-) -> Result<PortfolioRiskComposition, Box<dyn std::error::Error>> {
-    let instrument_buckets = document
-        .instrument_buckets
-        .into_iter()
-        .map(|(instrument_id, bucket)| {
-            (
-                instrument_id,
-                InstrumentBucket {
-                    asset_class: bucket.asset_class,
-                    currency: bucket.currency,
-                    sector: bucket.sector,
-                },
-            )
-        })
-        .collect();
-    Ok(PortfolioRiskComposition {
-        policy: follon_risk::PortfolioRiskPolicy {
-            version: document.policy_version,
-            global_kill_switch: false,
-            max_gross_exposure: decimal(&document.max_gross_exposure)?,
-            max_abs_net_exposure: decimal(&document.max_abs_net_exposure)?,
-            max_leverage_bps: decimal(&document.max_leverage_bps)?,
-            max_concentration_bps: decimal(&document.max_concentration_bps)?,
-            // Real, operator-configurable (Slice 2): `core/paper` durably
-            // tracks a running peak equity (`PaperTradingService::peak_equity`),
-            // so drawdown is a genuine computed ratio. Absent means "no real
-            // limit" (100%, which the ratio can never reach).
-            max_drawdown_bps: match document.max_drawdown_bps {
-                Some(value) => decimal(&value)?,
-                None => Decimal::from_integer(10_000)?,
-            },
-            // Real, operator-configurable (Slice 2b): `core/paper` durably
-            // tracks a session-start equity baseline
-            // (`PaperTradingService::daily_baseline_equity`), reset at the
-            // first risk evaluation on a new UTC calendar day, so daily P&L is
-            // a genuine computed figure. Absent means "no real limit"
-            // (`i64::MAX`, which no real account's session P&L can reach).
-            max_daily_loss: match document.max_daily_loss {
-                Some(value) => decimal(&value)?,
-                None => Decimal::from_integer(i64::MAX)?,
-            },
-            // Real, operator-configurable (Slice 2c): real once `margin_rates`
-            // below is configured. Absent means "no real limit" (100%).
-            max_margin_utilization_bps: match document.max_margin_utilization_bps {
-                Some(value) => decimal(&value)?,
-                None => Decimal::from_integer(10_000)?,
-            },
-            max_abs_delta: Decimal::ZERO,
-            max_abs_gamma: Decimal::ZERO,
-            // core/paper already independently enforces open-order count and
-            // order rate (`MAX_OPEN_ORDERS_EXCEEDED`/`MAX_ORDER_RATE_EXCEEDED`
-            // in `PaperTradingService::evaluate_risk`); these permissive
-            // sentinels keep this composed kernel from ever producing a
-            // second, parallel copy of the same check.
-            max_open_orders: usize::MAX,
-            max_order_rate: u32::MAX,
-            allowed_instruments: document.allowed_instruments.into_iter().collect(),
-            restricted_instruments: document.restricted_instruments.into_iter().collect(),
-            sector_limits: decimal_map(document.sector_limits)?,
-            asset_class_limits: decimal_map(document.asset_class_limits)?,
-            currency_limits: decimal_map(document.currency_limits)?,
-            // Real, operator-configurable (Slice 2d): `core/paper` durably
-            // tracks each strategy's own net contribution to every
-            // instrument (`PaperTradingService::strategy_attribution`), so a
-            // strategy-bucket limit is a genuine cumulative-exposure check.
-            strategy_limits: decimal_map(document.strategy_limits)?,
-            max_news_slippage_bps: None,
-            max_spread_multiplier_bps: None,
-        },
-        instrument_buckets,
-        margin_rates: if document.margin_rates.is_empty() {
-            None
-        } else {
-            Some(
-                document
-                    .margin_rates
-                    .into_iter()
-                    .map(|(asset_class, rate)| {
-                        (
-                            asset_class,
-                            follon_accounting::MarginRate {
-                                initial_bps: rate.initial_bps,
-                                maintenance_bps: rate.maintenance_bps,
-                            },
-                        )
-                    })
-                    .collect(),
-            )
-        },
-    })
 }
 
 struct CommandArguments {
@@ -283,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let portfolio_risk = configuration
         .risk
         .portfolio_risk
-        .map(portfolio_risk_composition)
+        .map(PortfolioRiskDocument::into_composition)
         .transpose()?;
     let risk = PaperRiskPolicy {
         version: configuration.risk.policy_version,
@@ -623,7 +465,7 @@ mod tests {
             .risk
             .portfolio_risk
             .expect("fixture declares a portfolio_risk block");
-        let composition = portfolio_risk_composition(document).unwrap();
+        let composition = document.into_composition().unwrap();
         assert_eq!(
             composition.policy.max_gross_exposure,
             decimal("500000").unwrap()

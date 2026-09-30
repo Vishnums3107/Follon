@@ -14,7 +14,7 @@ lands.
 | `core/identity` | Customer password rotation, TOTP/recovery MFA, session, tenant, revocation, and RBAC invariants |
 | `core/instrument` through `core/secrets` | Other trading-core modules, each owning one bounded capability |
 | `adapters/brokers/ibkr` | PAPER bridge plus signed/review-bound controlled-LIVE adapter edge |
-| `adapters/persistence/postgres` | Checksum-bound PostgreSQL migrations, events/outbox/checkpoints, forced RLS, IAM/accounting/broker and complete product projection schema |
+| `adapters/persistence/postgres` | Checksum-bound PostgreSQL migrations, events/outbox/checkpoints, forced RLS, append-only evidence triggers, IAM/accounting/broker and complete product projection schema |
 | `services/trading-api` | Versioned tonic gRPC topology for scheduled/passive/options-combination EMS, configured risk-gated PAPER combination submission, aggregate risk, margin, health, and PostgreSQL startup |
 | `python/strategy-sdk` | Supported strategy interface |
 | `python/storage-adapter` | Research storage publication and catalogue adapter |

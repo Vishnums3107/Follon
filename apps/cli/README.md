@@ -173,6 +173,14 @@ bundle hash is computed over), `dependency.lock`, `configuration.json`,
 carried. `VERIFIED_PORTABLE` covers only the recorded runtime target, and no
 capsule has yet been verified on a second machine.
 
+An evaluation that applied corporate actions (`--actions`, above) is packaged and
+verified with the same file: `capsule-package ... --bars <csv> --actions <csv>`
+and `capsule-verify <capsule> --bars <csv> --actions <csv>`. Like the bars, the
+file is referenced by the dataset's content hash, which covers the actions, and is
+never carried. A replay with different actions, or with none, cannot reproduce the
+receipt, and `capsule-package` refuses an evaluation that applied actions unless they
+are supplied.
+
 A sealed capsule can carry one detached Ed25519 signature over its manifest
 bytes. The manifest hash-binds every other member, so the signature covers the
 whole capsule. Keys use the `follon-admin release-keygen` format:

@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.local/contracts/v2/external-acceptance-evidence.schema.json",
+  "title": "Follon external acceptance evidence record, version 2",
+  "description": "One line of an *.acceptance.ndjson ledger. A reviewer signs it, it names the release it exercised, its attributes state what the session, partner or customer actually was, and it chains to the record before it. Version 1 records were unsigned and are no longer read. `tools/acceptance_evidence.py` verifies the signature, the retained artifact and the criteria, which a schema cannot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "acceptance_evidence_schema_version",
+    "evidence_id",
+    "evidence_type",
+    "subject_id",
+    "occurred_at",
+    "observed_by",
+    "reviewed_by",
+    "source_artifact_sha256",
+    "outcome",
+    "notes",
+    "release_id",
+    "environment",
+    "attributes",
+    "reviewer_key_id",
+    "reviewer_signature",
+    "prev_hash",
+    "record_hash"
+  ],
+  "properties": {
+    "acceptance_evidence_schema_version": { "const": 2 },
+    "evidence_id": { "$ref": "#/$defs/canonicalId" },
+    "evidence_type": {
+      "enum": ["paper_session", "live_session", "design_partner", "broker_options", "paying_customer"]
+    },
+    "subject_id": { "$ref": "#/$defs/canonicalId" },
+    "occurred_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "observed_by": { "$ref": "#/$defs/canonicalId" },
+    "reviewed_by": { "$ref": "#/$defs/canonicalId", "description": "Must differ from observed_by, and must be the reviewer the trusted key set binds reviewer_key_id to." },
+    "source_artifact_sha256": { "$ref": "#/$defs/sha256", "description": "The SHA-256 of the retained artifact the reviewer examined. The audit re-hashes the file of that name in the artifact root." },
+    "outcome": { "enum": ["accepted", "rejected"] },
+    "notes": { "type": "string", "maxLength": 1024, "pattern": "^[^\\n]*$" },
+    "release_id": { "$ref": "#/$defs/canonicalId", "description": "The release the evidence exercised. It counts only toward that release's gates." },
+    "environment": {
+      "enum": ["PAPER", "LIVE", null],
+      "description": "PAPER for a paper_session, LIVE for a live_session, null for every other evidence type."
+    },
+    "attributes": { "type": "object" },
+    "reviewer_key_id": { "$ref": "#/$defs/canonicalId" },
+    "reviewer_signature": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{128}$",
+      "description": "Ed25519 over the domain 'follon-acceptance-evidence-v2\\n' followed by the canonical JSON of every other field except record_hash."
+    },
+    "prev_hash": { "$ref": "#/$defs/sha256" },
+    "record_hash": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "evidence_type": { "enum": ["paper_session", "live_session"] } }, "required": ["evidence_type"] },
+      "then": {
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "session_seconds",
+              "orders_submitted",
+              "reconciliations_completed",
+              "unknown_orders_at_close",
+              "reconciliation_discrepancies",
+              "unexplained_incidents",
+              "unplanned_reconnects",
+              "planned_reconnect_drills"
+            ],
+            "properties": {
+              "session_seconds": { "type": "integer", "minimum": 0 },
+              "orders_submitted": { "type": "integer", "minimum": 0 },
+              "reconciliations_completed": { "type": "integer", "minimum": 0 },
+              "unknown_orders_at_close": { "type": "integer", "minimum": 0 },
+              "reconciliation_discrepancies": { "type": "integer", "minimum": 0 },
+              "unexplained_incidents": { "type": "integer", "minimum": 0 },
+              "unplanned_reconnects": { "type": "integer", "minimum": 0 },
+              "planned_reconnect_drills": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "evidence_type": { "const": "design_partner" } }, "required": ["evidence_type"] },
+      "then": {
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["workflows_completed", "unaided"],
+            "properties": {
+              "workflows_completed": { "type": "integer", "minimum": 0 },
+              "unaided": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "evidence_type": { "const": "broker_options" } }, "required": ["evidence_type"] },
+      "then": {
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reconciled_environments"],
+            "properties": {
+              "reconciled_environments": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "enum": ["BACKTEST", "LIVE", "PAPER"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "evidence_type": { "const": "paying_customer" } }, "required": ["evidence_type"] },
+      "then": {
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["customer_kind", "subscription_id"],
+            "properties": {
+              "customer_kind": { "enum": ["professional", "organisation"] },
+              "subscription_id": { "$ref": "#/$defs/canonicalId" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "evidence_type": { "enum": ["paper_session", "live_session"] } }, "required": ["evidence_type"] },
+      "then": {
+        "properties": { "environment": { "enum": ["PAPER", "LIVE"] } }
+      },
+      "else": {
+        "properties": { "environment": { "const": null } }
+      }
+    }
+  ],
+  "$defs": {
+    "canonicalId": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

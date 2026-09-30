@@ -11,7 +11,7 @@ import {
   renderOptionsDashboard,
   renderOperationsDashboard,
   renderPaperDashboard,
-} from "./evidence.js";
+} from "./evidence/index.js";
 import {
   FeatureDefinition,
   SystemStatus,
@@ -27,7 +27,7 @@ import {
   WorkspaceSnapshot,
   parseWorkspaceSnapshot,
   renderWorkspace,
-} from "./workspaces.js";
+} from "./workspaces/index.js";
 import {
   WORKSPACES,
   WorkspaceDefinition,

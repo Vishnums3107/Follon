@@ -78,8 +78,13 @@ python tools/generate_pipeline_evidence.py       # full 23-step evidence pipelin
 ```
 
 `python tools/session_status.py` runs all of the above except the pipeline and
-records the real result. Three PostgreSQL tests are ignored unless
-`FOLLON_TEST_DATABASE_URL` points at a disposable database.
+records the real result. Nine PostgreSQL tests are ignored unless
+`FOLLON_TEST_DATABASE_URL` points at a disposable database. With it set, the tool
+runs them as a suite of their own, one at a time because one takes exclusive table
+locks, and without it the block reports that suite skipped and names the variable. Retained evidence is append-only in that database,
+so empty it by dropping and recreating it, never by deleting rows. A throwaway
+server that leaves an installed PostgreSQL alone is `initdb` in a temporary
+directory, started on a spare loopback port with `pg_ctl`.
 
 ## What this repository is not
 

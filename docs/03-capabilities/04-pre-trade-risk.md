@@ -23,3 +23,18 @@ A decision records approved/rejected status, machine-readable reason codes, inpu
 - A kill switch takes effect independently of strategy-worker health.
 - Stale data blocks affected strategies or orders according to a documented safe policy.
 - Dangerous policy changes require attributable versioning and appropriate approval.
+- Aggregate limits are ratios of equity, so they cannot be computed once equity is
+  zero or negative. That is not permission to skip them: a PAPER or controlled-LIVE
+  account with aggregate risk configured refuses every order that does not move a
+  position toward flat, with `PORTFOLIO_EQUITY_NOT_POSITIVE`. A trade that reduces a
+  position, without crossing through flat, still passes, so an account that is
+  underwater can close exposure and nothing else. A combination reduces risk only
+  if every leg does. What is already working counts: the unfilled quantity of every
+  working order, and of every leg of a working combination, that reduces the same
+  position claims part of it first, so two orders that each close the whole position
+  cannot together reverse it. Working orders that add exposure claim nothing.
+- Position limits and the aggregate composition judge an order against the position
+  as filled. They do not yet count working orders, so several orders that are each
+  within a limit can together exceed it once they fill. The unfilled quantity of a
+  working order is known, so this is a gap in the check and not in the data
+  (delivery state E7.14).

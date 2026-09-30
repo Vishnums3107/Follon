@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::io::{self, Write};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 
 use follon_domain::{
@@ -24,6 +24,11 @@ use sha2::{Digest, Sha256};
 
 pub mod capsule;
 pub mod provenance;
+mod worker_io;
+
+pub use worker_io::StrategyWorkerLimits;
+
+use worker_io::WorkerTransport;
 
 pub use capsule::{
     build_strategy_bundle, extract_strategy_bundle, open_strategy_bundle, read_strategy_capsule,
@@ -497,6 +502,87 @@ impl EventSink for FileEventStore {
     }
 }
 
+/// What a corporate action did to the account a strategy trades (delivery state E8.3).
+///
+/// A strategy reads its position and cash from the portfolio snapshot it is handed, and
+/// that snapshot follows fills. Without this a split or a dividend would leave it stale
+/// until the next fill, and the strategy would size an exit from a quantity the account no
+/// longer holds. Only an action that changed the account is delivered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CorporateActionEffect {
+    /// A split multiplied a held position's quantity by `ratio`. `position` is the
+    /// position after the split, as the replay engine holds it.
+    Split {
+        /// Immutable canonical corporate-action identity.
+        action_id: String,
+        /// New shares per old share.
+        ratio: Decimal,
+        /// The account's position in the instrument after the split.
+        position: PositionSnapshot,
+    },
+    /// A cash dividend credited the account for the shares it held.
+    CashDividend {
+        /// Immutable canonical corporate-action identity.
+        action_id: String,
+        /// The account credited.
+        account_id: String,
+        /// The instrument that paid.
+        instrument_id: String,
+        /// The cash credited, which is what the ledger booked.
+        cash_credited: Decimal,
+    },
+}
+
+impl CorporateActionEffect {
+    /// The corporate action's identity.
+    pub fn action_id(&self) -> &str {
+        match self {
+            Self::Split { action_id, .. } | Self::CashDividend { action_id, .. } => action_id,
+        }
+    }
+
+    /// The account the action changed.
+    pub fn account_id(&self) -> &str {
+        match self {
+            Self::Split { position, .. } => &position.account_id,
+            Self::CashDividend { account_id, .. } => account_id,
+        }
+    }
+
+    /// The instrument the action concerned.
+    pub fn instrument_id(&self) -> &str {
+        match self {
+            Self::Split { position, .. } => &position.instrument_id,
+            Self::CashDividend { instrument_id, .. } => instrument_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EngineError> {
+        validate_canonical_id("corporate action id", self.action_id())?;
+        validate_canonical_id("corporate action account_id", self.account_id())?;
+        validate_canonical_id("corporate action instrument_id", self.instrument_id())?;
+        match self {
+            Self::Split {
+                ratio, position, ..
+            } => {
+                if *ratio <= Decimal::ZERO || position.quantity == Decimal::ZERO {
+                    return Err(EngineError(
+                        "a split effect needs a positive ratio and a held position".to_owned(),
+                    ));
+                }
+            }
+            Self::CashDividend { cash_credited, .. } => {
+                if *cash_credited <= Decimal::ZERO {
+                    return Err(EngineError(
+                        "a dividend effect must credit a positive amount".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The only strategy interaction point in the trading kernel.
 pub trait Strategy {
     /// Handles one normalized bar and may emit exactly one declarative intent.
@@ -532,6 +618,17 @@ pub trait Strategy {
         _fill: &Fill,
         _position: &PositionSnapshot,
     ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Receives what a corporate action did to the account, after the replay applied it
+    /// to the ledger and the engine's portfolio.
+    ///
+    /// The default deliberately does nothing. Isolated workers use this hook, as they use
+    /// [`Self::on_execution`], to keep the portfolio snapshot they are handed true to the
+    /// ledger. It changes nothing a strategy could not already see, and it needs no worker
+    /// protocol: the snapshot is built by the host for every callback.
+    fn on_corporate_action(&mut self, _effect: &CorporateActionEffect) -> Result<(), EngineError> {
         Ok(())
     }
 }
@@ -703,6 +800,44 @@ impl WorkerRuntimeServices {
         Ok(())
     }
 
+    /// Applies what a corporate action did to the account, so the next snapshot a strategy
+    /// is handed matches the ledger (E8.3). Everything is checked before anything changes.
+    fn apply_corporate_action(
+        &mut self,
+        effect: &CorporateActionEffect,
+    ) -> Result<(), EngineError> {
+        effect.validate()?;
+        match effect {
+            CorporateActionEffect::Split {
+                ratio, position, ..
+            } => {
+                let held = self.positions.get(&position.instrument_id).ok_or_else(|| {
+                    EngineError("worker service snapshot holds no position to split".to_owned())
+                })?;
+                // The mark follows the shares: after a split of n each is worth 1/n. The
+                // next bar refreshes it, but a callback that carries no bar would not.
+                let mark_price = held.mark_price.checked_div(*ratio)?;
+                if mark_price <= Decimal::ZERO {
+                    return Err(EngineError(
+                        "split would round the worker's mark price down to nothing".to_owned(),
+                    ));
+                }
+                self.positions.insert(
+                    position.instrument_id.clone(),
+                    WorkerPortfolioPosition {
+                        quantity: position.quantity,
+                        average_cost: position.average_cost,
+                        mark_price,
+                    },
+                );
+            }
+            CorporateActionEffect::CashDividend { cash_credited, .. } => {
+                self.cash = self.cash.checked_add(*cash_credited)?;
+            }
+        }
+        Ok(())
+    }
+
     fn service_payload(&self, replay_time: &str) -> serde_json::Value {
         let history = self
             .history
@@ -846,12 +981,18 @@ impl WorkerRuntimeServices {
 /// The child receives only normalized market bars and immutable strategy
 /// context. Its output is parsed and validated as an intent before the risk
 /// engine sees it; a worker never receives adapters or credentials.
+///
+/// Every frame is bounded before it is buffered and every round trip has a
+/// deadline ([`StrategyWorkerLimits`]). A transport fault, meaning an oversized
+/// or truncated frame, a closed pipe or an expired deadline, ends the worker:
+/// its process is killed and it answers nothing further, because after a fault
+/// nothing says which request an answer belongs to.
 pub struct ProcessStrategyWorker {
     identity: StrategyWorkerIdentity,
     services: Option<WorkerRuntimeServices>,
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    transport: WorkerTransport,
+    terminated: bool,
 }
 
 impl ProcessStrategyWorker {
@@ -861,7 +1002,24 @@ impl ProcessStrategyWorker {
         arguments: impl IntoIterator<Item = OsString>,
         identity: StrategyWorkerIdentity,
     ) -> Result<Self, EngineError> {
-        Self::spawn_inner(program, arguments, identity, None, None)
+        Self::spawn_inner(
+            program,
+            arguments,
+            identity,
+            None,
+            None,
+            StrategyWorkerLimits::DEFAULT,
+        )
+    }
+
+    /// Starts a worker under explicit frame limits instead of the defaults.
+    pub fn spawn_bounded(
+        program: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = OsString>,
+        identity: StrategyWorkerIdentity,
+        limits: StrategyWorkerLimits,
+    ) -> Result<Self, EngineError> {
+        Self::spawn_inner(program, arguments, identity, None, None, limits)
     }
 
     /// Starts a worker with bounded point-in-time data, portfolio, state, and
@@ -878,6 +1036,7 @@ impl ProcessStrategyWorker {
             identity,
             Some(WorkerRuntimeServices::new(services)?),
             None,
+            StrategyWorkerLimits::DEFAULT,
         )
     }
 
@@ -899,6 +1058,7 @@ impl ProcessStrategyWorker {
             identity,
             Some(WorkerRuntimeServices::new(services)?),
             Some(sandbox),
+            StrategyWorkerLimits::DEFAULT,
         )
     }
 
@@ -908,8 +1068,10 @@ impl ProcessStrategyWorker {
         identity: StrategyWorkerIdentity,
         services: Option<WorkerRuntimeServices>,
         sandbox: Option<&StrategyWorkerSandbox>,
+        limits: StrategyWorkerLimits,
     ) -> Result<Self, EngineError> {
         identity.validate()?;
+        limits.validate()?;
         let mut command = Command::new(program);
         command
             .args(arguments)
@@ -945,11 +1107,20 @@ impl ProcessStrategyWorker {
             identity,
             services,
             child,
-            stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            transport: WorkerTransport::start(stdin, stdout, limits),
+            terminated: false,
         };
         worker.verify_ready()?;
         Ok(worker)
+    }
+
+    /// Ends a worker after a transport fault. Its framing state is unknown, so
+    /// it is never asked another question.
+    fn terminate(&mut self) {
+        self.terminated = true;
+        self.transport.close_input();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     fn verify_ready(&mut self) -> Result<(), EngineError> {
@@ -982,14 +1153,15 @@ impl ProcessStrategyWorker {
     }
 
     fn read_frame(&mut self) -> Result<serde_json::Value, EngineError> {
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(EngineError(
-                "strategy worker closed stdout before returning a response".to_owned(),
-            ));
-        }
-        serde_json::from_str(&line)
+        let line = match self.transport.receive() {
+            Ok(line) => line,
+            Err(fault) => {
+                let error = fault.describe(self.transport.limits());
+                self.terminate();
+                return Err(error);
+            }
+        };
+        serde_json::from_slice(&line)
             .map_err(|error| EngineError(format!("strategy worker emitted invalid JSON: {error}")))
     }
 
@@ -1065,15 +1237,17 @@ impl ProcessStrategyWorker {
                 .expect("worker request frame remains an object")
                 .insert("services".to_owned(), services.service_payload(replay_time));
         }
+        if self.terminated {
+            return Err(EngineError(
+                "strategy worker was ended by an earlier transport fault".to_owned(),
+            ));
+        }
         let serialized =
-            serde_json::to_string(&frame).expect("serializing a JSON worker frame cannot fail");
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| EngineError("strategy worker stdin is already closed".to_owned()))?;
-        stdin.write_all(serialized.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
+            serde_json::to_vec(&frame).expect("serializing a JSON worker frame cannot fail");
+        if let Err(error) = self.transport.send(serialized) {
+            self.terminate();
+            return Err(error);
+        }
 
         let response = self.read_frame()?;
         let object = response
@@ -1200,11 +1374,23 @@ impl Strategy for ProcessStrategyWorker {
         }
         Ok(())
     }
+
+    fn on_corporate_action(&mut self, effect: &CorporateActionEffect) -> Result<(), EngineError> {
+        if effect.account_id() != self.identity.account_id {
+            return Err(EngineError(
+                "corporate action effect belongs to another account than the worker's".to_owned(),
+            ));
+        }
+        if let Some(services) = self.services.as_mut() {
+            services.apply_corporate_action(effect)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ProcessStrategyWorker {
     fn drop(&mut self) {
-        self.stdin.take();
+        self.transport.close_input();
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -2327,6 +2513,32 @@ impl Portfolio {
         Ok(())
     }
 
+    /// Applies a stock split to the position, as `BacktestLedger` does.
+    ///
+    /// The quantity is multiplied by `ratio` and the average cost divided by it, so
+    /// the position's total cost is unchanged and its realized P&L is untouched. The
+    /// arithmetic is the ledger's own, operation for operation, so the replay's
+    /// position and the ledger's cannot drift apart. A flat position has nothing to
+    /// scale, and a short scales like a long: its quantity keeps its sign and its
+    /// per-unit proceeds are divided. A split that would round a held position down
+    /// to nothing is refused, because a portfolio holding no quantity at a cost is
+    /// not one this type can represent.
+    pub fn apply_split(&mut self, ratio: Decimal) -> Result<(), EngineError> {
+        if ratio <= Decimal::ZERO {
+            return Err(EngineError("split ratio must be positive".to_owned()));
+        }
+        let quantity = self.quantity.checked_mul(ratio)?;
+        let average_cost = self.average_cost.checked_div(ratio)?;
+        if quantity == Decimal::ZERO && self.quantity != Decimal::ZERO {
+            return Err(EngineError(
+                "split would round the held position down to nothing".to_owned(),
+            ));
+        }
+        self.quantity = quantity;
+        self.average_cost = average_cost;
+        Ok(())
+    }
+
     /// Returns a rebuildable position projection.
     pub fn position_snapshot(&self) -> PositionSnapshot {
         PositionSnapshot {
@@ -2388,6 +2600,7 @@ pub struct ReplayEngine {
     fill_model: DeterministicFillModel,
     portfolios: BTreeMap<(String, String), Portfolio>,
     working_orders: BTreeMap<String, SimulatedWorkingOrder>,
+    corporate_action_ids: BTreeSet<String>,
     news_headlines: BTreeMap<String, ReplayedNewsHeadline>,
     news_sentiment_event_ids: BTreeSet<String>,
 }
@@ -2427,6 +2640,7 @@ impl ReplayEngine {
             fill_model,
             portfolios: BTreeMap::new(),
             working_orders: BTreeMap::new(),
+            corporate_action_ids: BTreeSet::new(),
             news_headlines: BTreeMap::new(),
             news_sentiment_event_ids: BTreeSet::new(),
         })
@@ -3233,6 +3447,89 @@ impl ReplayEngine {
         self.replay_bar(sink, strategy, account_id, event_time, bar, Some(reference))
     }
 
+    /// Applies a stock split to every account's position in `instrument_id` and
+    /// records each scaled position as a `Position` event (E8.2).
+    ///
+    /// The backtest ledger applies a split to its own position and FIFO lots. This
+    /// engine's portfolio is a second book: it is what a strategy's execution
+    /// callbacks and the fingerprinted event stream project. Left alone it would keep
+    /// the pre-split quantity, so a strategy that sold what it now holds would be
+    /// refused, and one that sold the old quantity would leave the two books
+    /// disagreeing. `applied_at` is the replay time the split is applied, the first
+    /// bar at or after the time it took effect.
+    ///
+    /// An order resting in the instrument cannot be carried across a split. Its
+    /// quantity and limit are in pre-split units, and a venue's own response to a
+    /// split, which adjusts or cancels the order, is not modelled. It is refused
+    /// before anything changes, rather than filled at a price level it was not
+    /// written for. That is E3.6g's decision for a lot-size change, applied to splits.
+    /// A position the split cannot scale refuses it the same way, for every holder:
+    /// the action applies to all of them or to none.
+    ///
+    /// Each action applies once. A cash dividend needs no counterpart here: this
+    /// portfolio holds a position and its trading P&L, and income is the ledger's.
+    pub fn apply_split(
+        &mut self,
+        sink: &mut impl EventSink,
+        action_id: &str,
+        instrument_id: &str,
+        ratio: Decimal,
+        applied_at: &str,
+    ) -> Result<Vec<EventEnvelope>, EngineError> {
+        validate_canonical_id("corporate action id", action_id)?;
+        validate_canonical_id("corporate action instrument_id", instrument_id)?;
+        if ratio <= Decimal::ZERO {
+            return Err(EngineError("split ratio must be positive".to_owned()));
+        }
+        if self.corporate_action_ids.contains(action_id) {
+            return Err(EngineError(format!(
+                "corporate action {action_id} was already applied to the replay"
+            )));
+        }
+        if let Some((order_id, _)) = self
+            .working_orders
+            .iter()
+            .find(|(_, working)| working.order.intent.instrument_id == instrument_id)
+        {
+            return Err(EngineError(format!(
+                "working order {order_id} cannot rest across {instrument_id}'s split {action_id}"
+            )));
+        }
+        // Scale a copy of every holding first. A position the split cannot scale then
+        // refuses the whole action before any book, the clock or the stream has changed.
+        let mut scaled = Vec::new();
+        for ((account_id, held), portfolio) in &self.portfolios {
+            if held == instrument_id && portfolio.quantity != Decimal::ZERO {
+                let mut after = portfolio.clone();
+                after.apply_split(ratio)?;
+                scaled.push((account_id.clone(), after));
+            }
+        }
+        self.clock.advance_to(applied_at)?;
+        self.corporate_action_ids.insert(action_id.to_owned());
+        let correlation_id = format!("corr-corporate-action-{action_id}");
+        let mut events = Vec::with_capacity(scaled.len());
+        for (account_id, after) in scaled {
+            let position = after.position_snapshot();
+            self.portfolios
+                .insert((account_id.clone(), instrument_id.to_owned()), after);
+            let current_time = self.clock.now().to_owned();
+            events.push(self.emit(
+                sink,
+                EventPayload::Position(position),
+                &current_time,
+                &correlation_id,
+                None,
+                "portfolio_engine",
+                "corporate_action",
+                Some(account_id.as_str()),
+                None,
+                Some(instrument_id),
+            )?);
+        }
+        Ok(events)
+    }
+
     fn emit_order_change(
         &mut self,
         sink: &mut impl EventSink,
@@ -3498,24 +3795,271 @@ mod tests {
         })
     }
 
-    #[test]
-    fn two_runs_of_a_worker_hash_strings_identically() {
-        let Some(python) = python_executable() else {
-            eprintln!("Python is unavailable; the worker hash-seed fixture was skipped");
-            return;
-        };
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/worker/hash-seed-worker.py")
-            .canonicalize()
-            .expect("fixture path");
-        let identity = StrategyWorkerIdentity {
+    fn worker_identity() -> StrategyWorkerIdentity {
+        StrategyWorkerIdentity {
             account_id: "acct.paper.001".to_owned(),
             strategy_id: "strategy-worker-001".to_owned(),
             strategy_version: "v1".to_owned(),
             configuration_version: "cfg-v1".to_owned(),
             strategy_bundle_hash: "a".repeat(64),
             environment: "SIMULATION".to_owned(),
+        }
+    }
+
+    fn worker_fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/worker")
+            .join(name)
+            .canonicalize()
+            .expect("fixture path")
+    }
+
+    /// Starts the misbehaving fixture in one mode under explicit limits, or
+    /// `None` when Python is unavailable so the caller can skip.
+    fn misbehaving_worker(
+        mode: &str,
+        size: Option<usize>,
+        limits: StrategyWorkerLimits,
+    ) -> Option<ProcessStrategyWorker> {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the {mode} worker fixture was skipped");
+            return None;
         };
+        let identity = worker_identity();
+        let mut arguments: Vec<OsString> = vec![
+            worker_fixture("misbehaving-worker.py").into_os_string(),
+            identity.strategy_bundle_hash.clone().into(),
+            identity.strategy_id.clone().into(),
+            identity.strategy_version.clone().into(),
+            mode.into(),
+        ];
+        arguments.extend(size.map(|size| OsString::from(size.to_string())));
+        Some(
+            ProcessStrategyWorker::spawn_bounded(python.as_os_str(), arguments, identity, limits)
+                .expect("worker starts"),
+        )
+    }
+
+    fn worker_limits(max_frame_bytes: usize, deadline_millis: u64) -> StrategyWorkerLimits {
+        StrategyWorkerLimits {
+            max_frame_bytes,
+            frame_deadline: std::time::Duration::from_millis(deadline_millis),
+        }
+    }
+
+    /// Runs a worker round trip on another thread, so a missing bound or
+    /// deadline fails the test instead of hanging it. The outcome is the error
+    /// text and whether the worker's process had been ended.
+    fn failed_round_trip(mut worker: ProcessStrategyWorker, bar: Bar) -> (String, bool) {
+        let (sender, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let error = worker
+                .request_intent(&bar, "2026-01-02T14:31:00Z")
+                .expect_err("the worker misbehaves");
+            let ended = worker.child.try_wait().expect("child status").is_some();
+            let _ = sender.send((error.0, ended));
+        });
+        outcome
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the round trip returned neither an answer nor an error")
+    }
+
+    #[test]
+    fn a_worker_that_never_answers_ends_at_the_frame_deadline() {
+        let Some(worker) = misbehaving_worker("silent", None, worker_limits(64 * 1024, 500)) else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(
+            error.contains("did not answer within the 0.5 second frame deadline"),
+            "{error}"
+        );
+        assert!(ended, "the unresponsive worker's process was left running");
+    }
+
+    #[test]
+    fn a_worker_that_stops_reading_cannot_hang_the_write() {
+        let Some(worker) = misbehaving_worker("deaf", None, worker_limits(64 * 1024, 1_000)) else {
+            return;
+        };
+        // Far past any pipe buffer, so the write blocks against a worker that
+        // never reads.
+        let heavy = Bar {
+            instrument_id: "a".repeat(4 * 1024 * 1024),
+            ..bar()
+        };
+        let (error, ended) = failed_round_trip(worker, heavy);
+        assert!(error.contains("frame deadline"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn an_endless_frame_is_refused_at_the_limit_not_buffered_to_its_end() {
+        let Some(worker) = misbehaving_worker("endless", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("65536 byte frame limit"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn an_oversized_complete_frame_is_refused() {
+        let Some(worker) = misbehaving_worker("oversized", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("frame limit"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_frame_cut_off_mid_line_is_a_transport_fault() {
+        let Some(worker) = misbehaving_worker("truncated", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("in the middle of a frame"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn the_frame_limit_counts_the_newline_and_admits_exactly_the_limit() {
+        let limit = 8 * 1024;
+        let Some(mut worker) =
+            misbehaving_worker("exact", Some(limit), worker_limits(limit, 30_000))
+        else {
+            return;
+        };
+        let error = worker
+            .request_intent(&bar(), "2026-01-02T14:31:00Z")
+            .expect_err("the fixture answers with an error frame");
+        assert_eq!(
+            error.0,
+            "strategy worker rejected the callback: fixture.exact"
+        );
+        drop(worker);
+
+        let Some(worker) =
+            misbehaving_worker("exact", Some(limit + 1), worker_limits(limit, 30_000))
+        else {
+            return;
+        };
+        let (error, ended) = failed_round_trip(worker, bar());
+        assert!(error.contains("8192 byte frame limit"), "{error}");
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_worker_within_its_limits_keeps_answering() {
+        let Some(mut worker) = misbehaving_worker("well", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        for _ in 0..3 {
+            let error = worker
+                .request_intent(&bar(), "2026-01-02T14:31:00Z")
+                .expect_err("the fixture rejects every callback");
+            assert_eq!(error.0, "strategy worker rejected the callback: fixture.ok");
+        }
+        assert!(!worker.terminated);
+    }
+
+    #[test]
+    fn a_worker_ended_by_a_fault_answers_nothing_further() {
+        let Some(mut worker) = misbehaving_worker("silent", None, worker_limits(64 * 1024, 300))
+        else {
+            return;
+        };
+        let first = worker
+            .request_intent(&bar(), "2026-01-02T14:31:00Z")
+            .expect_err("the fixture never answers");
+        assert!(first.0.contains("frame deadline"), "{}", first.0);
+        let second = worker
+            .request_intent(&bar(), "2026-01-02T14:31:01Z")
+            .expect_err("an ended worker is not asked again");
+        assert!(
+            second.0.contains("ended by an earlier transport fault"),
+            "{}",
+            second.0
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_json_is_a_protocol_error_not_a_transport_fault() {
+        let Some(mut worker) =
+            misbehaving_worker("garbage", None, worker_limits(64 * 1024, 30_000))
+        else {
+            return;
+        };
+        let error = worker
+            .request_intent(&bar(), "2026-01-02T14:31:00Z")
+            .expect_err("the fixture answers with garbage");
+        assert!(error.0.contains("emitted invalid JSON"), "{}", error.0);
+        assert!(!worker.terminated);
+    }
+
+    #[test]
+    fn worker_limits_that_would_fail_a_well_formed_worker_are_refused() {
+        for limits in [
+            worker_limits(StrategyWorkerLimits::MIN_FRAME_BYTES - 1, 1_000),
+            worker_limits(StrategyWorkerLimits::MAX_FRAME_BYTES + 1, 1_000),
+            worker_limits(usize::MAX, 1_000),
+            worker_limits(64 * 1024, 0),
+        ] {
+            assert!(limits.validate().is_err(), "{limits:?}");
+        }
+        assert!(StrategyWorkerLimits::DEFAULT.validate().is_ok());
+        for edge in [
+            StrategyWorkerLimits::MIN_FRAME_BYTES,
+            StrategyWorkerLimits::MAX_FRAME_BYTES,
+        ] {
+            assert!(worker_limits(edge, 1).validate().is_ok(), "{edge}");
+        }
+        assert_eq!(
+            StrategyWorkerLimits::default(),
+            StrategyWorkerLimits::DEFAULT
+        );
+        // Refused before any process starts.
+        let refusal = ProcessStrategyWorker::spawn_bounded(
+            "unused-program",
+            Vec::<OsString>::new(),
+            worker_identity(),
+            worker_limits(100, 1_000),
+        )
+        .err()
+        .expect("a frame limit below the minimum is refused");
+        assert!(
+            refusal.0.contains("between 4096 and 268435456 bytes"),
+            "{}",
+            refusal.0
+        );
+        let refusal = ProcessStrategyWorker::spawn_bounded(
+            "unused-program",
+            Vec::<OsString>::new(),
+            worker_identity(),
+            worker_limits(usize::MAX, 1_000),
+        )
+        .err()
+        .expect("a frame limit above the maximum is refused");
+        assert!(
+            refusal.0.contains("between 4096 and 268435456 bytes"),
+            "{}",
+            refusal.0
+        );
+    }
+
+    #[test]
+    fn two_runs_of_a_worker_hash_strings_identically() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the worker hash-seed fixture was skipped");
+            return;
+        };
+        let fixture = worker_fixture("hash-seed-worker.py");
+        let identity = worker_identity();
         // The fixture answers every callback with an error whose code is the
         // hash of a fixed string, so the error text exposes each process's
         // string-hash seed.
@@ -5050,6 +5594,193 @@ mod tests {
                 replay_time,
             )
             .is_err());
+    }
+
+    /// Services that hold one share bought at 100 with a 0.10 fee, and 899.90 of cash.
+    fn services_holding_one_share(price: &str) -> WorkerRuntimeServices {
+        let mut services = WorkerRuntimeServices::new(StrategyWorkerServicesConfig {
+            currency: "USD".to_owned(),
+            initial_cash: Decimal::from_integer(1_000).unwrap(),
+        })
+        .unwrap();
+        let fill = Fill {
+            execution_id: "exec.worker.001".to_owned(),
+            order_id: "order.worker.001".to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(1).unwrap(),
+            price: Decimal::from_str(price).unwrap(),
+            fee: Decimal::from_str("0.10").unwrap(),
+            executed_at: "2026-01-02T14:31:00Z".to_owned(),
+        };
+        let position = PositionSnapshot {
+            account_id: "acct.paper.001".to_owned(),
+            instrument_id: fill.instrument_id.clone(),
+            quantity: Decimal::from_integer(1).unwrap(),
+            average_cost: Decimal::from_str("100.10").unwrap(),
+            realized_pnl: Decimal::ZERO,
+        };
+        services.apply_execution(&fill, &position).unwrap();
+        services
+    }
+
+    fn split_effect(
+        instrument_id: &str,
+        ratio: &str,
+        quantity: &str,
+        average_cost: &str,
+    ) -> CorporateActionEffect {
+        CorporateActionEffect::Split {
+            action_id: "action-split-001".to_owned(),
+            ratio: Decimal::from_str(ratio).unwrap(),
+            position: PositionSnapshot {
+                account_id: "acct.paper.001".to_owned(),
+                instrument_id: instrument_id.to_owned(),
+                quantity: Decimal::from_str(quantity).unwrap(),
+                average_cost: Decimal::from_str(average_cost).unwrap(),
+                realized_pnl: Decimal::ZERO,
+            },
+        }
+    }
+
+    fn dividend_effect_for(
+        action_id: &str,
+        account_id: &str,
+        instrument_id: &str,
+        cash_credited: &str,
+    ) -> CorporateActionEffect {
+        CorporateActionEffect::CashDividend {
+            action_id: action_id.to_owned(),
+            account_id: account_id.to_owned(),
+            instrument_id: instrument_id.to_owned(),
+            cash_credited: Decimal::from_str(cash_credited).unwrap(),
+        }
+    }
+
+    fn dividend_effect(action_id: &str, cash_credited: &str) -> CorporateActionEffect {
+        dividend_effect_for(
+            action_id,
+            "acct.paper.001",
+            "inst.us_equity.spy",
+            cash_credited,
+        )
+    }
+
+    #[test]
+    fn worker_services_follow_a_split_and_a_dividend() {
+        let at = "2026-01-02T14:32:00Z";
+        let mut services = services_holding_one_share("100");
+        services
+            .apply_corporate_action(&split_effect("inst.us_equity.spy", "2", "2", "50.05"))
+            .unwrap();
+
+        let payload = services.service_payload(at);
+        let position = &payload["portfolio"]["positions"][0];
+        // The position is the engine's, and the mark follows the shares: 100 became 50.
+        assert_eq!(position["quantity"], "2.00000000");
+        assert_eq!(position["average_cost"], "50.05000000");
+        assert_eq!(position["mark_price"], "50.00000000");
+        assert_eq!(
+            payload["portfolio"]["cash_by_currency"][0]["amount"],
+            "899.90000000"
+        );
+
+        // A dividend changes cash and nothing about the position.
+        services
+            .apply_corporate_action(&dividend_effect("action-dividend-001", "0.50"))
+            .unwrap();
+        let payload = services.service_payload(at);
+        assert_eq!(payload["portfolio"]["positions"][0], *position);
+        assert_eq!(
+            payload["portfolio"]["cash_by_currency"][0]["amount"],
+            "900.40000000"
+        );
+    }
+
+    #[test]
+    fn worker_services_refuse_an_effect_they_cannot_apply_and_change_nothing() {
+        let at = "2026-01-02T14:32:00Z";
+        let mut services = services_holding_one_share("100");
+        let before = services.service_payload(at);
+        for (name, effect) in [
+            (
+                "a split of a position the services do not hold",
+                split_effect("inst.us_equity.qqq", "2", "2", "50.05"),
+            ),
+            (
+                "a split with a zero ratio",
+                split_effect("inst.us_equity.spy", "0", "2", "50.05"),
+            ),
+            (
+                "a split with a negative ratio",
+                split_effect("inst.us_equity.spy", "-2", "2", "50.05"),
+            ),
+            (
+                "a split that leaves a flat position",
+                split_effect("inst.us_equity.spy", "2", "0", "0"),
+            ),
+            (
+                "a dividend that credits nothing",
+                dividend_effect("action-dividend-001", "0"),
+            ),
+            (
+                "a dividend that debits",
+                dividend_effect("action-dividend-001", "-0.50"),
+            ),
+            (
+                "an action that is not canonical",
+                dividend_effect("Not Canonical", "0.50"),
+            ),
+            (
+                "an account that is not canonical",
+                dividend_effect_for(
+                    "action-dividend-001",
+                    "Not Canonical",
+                    "inst.us_equity.spy",
+                    "0.50",
+                ),
+            ),
+            (
+                "an instrument that is not canonical",
+                dividend_effect_for(
+                    "action-dividend-001",
+                    "acct.paper.001",
+                    "Not Canonical",
+                    "0.50",
+                ),
+            ),
+        ] {
+            assert!(
+                services.apply_corporate_action(&effect).is_err(),
+                "{name} was accepted"
+            );
+            assert_eq!(services.service_payload(at), before, "{name}");
+        }
+
+        // A mark the split would round to nothing is refused too, as the SDK would refuse a
+        // position with no mark, and nothing moves.
+        let mut tiny = services_holding_one_share("0.00000001");
+        let before = tiny.service_payload(at);
+        let error = tiny
+            .apply_corporate_action(&split_effect("inst.us_equity.spy", "2", "2", "50.05"))
+            .unwrap_err();
+        assert_eq!(
+            error.0,
+            "split would round the worker's mark price down to nothing"
+        );
+        assert_eq!(tiny.service_payload(at), before);
+    }
+
+    #[test]
+    fn a_corporate_action_effect_names_its_action_account_and_instrument() {
+        for effect in [
+            split_effect("inst.us_equity.spy", "2", "2", "50.05"),
+            dividend_effect("action-split-001", "0.50"),
+        ] {
+            assert_eq!(effect.action_id(), "action-split-001");
+            assert_eq!(effect.account_id(), "acct.paper.001");
+            assert_eq!(effect.instrument_id(), "inst.us_equity.spy");
+        }
     }
 
     #[test]

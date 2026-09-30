@@ -40,6 +40,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         5,
         include_str!("../migrations/0005_execution_plan_evidence.sql"),
     ),
+    (
+        6,
+        include_str!("../migrations/0006_evidence_immutability.sql"),
+    ),
 ];
 
 /// Durable persistence failure.
@@ -159,6 +163,12 @@ impl PostgresStore {
     /// Applies every embedded migration in order under an advisory lock and
     /// refuses a checksum mismatch for any already-recorded version.
     pub fn migrate(&mut self) -> Result<(), PersistenceError> {
+        self.migrate_through(i64::MAX)
+    }
+
+    /// Applies the embedded migrations up to and including `last_version`, which
+    /// lets a test build the schema an older release left behind and upgrade it.
+    fn migrate_through(&mut self, last_version: i64) -> Result<(), PersistenceError> {
         let mut transaction = self.client.transaction()?;
         transaction.batch_execute(
             "SELECT pg_advisory_xact_lock(6433752855195311);\
@@ -168,7 +178,10 @@ impl PostgresStore {
                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
              );",
         )?;
-        for (version, sql) in MIGRATIONS {
+        for (version, sql) in MIGRATIONS
+            .iter()
+            .filter(|(version, _)| *version <= last_version)
+        {
             let checksum = Sha256::digest(sql.as_bytes()).to_vec();
             if let Some(row) = transaction.query_opt(
                 "SELECT sha256 FROM follon_schema_migrations WHERE version = $1",
@@ -555,10 +568,23 @@ mod tests {
             "execution_plan_evidence",
             "execution_route_decisions",
             "execution_benchmark_evidence",
+            "refuse_evidence_mutation",
+            "refuse_version_rewrite",
+            "BEFORE UPDATE OR DELETE",
+            "BEFORE TRUNCATE",
+            "news_sentiments_tenant_news_fkey",
+            "news rows exist that predate tenant ownership",
+            "ENABLE ALWAYS TRIGGER refuse_mutation",
+            "ENABLE ALWAYS TRIGGER refuse_truncate",
+            "'infinity'::timestamptz",
         ] {
             assert!(migration_sql.contains(required), "missing {required}");
         }
-        assert_eq!(MIGRATIONS.len(), 5);
+        assert_eq!(MIGRATIONS.len(), 6);
+        // Versions are consecutive, so a migration can be neither skipped nor reordered.
+        for (index, (version, _)) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(*version, i64::try_from(index).unwrap() + 1);
+        }
     }
 
     #[test]
@@ -575,12 +601,13 @@ mod tests {
     #[test]
     #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
     fn postgres_migration_append_and_idempotency_round_trip() {
-        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
-        let mut store = PostgresStore::connect_development(&uri).unwrap();
-        store.migrate().unwrap();
-        store.provision_tenant("tenant.acme", "ACME").unwrap();
-        let first = store.append_event(&sample_event()).unwrap();
-        let second = store.append_event(&sample_event()).unwrap();
+        // Its own tenant and identifiers, because domain events cannot be deleted and a
+        // rerun against the same database must not find last run's.
+        let mut store = connected_store();
+        let event = sample_event_for(&run_tag("round-trip"));
+        store.provision_tenant(&event.tenant_id, "ACME").unwrap();
+        let first = store.append_event(&event).unwrap();
+        let second = store.append_event(&event).unwrap();
         assert!(first.inserted);
         assert!(!second.inserted);
         assert_eq!(first.aggregate_sequence, second.aggregate_sequence);
@@ -622,10 +649,9 @@ mod tests {
         // raw unique-violation error. See
         // `append_event_reconciles_concurrent_duplicate_submissions_of_the_same_idempotency_key`
         // below for a best-effort test that drives the actual race.
-        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
-        let mut store = PostgresStore::connect_development(&uri).unwrap();
-        store.migrate().unwrap();
-        let event = sample_event_for("race-recovery");
+        let mut store = connected_store();
+        let tag = run_tag("race-recovery");
+        let event = sample_event_for(&tag);
         store.provision_tenant(&event.tenant_id, "ACME").unwrap();
 
         let canonical_payload = serde_json::to_vec(&event.payload).unwrap();
@@ -668,7 +694,7 @@ mod tests {
         // Same idempotency key, different payload: must still be rejected,
         // exactly as the existing non-racing pre-check already rejects it.
         let mut conflicting = event.clone();
-        conflicting.event_id = format!("event.{}-2", "race-recovery");
+        conflicting.event_id = format!("event.{tag}-2");
         conflicting.payload = serde_json::json!({"quantity": "2.00000000"});
         let error = store.append_event(&conflicting).unwrap_err();
         assert!(error
@@ -696,9 +722,8 @@ mod tests {
         // instead race the unrelated `domain_events` primary key and never
         // exercise the idempotency-key recovery path this test targets.
         let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
-        let mut setup_store = PostgresStore::connect_development(&uri).unwrap();
-        setup_store.migrate().unwrap();
-        let event = sample_event_for("concurrent-race");
+        let mut setup_store = connected_store();
+        let event = sample_event_for(&run_tag("concurrent-race"));
         setup_store
             .provision_tenant(&event.tenant_id, "ACME")
             .unwrap();
@@ -742,5 +767,566 @@ mod tests {
             1,
             "exactly one concurrent caller should report having performed the insert"
         );
+    }
+
+    // Retained evidence and news tenancy (delivery state E7.7).
+    //
+    // Retained evidence cannot be deleted, so the rows these tests write outlive them. Each
+    // run therefore gets its own tenant and identifiers from `run_tag`, and the tests are
+    // for a disposable database, as the ignore attribute says.
+
+    const APPEND_ONLY: [&str; 16] = [
+        "domain_events",
+        "journal_transactions",
+        "journal_lines",
+        "risk_policy_versions",
+        "broker_commands",
+        "broker_receipts",
+        "strategy_versions",
+        "configuration_versions",
+        "audit_event_indexes",
+        "news_headlines",
+        "news_sentiments",
+        "fx_pricing_snapshots",
+        "venue_capabilities",
+        "execution_plan_evidence",
+        "execution_route_decisions",
+        "execution_benchmark_evidence",
+    ];
+    const VERSIONED: [&str; 2] = [
+        "instrument_reference_versions",
+        "fx_instrument_economics_versions",
+    ];
+    const ISOLATION_ROLE: &str = "follon_isolation_test";
+    const SHA256_ZERO: &str = "decode(repeat('00', 32), 'hex')";
+
+    fn run_tag(name: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{name}-{}-{nanos}", std::process::id())
+    }
+
+    /// One database test at a time. `TRUNCATE ... CASCADE`, which a test here runs on purpose
+    /// to see it refused, takes an exclusive lock on every table it reaches, so it deadlocks
+    /// with a test that is writing to any of them at that moment. A review saw it fail about
+    /// one run in four when the tests ran in parallel, as `cargo test` does by default.
+    static DATABASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A connected, migrated store that holds the database for as long as it lives.
+    struct LockedStore {
+        store: PostgresStore,
+        _exclusive: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl std::ops::Deref for LockedStore {
+        type Target = PostgresStore;
+
+        fn deref(&self) -> &PostgresStore {
+            &self.store
+        }
+    }
+
+    impl std::ops::DerefMut for LockedStore {
+        fn deref_mut(&mut self) -> &mut PostgresStore {
+            &mut self.store
+        }
+    }
+
+    fn connected_store() -> LockedStore {
+        // A test that panicked while holding the database poisons the lock, and the tests
+        // after it are no less able to run.
+        let exclusive = DATABASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
+        let mut store = PostgresStore::connect_development(&uri).unwrap();
+        store.migrate().unwrap();
+        LockedStore {
+            store,
+            _exclusive: exclusive,
+        }
+    }
+
+    /// Runs `sql` as `tenant` and commits it.
+    fn commit_as_tenant(store: &mut PostgresStore, tenant: &str, sql: &str) {
+        let mut transaction = store.client.transaction().unwrap();
+        set_tenant(&mut transaction, tenant).unwrap();
+        transaction.batch_execute(sql).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    /// Runs `sql` as `tenant`, rolls it back whatever it did, and returns the database's
+    /// refusal if there was one. Nothing an accepted statement did survives, so a
+    /// guard that fails to refuse cannot damage the rows the test still needs.
+    fn refusal(
+        store: &mut PostgresStore,
+        tenant: &str,
+        role: Option<&str>,
+        sql: &str,
+    ) -> Option<String> {
+        let mut transaction = store.client.transaction().unwrap();
+        if let Some(role) = role {
+            transaction
+                .batch_execute(&format!("SET LOCAL ROLE {role}"))
+                .unwrap();
+        }
+        set_tenant(&mut transaction, tenant).unwrap();
+        transaction
+            .batch_execute(sql)
+            .err()
+            .map(|error| PersistenceError::from(error).0)
+    }
+
+    /// How many rows a query returns as `tenant`, under `role` when given.
+    fn visible_rows(
+        store: &mut PostgresStore,
+        tenant: &str,
+        role: Option<&str>,
+        query: &str,
+    ) -> i64 {
+        let mut transaction = store.client.transaction().unwrap();
+        if let Some(role) = role {
+            transaction
+                .batch_execute(&format!("SET LOCAL ROLE {role}"))
+                .unwrap();
+        }
+        set_tenant(&mut transaction, tenant).unwrap();
+        transaction.query_one(query, &[]).unwrap().get(0)
+    }
+
+    /// One row in each append-only table, all owned by `tenant`, and the user the
+    /// approvals name. `event_id` is the domain event `append_event` already wrote.
+    fn evidence_rows_sql(tenant: &str, event_id: &str, tag: &str) -> String {
+        format!(
+            "INSERT INTO customer_users (user_id, tenant_id, normalized_email, password_hash) \
+               VALUES ('user.{tag}', '{tenant}', 'user.{tag}@example.test', 'hash'); \
+             INSERT INTO risk_policy_versions (policy_id, version, tenant_id, document, document_sha256, approved_by, effective_at) \
+               VALUES ('policy.{tag}', 1, '{tenant}', '{{}}', {SHA256_ZERO}, 'user.{tag}', NOW()); \
+             INSERT INTO strategy_versions (tenant_id, strategy_id, version, bundle_sha256, runtime_contract_version, metadata, created_by) \
+               VALUES ('{tenant}', 'strategy.{tag}', 1, {SHA256_ZERO}, 'v1', '{{}}', 'user.{tag}'); \
+             INSERT INTO configuration_versions (tenant_id, configuration_id, version, document, document_sha256, approved_by, effective_at) \
+               VALUES ('{tenant}', 'configuration.{tag}', 1, '{{}}', {SHA256_ZERO}, 'user.{tag}', NOW()); \
+             INSERT INTO audit_event_indexes (tenant_id, event_id, event_type, occurred_at) \
+               VALUES ('{tenant}', '{event_id}', 'order.accepted', NOW()); \
+             INSERT INTO journal_transactions (transaction_id, tenant_id, reference_id, occurred_at, idempotency_key) \
+               VALUES ('journal.{tag}', '{tenant}', 'reference.{tag}', NOW(), 'idempotency.journal.{tag}'); \
+             INSERT INTO journal_lines (transaction_id, line_number, tenant_id, account_id, currency, debit, credit) \
+               VALUES ('journal.{tag}', 1, '{tenant}', 'cash', 'USD', 10, 0), ('journal.{tag}', 2, '{tenant}', 'equity', 'USD', 0, 10); \
+             INSERT INTO broker_commands (command_id, tenant_id, broker_account_id, mode, command_type, payload) \
+               VALUES ('command.{tag}', '{tenant}', 'account.{tag}', 'PAPER', 'submit', '{{}}'); \
+             INSERT INTO broker_receipts (receipt_id, tenant_id, command_id, state, payload, received_at) \
+               VALUES ('receipt.{tag}', '{tenant}', 'command.{tag}', 'ACCEPTED', '{{}}', NOW()); \
+             INSERT INTO news_headlines (tenant_id, news_id, source, headline, raw_body_hash, sequence_number, event_time_ns, receive_time_ns) \
+               VALUES ('{tenant}', 'news.{tag}', 'wire', 'headline', repeat('a', 64), 1, 1, 2); \
+             INSERT INTO news_sentiments (tenant_id, event_id, causation_news_id, instrument_id, taxonomy, sentiment_polarity_bps, confidence_bps, novelty_score_bps, surprise_magnitude_bps, event_time_ns) \
+               VALUES ('{tenant}', 'sentiment.{tag}', 'news.{tag}', 'inst.us_equity.spy', 'taxonomy.one', 0, 0, 0, 0, 1); \
+             INSERT INTO fx_pricing_snapshots (tenant_id, snapshot_id, instrument_id, reference_version, product, base_currency, quote_currency, source_id, source_sequence, source_time, received_at, terms, terms_sha256) \
+               VALUES ('{tenant}', 'snapshot.{tag}', 'inst.fx.eurusd', 'reference.one', 'FX_SPOT', 'EUR', 'USD', 'source.one', 0, NOW() - INTERVAL '1 minute', NOW(), '{{}}', {SHA256_ZERO}); \
+             INSERT INTO venue_capabilities (tenant_id, venue, capability_version, supported_order_kinds, document_sha256) \
+               VALUES ('{tenant}', 'venue.{tag}', 'v1', '[]', {SHA256_ZERO}); \
+             INSERT INTO execution_plan_evidence (tenant_id, evidence_id, parent_order_id, account_id, instrument_id, side, parent_quantity, algorithm, children, unallocated_quantity, plan_sha256) \
+               VALUES ('{tenant}', 'plan.{tag}', 'order.{tag}', 'account.{tag}', 'inst.us_equity.spy', 'BUY', '10', 'twap', '[]', '0', {SHA256_ZERO}); \
+             INSERT INTO execution_route_decisions (tenant_id, decision_id, evidence_id, parent_order_id, venue, capability_version, allocated_quantity, all_in_price, fee_per_unit, latency_rank, decision_sha256) \
+               VALUES ('{tenant}', 'decision.{tag}', 'plan.{tag}', 'order.{tag}', 'venue.{tag}', 'v1', '10', '100', '0.01', 0, {SHA256_ZERO}); \
+             INSERT INTO execution_benchmark_evidence (tenant_id, benchmark_id, evidence_id, parent_order_id, arrival_price, target_price, source, benchmark_sha256) \
+               VALUES ('{tenant}', 'benchmark.{tag}', 'plan.{tag}', 'order.{tag}', '100', '101', 'source.one', {SHA256_ZERO});"
+        )
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn every_evidence_table_carries_both_guards() {
+        let mut store = connected_store();
+        for table in APPEND_ONLY.iter().chain(VERSIONED.iter()) {
+            let triggers: Vec<(String, String)> = store
+                .client
+                .query(
+                    "SELECT tgname, tgenabled::text FROM pg_trigger \
+                     WHERE tgrelid = $1::text::regclass AND NOT tgisinternal ORDER BY tgname",
+                    &[table],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            for guard in ["refuse_mutation", "refuse_truncate"] {
+                let state = triggers
+                    .iter()
+                    .find(|(name, _)| name == guard)
+                    .unwrap_or_else(|| panic!("{table} has no {guard} trigger: {triggers:?}"));
+                // 'A' fires in every session role. The default, 'O', is switched off by
+                // `SET session_replication_role = replica`, which is no DDL and no log line.
+                assert_eq!(
+                    state.1, "A",
+                    "{table}'s {guard} can be switched off by a SET"
+                );
+            }
+        }
+    }
+
+    /// The guards must survive a session that says it is a replica, which is what a bulk
+    /// loader does and what turns off an ordinary trigger. Only a superuser, or a role
+    /// granted the setting, can say it, so where the connection is neither, the state check
+    /// in `every_evidence_table_carries_both_guards` is the whole proof.
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn the_guards_hold_in_a_session_that_says_it_is_a_replica() {
+        let mut store = connected_store();
+        let tag = run_tag("replica");
+        let event = sample_event_for(&tag);
+        store.provision_tenant(&event.tenant_id, "Replica").unwrap();
+        store.append_event(&event).unwrap();
+        let mut said_it = false;
+        for statement in [
+            format!(
+                "UPDATE domain_events SET payload = '{{}}' WHERE tenant_id = '{}'",
+                event.tenant_id
+            ),
+            format!(
+                "DELETE FROM domain_events WHERE tenant_id = '{}'",
+                event.tenant_id
+            ),
+            "TRUNCATE domain_events CASCADE".to_owned(),
+        ] {
+            let mut transaction = store.client.transaction().unwrap();
+            if transaction
+                .batch_execute("SET LOCAL session_replication_role = replica")
+                .is_err()
+            {
+                return;
+            }
+            said_it = true;
+            set_tenant(&mut transaction, &event.tenant_id).unwrap();
+            let error = transaction
+                .batch_execute(&statement)
+                .err()
+                .map(|error| PersistenceError::from(error).0)
+                .unwrap_or_else(|| panic!("{statement} was accepted as a replica"));
+            assert!(
+                error.contains("[23001]") && error.contains("retained evidence is append-only"),
+                "{statement}: {error}"
+            );
+        }
+        assert!(said_it);
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn retained_evidence_refuses_update_delete_and_truncate() {
+        let mut store = connected_store();
+        let tag = run_tag("immutable");
+        let event = sample_event_for(&tag);
+        store
+            .provision_tenant(&event.tenant_id, "Evidence")
+            .unwrap();
+        store.append_event(&event).unwrap();
+        commit_as_tenant(
+            &mut store,
+            &event.tenant_id,
+            &evidence_rows_sql(&event.tenant_id, &event.event_id, &tag),
+        );
+
+        for table in APPEND_ONLY {
+            // Scoped to this run's own rows, so it is the row this test wrote that is
+            // protected and not one an earlier run left behind.
+            let mine = format!("WHERE tenant_id = '{}'", event.tenant_id);
+            let attempts = [
+                (
+                    "UPDATE",
+                    format!("UPDATE {table} SET tenant_id = tenant_id {mine}"),
+                ),
+                ("DELETE", format!("DELETE FROM {table} {mine}")),
+                ("TRUNCATE", format!("TRUNCATE {table} CASCADE")),
+            ];
+            for (verb, statement) in attempts {
+                let error = refusal(&mut store, &event.tenant_id, None, &statement)
+                    .unwrap_or_else(|| panic!("{statement} was accepted"));
+                assert!(
+                    error.contains("[23001]")
+                        && error.contains(&format!("{verb} on "))
+                        && error.contains("retained evidence is append-only"),
+                    "{statement}: {error}"
+                );
+                if verb != "TRUNCATE" {
+                    // The refusal names the table it guards.
+                    assert!(
+                        error.contains(&format!("{verb} on {table} is refused")),
+                        "{statement}: {error}"
+                    );
+                }
+            }
+            let kept = visible_rows(
+                &mut store,
+                &event.tenant_id,
+                None,
+                &format!(
+                    "SELECT count(*) FROM {table} WHERE tenant_id = '{}'",
+                    event.tenant_id
+                ),
+            );
+            assert!(kept >= 1, "{table} lost its row");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn a_reference_version_may_only_be_closed_once_and_is_otherwise_fixed() {
+        let mut store = connected_store();
+        let tag = run_tag("versioned");
+        let tenant = format!("tenant.{tag}");
+        store.provision_tenant(&tenant, "Versions").unwrap();
+        let cases = [
+            (
+                "instrument_reference_versions",
+                format!(
+                    "INSERT INTO instrument_reference_versions (tenant_id, instrument_id, version, document, document_sha256, effective_from) \
+                     VALUES ('{tenant}', 'inst.{tag}', 1, '{{\"tick\": 0.10}}', {SHA256_ZERO}, NOW() - INTERVAL '1 day')"
+                ),
+                "document = '{\"changed\": true}'",
+                // The same number, written with another scale: equal to jsonb, not the same document.
+                "document = '{\"tick\": 0.1}'",
+            ),
+            (
+                "fx_instrument_economics_versions",
+                format!(
+                    "INSERT INTO fx_instrument_economics_versions (tenant_id, instrument_id, version, product, base_currency, quote_currency, terms, document_sha256, effective_from) \
+                     VALUES ('{tenant}', 'inst.{tag}', 1, 'FX_SPOT', 'EUR', 'USD', '{{\"lot\": 1.000}}', {SHA256_ZERO}, NOW() - INTERVAL '1 day')"
+                ),
+                "terms = '{\"changed\": true}'",
+                "terms = '{\"lot\": 1.0}'",
+            ),
+        ];
+        // Every statement is scoped to this run's tenant, so it is this run's version that is
+        // tested, and not one an earlier run left closed.
+        let mine = format!("WHERE tenant_id = '{tenant}'");
+        let version_message = "a version may only be closed, once";
+        let evidence_message = "retained evidence is append-only";
+        for (table, insert, rewrite, rescale) in cases {
+            commit_as_tenant(&mut store, &tenant, &insert);
+            let close = format!("UPDATE {table} SET effective_to = NOW() {mine}");
+            let refused = |store: &mut PostgresStore, statement: &str, message: &str| {
+                let error = refusal(store, &tenant, None, statement)
+                    .unwrap_or_else(|| panic!("{table}: {statement} was accepted"));
+                assert!(
+                    error.contains("[23001]") && error.contains(message),
+                    "{table}: {statement}: {error}"
+                );
+            };
+
+            // While it is open, rewriting a version, alone or as it is closed, and
+            // deleting it are refused, and so is closing it with no end, which would spend
+            // the one close. Rewriting only the scale of a number as it is closed is a
+            // rewrite too. Truncating the table is refused as well.
+            for statement in [
+                format!("UPDATE {table} SET {rewrite} {mine}"),
+                format!("UPDATE {table} SET effective_to = NOW(), {rewrite} {mine}"),
+                format!("UPDATE {table} SET effective_to = NOW(), {rescale} {mine}"),
+                format!("UPDATE {table} SET effective_to = 'infinity' {mine}"),
+                format!("DELETE FROM {table} {mine}"),
+            ] {
+                refused(&mut store, &statement, version_message);
+            }
+            refused(
+                &mut store,
+                &format!("TRUNCATE {table} CASCADE"),
+                evidence_message,
+            );
+
+            // Closing it is allowed, once, and it is fixed after that.
+            commit_as_tenant(&mut store, &tenant, &close);
+            for statement in [
+                close.clone(),
+                format!("UPDATE {table} SET effective_to = effective_to + INTERVAL '1 day' {mine}"),
+                format!("UPDATE {table} SET {rewrite} {mine}"),
+                format!("DELETE FROM {table} {mine}"),
+            ] {
+                refused(&mut store, &statement, version_message);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn news_is_owned_by_one_tenant_and_invisible_to_the_rest() {
+        let mut store = connected_store();
+        let tag = run_tag("news");
+        let (owner, other) = (format!("tenant.{tag}-a"), format!("tenant.{tag}-b"));
+        store.provision_tenant(&owner, "Owner").unwrap();
+        store.provision_tenant(&other, "Other").unwrap();
+        let news_id = format!("news.{tag}");
+        let headline = |tenant: &str| {
+            format!(
+                "INSERT INTO news_headlines (tenant_id, news_id, source, headline, raw_body_hash, sequence_number, event_time_ns, receive_time_ns) \
+                 VALUES ('{tenant}', '{news_id}', 'wire', 'headline', repeat('a', 64), 1, 1, 2)"
+            )
+        };
+        let sentiment = |tenant: &str, cause: &str| {
+            format!(
+                "INSERT INTO news_sentiments (tenant_id, event_id, causation_news_id, instrument_id, taxonomy, sentiment_polarity_bps, confidence_bps, novelty_score_bps, surprise_magnitude_bps, event_time_ns) \
+                 VALUES ('{tenant}', 'sentiment.{tag}', '{cause}', 'inst.us_equity.spy', 'taxonomy.one', 0, 0, 0, 0, 1)"
+            )
+        };
+        commit_as_tenant(
+            &mut store,
+            &owner,
+            &format!("{}; {}", headline(&owner), sentiment(&owner, &news_id)),
+        );
+
+        // The database's owner and its superusers bypass row-level security, as they would
+        // for the application's role only if it were misconfigured. This role does not.
+        store
+            .client
+            .batch_execute(&format!(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{ISOLATION_ROLE}') \
+                   THEN CREATE ROLE {ISOLATION_ROLE} NOLOGIN; END IF; END $$; \
+                 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {ISOLATION_ROLE};"
+            ))
+            .unwrap();
+        let role = Some(ISOLATION_ROLE);
+        let count = format!("SELECT count(*) FROM news_headlines WHERE news_id = '{news_id}'");
+
+        let sentiments =
+            format!("SELECT count(*) FROM news_sentiments WHERE event_id = 'sentiment.{tag}'");
+
+        assert_eq!(visible_rows(&mut store, &owner, role, &count), 1);
+        assert_eq!(visible_rows(&mut store, &owner, role, &sentiments), 1);
+        assert_eq!(
+            visible_rows(&mut store, &other, role, &count),
+            0,
+            "another tenant can see the headline"
+        );
+        assert_eq!(
+            visible_rows(&mut store, &other, role, &sentiments),
+            0,
+            "another tenant can see the sentiment"
+        );
+
+        // A row must belong to a tenant that exists.
+        let stranger = format!("tenant.{tag}-none");
+        let error = refusal(&mut store, &stranger, role, &headline(&stranger))
+            .expect("a headline for a tenant that does not exist was accepted");
+        assert!(error.contains("foreign key"), "{error}");
+
+        // Another tenant cannot write a row for the owner.
+        let error = refusal(&mut store, &other, role, &headline(&owner))
+            .expect("a row for another tenant was accepted");
+        assert!(error.contains("row-level security"), "{error}");
+
+        // The same identifier is a different headline for each tenant.
+        assert_eq!(refusal(&mut store, &other, role, &headline(&other)), None);
+
+        // A sentiment cannot be caused by another tenant's headline, but can by its own.
+        let error = refusal(&mut store, &other, role, &sentiment(&other, &news_id))
+            .expect("a sentiment on another tenant's headline was accepted");
+        assert!(error.contains("foreign key"), "{error}");
+        let own = format!("{}; {}", headline(&other), sentiment(&other, &news_id));
+        assert_eq!(refusal(&mut store, &other, role, &own), None);
+    }
+
+    #[test]
+    #[ignore = "requires FOLLON_TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+    fn the_migration_refuses_news_rows_it_cannot_assign_to_a_tenant() {
+        let uri = std::env::var("FOLLON_TEST_DATABASE_URL").expect("database URL");
+        let config: postgres::Config = uri.parse().expect("the database URL parses");
+        let scratch = format!("follon_upgrade_{}", run_tag("news").replace('-', "_"));
+        let mut admin = {
+            let mut config = config.clone();
+            config.dbname("postgres");
+            config.connect(NoTls).unwrap()
+        };
+        admin
+            .batch_execute(&format!("CREATE DATABASE {scratch}"))
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scratch_config = config.clone();
+            scratch_config.dbname(&scratch);
+            let mut store = PostgresStore {
+                client: scratch_config.connect(NoTls).unwrap(),
+            };
+
+            // The schema an earlier release left behind, with a headline nobody owns.
+            store.migrate_through(5).unwrap();
+            let recorded: Vec<i64> = store
+                .client
+                .query(
+                    "SELECT version FROM follon_schema_migrations ORDER BY version",
+                    &[],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(recorded, vec![1, 2, 3, 4, 5]);
+            store
+                .client
+                .batch_execute(
+                    "INSERT INTO news_headlines (news_id, source, headline, raw_body_hash, sequence_number, event_time_ns, receive_time_ns) \
+                     VALUES ('news.unowned-1', 'wire', 'headline', repeat('a', 64), 1, 1, 2); \
+                     INSERT INTO news_sentiments (event_id, causation_news_id, instrument_id, taxonomy, sentiment_polarity_bps, confidence_bps, novelty_score_bps, surprise_magnitude_bps, event_time_ns) \
+                     VALUES ('sentiment.unowned-1', 'news.unowned-1', 'inst.us_equity.spy', 'taxonomy.one', 0, 0, 0, 0, 1)",
+                )
+                .unwrap();
+
+            // The upgrade refuses to guess an owner, leaves nothing half done, and says what
+            // the operator can do, which is the one thing that is possible before the
+            // migration has given the tables a tenant to assign.
+            let error = store.migrate().unwrap_err();
+            assert!(
+                error
+                    .0
+                    .contains("news rows exist that predate tenant ownership")
+                    && error
+                        .0
+                        .contains("empty news_sentiments and then news_headlines"),
+                "{}",
+                error.0
+            );
+            let applied: i64 = store
+                .client
+                .query_one(
+                    "SELECT count(*) FROM follon_schema_migrations WHERE version = 6",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(applied, 0);
+            let columns: i64 = store
+                .client
+                .query_one(
+                    "SELECT count(*) FROM information_schema.columns \
+                     WHERE table_name = 'news_headlines' AND column_name = 'tenant_id'",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(columns, 0, "the refused upgrade still added the column");
+
+            // Once the operator has done what the message says, in the order it says, the same
+            // upgrade goes through. The sentiment goes first because it names the headline.
+            store
+                .client
+                .batch_execute("DELETE FROM news_sentiments; DELETE FROM news_headlines")
+                .unwrap();
+            store.migrate().unwrap();
+            let columns: i64 = store
+                .client
+                .query_one(
+                    "SELECT count(*) FROM information_schema.columns \
+                     WHERE table_name IN ('news_headlines', 'news_sentiments') \
+                       AND column_name = 'tenant_id'",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(columns, 2);
+        }));
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
+            .unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

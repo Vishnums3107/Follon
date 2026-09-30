@@ -557,8 +557,9 @@ fn evaluate_backtest(
 /// recorded, and the completion manifest must hash-bind the artifact. The
 /// capsule's own copies are then replayed in a sandbox, and a manifest is
 /// sealed only if that replay reproduces the completion manifest byte for
-/// byte. The evaluation must have run without corporate actions, because the
-/// replay supplies none.
+/// byte. An evaluation that applied corporate actions is packaged with the same file,
+/// `--actions`, which the replay applies too. Like the bars it is referenced by the
+/// dataset's content hash, which covers the actions, and is never carried.
 fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (positional, flags) = parse_flag_values(
         arguments,
@@ -573,12 +574,13 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
             "--packaged-at",
             "--output",
         ],
-        &[],
+        &["--actions"],
     )?;
     if !positional.is_empty() {
-        return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> --python <interpreter> --packaged-at <utc> --output <dir>".into());
+        return Err("usage: follon-backtest capsule-package --bundle-root <dir> --sdk-root <dir> --lock <file> --config <file> --evaluation <artifact.json> --bars <csv> [--actions <csv>] --python <interpreter> --packaged-at <utc> --output <dir>".into());
     }
     let flag = |name: &str| flags[name].as_str();
+    let actions = flags.get("--actions").map(Path::new);
 
     let lock_bytes = fs::read(flag("--lock"))?;
     let lock = follon_control_plane::StrategyBundleLock::parse(&lock_bytes)?;
@@ -627,20 +629,57 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("evaluation dataset has no {field}"))
     };
+    // An evaluation that applied corporate actions cannot be replayed without them, so
+    // say so here rather than let the replay fail to reproduce the receipt unexplained.
+    let applied = artifact
+        .get("performance")
+        .and_then(|performance| performance.get("corporate_action_count"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("evaluation artifact has no corporate action count")?;
+    if applied > 0 && actions.is_none() {
+        return Err(format!(
+            "the evaluation applied {applied} corporate action(s), which the replay needs: pass the same file with --actions"
+        )
+        .into());
+    }
+    let actions_hint = if actions.is_some() {
+        " --actions <the corporate actions of that dataset>"
+    } else {
+        ""
+    };
     let replay_command = format!(
-        "follon-backtest capsule-verify <capsule-dir> --bars <{} {} bars, dataset content hash {}> --python <{} interpreter>",
+        "follon-backtest capsule-verify <capsule-dir> --bars <{} {} bars, dataset content hash {}>{actions_hint} --python <{} interpreter>",
         dataset("dataset_id")?,
         dataset("dataset_version")?,
         dataset("content_hash")?,
         contents.lock.runtime,
     );
 
-    let reproduced = replay_capsule(&contents, Path::new(flag("--bars")), flag("--python"))?;
-    let manifest = contents.seal(
-        flag("--packaged-at"),
-        &replay_command,
-        reproduced.as_bytes(),
+    let reproduced = replay_capsule(
+        &contents,
+        Path::new(flag("--bars")),
+        actions,
+        flag("--python"),
     )?;
+    let manifest = contents
+        .seal(
+            flag("--packaged-at"),
+            &replay_command,
+            reproduced.as_bytes(),
+        )
+        .map_err(|error| {
+            if actions.is_none() {
+                // The dataset's content hash covers the corporate actions a file holds, so
+                // an evaluation run with one whose actions all fell outside its bars, and
+                // so applied none, is still bound to inputs this replay was not given.
+                format!(
+                    "{}; if the evaluation was run with --actions, package it with the same file",
+                    error.0
+                )
+            } else {
+                error.0
+            }
+        })?;
     let output = PathBuf::from(flag("--output"));
     contents.write_sealed(&manifest, &output)?;
     let sealed = read_strategy_capsule(&output)?;
@@ -664,14 +703,18 @@ fn run_capsule_package(arguments: &[String]) -> Result<(), Box<dyn std::error::E
 /// capsule's own strategy and SDK are replayed in a sandbox. Success means the
 /// replay reproduced the sealed evaluation receipt byte for byte.
 fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (positional, flags) =
-        parse_flag_values(arguments, &["--bars", "--python"], &["--trusted-key"])?;
+    let (positional, flags) = parse_flag_values(
+        arguments,
+        &["--bars", "--python"],
+        &["--trusted-key", "--actions"],
+    )?;
     let [capsule_directory] = positional.as_slice() else {
         return Err(
-            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> --python <interpreter> [--trusted-key <key.json>]"
+            "usage: follon-backtest capsule-verify <capsule-dir> --bars <csv> [--actions <csv>] --python <interpreter> [--trusted-key <key.json>]"
                 .into(),
         );
     };
+    let actions = flags.get("--actions").map(Path::new);
     let sealed = read_strategy_capsule(Path::new(capsule_directory))?;
     let signer = match (flags.get("--trusted-key"), &sealed.signature) {
         (Some(path), _) => {
@@ -688,10 +731,16 @@ fn run_capsule_verify(arguments: &[String]) -> Result<(), Box<dyn std::error::Er
     let reproduced = replay_capsule(
         &sealed.contents,
         Path::new(&flags["--bars"]),
+        actions,
         &flags["--python"],
     )?;
     if reproduced.as_bytes() != sealed.contents.receipt() {
-        return Err("capsule replay did not reproduce its evaluation receipt".into());
+        return Err(if actions.is_none() {
+            "capsule replay did not reproduce its evaluation receipt (if the evaluation applied corporate actions, pass them with --actions)"
+        } else {
+            "capsule replay did not reproduce its evaluation receipt"
+        }
+        .into());
     }
     println!(
         "{} {}: replay reproduced {}; {signer}",
@@ -745,6 +794,7 @@ fn run_capsule_sign(arguments: &[String]) -> Result<(), Box<dyn std::error::Erro
 fn replay_capsule(
     contents: &CapsuleContents,
     bars: &Path,
+    actions: Option<&Path>,
     python: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if !Path::new(python).is_absolute() {
@@ -781,7 +831,7 @@ fn replay_capsule(
     let outputs = evaluate_backtest(
         bars,
         &configuration_path,
-        None,
+        actions,
         StrategyMode::Python(Box::new(worker)),
     )?;
     Ok(outputs.completion_manifest)
@@ -2288,7 +2338,7 @@ fn advanced_account_projection(
     runtime: &AdvancedAccountRuntime,
 ) -> Result<AdvancedBacktestReport, Box<dyn std::error::Error>> {
     let mut account = AdvancedBacktestAccount::new(runtime.cash_by_currency.clone())?;
-    let mut marks = BTreeMap::new();
+    let mut marks: BTreeMap<String, Decimal> = BTreeMap::new();
     let mut actions: Vec<_> = corporate_actions.iter().collect();
     actions.sort_by(|left, right| {
         left.effective_at()
@@ -2355,7 +2405,21 @@ fn advanced_account_projection(
             .get(next_action)
             .is_some_and(|action| action.effective_at() <= event_time)
         {
-            account.apply_corporate_action(actions[next_action])?;
+            let action = actions[next_action];
+            account.apply_corporate_action(action)?;
+            // A split multiplies the position and not the instrument's last mark, which is a
+            // price before it. Until its next bar, margin, financing and the report would
+            // value the shares the split added at that price (delivery state E8.6).
+            if let follon_market_data::CorporateAction::Split {
+                instrument_id,
+                ratio,
+                ..
+            } = action
+            {
+                if let Some(mark) = marks.get_mut(instrument_id.as_str()) {
+                    *mark = mark.checked_div(*ratio)?;
+                }
+            }
             next_action += 1;
         }
         while runtime
@@ -2477,6 +2541,75 @@ mod tests {
         std::fs::write(&invalid_path, invalid).unwrap();
         assert!(load_runtime_configuration(&invalid_path).is_err());
         std::fs::remove_file(invalid_path).unwrap();
+    }
+
+    /// A split multiplies the shares held and leaves the mark, which is a price before it, so
+    /// the advanced account valued the added shares at that price until the instrument's next
+    /// bar, or for good when none followed (delivery state E8.6, found in review). The split is
+    /// applied while another instrument's bar is processed, which is what leaves the mark stale.
+    #[test]
+    fn the_advanced_account_values_a_split_instrument_at_the_split() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/config/backtest-v1.json");
+        let loaded = load_runtime_configuration(&fixture).unwrap();
+        let bar = |time: &str, instrument: &str, close: &str| {
+            serde_json::json!({
+                "event_type": "market.bar.v1",
+                "event_time": time,
+                "payload": {"instrument_id": instrument, "close": close},
+            })
+            .to_string()
+        };
+        let fill = serde_json::json!({
+            "event_type": "execution.fill.v1",
+            "event_time": "2026-01-02T14:31:00Z",
+            "payload": {
+                "side": "BUY",
+                "execution_id": "execution-1",
+                "order_id": "order-1",
+                "instrument_id": "inst.us_equity.spy",
+                "quantity": "1",
+                "price": "100",
+                "fee": "0.10",
+                "executed_at": "2026-01-02T14:31:00Z",
+            },
+        })
+        .to_string();
+        let events = vec![
+            bar("2026-01-02T14:30:00Z", "inst.us_equity.spy", "100"),
+            fill,
+            bar("2026-01-02T14:31:00Z", "inst.us_equity.spy", "100"),
+            bar("2026-01-02T14:33:00Z", "inst.us_equity.aaa", "10"),
+        ];
+        let split =
+            |instrument: &str, at: &str, ratio: &str| follon_market_data::CorporateAction::Split {
+                action_id: "action-split-001".to_owned(),
+                instrument_id: instrument.to_owned(),
+                effective_at: at.to_owned(),
+                ratio: decimal(ratio).unwrap(),
+            };
+
+        // The 2:1 split of the held instrument waits for 14:32 and is applied at the last
+        // bar, which belongs to another instrument. Two shares at 50 are worth 100, and they
+        // cost 50 each, so nothing is unrealized.
+        let report = advanced_account_projection(
+            &events,
+            &[split("inst.us_equity.spy", "2026-01-02T14:32:00Z", "2")],
+            &loaded.advanced_account,
+        )
+        .unwrap();
+        assert_eq!(report.margin.position_market_value, decimal("100").unwrap());
+        assert_eq!(report.unrealized_pnl, Decimal::ZERO);
+
+        // A split of an instrument the account does not hold revalues nothing of it.
+        let unheld = advanced_account_projection(
+            &events,
+            &[split("inst.us_equity.aaa", "2026-01-02T14:32:00Z", "2")],
+            &loaded.advanced_account,
+        )
+        .unwrap();
+        assert_eq!(unheld.margin.position_market_value, decimal("100").unwrap());
+        assert_eq!(unheld.unrealized_pnl, Decimal::ZERO);
     }
 
     #[test]

@@ -7,8 +7,8 @@ import {
   parseExperimentLineage,
   parseResearchJob,
   parseAssistantEvidence,
-} from "../dist/evidence.js";
-import { renderWorkspace } from "../dist/workspaces.js";
+} from "../dist/evidence/index.js";
+import { renderWorkspace } from "../dist/workspaces/index.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(testDir, "..", "..", "..");

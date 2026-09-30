@@ -1,4 +1,12 @@
 //! Adapter-v3 atomic execution evidence and the PAPER combination lifecycle.
+use std::collections::BTreeSet;
+
+use follon_control_plane::Portfolio;
+use follon_domain::{
+    validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, Fill, OrderState, Side,
+};
+use serde::{Deserialize, Serialize};
+
 use super::*;
 
 /// One complete native combination execution, assembled by the adapter.

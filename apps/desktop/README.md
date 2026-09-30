@@ -39,6 +39,13 @@ so almost any spread with a short leg — is refused unless the operator-authore
 
 The UI never grants that permission itself.
 
+The file may also carry an optional `portfolio_risk` block, the aggregate limits
+`follon-paper-status` and the gRPC PAPER route read: gross and net exposure,
+leverage, concentration, drawdown, daily loss, margin utilisation and sector,
+asset-class, currency and strategy limits. With it, every order and combination the
+gateway submits is gated by them. An unparseable block disables the gateway before
+its journal is touched.
+
 The same file must list the venue tick size and lot size of every instrument
 the operator may trade. Both tables must list the same instruments: a file
 that lists an instrument in only one of them is refused when the gateway
@@ -98,6 +105,22 @@ rejects traversal and symlink escapes, sends a restrictive content-security
 policy, caps individual rendered artifacts at 10 MiB, and bounds records in the
 unified workspace projection. Browser module imports use explicit `.js` URLs so
 the unbundled ESM graph works on the static server.
+
+## Source layout
+
+`src/` is organised by feature; each folder has an `index.ts` that re-exports its
+public API, and importers go through it.
+
+| Path | Holds |
+| --- | --- |
+| `react-main.tsx`, `main.ts`, `app-shell.tsx` | Entry point, gateway wiring and the React shell |
+| `routes.ts`, `catalog.ts`, `command-palette.ts` | Typed workspace routes, the feature catalogue and the palette |
+| `evidence/` | Evidence types, parsers and type guards by domain (`core`, `operations`, `research`, `planning`, `durability`) and the DOM `render` module |
+| `workspaces/` | The workspace snapshot parser, the dispatcher (`render.ts`), one module per workspace, and the shared `panels`, `visualizers`, `format` and `advanced-evidence` helpers |
+| `orders/` | The PAPER order ticket, the combination ticket and the combination-intent model |
+
+The evidence contract tests read these folders as one logical module each, so
+adding a file to a feature folder needs no test change.
 
 ## Validate the projection
 

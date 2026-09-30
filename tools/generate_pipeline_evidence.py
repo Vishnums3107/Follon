@@ -23,6 +23,8 @@ VAR_DIR = REPOSITORY_ROOT / "var"
 # evidence, a report, or review material; a ledger there is never
 # operational acceptance evidence (E6.1).
 ACCEPTANCE_LEDGER_DIRECTORY = "acceptance"
+ACCEPTANCE_ARTIFACT_DIRECTORY = "acceptance-artifacts"
+ACCEPTANCE_REVIEWERS_FILE = "acceptance-trusted-reviewers.json"
 
 
 def sha256_file(path: Path) -> str:
@@ -68,7 +70,7 @@ def run_step(
     return result
 
 
-def publish_acceptance_status(var_dir: Path) -> Path:
+def publish_acceptance_status(var_dir: Path, release_id: str) -> Path:
     """Step 23: audits the operational acceptance ledgers and publishes their gate counts.
 
     Only `var_dir/acceptance` is audited. The tool searches its root
@@ -79,16 +81,31 @@ def publish_acceptance_status(var_dir: Path) -> Path:
 
     The directory is created empty when absent. An empty directory is the
     truth when no ledger has been retained, and the tool refuses a missing
-    root rather than reporting zero.
+    root rather than reporting zero. The same goes for the retained artifact
+    root, and for the trusted reviewer set: a set nobody has provisioned is
+    empty, so no signature counts. An operator's own set, written before the
+    pipeline runs, is never overwritten (E6.4).
     """
     ledger_root = var_dir / ACCEPTANCE_LEDGER_DIRECTORY
     ledger_root.mkdir(parents=True, exist_ok=True)
+    artifact_root = var_dir / ACCEPTANCE_ARTIFACT_DIRECTORY
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    reviewers = var_dir / ACCEPTANCE_REVIEWERS_FILE
+    if not reviewers.exists():
+        reviewers.write_text(
+            json.dumps({"trusted_reviewers_schema_version": 1, "reviewers": []}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     target = var_dir / "follon-acceptance-status.json"
     run_step(
         "Step 23: Auditing External Acceptance Ledgers & Real Gate Counts",
         [
-            sys.executable, "tools/acceptance_evidence.py",
+            sys.executable, "tools/acceptance_evidence.py", "audit",
             str(ledger_root),
+            "--trusted-reviewers", str(reviewers),
+            "--artifact-root", str(artifact_root),
+            "--release-id", release_id,
             "--output", str(target),
         ],
         targets=[target],
@@ -788,8 +805,10 @@ def main() -> None:
     )
 
     # 23. Tamper-Evident Acceptance Status Ledger Gate Counts, from the
-    # operational ledger root only.
-    publish_acceptance_status(VAR_DIR)
+    # operational ledger root only, for the release this run just built.
+    publish_acceptance_status(
+        VAR_DIR, json.loads(manifest_target.read_text(encoding="utf-8"))["release_id"]
+    )
 
     # 23b. Repository-authored dynamic scan (E3.4). Starts the real dashboard
     # and trading API on loopback and probes them over the network. It is not

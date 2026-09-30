@@ -373,6 +373,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         // combination unit count. A ten-lot butterfly is not a ten-lot order.
         let mut largest_leg_quantity = Decimal::ZERO;
         let mut widest_leg_deviation_bps = Decimal::ZERO;
+        let mut every_leg_reduces = true;
         let mut leg_evidence = Vec::with_capacity(intent.legs.len());
         for leg in &intent.legs {
             let mark = market.mark_for(&leg.instrument_id).ok_or_else(|| {
@@ -397,6 +398,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .map(|portfolio| portfolio.position_snapshot().quantity)
                 .unwrap_or(Decimal::ZERO);
             let projected = held.checked_add(intent.projected_leg_delta(leg)?)?;
+            every_leg_reduces &= self.reduces_open_position(&leg.instrument_id, held, projected)?;
             if self.policy.breaches_position_limit(projected)? {
                 reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
             }
@@ -476,18 +478,17 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
 
         let mut portfolio_risk_limits = String::new();
         if let Some(composition) = self.policy.portfolio_risk.as_ref() {
-            if let Some((decision, margin_used)) =
-                self.combo_portfolio_risk_decision(composition, intent, market, decided_at)?
-            {
-                reasons.extend(
-                    decision
-                        .reason_codes
-                        .into_iter()
-                        // `SELF_TRADE_RISK` is already detected per leg above
-                        // from the same working-order state.
-                        .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
-                );
-                portfolio_risk_limits = format!(
+            match self.combo_portfolio_risk_decision(composition, intent, market, decided_at)? {
+                Some((decision, margin_used)) => {
+                    reasons.extend(
+                        decision
+                            .reason_codes
+                            .into_iter()
+                            // `SELF_TRADE_RISK` is already detected per leg above
+                            // from the same working-order state.
+                            .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
+                    );
+                    portfolio_risk_limits = format!(
                     ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
@@ -501,6 +502,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     margin_used,
                     decision.metrics.margin_utilization_bps,
                 );
+                }
+                // The group is atomic, so every leg must move its own position
+                // toward flat for the structure to reduce risk (E7.4b).
+                None if !every_leg_reduces => {
+                    reasons.push("PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned());
+                }
+                None => {}
             }
         }
 
@@ -846,6 +854,9 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             });
         }
 
+        // Before the approval is looked at, let alone consumed: a refusal here
+        // leaves the approval, the canary budget and the session untouched.
+        self.ensure_route_carries(intent.time_in_force, true)?;
         let registered = self.approvals.get(approval_id).ok_or_else(|| {
             LiveError("live canary combination lacks a registered approval".to_owned())
         })?;
@@ -979,10 +990,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 })
             }
             Err(error) => {
-                // An adapter that cannot execute an atomic combination returns
-                // an error here, and that is a *transport* outcome like any
-                // other: the request may or may not have reached the venue, so
-                // the combination goes to UNKNOWN and the session is marked
+                // An adapter that does not declare combinations never gets
+                // here (`ensure_route_carries` refuses first). An error from
+                // one that does is a *transport* outcome like any other: the
+                // request may or may not have reached the venue, so the
+                // combination goes to UNKNOWN and the session is marked
                 // disconnected rather than assumed untouched. The approval
                 // stays consumed and the canary counter stays incremented --
                 // an attempt was made, and pretending otherwise would let one
@@ -1247,6 +1259,56 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         .any(|leg| leg.execution_id == execution_id)
             })
         })
+    }
+
+    /// Whether trading `instrument_id` from `current` to `projected` moves the position
+    /// toward flat, counting what working orders of either kind already claim of it.
+    pub(super) fn reduces_open_position(
+        &self,
+        instrument_id: &str,
+        current: Decimal,
+        projected: Decimal,
+    ) -> Result<bool, LiveError> {
+        let working = self.working_reduction(instrument_id, current)?;
+        Ok(reduces_position_with_working(current, projected, working)?)
+    }
+
+    /// The quantity working orders of either kind will still take off `position` in
+    /// `instrument_id`: sells against a long, buys against a short. A combination's legs
+    /// count individually, by the combination units still unfilled.
+    fn working_reduction(
+        &self,
+        instrument_id: &str,
+        position: Decimal,
+    ) -> Result<Decimal, LiveError> {
+        let reducing = if position > Decimal::ZERO {
+            Side::Sell
+        } else if position < Decimal::ZERO {
+            Side::Buy
+        } else {
+            return Ok(Decimal::ZERO);
+        };
+        let mut total = Decimal::ZERO;
+        for order in self.orders.values() {
+            let intent = &order.oms.intent;
+            if order.working() && intent.instrument_id == instrument_id && intent.side == reducing {
+                total = total.checked_add(intent.quantity.checked_sub(order.filled_quantity)?)?;
+            }
+        }
+        for order in self.combo_orders.values() {
+            if !order.working() {
+                continue;
+            }
+            let intent = &order.oms.intent;
+            let unfilled = intent.combo_quantity.checked_sub(order.filled_quantity)?;
+            for leg in &intent.legs {
+                if leg.instrument_id == instrument_id && leg.side == reducing {
+                    let ratio = Decimal::from_integer(i64::from(leg.ratio))?;
+                    total = total.checked_add(unfilled.checked_mul(ratio)?)?;
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Whether a working order of either kind would trade against `side` on

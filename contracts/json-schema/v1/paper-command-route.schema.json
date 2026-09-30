@@ -52,6 +52,7 @@
         "max_short_quantity": { "$ref": "#/$defs/positiveDecimal" }
       }
     },
+    "portfolio_risk": { "$ref": "#/$defs/portfolioRisk", "description": "Aggregate portfolio limits: gross and net exposure, leverage, concentration, drawdown, daily loss, margin utilisation and sector, asset-class, currency and strategy buckets. The same document follon-paper-status reads. Absent, no aggregate limit applies. Present, it gates every order and combination the route accepts, and it is part of the journal's configuration fingerprint, so a journal reopens only under the limits it was written with." },
     "kill_switch_version": { "type": "string", "minLength": 1 },
     "adapter_kind": { "enum": ["IBKR_PAPER_MODEL", "IBKR_PAPER_BRIDGE"], "description": "IBKR_PAPER_MODEL is the in-process deterministic model. IBKR_PAPER_BRIDGE starts the official-API IBKR PAPER bridge process, which carries single DAY orders only: a combination, a GTC order or a replacement is refused before an order exists." },
     "ibkr_bridge": { "$ref": "#/$defs/ibkrBridge" },
@@ -69,6 +70,137 @@
     "decimal": { "type": "string", "pattern": "^-?[0-9]+(?:\\.[0-9]{1,8})?$" },
     "positiveDecimal": { "type": "string", "pattern": "^(?=[0-9]+(?:\\.[0-9]{1,8})?$)(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$" },
     "basisPoints": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,3})(?:\\.[0-9]{1,8})?$" },
+    "portfolioRisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_version",
+        "max_gross_exposure",
+        "max_abs_net_exposure",
+        "max_leverage_bps",
+        "max_concentration_bps"
+      ],
+      "properties": {
+        "policy_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_gross_exposure": {
+          "$ref": "#/$defs/positiveDecimal"
+        },
+        "max_abs_net_exposure": {
+          "$ref": "#/$defs/positiveDecimal"
+        },
+        "max_leverage_bps": {
+          "type": "string",
+          "pattern": "^(?:0|[1-9][0-9]{0,5})(?:\\.[0-9]{1,8})?$"
+        },
+        "max_concentration_bps": {
+          "$ref": "#/$defs/basisPoints"
+        },
+        "max_drawdown_bps": {
+          "type": "string",
+          "pattern": "^(?:10000|[0-9]{1,4})(?:\\.[0-9]{1,8})?$"
+        },
+        "max_daily_loss": {
+          "type": "string",
+          "pattern": "^[0-9]+(?:\\.[0-9]{1,8})?$"
+        },
+        "max_margin_utilization_bps": {
+          "type": "string",
+          "pattern": "^(?:10000|[0-9]{1,4})(?:\\.[0-9]{1,8})?$"
+        },
+        "allowed_instruments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/canonicalId"
+          }
+        },
+        "restricted_instruments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/canonicalId"
+          }
+        },
+        "sector_limits": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/positiveDecimal"
+          }
+        },
+        "asset_class_limits": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/positiveDecimal"
+          }
+        },
+        "currency_limits": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/positiveDecimal"
+          }
+        },
+        "strategy_limits": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/positiveDecimal"
+          }
+        },
+        "instrument_buckets": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/instrumentBucket"
+          }
+        },
+        "margin_rates": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/marginRate"
+          }
+        }
+      }
+    },
+    "instrumentBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_class",
+        "currency",
+        "sector"
+      ],
+      "properties": {
+        "asset_class": {
+          "$ref": "#/$defs/canonicalId"
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "sector": {
+          "$ref": "#/$defs/canonicalId"
+        }
+      }
+    },
+    "marginRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initial_bps",
+        "maintenance_bps"
+      ],
+      "properties": {
+        "initial_bps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "maintenance_bps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        }
+      }
+    },
     "ibkrBridge": {
       "type": "object",
       "additionalProperties": false,

@@ -10,11 +10,15 @@ from zoneinfo import ZoneInfoNotFoundError
 from follon_ibkr_gateway import (
     BridgeFailure,
     BridgeProtocol,
+    BridgeRefusal,
+    InstrumentContract,
+    SubmitRequest,
     create_official_backend,
     load_instruments,
     normalize_execution_time,
     normalize_order_state,
     parse_arguments,
+    validate_submit,
 )
 
 
@@ -341,6 +345,390 @@ class OfficialBackendExecutionTimeTests(unittest.TestCase):
         event = backend.app.events.get_nowait()
         self.assertEqual(event["event_type"], "EXECUTION")
         self.assertEqual(event["executed_at"], "2026-01-02T14:31:00Z")
+
+
+def _raise(error: Exception):
+    raise error
+
+
+class RefusalProtocolTests(unittest.TestCase):
+    """A request refused before IBKR is contacted is a rejection, not a failure (E5.4)."""
+
+    def setUp(self) -> None:
+        self.backend = FakeBackend()
+        self.protocol = BridgeProtocol(self.backend)
+
+    def test_a_refused_submit_is_a_clean_rejection_not_a_failure(self) -> None:
+        self.backend.submit = lambda payload: _raise(
+            BridgeRefusal("INSTRUMENT_UNMAPPED", "private detail")
+        )
+        response = self.protocol.handle(request("submit", {}))
+        self.assertTrue(response["ok"])
+        self.assertIsNone(response["error"])
+        self.assertEqual(
+            response["result"],
+            {
+                "status": "REJECTED",
+                "broker_order_id": None,
+                "reason": "IBKR_BRIDGE_REFUSED_INSTRUMENT_UNMAPPED",
+            },
+        )
+        self.assertNotIn("private", json.dumps(response))
+
+    def test_a_submit_failure_that_is_not_a_refusal_stays_a_failure(self) -> None:
+        # Whether the order reached IBKR is unknown, so the rejection above
+        # must not be extended to it.
+        self.backend.submit = lambda payload: _raise(BridgeFailure("ambiguous"))
+        response = self.protocol.handle(request("submit", {}))
+        self.assertFalse(response["ok"])
+        self.assertIsNone(response["result"])
+
+    def test_a_refusal_raised_by_another_operation_stays_a_failure(self) -> None:
+        self.backend.poll = lambda: _raise(BridgeRefusal("GATEWAY_DISCONNECTED", "down"))
+        response = self.protocol.handle(request("poll", {}))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"], "down")
+
+
+_CONTRACT = InstrumentContract(
+    con_id=265598,
+    symbol="AAPL",
+    security_type="STK",
+    exchange="SMART",
+    primary_exchange="NASDAQ",
+    currency="USD",
+)
+
+
+class SubmitValidationTests(unittest.TestCase):
+    """Every check the bridge makes before IBKR is contacted, without `ibapi`."""
+
+    def refusal_code(self, **changes) -> str:
+        payload = _submit_payload("order.validate.1") | changes
+        with self.assertRaises(BridgeRefusal) as caught:
+            validate_submit(payload, "acct.paper.1", {"aapl.xnas": _CONTRACT})
+        return caught.exception.code
+
+    def test_a_valid_payload_is_normalized(self) -> None:
+        request_ = validate_submit(
+            _submit_payload("order.validate.1") | {"quantity": "10.50", "limit_price": "101.25"},
+            "acct.paper.1",
+            {"aapl.xnas": _CONTRACT},
+        )
+        self.assertEqual(
+            request_,
+            SubmitRequest(
+                client_order_id="order.validate.1",
+                contract=_CONTRACT,
+                side="BUY",
+                quantity="10.50",
+                limit_price="101.25",
+            ),
+        )
+
+    def test_each_refusal_carries_its_own_code(self) -> None:
+        self.assertEqual(self.refusal_code(instrument_id="msft.xnas"), "INSTRUMENT_UNMAPPED")
+        self.assertEqual(self.refusal_code(account_id="acct.other"), "ACCOUNT_MISMATCH")
+        self.assertEqual(self.refusal_code(side="HOLD"), "INVALID_SIDE")
+        self.assertEqual(self.refusal_code(side=["BUY"]), "INVALID_SIDE")
+
+    def test_malformed_values_are_an_invalid_request(self) -> None:
+        for changes in (
+            {"quantity": "0"},
+            {"quantity": "-1"},
+            {"quantity": "many"},
+            {"quantity": 5},
+            {"limit_price": "0"},
+            {"limit_price": "cheap"},
+            {"client_order_id": "Not Canonical"},
+            {"instrument_id": "BAD ID"},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.refusal_code(**changes), "INVALID_REQUEST")
+
+    def test_a_payload_that_does_not_match_the_protocol_is_an_invalid_request(self) -> None:
+        extra = _submit_payload("order.validate.1") | {"unexpected": True}
+        missing = {
+            key: value
+            for key, value in _submit_payload("order.validate.1").items()
+            if key != "limit_price"
+        }
+        for payload in (extra, missing, "not an object"):
+            with self.subTest(payload=payload), self.assertRaises(BridgeRefusal) as caught:
+                validate_submit(payload, "acct.paper.1", {"aapl.xnas": _CONTRACT})
+            self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+
+
+class OfficialBackendRefusalTests(unittest.TestCase):
+    """The real `OfficialBackend` refuses before anything is transmitted (E5.4)."""
+
+    def _backend(self):
+        backend = _build_official_backend()
+        backend.app.placeOrder = mock.Mock()
+        backend.app.cancelOrder = mock.Mock()
+        return backend
+
+    def _refusal_code(self, backend, payload) -> str:
+        with self.assertRaises(BridgeRefusal) as caught:
+            backend.submit(payload)
+        return caught.exception.code
+
+    def test_a_refused_submit_transmits_nothing_and_consumes_no_order_id(self) -> None:
+        for name, prepare, payload_changes, code in (
+            ("unmapped instrument", lambda app: None, {"instrument_id": "msft.xnas"}, "INSTRUMENT_UNMAPPED"),
+            ("wrong account", lambda app: None, {"account_id": "acct.other"}, "ACCOUNT_MISMATCH"),
+            ("gateway disconnected", lambda app: setattr(app, "connected_ready", False), {}, "GATEWAY_DISCONNECTED"),
+            ("no order id yet", lambda app: setattr(app, "next_order_id", None), {}, "ORDER_ID_UNAVAILABLE"),
+        ):
+            with self.subTest(name):
+                backend = self._backend()
+                prepare(backend.app)
+                order_id_before = backend.app.next_order_id
+                payload = _submit_payload("order.refused.1") | payload_changes
+                self.assertEqual(self._refusal_code(backend, payload), code)
+                backend.app.placeOrder.assert_not_called()
+                self.assertEqual(backend.app.next_order_id, order_id_before)
+                self.assertEqual(backend.app.order_by_client, {})
+                self.assertEqual(backend.app.client_by_order, {})
+
+    def test_a_disconnected_gateway_does_not_reject_the_retry_of_a_known_order(self) -> None:
+        # The order may already be working at IBKR, so its retry is answered from
+        # what the bridge knows, never refused as a new order would be.
+        backend = self._backend()
+        with backend.app.condition:
+            backend.app.order_by_client["order.retry.known"] = 900
+            backend.app.orders["order.retry.known"] = {
+                "client_order_id": "order.retry.known",
+                "broker_order_id": "ibkr-paper-order-900",
+                "state": "ACKNOWLEDGED",
+                "filled_quantity": "0",
+            }
+            backend.app.connected_ready = False
+        response = backend.submit(_submit_payload("order.retry.known"))
+        self.assertEqual(response["status"], "ACKNOWLEDGED")
+        backend.app.placeOrder.assert_not_called()
+
+    def test_cancelling_an_unknown_order_is_reported_as_a_rejected_cancellation(self) -> None:
+        backend = self._backend()
+        self.assertEqual(backend.cancel({"client_order_id": "order.never.sent"}), {})
+        backend.app.cancelOrder.assert_not_called()
+        self.assertEqual(
+            backend.app.events.get_nowait(),
+            {
+                "event_type": "CANCEL_REJECTED",
+                "client_order_id": "order.never.sent",
+                "reason": "IBKR_BRIDGE_REFUSED_ORDER_UNKNOWN",
+            },
+        )
+        self.assertTrue(backend.app.events.empty())
+
+    def test_cancelling_while_disconnected_is_reported_as_a_rejected_cancellation(self) -> None:
+        backend = self._backend()
+        with backend.app.condition:
+            backend.app.order_by_client["order.live.1"] = 901
+            backend.app.connected_ready = False
+        self.assertEqual(backend.cancel({"client_order_id": "order.live.1"}), {})
+        backend.app.cancelOrder.assert_not_called()
+        self.assertEqual(
+            backend.app.events.get_nowait()["reason"], "IBKR_BRIDGE_REFUSED_GATEWAY_DISCONNECTED"
+        )
+        self.assertNotIn("order.live.1", backend.app.cancel_requested)
+
+    def test_cancelling_a_known_order_is_sent_and_remembered(self) -> None:
+        backend = self._backend()
+        with backend.app.condition:
+            backend.app.order_by_client["order.live.2"] = 902
+        self.assertEqual(backend.cancel({"client_order_id": "order.live.2"}), {})
+        backend.app.cancelOrder.assert_called_once_with(902, "")
+        self.assertIn("order.live.2", backend.app.cancel_requested)
+        self.assertTrue(backend.app.events.empty())
+
+    def test_a_malformed_cancel_payload_is_still_a_failure(self) -> None:
+        backend = self._backend()
+        with self.assertRaises(BridgeFailure):
+            backend.cancel({"client_order_id": "Not Canonical"})
+        self.assertTrue(backend.app.events.empty())
+
+
+class OfficialBackendErrorCodeTests(unittest.TestCase):
+    """IBKR message codes are classified by what they say about a tracked order (E5.4).
+
+    The codes come from IBKR's documentation, not from a retained Gateway session
+    (delivery state E5.6), so these tests pin the classification, not IBKR's behavior.
+    """
+
+    ORDER_ID = 555
+    CLIENT_ORDER_ID = "order.err.1"
+
+    def _backend_with_working_order(self):
+        backend = _build_official_backend()
+        with backend.app.condition:
+            backend.app.client_by_order[self.ORDER_ID] = self.CLIENT_ORDER_ID
+            backend.app.order_by_client[self.CLIENT_ORDER_ID] = self.ORDER_ID
+            backend.app.orders[self.CLIENT_ORDER_ID] = {
+                "client_order_id": self.CLIENT_ORDER_ID,
+                "broker_order_id": f"ibkr-paper-order-{self.ORDER_ID}",
+                "state": "ACKNOWLEDGED",
+                "filled_quantity": "0",
+            }
+        return backend
+
+    def _state(self, backend) -> str:
+        return backend.app.orders[self.CLIENT_ORDER_ID]["state"]
+
+    def test_notices_and_warnings_leave_a_working_order_working(self) -> None:
+        for code in (131, 202, 399, 404, 2100, 2109, 2169):
+            with self.subTest(code=code):
+                backend = self._backend_with_working_order()
+                backend.app.error(self.ORDER_ID, code, "notice", "")
+                self.assertEqual(self._state(backend), "ACKNOWLEDGED")
+                self.assertTrue(backend.app.events.empty())
+
+    def _backend_placing_an_order(self):
+        """An order handed to IBKR whose first callback has not arrived."""
+        backend = _build_official_backend()
+        with backend.app.condition:
+            backend.app.client_by_order[self.ORDER_ID] = self.CLIENT_ORDER_ID
+            backend.app.order_by_client[self.CLIENT_ORDER_ID] = self.ORDER_ID
+        return backend
+
+    def _drain(self, backend) -> list[dict]:
+        events = []
+        while not backend.app.events.empty():
+            events.append(backend.app.events.get_nowait())
+        return events
+
+    def test_a_held_or_amended_order_is_acknowledged_not_rejected(self) -> None:
+        # 404: held while shares are located for a short sale. 131: an attribute is ignored.
+        # IBKR reports the message first and the status after, and the order works.
+        for code in (404, 131):
+            with self.subTest(code=code):
+                backend = self._backend_placing_an_order()
+                backend.app.error(self.ORDER_ID, code, "the order is held", "")
+                backend.app.orderStatus(
+                    self.ORDER_ID, "PreSubmitted", 0, 10, 0.0, 1, 0, 0.0, 7, "", 0.0
+                )
+                self.assertEqual(self._state(backend), "ACKNOWLEDGED")
+                self.assertEqual(
+                    self._drain(backend),
+                    [
+                        {
+                            "event_type": "ACKNOWLEDGED",
+                            "client_order_id": self.CLIENT_ORDER_ID,
+                            "broker_order_id": f"ibkr-paper-order-{self.ORDER_ID}",
+                        }
+                    ],
+                )
+
+    def test_a_finished_order_is_not_reopened_by_a_late_status(self) -> None:
+        for label, finish, finished_state in (
+            ("rejected", lambda app: app.error(self.ORDER_ID, 201, "rejected", ""), "REJECTED"),
+            (
+                "cancelled",
+                lambda app: app.orderStatus(
+                    self.ORDER_ID, "Cancelled", 0, 10, 0.0, 1, 0, 0.0, 7, "", 0.0
+                ),
+                "CANCELLED",
+            ),
+            (
+                "filled",
+                lambda app: app.orderStatus(
+                    self.ORDER_ID, "Filled", 10, 0, 100.0, 1, 0, 100.0, 7, "", 0.0
+                ),
+                "FILLED",
+            ),
+        ):
+            with self.subTest(label=label):
+                backend = self._backend_with_working_order()
+                finish(backend.app)
+                self.assertEqual(self._state(backend), finished_state)
+                reported = self._drain(backend)
+                # The same order, in the order IBKR can deliver a stale callback.
+                for status, filled, remaining in (
+                    ("PreSubmitted", 0, 10),
+                    ("Submitted", 0, 10),
+                    ("Submitted", 4, 6),
+                ):
+                    backend.app.orderStatus(
+                        self.ORDER_ID, status, filled, remaining, 0.0, 1, 0, 0.0, 7, "", 0.0
+                    )
+                self.assertEqual(self._state(backend), finished_state)
+                self.assertEqual(
+                    backend.app.orders[self.CLIENT_ORDER_ID]["filled_quantity"],
+                    "10" if finished_state == "FILLED" else "0",
+                )
+                self.assertEqual(self._drain(backend), [], f"{label}: {reported}")
+
+    def test_a_late_error_does_not_reject_a_finished_order_or_report_a_second_rejection(self) -> None:
+        for code in (201, 110):
+            for state in ("REJECTED", "FILLED", "CANCELLED"):
+                with self.subTest(code=code, state=state):
+                    backend = self._backend_with_working_order()
+                    backend.app.orders[self.CLIENT_ORDER_ID]["state"] = state
+                    backend.app.error(self.ORDER_ID, code, "rejected", "")
+                    self.assertEqual(self._state(backend), state)
+                    self.assertTrue(backend.app.events.empty())
+
+    def test_the_warning_band_ends_where_ibkr_documents_it(self) -> None:
+        for code, state in ((2099, "REJECTED"), (2100, "ACKNOWLEDGED"), (2169, "ACKNOWLEDGED"), (2170, "REJECTED")):
+            with self.subTest(code=code):
+                backend = self._backend_with_working_order()
+                backend.app.error(self.ORDER_ID, code, "message", "")
+                self.assertEqual(self._state(backend), state)
+
+    def test_a_failed_cancellation_this_bridge_requested_is_reported_once(self) -> None:
+        for code in (135, 136, 161, 10147, 10148):
+            with self.subTest(code=code):
+                backend = self._backend_with_working_order()
+                backend.app.cancel_requested.add(self.CLIENT_ORDER_ID)
+                backend.app.error(self.ORDER_ID, code, "cannot cancel", "")
+                self.assertEqual(self._state(backend), "ACKNOWLEDGED")
+                self.assertEqual(
+                    backend.app.events.get_nowait(),
+                    {
+                        "event_type": "CANCEL_REJECTED",
+                        "client_order_id": self.CLIENT_ORDER_ID,
+                        "reason": f"IBKR_ERROR_{code}",
+                    },
+                )
+                backend.app.error(self.ORDER_ID, code, "cannot cancel", "")
+                self.assertTrue(backend.app.events.empty())
+
+    def test_a_cancel_failure_the_bridge_did_not_ask_for_changes_nothing(self) -> None:
+        backend = self._backend_with_working_order()
+        backend.app.error(self.ORDER_ID, 10148, "cannot cancel", "")
+        self.assertEqual(self._state(backend), "ACKNOWLEDGED")
+        self.assertTrue(backend.app.events.empty())
+
+    def test_a_terminal_status_forgets_the_cancel_request(self) -> None:
+        backend = self._backend_with_working_order()
+        backend.app.cancel_requested.add(self.CLIENT_ORDER_ID)
+        backend.app.orderStatus(
+            self.ORDER_ID, "Cancelled", 0, 10, 0.0, 0, 0, 0.0, 7, "", 0.0
+        )
+        self.assertNotIn(self.CLIENT_ORDER_ID, backend.app.cancel_requested)
+
+    def test_an_order_rejection_still_rejects(self) -> None:
+        for code in (201, 110):
+            with self.subTest(code=code):
+                backend = self._backend_with_working_order()
+                backend.app.error(self.ORDER_ID, code, "rejected", "")
+                self.assertEqual(self._state(backend), "REJECTED")
+                self.assertEqual(
+                    backend.app.events.get_nowait(),
+                    {
+                        "event_type": "REJECTED",
+                        "client_order_id": self.CLIENT_ORDER_ID,
+                        "reason": f"IBKR_ERROR_{code}",
+                    },
+                )
+
+    def test_an_error_for_no_tracked_order_changes_nothing(self) -> None:
+        backend = self._backend_with_working_order()
+        backend.app.error(-1, 201, "rejected", "")
+        backend.app.error(999, 10148, "cannot cancel", "")
+        self.assertEqual(self._state(backend), "ACKNOWLEDGED")
+        self.assertTrue(backend.app.events.empty())
 
 
 if __name__ == "__main__":
