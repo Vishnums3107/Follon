@@ -577,12 +577,97 @@ class OfficialBackendErrorCodeTests(unittest.TestCase):
         return backend.app.orders[self.CLIENT_ORDER_ID]["state"]
 
     def test_notices_and_warnings_leave_a_working_order_working(self) -> None:
-        for code in (202, 399, 2100, 2109, 2169):
+        for code in (131, 202, 399, 404, 2100, 2109, 2169):
             with self.subTest(code=code):
                 backend = self._backend_with_working_order()
                 backend.app.error(self.ORDER_ID, code, "notice", "")
                 self.assertEqual(self._state(backend), "ACKNOWLEDGED")
                 self.assertTrue(backend.app.events.empty())
+
+    def _backend_placing_an_order(self):
+        """An order handed to IBKR whose first callback has not arrived."""
+        backend = _build_official_backend()
+        with backend.app.condition:
+            backend.app.client_by_order[self.ORDER_ID] = self.CLIENT_ORDER_ID
+            backend.app.order_by_client[self.CLIENT_ORDER_ID] = self.ORDER_ID
+        return backend
+
+    def _drain(self, backend) -> list[dict]:
+        events = []
+        while not backend.app.events.empty():
+            events.append(backend.app.events.get_nowait())
+        return events
+
+    def test_a_held_or_amended_order_is_acknowledged_not_rejected(self) -> None:
+        # 404: held while shares are located for a short sale. 131: an attribute is ignored.
+        # IBKR reports the message first and the status after, and the order works.
+        for code in (404, 131):
+            with self.subTest(code=code):
+                backend = self._backend_placing_an_order()
+                backend.app.error(self.ORDER_ID, code, "the order is held", "")
+                backend.app.orderStatus(
+                    self.ORDER_ID, "PreSubmitted", 0, 10, 0.0, 1, 0, 0.0, 7, "", 0.0
+                )
+                self.assertEqual(self._state(backend), "ACKNOWLEDGED")
+                self.assertEqual(
+                    self._drain(backend),
+                    [
+                        {
+                            "event_type": "ACKNOWLEDGED",
+                            "client_order_id": self.CLIENT_ORDER_ID,
+                            "broker_order_id": f"ibkr-paper-order-{self.ORDER_ID}",
+                        }
+                    ],
+                )
+
+    def test_a_finished_order_is_not_reopened_by_a_late_status(self) -> None:
+        for label, finish, finished_state in (
+            ("rejected", lambda app: app.error(self.ORDER_ID, 201, "rejected", ""), "REJECTED"),
+            (
+                "cancelled",
+                lambda app: app.orderStatus(
+                    self.ORDER_ID, "Cancelled", 0, 10, 0.0, 1, 0, 0.0, 7, "", 0.0
+                ),
+                "CANCELLED",
+            ),
+            (
+                "filled",
+                lambda app: app.orderStatus(
+                    self.ORDER_ID, "Filled", 10, 0, 100.0, 1, 0, 100.0, 7, "", 0.0
+                ),
+                "FILLED",
+            ),
+        ):
+            with self.subTest(label=label):
+                backend = self._backend_with_working_order()
+                finish(backend.app)
+                self.assertEqual(self._state(backend), finished_state)
+                reported = self._drain(backend)
+                # The same order, in the order IBKR can deliver a stale callback.
+                for status, filled, remaining in (
+                    ("PreSubmitted", 0, 10),
+                    ("Submitted", 0, 10),
+                    ("Submitted", 4, 6),
+                ):
+                    backend.app.orderStatus(
+                        self.ORDER_ID, status, filled, remaining, 0.0, 1, 0, 0.0, 7, "", 0.0
+                    )
+                self.assertEqual(self._state(backend), finished_state)
+                self.assertEqual(
+                    backend.app.orders[self.CLIENT_ORDER_ID]["filled_quantity"],
+                    "10" if finished_state == "FILLED" else "0",
+                )
+                self.assertEqual(self._drain(backend), [], f"{label}: {reported}")
+
+    def test_a_late_error_does_not_reject_a_finished_order_or_report_a_second_rejection(self) -> None:
+        for code in (201, 110):
+            for state in ("REJECTED", "FILLED", "CANCELLED"):
+                with self.subTest(code=code, state=state):
+                    backend = self._backend_with_working_order()
+                    backend.app.orders[self.CLIENT_ORDER_ID]["state"] = state
+                    backend.app.error(self.ORDER_ID, code, "rejected", "")
+                    self.assertEqual(self._state(backend), state)
+                    self.assertTrue(backend.app.events.empty())
 
     def test_the_warning_band_ends_where_ibkr_documents_it(self) -> None:
         for code, state in ((2099, "REJECTED"), (2100, "ACKNOWLEDGED"), (2169, "ACKNOWLEDGED"), (2170, "REJECTED")):

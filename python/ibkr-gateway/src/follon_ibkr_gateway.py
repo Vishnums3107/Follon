@@ -53,15 +53,24 @@ class BridgeRefusal(BridgeFailure):
 # no retained Gateway session has produced them here (delivery state E5.6).
 #
 # * A notice describes an order that keeps its state: 202 reports a
-#   cancellation whose result `orderStatus` carries, and 399 is an order
-#   warning such as "will not be placed until the market opens". Treating
-#   either as a rejection would record an order IBKR still holds as terminal.
+#   cancellation whose result `orderStatus` carries, 399 is an order warning
+#   such as "will not be placed until the market opens", 404 says the order is
+#   held while shares are located for a short sale, and 131 says an order
+#   attribute is ignored. Treating any of them as a rejection would record an
+#   order IBKR still holds as terminal (delivery state E5.4, and again after a
+#   review found 404 and 131 among the codes that were still rejecting).
 # * 2100-2169 are system warnings, such as data-farm status.
 # * A cancel-failure code says the order was not cancelled and still works.
-# * Any other code on a tracked order remains a rejection, as before.
-NOTICE_CODES = frozenset({202, 399})
+# * Any other code on a tracked order remains a rejection, as before. That
+#   list is IBKR's, it is long, and only a retained Gateway session can say
+#   which codes a real order meets (delivery state E5.6).
+NOTICE_CODES = frozenset({131, 202, 399, 404})
 WARNING_CODES = range(2100, 2170)
 CANCEL_FAILURE_CODES = frozenset({135, 136, 161, 10147, 10148})
+# An order that has reached one of these is finished. IBKR delivers callbacks from its
+# own thread and can repeat or reorder them, so a late status or error must not reopen
+# an order the core has been told is over.
+TERMINAL_STATES = frozenset({"CANCELLED", "FILLED", "REJECTED"})
 
 
 class Backend(Protocol):
@@ -382,6 +391,9 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 if normalized in {"CANCELLED", "FILLED", "REJECTED"}:
                     self.cancel_requested.discard(client_order_id)
                 previous = self.orders.get(client_order_id, {}).get("state")
+                if previous in TERMINAL_STATES and normalized != previous:
+                    self.condition.notify_all()
+                    return
                 self.orders[client_order_id] = {
                     "client_order_id": client_order_id,
                     "broker_order_id": f"ibkr-paper-order-{orderId}",
@@ -579,7 +591,10 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                                 "reason": f"IBKR_ERROR_{errorCode}",
                             }
                         )
-                elif client_order_id is not None:
+                elif (
+                    client_order_id is not None
+                    and self.orders.get(client_order_id, {}).get("state") not in TERMINAL_STATES
+                ):
                     self.orders[client_order_id] = {
                         "client_order_id": client_order_id,
                         "broker_order_id": f"ibkr-paper-order-{reqId}",

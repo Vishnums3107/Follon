@@ -301,3 +301,34 @@ fn only_a_trade_toward_flat_reduces_a_position() {
         );
     }
 }
+
+/// Two orders that each close the whole position are each a reduction alone and
+/// together reverse it, so the second is judged against what the first has already
+/// claimed (delivery state E7.4b, review finding).
+#[test]
+fn a_reduction_must_fit_inside_the_position_beside_what_is_already_working() {
+    let cases = [
+        // (current, projected, already working in this direction, reduces)
+        ("100", "0", "0", true),
+        ("100", "0", "100", false),
+        ("100", "40", "40", true),
+        ("100", "40", "40.00000001", false),
+        ("-100", "0", "0", true),
+        ("-100", "0", "100", false),
+        ("-100", "-40", "40", true),
+        ("-100", "-40", "41", false),
+        // A trade that is not a reduction on its own is never made one by what is working.
+        ("100", "-20", "0", false),
+        ("100", "110", "0", false),
+        ("100", "100", "0", false),
+        ("0", "5", "0", false),
+    ];
+    for (current, projected, working, expected) in cases {
+        assert_eq!(
+            reduces_position_with_working(decimal(current), decimal(projected), decimal(working))
+                .unwrap(),
+            expected,
+            "{current} -> {projected} with {working} working"
+        );
+    }
+}

@@ -18,8 +18,9 @@ use follon_accounting::{
 };
 use follon_control_plane::{EngineError, OmsComboOrder, OmsOrder, Portfolio};
 use follon_domain::{
-    price_deviation_bps, reduces_position, validate_canonical_id, validate_utc_timestamp,
-    ComboIntent, Decimal, Fill, OrderIntent, OrderState, RiskDecision, Side, TimeInForce,
+    price_deviation_bps, reduces_position_with_working, validate_canonical_id,
+    validate_utc_timestamp, ComboIntent, Decimal, Fill, OrderIntent, OrderState, RiskDecision,
+    Side, TimeInForce,
 };
 use follon_instrument::{TradingCalendar, TradingSession};
 
@@ -3292,11 +3293,17 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 // Skipping the check outright would let an underwater account
                 // open more exposure past every aggregate limit exactly when
                 // they matter, so only a trade that moves this position toward
-                // flat may pass. The rest is refused (delivery state E7.4b).
-                None if !reduces_position(current_position, projected_position) => {
-                    reasons.push("PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned());
+                // flat may pass, counting what working orders already claim of
+                // it. The rest is refused (delivery state E7.4b).
+                None => {
+                    if !self.reduces_open_position(
+                        &intent.instrument_id,
+                        current_position,
+                        projected_position,
+                    )? {
+                        reasons.push("PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned());
+                    }
                 }
-                None => {}
             }
         }
         let approved = reasons.is_empty();
@@ -7005,6 +7012,302 @@ mod tests {
             follon_domain::ComboPriceLimit::MaximumDebit(amount("29992.50")),
         );
         assert!(!closing.reason_codes.contains(&refused));
+    }
+
+    /// Puts an order that is still working into the service, as a canary submission would,
+    /// without spending an approval or a canary slot.
+    fn rest_order(
+        service: &mut LiveTradingService<TestBroker>,
+        id: &str,
+        side: Side,
+        quantity: &str,
+        filled: &str,
+    ) {
+        let mut order = intent("LIVE", id);
+        order.side = side;
+        order.quantity = amount(quantity);
+        let market = market();
+        let policy_version = service.policy.version.clone();
+        let decision = LiveRiskDecision {
+            decision_id: format!("live-risk-{id}"),
+            approved: true,
+            reason_codes: vec!["APPROVED".to_owned()],
+            policy_version: policy_version.clone(),
+            decided_at: "2026-01-02T14:31:00Z".to_owned(),
+            market_fingerprint: market_fingerprint(&market),
+            evaluated_limits: String::new(),
+        };
+        let core_decision = RiskDecision {
+            decision_id: decision.decision_id.clone(),
+            intent_id: id.to_owned(),
+            approved: true,
+            reason_codes: decision.reason_codes.clone(),
+            policy_version,
+            decided_at: decision.decided_at.clone(),
+            correlation_id: order.correlation_id.clone(),
+            actor: "live_risk_engine".to_owned(),
+            evaluated_limits: String::new(),
+        };
+        let mut oms = OmsOrder::from_approved_intent(order, &core_decision).expect("an order");
+        oms.transition(OrderState::Approved, "LIVE_RISK_APPROVED")
+            .expect("approved");
+        oms.transition(
+            OrderState::PendingSubmit,
+            "LIVE_CANARY_SUBMISSION_REQUESTED",
+        )
+        .expect("pending");
+        service.orders.insert(
+            oms.order_id.clone(),
+            LiveOrder {
+                oms,
+                approval_id: "approval.live.rest".to_owned(),
+                market,
+                decision,
+                broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                replace_return_state: None,
+                filled_quantity: amount(filled),
+            },
+        );
+    }
+
+    /// Two orders that each close the whole short are each a reduction alone and would
+    /// together reverse it into a long, so an underwater account is refused the second
+    /// (delivery state E7.4b, found in review): what is already working claims part of the
+    /// position first.
+    #[test]
+    fn an_underwater_live_account_cannot_reverse_a_position_with_two_working_reductions() {
+        let mut service = service_holding_a_short_under_aggregate_risk("underwater-working");
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+        let assess =
+            |service: &mut LiveTradingService<TestBroker>, id: &str, side: Side, quantity: &str| {
+                let mut order = intent("LIVE", id);
+                order.side = side;
+                order.quantity = amount(quantity);
+                let market = LiveMarketData {
+                    instrument_id: "inst.us_equity.spy".to_owned(),
+                    mark_price: amount("600"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                };
+                service
+                    .evaluate_risk(&order, &market, "2026-01-02T14:32:00Z", true)
+                    .expect("a risk decision")
+            };
+        // Short 2 at a mark of 600 is underwater, and buying it all back alone is a reduction.
+        assert!(
+            !assess(&mut service, "intent.live.claims.alone", Side::Buy, "2")
+                .reason_codes
+                .contains(&refused)
+        );
+
+        // A sale that is working adds to the short and claims nothing of it.
+        rest_order(
+            &mut service,
+            "intent.live.claims.sale",
+            Side::Sell,
+            "5",
+            "0",
+        );
+        assert!(
+            !assess(&mut service, "intent.live.claims.opposite", Side::Buy, "2")
+                .reason_codes
+                .contains(&refused)
+        );
+
+        // A purchase of the whole short that is working claims all of it.
+        rest_order(
+            &mut service,
+            "intent.live.claims.cover",
+            Side::Buy,
+            "2",
+            "0",
+        );
+        for (id, quantity) in [
+            ("intent.live.claims.second", "2"),
+            ("intent.live.claims.one", "1"),
+        ] {
+            assert!(
+                assess(&mut service, id, Side::Buy, quantity)
+                    .reason_codes
+                    .contains(&refused),
+                "{id}"
+            );
+        }
+    }
+
+    /// A part-filled order claims only what it has left.
+    #[test]
+    fn an_underwater_live_account_counts_only_the_unfilled_part_of_a_working_reduction() {
+        let mut service = service_holding_a_short_under_aggregate_risk("underwater-part-filled");
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+        let fill = |id: &str, side: Side, price: &str| Fill {
+            execution_id: format!("execution.live.claims.{id}"),
+            order_id: format!("order.live.claims.{id}"),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            side,
+            quantity: amount(if side == Side::Sell { "2" } else { "1" }),
+            price: amount(price),
+            fee: Decimal::ZERO,
+            executed_at: "2026-01-02T14:31:30Z".to_owned(),
+        };
+        // Short 4 in all, then a purchase of 2 of which 1 has filled, at the mark of 600:
+        // the short is 3, equity is 1,040 - 600 - 3 * 600 = -1,360, and the 1 still working
+        // claims 1 of the 3.
+        service
+            .apply_accounted_fill(&fill("more", Side::Sell, "10"), "strategy.live.001")
+            .expect("a larger short");
+        service
+            .apply_accounted_fill(&fill("part", Side::Buy, "600"), "strategy.live.001")
+            .expect("the part that filled");
+        rest_order(&mut service, "intent.live.claims.part", Side::Buy, "2", "1");
+        let mut assess = |id: &str, quantity: &str| {
+            let mut order = intent("LIVE", id);
+            order.side = Side::Buy;
+            order.quantity = amount(quantity);
+            let market = LiveMarketData {
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                mark_price: amount("600"),
+                observed_at: "2026-01-02T14:32:00Z".to_owned(),
+            };
+            service
+                .evaluate_risk(&order, &market, "2026-01-02T14:32:00Z", true)
+                .expect("a risk decision")
+        };
+        // The other 2 may be bought back and not one more.
+        assert!(!assess("intent.live.claims.rest", "2")
+            .reason_codes
+            .contains(&refused));
+        assert!(assess("intent.live.claims.over", "3")
+            .reason_codes
+            .contains(&refused));
+    }
+
+    /// A combination's legs claim their instruments as plain orders do, by the units unfilled.
+    #[test]
+    fn an_underwater_live_account_counts_the_legs_of_a_working_combination() {
+        let path = journal_path("underwater-combo-working");
+        let mut risk_policy = policy_permitting_shorts();
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: permissive_portfolio_risk_policy(),
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        for (instrument, side, price) in [
+            ("inst.us_option.spy.near", Side::Buy, "7.50"),
+            ("inst.us_option.spy.far", Side::Sell, "5"),
+        ] {
+            service
+                .apply_accounted_fill(
+                    &Fill {
+                        execution_id: format!("execution.live.claims.{instrument}"),
+                        order_id: "order.live.claims.vertical".to_owned(),
+                        instrument_id: instrument.to_owned(),
+                        side,
+                        quantity: amount("4"),
+                        price: amount(price),
+                        fee: Decimal::ZERO,
+                        executed_at: "2026-01-02T14:31:00Z".to_owned(),
+                    },
+                    "strategy.live.001",
+                )
+                .expect("a leg of the vertical");
+        }
+        let market = LiveComboMarketData {
+            marks: vec![
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.near".to_owned(),
+                    mark_price: amount("7.50"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+                LiveMarketData {
+                    instrument_id: "inst.us_option.spy.far".to_owned(),
+                    mark_price: amount("30000"),
+                    observed_at: "2026-01-02T14:32:00Z".to_owned(),
+                },
+            ],
+        };
+        // Long 4 near, short 4 far: closing sells the near and buys the far.
+        // A leg's ratio multiplies the units, so one unit at a ratio of three closes three
+        // contracts.
+        let closing = |id: &str, units: &str, ratio: u32| {
+            let mut structure = combo_intent(id);
+            structure.combo_quantity = amount(units);
+            structure.legs[0].side = Side::Sell;
+            structure.legs[0].ratio = ratio;
+            structure.legs[0].limit_price = amount("7.50");
+            structure.legs[1].side = Side::Buy;
+            structure.legs[1].ratio = ratio;
+            structure.legs[1].limit_price = amount("30000");
+            structure.price_limit = follon_domain::ComboPriceLimit::MaximumDebit(amount("90000"));
+            structure
+        };
+        let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+
+        // Three contracts of the closing are working, so of the four held one more fits and
+        // two more would reverse the position.
+        let resting = closing("intent.live.claims.combo.resting", "1", 3);
+        let resting_decision = LiveRiskDecision {
+            decision_id: "live-risk-resting".to_owned(),
+            approved: true,
+            reason_codes: vec!["APPROVED".to_owned()],
+            policy_version: service.policy.version.clone(),
+            decided_at: "2026-01-02T14:31:00Z".to_owned(),
+            market_fingerprint: String::new(),
+            evaluated_limits: String::new(),
+        };
+        let core_decision = RiskDecision {
+            decision_id: resting_decision.decision_id.clone(),
+            intent_id: resting.intent_id.clone(),
+            approved: true,
+            reason_codes: resting_decision.reason_codes.clone(),
+            policy_version: resting_decision.policy_version.clone(),
+            decided_at: resting_decision.decided_at.clone(),
+            correlation_id: resting.correlation_id.clone(),
+            actor: "live_risk_engine".to_owned(),
+            evaluated_limits: String::new(),
+        };
+        let mut oms =
+            OmsComboOrder::from_approved_intent(resting, &core_decision).expect("a combination");
+        oms.transition(OrderState::Approved, "LIVE_COMBO_RISK_APPROVED")
+            .expect("approved");
+        oms.transition(
+            OrderState::PendingSubmit,
+            "LIVE_CANARY_COMBO_SUBMISSION_REQUESTED",
+        )
+        .expect("pending");
+        service.combo_orders.insert(
+            oms.order_id.clone(),
+            LiveComboOrder {
+                oms,
+                approval_id: "approval.live.rest".to_owned(),
+                market: market.clone(),
+                decision: resting_decision,
+                broker_order_id: None,
+                broker_order_versions: Vec::new(),
+                filled_quantity: Decimal::ZERO,
+                executions: BTreeMap::new(),
+            },
+        );
+        let one = service
+            .evaluate_combo_risk(
+                &closing("intent.live.claims.combo.one", "1", 1),
+                &market,
+                "2026-01-02T14:32:00Z",
+                true,
+            )
+            .expect("a combination decision");
+        assert!(!one.reason_codes.contains(&refused));
+        let two = service
+            .evaluate_combo_risk(
+                &closing("intent.live.claims.combo.two", "2", 1),
+                &market,
+                "2026-01-02T14:32:00Z",
+                true,
+            )
+            .expect("a combination decision");
+        assert!(two.reason_codes.contains(&refused));
+        let _ = fs::remove_file(&path);
     }
 
     /// An adapter that declares nothing is never handed a combination, a GTC

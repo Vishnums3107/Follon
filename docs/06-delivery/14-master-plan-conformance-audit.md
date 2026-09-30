@@ -4817,6 +4817,86 @@ These are mandatory master-plan acceptance conditions and are currently open:
        install and upgrade path was exercised on empty tables, because no writer in this repository
        inserts news. Nothing was pushed, so no GitHub run has seen it. No external gate moved.
 
+116. The reduce-only rule counts what is already working (2026-09-30, Financial risk controls; a
+     defect in item 107's rule, E7.4b). Found by an independent review of the slice.
+     - **Gap.** With aggregate risk configured and equity not positive, PAPER and controlled LIVE
+       let an order through only if it moved its position toward flat. Each order was judged
+       against the filled position alone, so two working orders that each sold the whole of a long
+       were each a reduction, both were approved, and together they reversed it into a short: the
+       one thing the rule exists to stop, in an account that was already underwater.
+     - **Behavior.** `reduces_position_with_working` in `core/domain` is `reduces_position` plus a
+       claim: the trade must fit inside the position beside what is already working. PAPER and
+       LIVE each total the unfilled quantity of every working order, and of every leg of a working
+       combination (by the combination units unfilled and the leg's ratio), that trades in the
+       reducing direction on that instrument, and pass it in. Working orders that add exposure
+       claim nothing, since one that never fills would otherwise refuse a reduction for something
+       that did not happen. A cancelled or filled order claims nothing.
+     - **Tests.** Seven were added: one domain table of boundary cases, and for each of PAPER and
+       LIVE a test that two working reductions cannot reverse the position, one that only the
+       unfilled part of a partly filled order is claimed and a cancellation releases it, and one
+       for the legs of a working combination, whose ratio multiplies the units. Each account is
+       asserted to be underwater first: the review's own scenario was not, and only looked as if
+       it were.
+     - **Rule 5.** 19 of 19 injected defects were caught by the intended tests: the trade's own
+       quantity, or what is working, left out; an inclusive boundary made exclusive; the wrong
+       side claimed; fills not taken off a working order; finished orders claiming and working ones
+       not; combinations skipped or their ratio ignored; and either gate, single or combination, in
+       either environment, passing nothing that is working. Two survived the first run, both
+       "fills not taken off a working order", because the part-filled cases refused the next order
+       whichever number was used. The cases were changed so that only the unfilled quantity lets
+       the last order through, and both were then caught.
+     - **Measured result.** The Rust workspace rose from 638 to 645 passed / 0 failed / 8 ignored
+       for this item, and the final run below measured all eight suites green with the full
+       evidence pipeline exiting 0.
+     - **Boundary.** Position limits and the aggregate composition still judge an order against
+       the filled position and ignore working orders (E7.14, open). This item makes the
+       equity-not-positive rule count them, and no other rule.
+
+117. A strategy worker's frame limit is bounded at both ends (2026-09-30, Security and
+     reliability; a defect in item 105, E7.2). Found by an independent review of the slice.
+     - **Gap.** `StrategyWorkerLimits::validate` refused a frame limit below 4 KiB and accepted
+       anything above it, `usize::MAX` included, and the reader added one to the limit to see a
+       frame that was a byte too long. At the top of the range that overflowed: a panic in a debug
+       build, and a limit of zero in a release build, where every frame would then be refused as
+       oversized.
+     - **Behavior.** The limit must lie between 4 KiB and 256 MiB (`MAX_FRAME_BYTES`), since a
+       bound no machine could honour bounds nothing. The reader's arithmetic saturates, so it is
+       correct wherever the limit came from. The defaults are unchanged.
+     - **Tests.** One test was added, that the reader still reads a frame with a limit of
+       `usize::MAX`, and the limits test now refuses a limit one byte over the maximum and
+       `usize::MAX`, accepts both ends, and holds `spawn_bounded` to the message.
+     - **Rule 5.** 4 of 4 injected defects were caught: no upper bound, an exclusive upper bound, no
+       lower bound, and the reader's addition left to overflow.
+     - **Measured result.** The Rust workspace rose by one passed test for this item.
+     - **Boundary.** Only the Rust caller can set the limits. No command-line option does, so an
+       operator can not yet tune them.
+
+118. The IBKR bridge no longer rejects a held order or reopens a finished one (2026-09-30,
+     Reliability; a defect in item 103, E5.4). Found by an independent review of the slice.
+     - **Gap.** Two documented IBKR warnings still rejected the order they concerned: 404, that the
+       order is held while shares are located for a short sale, and 131, that an attribute is
+       ignored. IBKR reports either before the status that says the order works, so a held order
+       was reported rejected, then acknowledged, and left `ACKNOWLEDGED` in the bridge after the
+       core had been told it was over. The same hole opened for any status that arrived after a
+       terminal one: IBKR delivers callbacks from its own thread and can repeat or reorder them,
+       and a later `PreSubmitted` reopened a rejected, cancelled or filled order.
+     - **Behavior.** 404 and 131 join 202 and 399 as notices, which leave an order's state alone. A
+       finished order (`FILLED`, `CANCELLED`, `REJECTED`) is final: a later status that differs is
+       ignored, and a later error neither rejects it nor reports a second rejection. Any other
+       code on a tracked order still rejects it, as before, and the code list is IBKR's documented
+       one and still not measured against a real session (E5.6).
+     - **Tests.** Three were added, and the notices test now covers 131 and 404: a held or
+       amended order is acknowledged and its only event is the acknowledgement, a finished order
+       stays finished through three later statuses for each of the three ways it can finish, and
+       a late error changes nothing on any finished order.
+     - **Rule 5.** 7 of 7 injected defects were caught: either code missing from the notices, the
+       status guard or the error guard removed, and each of the three states missing from the
+       finished set.
+     - **Measured result.** The Python suite rose from 170 to 173 passed.
+     - **Boundary.** The list of codes that reject is still IBKR's documentation and not a
+       retained Gateway session, so a warning this repository has not met can still reject its
+       order until E5.6 shows it, and that is recorded rather than guessed.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

@@ -398,7 +398,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .map(|portfolio| portfolio.position_snapshot().quantity)
                 .unwrap_or(Decimal::ZERO);
             let projected = held.checked_add(intent.projected_leg_delta(leg)?)?;
-            every_leg_reduces &= reduces_position(held, projected);
+            every_leg_reduces &= self.reduces_open_position(&leg.instrument_id, held, projected)?;
             if self.policy.breaches_position_limit(projected)? {
                 reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
             }
@@ -1259,6 +1259,56 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                         .any(|leg| leg.execution_id == execution_id)
             })
         })
+    }
+
+    /// Whether trading `instrument_id` from `current` to `projected` moves the position
+    /// toward flat, counting what working orders of either kind already claim of it.
+    pub(super) fn reduces_open_position(
+        &self,
+        instrument_id: &str,
+        current: Decimal,
+        projected: Decimal,
+    ) -> Result<bool, LiveError> {
+        let working = self.working_reduction(instrument_id, current)?;
+        Ok(reduces_position_with_working(current, projected, working)?)
+    }
+
+    /// The quantity working orders of either kind will still take off `position` in
+    /// `instrument_id`: sells against a long, buys against a short. A combination's legs
+    /// count individually, by the combination units still unfilled.
+    fn working_reduction(
+        &self,
+        instrument_id: &str,
+        position: Decimal,
+    ) -> Result<Decimal, LiveError> {
+        let reducing = if position > Decimal::ZERO {
+            Side::Sell
+        } else if position < Decimal::ZERO {
+            Side::Buy
+        } else {
+            return Ok(Decimal::ZERO);
+        };
+        let mut total = Decimal::ZERO;
+        for order in self.orders.values() {
+            let intent = &order.oms.intent;
+            if order.working() && intent.instrument_id == instrument_id && intent.side == reducing {
+                total = total.checked_add(intent.quantity.checked_sub(order.filled_quantity)?)?;
+            }
+        }
+        for order in self.combo_orders.values() {
+            if !order.working() {
+                continue;
+            }
+            let intent = &order.oms.intent;
+            let unfilled = intent.combo_quantity.checked_sub(order.filled_quantity)?;
+            for leg in &intent.legs {
+                if leg.instrument_id == instrument_id && leg.side == reducing {
+                    let ratio = Decimal::from_integer(i64::from(leg.ratio))?;
+                    total = total.checked_add(unfilled.checked_mul(ratio)?)?;
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Whether a working order of either kind would trade against `side` on

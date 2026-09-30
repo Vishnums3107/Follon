@@ -35,6 +35,34 @@ pub fn reduces_position(current: Decimal, projected: Decimal) -> bool {
         || (current < Decimal::ZERO && projected <= Decimal::ZERO && projected > current)
 }
 
+/// [`reduces_position`], once the orders already working in the instrument are counted.
+///
+/// `working_reduction` is the quantity those orders will still take off this position, in the
+/// direction of the trade being judged. Two orders that each sell the whole of a long position
+/// are each a reduction alone, and filled together they reverse it. So a trade is a reduction
+/// only if it and everything already working fit inside the position that is held. Nothing
+/// working in the other direction is counted: an order that adds exposure may never fill, and
+/// assuming it does would let a reduction be refused for something that may not happen.
+pub fn reduces_position_with_working(
+    current: Decimal,
+    projected: Decimal,
+    working_reduction: Decimal,
+) -> Result<bool, DecimalError> {
+    if !reduces_position(current, projected) {
+        return Ok(false);
+    }
+    let claimed = magnitude(projected.checked_sub(current)?)?.checked_add(working_reduction)?;
+    Ok(claimed <= magnitude(current)?)
+}
+
+fn magnitude(value: Decimal) -> Result<Decimal, DecimalError> {
+    if value < Decimal::ZERO {
+        Decimal::ZERO.checked_sub(value)
+    } else {
+        Ok(value)
+    }
+}
+
 /// Supported first-slice order types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderType {

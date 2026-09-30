@@ -56,19 +56,19 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-29T15:40:34Z  
+**Measured at:** 2026-09-30T04:31:55Z  
 **Branch:** `refactor/module-decomposition`  
-**HEAD:** `c6f621d` -- feat(cli): capsule replay takes an evaluation's corporate actions -- E8.4a (2026-09-29T21:00:10+05:30)  
-**Uncommitted paths:** 7
+**HEAD:** `4cdbd59` -- docs(delivery-state): do not state a commit count that the next commit changes (2026-09-29T21:19:02+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 638 | 0 | 8 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 646 | 0 | 8 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 8 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 170 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 173 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -249,7 +249,7 @@ epic lands (see the correction under the external gates).
 | E5.1 | The real adapter refuses, before transmitting and as a clean rejection, what its bridge cannot execute. That covers combinations: the Python dispatch has no `submit_combo`, and the Rust payload drops each leg's quantity and the debit or credit sign. It also covers any time in force other than DAY. Replacement is already refused by the trait default, but `core/paper` records that refusal as `UNKNOWN`. **Landed as `PaperBrokerCapabilities`**: every adapter declares what it carries, defaulting to single DAY orders, and the service refuses anything more before risk is evaluated or an order exists. The real adapter declares the default, and its transport no longer emits `submit_combo` (audit item 87). | **done** 2026-09-28 |
 | E5.2 | The authenticated gRPC PAPER route composes the real bridge by configuration, with the model as the default. **E5.2a** binds the adapter and IBKR session to the journal fingerprint (audit item 99). **E5.2b** adds operator-attributed single-order submit and cancel over the journaled kernel (items 100–101). **E5.2c** adds a risk-manager `ReconcilePaperAccount` RPC: it drains broker events, compares the snapshot, returns its discrepancies and UNKNOWN count, and can explicitly reconnect. A stateful bridge protocol fixture applied a fill and reconciled its account; a model restart surfaced missing broker state rather than reporting clean (audit item 102). No background poller or real Gateway evidence is claimed. | E5.2a–c **done** 2026-09-29; E5.5 and E5.6 open |
 | E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
-| E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR, from transport ambiguity. Before, every `ok: false` reply stranded the order `UNKNOWN` and disconnected the session. **Now** a refused submission answers `REJECTED` (`IBKR_BRIDGE_REFUSED_<CODE>`) and leaves the session connected, a refused cancellation is reported as a `CANCEL_REJECTED` event so the order returns to working, and anything else stays `UNKNOWN`. IBKR's notices (202, 399, the 2100–2169 warnings) no longer reject a working order, and its cancel-failure codes (135, 136, 161, 10147, 10148) report a rejected cancellation. The code table is IBKR's documented one, not measured against a real TWS (E5.6). Audit item 103. | **done** 2026-09-29 |
+| E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR, from transport ambiguity. Before, every `ok: false` reply stranded the order `UNKNOWN` and disconnected the session. **Now** a refused submission answers `REJECTED` (`IBKR_BRIDGE_REFUSED_<CODE>`) and leaves the session connected, a refused cancellation is reported as a `CANCEL_REJECTED` event so the order returns to working, and anything else stays `UNKNOWN`. IBKR's notices (131, 202, 399, 404, the 2100–2169 warnings) no longer reject a working order, and its cancel-failure codes (135, 136, 161, 10147, 10148) report a rejected cancellation. **A review on 2026-09-30 found 404 (held while shares are located) and 131 (an attribute is ignored) still rejecting, and a status that arrived after a rejection reopening the order** as `ACKNOWLEDGED`; both are fixed, and a finished order is now final against a late status or a second error (audit item 118). The code table is IBKR's documented one, not measured against a real TWS (E5.6). Audit item 103. | **done** 2026-09-29; review fix 2026-09-30 |
 | E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
 | E5.6 | Retained Gateway evidence against a real TWS or IB Gateway PAPER session: restart, reconnect, cancellation races and reconciliation. | **external** |
 | E5.7 | E5.1's analogue for controlled LIVE. `IbkrControlledLiveAdapter` inherited a refusing `submit_combo`, and `core/live` recorded that refusal as a transport failure: the combination became `UNKNOWN`, the session disconnected, and the approval and a canary slot stayed consumed. **Now** every LIVE adapter declares `LiveBrokerCapabilities`, defaulting to single DAY orders. The service refuses a combination, a GTC intent or a replacement the adapter did not declare before the approval is looked at, a canary slot is spent or an order exists. It is a separate type from PAPER's, so PAPER can never widen what LIVE attempts. The IBKR LIVE adapter declares replacement only. Audit item 104. Still latent: no application composes a LIVE adapter that can trade. | **done** 2026-09-29 |
@@ -276,10 +276,10 @@ passes it for production.
 | Slice | Scope | State |
 | --- | --- | --- |
 | E7.1 | E3.11's link guard for every durable writer it did not cover. The operations journal's reader reports a dangling link as a healthy empty journal. The replay `FileEventStore` and the backtest `FileExperimentStore` check `exists()` and then open with `create(true)`. `follon-news` output uses `File::create`, which truncates a link's target. `write_immutable` leaves its staging file behind on a dangling link. **Each now refuses any link without following it**; the experiment store checks again at every write, because it reopens its file each time (audit item 91). | **done** 2026-09-28 |
-| E7.2 | Strategy-worker frames. Each was one newline-terminated JSON line, read with an unbounded `read_line` and no deadline, and written with a blocking `write_all`. **Now** every frame is bounded before it is buffered (16 MiB, newline included), and every round trip, request write included, has a 60-second deadline. Both are `StrategyWorkerLimits`, and `ProcessStrategyWorker::spawn_bounded` sets them explicitly. A transport fault (oversized or cut-off frame, closed pipe, expired deadline) kills the worker and it is never asked again. The reader is `core/control-plane/src/worker_io.rs`, not the IBKR bridge's, because `core` cannot depend on an adapter. Audit item 105. | **done** 2026-09-29 |
+| E7.2 | Strategy-worker frames. Each was one newline-terminated JSON line, read with an unbounded `read_line` and no deadline, and written with a blocking `write_all`. **Now** every frame is bounded before it is buffered (16 MiB, newline included), and every round trip, request write included, has a 60-second deadline. Both are `StrategyWorkerLimits`, and `ProcessStrategyWorker::spawn_bounded` sets them explicitly. A transport fault (oversized or cut-off frame, closed pipe, expired deadline) kills the worker and it is never asked again. The reader is `core/control-plane/src/worker_io.rs`, not the IBKR bridge's, because `core` cannot depend on an adapter. Audit item 105. **A review on 2026-09-30 found that `validate` accepted a frame limit of `usize::MAX` and the reader then overflowed adding one to it;** the limit is now bounded to 4 KiB–256 MiB and the arithmetic saturates (audit item 117). | **done** 2026-09-29; review fix 2026-09-30 |
 | E7.3 | Worker determinism. The worker's environment is cleared and `PYTHONHASHSEED` is never set, so string-hash iteration order differs between two runs of one strategy. **The parent now sets `PYTHONHASHSEED=0`** for every worker, capsule replays included (audit item 92). The backtest `seed` still does not seed a strategy's own randomness. | **done** 2026-09-28 |
 | E7.4a | Portfolio-risk configuration fingerprints. PAPER's and LIVE's both omitted `max_daily_loss`, `max_drawdown_bps`, `max_margin_utilization_bps`, `strategy_limits` and `margin_rates`. **Now every field enters both**, through `PortfolioRiskPolicy::canonical_parts`, whose exhaustive destructuring makes a new field a compile error until it is rendered. The part is tagged `v2`, so a journal or LIVE approval made under the incomplete version-1 fingerprint is refused rather than trusted (audit item 98). | **done** 2026-09-29 |
-| E7.4b | The aggregate portfolio-risk check was skipped outright when equity is not positive. Failing closed on everything would also have refused risk-reducing orders, such as closing positions, so the treatment was left to the operator. **Decided 2026-09-29 by the agent under the operator's blanket delegation (Settled direction item 6): reduce-only.** With aggregate risk configured, PAPER and controlled LIVE refuse every order that does not move a position strictly toward flat (`PORTFOLIO_EQUITY_NOT_POSITIVE`), a combination unless every leg does, and still pass one that reduces a position without crossing through flat. `follon_domain::reduces_position` is the one definition. Audit item 107. | **done** 2026-09-29 |
+| E7.4b | The aggregate portfolio-risk check was skipped outright when equity is not positive. Failing closed on everything would also have refused risk-reducing orders, such as closing positions, so the treatment was left to the operator. **Decided 2026-09-29 by the agent under the operator's blanket delegation (Settled direction item 6): reduce-only.** With aggregate risk configured, PAPER and controlled LIVE refuse every order that does not move a position strictly toward flat (`PORTFOLIO_EQUITY_NOT_POSITIVE`), a combination unless every leg does, and still pass one that reduces a position without crossing through flat. `follon_domain::reduces_position` is the one definition. Audit item 107. **A review on 2026-09-30 found the rule judged each order against the filled position alone:** two working orders that each sold the whole of a long were each a reduction, and together they reversed it. **Now** what is already working counts, so the unfilled quantity of every working order (and of every leg of a working combination) that reduces the same position claims part of it first (`reduces_position_with_working`; audit item 116). | **done** 2026-09-29; review fix 2026-09-30 |
 | E7.5 | Aggregate portfolio risk in the order-submitting routes. Only the read-only `follon-paper-status` composed it. **Now** the gRPC PAPER route's and the desktop gateway's configurations take an optional `portfolio_risk` block, the document `follon-paper-status` reads. It moved into `core/paper` as `PortfolioRiskDocument`, so no application can read a limit differently. Present, it gates every order and combination through the composed kernel and is part of the journal fingerprint; absent, nothing changes. The route's JSON schema publishes it and is tested equal to the version-2 paper schema's. Audit item 110. Controlled LIVE already composes it through `LiveConfiguration`, and is unchanged. | **done** 2026-09-29 |
 | E7.6 | `release-keygen` validates every output before it writes the private key (E3.11's finding). **Done:** a link, an existing file, a non-UTF-8 name, a bad parent or one path for both outputs is refused before a key exists, so none of them leaves a private key behind. Whether to delete a key after a late write failure, such as a full disk, is still a custody decision (audit item 97). | **done** 2026-09-29 |
 | E7.7 | PostgreSQL evidence tables refuse UPDATE and DELETE, and the news tables get a tenant. **Now** migration 0006 attaches a `BEFORE UPDATE OR DELETE` row trigger and a `BEFORE TRUNCATE` statement trigger to 16 append-only tables (domain events, the journal, risk policy, strategy and configuration versions, broker commands and receipts, the audit index, news, FX pricing and the execution evidence), each raising `restrict_violation`. Two versioned reference tables, instrument reference and FX economics, may be closed once by giving `effective_to` a value and are otherwise fixed. The news tables gained a tenant, per-tenant keys, tenant-scoped foreign keys and the row-level security every other table has, and the migration refuses to run over news rows it cannot assign, so it never guesses an owner. The triggers are the application's boundary, not a defence against the database's owner, who can disable one with a DDL statement that shows in the logs. **Verified against a real server for the first time in this environment:** a throwaway PostgreSQL 17 ran all eight database tests, twice over one database, and a backup of it restored cleanly through `tools/postgres_recovery.py`. `session_status.py` now runs the database tests whenever `FOLLON_TEST_DATABASE_URL` is set. Audit item 115. | **done** 2026-09-29 |
@@ -289,6 +289,7 @@ passes it for production.
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |
 | E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open: `O_NOFOLLOW` on Unix, and on Windows `FILE_FLAG_OPEN_REPARSE_POINT` followed by a check of the handle's own file type. **Deferred 2026-09-29, not attempted:** the Unix half cannot be compiled or tested on this Windows host (no Linux toolchain, no target, and Docker and WSL are stopped), and half a no-follow open would be worse than none. The guard sites, ten across eight crates, each check and then open; converting them means removing the check so the open itself is the guard. | open, needs a Linux environment |
 | E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
+| E7.14 | Position limits and the aggregate composition judge an order against the filled position and ignore working orders, so several orders that are each within a limit can together exceed it once they fill. Cash already counts what working orders reserve. **Found in review 2026-09-30**, and left open while E7.4b's reduce-only rule was fixed: counting working exposure in `breaches_position_limit` and in the aggregate candidate changes what `projected_position` and the portfolio metrics mean in the evidence every decision records. | open |
 
 ### E8 — Accounting and state parity (assessment priority 5)
 
@@ -816,6 +817,14 @@ the reversal here with its date.
      its successor takes over, so it is fixed except for setting `effective_to` from
      nothing to a value, once. Refusing that too would have made the versioning
      unusable, and allowing more would have let history be rewritten.
+   - **2026-09-30, from the review of the above.** E7.4b's reduce-only rule counts
+     the unfilled quantity of working orders that reduce the same position, and only
+     those. The alternative, counting every working order as if it would fill, would
+     refuse a reduction because of an opening order that may never fill. E7.2's frame
+     limit is capped at 256 MiB, which no worker has needed. E5.4's bridge treats 404
+     and 131 as notices and a finished order as final, because a mistaken rejection
+     leaves a live order the core believes is over, where a mistaken notice leaves an
+     order that the next status or reconciliation settles.
 
 ### Still unanswered
 
@@ -829,6 +838,29 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-30 — session 14
+
+- Resumed at `4cdbd59` with a clean tree. Four independent read-only reviews of
+  session 13's work (acceptance evidence, the replay changes, the PostgreSQL
+  migration, and the earlier broker, risk and worker slices) had been started
+  when the previous session ended, and all four died on an organisation spend
+  limit before they reported. Their scratch directories held the probes and
+  mutation runs they had written, so the findings were recovered from those and
+  each was reproduced or re-derived here before it was believed. One was not: a
+  review probe that claimed an account was underwater had failed its own
+  assertion and gone on without it.
+- Fixes from that review, each with rule-5 injections, all suites and the full
+  pipeline measured before its commit:
+  - **Review fixes to earlier slices (audit items 116 to 118).** E7.4b's reduce-only
+    rule now counts what is already working, so two orders that each close a whole
+    position cannot together reverse it. E7.2's frame limit is bounded at both ends
+    and its reader no longer overflows. E5.4's bridge treats IBKR's 404 and 131 as
+    notices instead of rejections, and a finished order stays finished against a late
+    status.
+- Measured at that commit: Rust 646 / 0 / 8 ignored, PostgreSQL 8 / 0 against a
+  throwaway server, Tauri 33, Python 173, both desktop suites green, the full
+  pipeline exit 0.
 
 ### 2026-09-29 — session 13
 

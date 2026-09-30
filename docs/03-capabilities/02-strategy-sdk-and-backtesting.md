@@ -53,7 +53,9 @@ A worker is untrusted code behind a pipe, so the host bounds it. A frame is one
 newline-terminated line of at most 16 MiB, refused before it is buffered in
 full. Each callback has a 60-second deadline that also covers the write of its
 request, so a worker that stops reading cannot hang a replay. These are the
-defaults of `StrategyWorkerLimits`. An oversized or cut-off frame, a closed pipe
+defaults of `StrategyWorkerLimits`, and a caller that sets its own may choose a
+frame limit from 4 KiB to 256 MiB, since a limit no machine could honour bounds
+nothing. An oversized or cut-off frame, a closed pipe
 or an expired deadline is a transport fault: the worker's process is ended and
 it is never asked another question, because no later answer could be matched to
 a request. The deadline only ends a replay with an error; time never enters a

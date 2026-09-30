@@ -4006,14 +4006,19 @@ mod tests {
     fn worker_limits_that_would_fail_a_well_formed_worker_are_refused() {
         for limits in [
             worker_limits(StrategyWorkerLimits::MIN_FRAME_BYTES - 1, 1_000),
+            worker_limits(StrategyWorkerLimits::MAX_FRAME_BYTES + 1, 1_000),
+            worker_limits(usize::MAX, 1_000),
             worker_limits(64 * 1024, 0),
         ] {
             assert!(limits.validate().is_err(), "{limits:?}");
         }
         assert!(StrategyWorkerLimits::DEFAULT.validate().is_ok());
-        assert!(worker_limits(StrategyWorkerLimits::MIN_FRAME_BYTES, 1)
-            .validate()
-            .is_ok());
+        for edge in [
+            StrategyWorkerLimits::MIN_FRAME_BYTES,
+            StrategyWorkerLimits::MAX_FRAME_BYTES,
+        ] {
+            assert!(worker_limits(edge, 1).validate().is_ok(), "{edge}");
+        }
         assert_eq!(
             StrategyWorkerLimits::default(),
             StrategyWorkerLimits::DEFAULT
@@ -4027,7 +4032,24 @@ mod tests {
         )
         .err()
         .expect("a frame limit below the minimum is refused");
-        assert!(refusal.0.contains("at least 4096 bytes"), "{}", refusal.0);
+        assert!(
+            refusal.0.contains("between 4096 and 268435456 bytes"),
+            "{}",
+            refusal.0
+        );
+        let refusal = ProcessStrategyWorker::spawn_bounded(
+            "unused-program",
+            Vec::<OsString>::new(),
+            worker_identity(),
+            worker_limits(usize::MAX, 1_000),
+        )
+        .err()
+        .expect("a frame limit above the maximum is refused");
+        assert!(
+            refusal.0.contains("between 4096 and 268435456 bytes"),
+            "{}",
+            refusal.0
+        );
     }
 
     #[test]

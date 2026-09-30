@@ -317,6 +317,250 @@ fn an_underwater_paper_account_may_only_reduce_a_position() {
     assert!(reducing.order_id.is_some());
 }
 
+const OPENED_AT: &str = "2026-01-02T14:31:00Z";
+const UNDERWATER_AT: &str = "2026-01-02T14:32:00Z";
+
+fn qqq_market(price: &str, observed_at: &str) -> PaperMarketData {
+    PaperMarketData {
+        instrument_id: "inst.us_equity.qqq".to_owned(),
+        mark_price: decimal("mark", price).unwrap(),
+        observed_at: observed_at.to_owned(),
+    }
+}
+
+/// Fills `quantity` of an acknowledged order at `price` and lets the service see it.
+fn fill_order(
+    service: &mut PaperTradingService<IbkrPaperAdapter>,
+    order_id: &str,
+    quantity: &str,
+    price: &str,
+    at: &str,
+) {
+    service
+        .broker_mut()
+        .queue_fill(
+            order_id,
+            decimal("quantity", quantity).unwrap(),
+            decimal("price", price).unwrap(),
+            Decimal::ZERO,
+            at,
+        )
+        .unwrap();
+    service.synchronize().unwrap();
+}
+
+/// A service long 100 SPY, bought at 100, and short 100 QQQ, sold at 100. Marking QQQ at
+/// 1,300 takes equity to 100,000 + 100 * 100 - 100 * 1,300 = -20,000, with the long still
+/// in hand to be closed.
+fn underwater_service_long_spy() -> PaperTradingService<IbkrPaperAdapter> {
+    let mut service = service_with_aggregate_risk_and_shorts();
+    let bought = service
+        .submit_intent(
+            OrderIntent {
+                quantity: decimal("quantity", "100").unwrap(),
+                ..intent("intent-long-spy", OPENED_AT)
+            },
+            market_at_price("100", OPENED_AT),
+            OPENED_AT,
+        )
+        .unwrap();
+    assert!(
+        bought.decision.approved,
+        "{:?}",
+        bought.decision.reason_codes
+    );
+    fill_order(
+        &mut service,
+        &bought.order_id.unwrap(),
+        "100",
+        "100",
+        "2026-01-02T14:31:01Z",
+    );
+    let shorted = service
+        .submit_intent(
+            OrderIntent {
+                instrument_id: "inst.us_equity.qqq".to_owned(),
+                side: Side::Sell,
+                quantity: decimal("quantity", "100").unwrap(),
+                ..intent("intent-short-qqq", OPENED_AT)
+            },
+            qqq_market("100", OPENED_AT),
+            OPENED_AT,
+        )
+        .unwrap();
+    assert!(
+        shorted.decision.approved,
+        "{:?}",
+        shorted.decision.reason_codes
+    );
+    fill_order(
+        &mut service,
+        &shorted.order_id.unwrap(),
+        "100",
+        "100",
+        "2026-01-02T14:31:02Z",
+    );
+    // The account is underwater: opening more exposure is refused for that reason.
+    let probe = service
+        .submit_intent(
+            OrderIntent {
+                instrument_id: "inst.us_equity.qqq".to_owned(),
+                side: Side::Sell,
+                quantity: decimal("quantity", "1").unwrap(),
+                ..intent("intent-underwater-probe", UNDERWATER_AT)
+            },
+            qqq_market("1300", UNDERWATER_AT),
+            UNDERWATER_AT,
+        )
+        .unwrap();
+    assert!(
+        probe
+            .decision
+            .reason_codes
+            .contains(&"PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned()),
+        "{:?}",
+        probe.decision.reason_codes
+    );
+    service
+}
+
+/// Sells SPY at the given quantity against the underwater account, returning the outcome.
+fn sell_spy(
+    service: &mut PaperTradingService<IbkrPaperAdapter>,
+    id: &str,
+    quantity: &str,
+) -> PaperSubmitOutcome {
+    service
+        .submit_intent(
+            OrderIntent {
+                side: Side::Sell,
+                quantity: decimal("quantity", quantity).unwrap(),
+                ..intent(id, UNDERWATER_AT)
+            },
+            market_at_price("100", UNDERWATER_AT),
+            UNDERWATER_AT,
+        )
+        .unwrap()
+}
+
+/// Two orders that each close the whole long are each a reduction alone and would together
+/// reverse it into a short, so an underwater account is refused the second (delivery state
+/// E7.4b, found in review): what is already working claims part of the position first.
+#[test]
+fn an_underwater_paper_account_cannot_reverse_a_position_with_two_working_reductions() {
+    let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+    let mut service = underwater_service_long_spy();
+
+    let first = sell_spy(&mut service, "intent-close-first", "100");
+    assert!(first.decision.approved, "{:?}", first.decision.reason_codes);
+    // The whole position is now claimed, so not even one more share is a reduction.
+    for (id, quantity) in [("intent-close-second", "100"), ("intent-close-one", "1")] {
+        let excess = sell_spy(&mut service, id, quantity);
+        assert!(!excess.decision.approved, "{id}");
+        assert!(excess.order_id.is_none(), "{id}");
+        assert!(excess.decision.reason_codes.contains(&refused), "{id}");
+    }
+
+    // Once the first order fills, the account is flat in SPY and a further sale opens a short.
+    fill_order(
+        &mut service,
+        &first.order_id.unwrap(),
+        "100",
+        "100",
+        "2026-01-02T14:32:01Z",
+    );
+    let opening = sell_spy(&mut service, "intent-open-short", "1");
+    assert!(opening.decision.reason_codes.contains(&refused));
+}
+
+/// A part-filled order claims only what it has left, and a cancelled one claims nothing.
+#[test]
+fn an_underwater_paper_account_counts_only_the_unfilled_part_of_a_working_reduction() {
+    let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+    let mut service = underwater_service_long_spy();
+
+    // Sell 50 of which 30 fill: 70 are held and the 20 still working claim 20 of them, so
+    // the other 50 may be sold and not one share more.
+    let first = sell_spy(&mut service, "intent-part-first", "50");
+    assert!(first.decision.approved, "{:?}", first.decision.reason_codes);
+    let first_id = first.order_id.unwrap();
+    fill_order(&mut service, &first_id, "30", "100", "2026-01-02T14:32:01Z");
+    let rest = sell_spy(&mut service, "intent-part-second", "50");
+    assert!(rest.decision.approved, "{:?}", rest.decision.reason_codes);
+    let beyond = sell_spy(&mut service, "intent-part-third", "1");
+    assert!(beyond.decision.reason_codes.contains(&refused));
+
+    // Cancelling the first order releases exactly the 20 it had left.
+    service.cancel_order(&first_id).unwrap();
+    service.synchronize().unwrap();
+    let released = sell_spy(&mut service, "intent-part-fourth", "20");
+    assert!(
+        released.decision.approved,
+        "{:?}",
+        released.decision.reason_codes
+    );
+    let exhausted = sell_spy(&mut service, "intent-part-fifth", "1");
+    assert!(exhausted.decision.reason_codes.contains(&refused));
+}
+
+/// A combination's legs claim their instruments as plain orders do, by the units unfilled.
+#[test]
+fn an_underwater_paper_account_counts_the_legs_of_a_working_combination() {
+    let refused = "PORTFOLIO_EQUITY_NOT_POSITIVE".to_owned();
+    let mut service = service_with_aggregate_risk_and_shorts();
+    let opening = submit_lifecycle_combo(&mut service, "claims-open");
+    let fill = combo_execution(&service, &opening, "group-claims", "4");
+    service.broker.queue_combo_fill(fill).unwrap();
+    service.synchronize().unwrap();
+    let market = PaperComboMarketData {
+        marks: vec![
+            PaperMarketData {
+                instrument_id: "inst.us_option.spy.near".to_owned(),
+                mark_price: decimal("mark", "7.50").unwrap(),
+                observed_at: UNDERWATER_AT.to_owned(),
+            },
+            PaperMarketData {
+                instrument_id: "inst.us_option.spy.far".to_owned(),
+                mark_price: decimal("mark", "30000").unwrap(),
+                observed_at: UNDERWATER_AT.to_owned(),
+            },
+        ],
+    };
+    // Long 4 near, short 4 far, so closing is a sale of the near and a purchase of the far.
+    // A leg's ratio multiplies the units, so one unit at a ratio of two closes two contracts.
+    let close =
+        |service: &mut PaperTradingService<IbkrPaperAdapter>, id: &str, units: &str, ratio: u32| {
+            let mut structure = combo_intent(id, UNDERWATER_AT);
+            structure.combo_quantity = decimal("units", units).unwrap();
+            structure.legs[0].side = Side::Sell;
+            structure.legs[0].ratio = ratio;
+            structure.legs[0].limit_price = decimal("near", "7.50").unwrap();
+            structure.legs[1].side = Side::Buy;
+            structure.legs[1].ratio = ratio;
+            structure.legs[1].limit_price = decimal("far", "30000").unwrap();
+            structure.price_limit =
+                follon_domain::ComboPriceLimit::MaximumDebit(decimal("debit", "59985").unwrap());
+            service
+                .submit_combo_intent(structure, market.clone(), UNDERWATER_AT)
+                .unwrap()
+        };
+
+    let first = close(&mut service, "claims-close-first", "1", 2);
+    assert!(first.decision.approved, "{:?}", first.decision.reason_codes);
+    let second = close(&mut service, "claims-close-second", "1", 1);
+    assert!(
+        second.decision.approved,
+        "{:?}",
+        second.decision.reason_codes
+    );
+    // Three of the four contracts are claimed. One more still fits, though the cash to pay
+    // for it is gone, and two more would reverse the position.
+    let exact = close(&mut service, "claims-close-exact", "1", 1);
+    assert!(!exact.decision.reason_codes.contains(&refused));
+    let too_many = close(&mut service, "claims-close-too-many", "2", 1);
+    assert!(too_many.decision.reason_codes.contains(&refused));
+}
+
 /// A combination is one atomic group, so it reduces risk only if every leg
 /// moves its own position toward flat.
 #[test]

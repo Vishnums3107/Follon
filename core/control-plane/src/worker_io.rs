@@ -45,12 +45,17 @@ impl StrategyWorkerLimits {
     /// inside it, so a smaller value could only refuse a well-formed worker.
     pub const MIN_FRAME_BYTES: usize = 4 * 1024;
 
-    /// Refuses limits that would make a well-formed worker fail.
+    /// The largest frame limit. A limit is a bound on what an untrusted worker may make
+    /// this process hold, so one that no machine could honour is a bound in name only.
+    pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Refuses limits that would make a well-formed worker fail, or that bound nothing.
     pub fn validate(&self) -> Result<(), EngineError> {
-        if self.max_frame_bytes < Self::MIN_FRAME_BYTES {
+        if !(Self::MIN_FRAME_BYTES..=Self::MAX_FRAME_BYTES).contains(&self.max_frame_bytes) {
             return Err(EngineError(format!(
-                "strategy worker frame limit must be at least {} bytes",
-                Self::MIN_FRAME_BYTES
+                "strategy worker frame limit must be between {} and {} bytes",
+                Self::MIN_FRAME_BYTES,
+                Self::MAX_FRAME_BYTES
             )));
         }
         if self.frame_deadline.is_zero() {
@@ -197,7 +202,7 @@ fn read_frame(reader: &mut impl BufRead, max_frame_bytes: usize) -> Result<Vec<u
     let mut bytes = Vec::new();
     match reader
         .by_ref()
-        .take(max_frame_bytes as u64 + 1)
+        .take((max_frame_bytes as u64).saturating_add(1))
         .read_until(b'\n', &mut bytes)
     {
         Ok(0) => Err(FrameFault::Closed),
@@ -238,6 +243,13 @@ mod tests {
         let mut over = vec![b'x'; 64];
         over.push(b'\n');
         assert!(matches!(read(&over, 64), Err(FrameFault::Oversized)));
+    }
+
+    /// The reader adds one to the limit to see a frame that is a byte too long, and a limit
+    /// at the end of the range must not overflow doing it.
+    #[test]
+    fn a_limit_at_the_end_of_the_range_still_reads_a_frame() {
+        assert_eq!(read(b"{}\n", usize::MAX).unwrap(), b"{}");
     }
 
     #[test]
