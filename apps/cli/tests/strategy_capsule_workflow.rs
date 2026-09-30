@@ -517,10 +517,14 @@ fn a_signed_capsule_verifies_only_under_its_trusted_key() {
 /// A corporate-action file with one split, dated at the first bar so that no order rests
 /// across it. The dataset content hash covers it, and the replay applies it.
 fn write_actions(path: &Path, ratio: &str) {
+    write_actions_at(path, "2026-01-02T14:31:00Z", ratio);
+}
+
+fn write_actions_at(path: &Path, effective_at: &str, ratio: &str) {
     fs::write(
         path,
         format!(
-            "action_id,instrument_id,action_type,effective_at,value\naction-split-001,inst.us_equity.spy,SPLIT,2026-01-02T14:31:00Z,{ratio}\n"
+            "action_id,instrument_id,action_type,effective_at,value\naction-split-001,inst.us_equity.spy,SPLIT,{effective_at},{ratio}\n"
         ),
     )
     .expect("actions are writable");
@@ -626,5 +630,74 @@ fn a_capsule_of_an_evaluation_with_corporate_actions_reproduces_only_with_them()
             && String::from_utf8_lossy(&different.stderr).contains("did not reproduce"),
         "a replay with different corporate actions was accepted\n{}",
         describe(&different)
+    );
+}
+
+/// A file whose only action falls after the last bar applies nothing, yet the dataset's
+/// content hash covers it. Packaging such an evaluation without the file passed the applied
+/// count check and then failed to reproduce the receipt without naming the cause
+/// (delivery state E8.6, found in review).
+#[test]
+fn packaging_an_evaluation_whose_actions_applied_nothing_still_points_at_the_actions() {
+    let Some(python) = python_executable() else {
+        eprintln!("Python is unavailable; the capsule workflow was skipped");
+        return;
+    };
+    let workspace = Workspace::new("late-actions");
+    let bundle = workspace.0.join("bundle");
+    let strategy_file = write_bundle(&bundle, "");
+    let lock_path = workspace.0.join("dependency.lock");
+    let hash = lock(&python, &bundle, &strategy_file, &lock_path);
+    let actions = workspace.0.join("actions.csv");
+    write_actions_at(&actions, "2030-01-01T00:00:00Z", "2.00000000");
+    let artifact = workspace.0.join("evaluation/python-backtest.json");
+    evaluate_with(
+        &python,
+        &bundle,
+        &strategy_file,
+        &hash,
+        &artifact,
+        Some(&actions),
+    );
+    let evaluation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&artifact).expect("artifact exists"))
+            .expect("artifact is JSON");
+    assert_eq!(
+        evaluation["performance"]["corporate_action_count"], 0,
+        "the split must fall outside the bars for this test to mean anything"
+    );
+    let hostile = hostile_directory(&workspace.0);
+
+    let without = package(
+        &python,
+        &bundle,
+        &lock_path,
+        &artifact,
+        &workspace.0.join("without"),
+        &hostile,
+    );
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(
+        !succeeded(&without)
+            && stderr.contains("did not reproduce")
+            && stderr.contains("package it with the same file"),
+        "the refusal did not name the missing actions\n{}",
+        describe(&without)
+    );
+    assert!(!workspace.0.join("without").exists());
+
+    let packaged = package_with(
+        &python,
+        &bundle,
+        &lock_path,
+        &artifact,
+        &workspace.0.join("with"),
+        &hostile,
+        Some(&actions),
+    );
+    assert!(
+        succeeded(&packaged),
+        "packaging with the actions failed\n{}",
+        describe(&packaged)
     );
 }

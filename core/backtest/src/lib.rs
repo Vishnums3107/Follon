@@ -2260,7 +2260,7 @@ impl BacktestRunner {
                 .then_with(|| left.action_id().cmp(right.action_id()))
         });
         let mut ledger = BacktestLedger::new(&input.currency, input.initial_cash)?;
-        let mut marks = BTreeMap::new();
+        let mut marks: BTreeMap<String, Decimal> = BTreeMap::new();
         let mut store = InMemoryEventStore::default();
         let mut canonical_events = Vec::new();
         let mut applied_corporate_action_ids = Vec::new();
@@ -2284,6 +2284,14 @@ impl BacktestRunner {
                         ratio,
                         ..
                     } => {
+                        // The instrument's last mark is a price before the split and its
+                        // position is now after it, so until its next bar an equity point
+                        // would count the shares the split added at the old price: a jump
+                        // at the split that nothing in the market caused, and an ending
+                        // equity that is wrong when no bar follows (delivery state E8.6).
+                        if let Some(mark) = marks.get_mut(instrument_id.as_str()) {
+                            *mark = mark.checked_div(*ratio)?;
+                        }
                         // The ledger is one book and the engine's portfolio another. The
                         // strategy's callbacks and the event stream project the engine's,
                         // so it follows the split too (delivery state E8.2).

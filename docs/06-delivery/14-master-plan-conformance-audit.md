@@ -4897,6 +4897,66 @@ These are mandatory master-plan acceptance conditions and are currently open:
        retained Gateway session, so a warning this repository has not met can still reject its
        order until E5.6 shows it, and that is recorded rather than guessed.
 
+119. A split no longer moves equity, and split lots total the position (2026-09-30, Reliability and
+     quality conformance, research-to-live parity; defects in items 93 and 112, E8.1 and E8.2, and in
+     the refusal of item 114). Found by an independent review of the replay changes.
+     - **Gap.** Three faults, each reproduced before it was fixed.
+       - The runner marks a position at the last bar of its instrument, and a split multiplied the
+         position and left the mark. A split is applied at the first bar at or after its time, whichever
+         instrument that bar belongs to, so when another instrument's bar came first an equity point
+         counted the added shares at the old price: 1,099.90 where 999.90 was due, and 949.90 for a
+         reverse split. The spike fed the equity curve and the maximum drawdown, and where the
+         instrument printed no later bar it was the ending equity. The CLI's advanced-account
+         projection, which replays the same events into a margin-aware account for the artifact's
+         "Advanced account" section, had the same fault, so its margin, financing and report valued
+         the added shares at the old price too.
+       - The ledger scaled each FIFO lot and rounded it down, and scaled the position once. With ratios
+         that do not scale exactly the lots could total less than the position: two lots of one, split
+         by a third and then by one and a half, held 0.99999998 against a position of 0.99999999, so a
+         sale of the whole position was refused. The reviewer's random walk found this in about a tenth
+         of 20,000 sequences.
+       - `capsule-package` refused an evaluation whose corporate actions all fell outside its bars with
+         "capsule replay did not reproduce the evaluation receipt", because the dataset's content hash
+         covers a file of actions that applied none, and the applied-count check saw nothing to ask for.
+     - **Behavior.**
+       - The runner, and the advanced-account projection likewise, divide the instrument's mark by the
+         ratio when they apply a split, so equity is what it was until the next bar, and a reverse
+         split works the same way. Only the split instrument's mark is touched. These are the only two
+         production callers of `apply_corporate_action`.
+       - `TaxLotBook::apply_split` puts the shortfall on the newest lot, so the lots always total exactly
+         what the position becomes, long and short. A lot that scales to nothing is dropped, as a
+         disposal drops an empty one, and an instrument whose lots all vanish leaves no bucket, which a
+         snapshot would refuse to restore. A split that would round a lot's unit cost to nothing is
+         refused and changes nothing.
+       - The packaging refusal now says to package with the same `--actions` file.
+       - The replay's remaining limits, found in the same review and kept as choices, are written into
+         the backtesting capability doc: a fractional position a whole-lot instrument cannot sell, a
+         reverse split that would round a position away ending the run, two same-time actions applied
+         in action-id order, and a sink that fails part-way ending the run with the split applied.
+     - **Tests.** Twelve were added. Five for the lots: the reviewer's case, its short-side twin, a lot
+       that scales to nothing and a position that does, a unit cost that rounds away, and a fixed-seed
+       walk of 400 sequences of purchases and inexact splits that holds the lots to the position after
+       every split. Five for the runner and the ledger, in `core/backtest/tests/split_valuation.rs`:
+       equity flat through a forward and a reverse split when another instrument's bar is processed
+       first, the ending equity with no later bar, a split that revalues only its own instrument, and
+       the sale of the whole position after two inexact splits. One for the capsule refusal, and one for
+       the advanced-account projection, which holds one instrument, splits it and then another, and reads
+       the margin valuation and unrealized P&L.
+     - **Rule 5.** 15 of 15 injected defects were caught by the intended tests: the mark not rebased,
+       multiplied instead of divided, or rebased for every instrument, in the runner and in the
+       advanced-account projection; the shortfall dropped, put on the
+       oldest lot, or computed against the lots themselves; a lot that scales to nothing kept, an emptied
+       bucket left behind, a unit cost that rounds away accepted; and the packaging hint removed,
+       inverted or losing its instruction. One survived the first run, the mark rebased for every
+       instrument, because the split had been applied on the held instrument's own bar, which refreshed
+       the wrong mark before equity was read. The test now holds one instrument and splits another
+       whose bar comes first, and it was then caught.
+     - **Measured result.** The Rust workspace rose from 646 to 658 passed / 0 failed / 8 ignored. The
+       final `python tools/session_status.py` run measured all eight suites green, and the full evidence
+       pipeline exited 0.
+     - **Boundary.** The advanced account takes the lot fix through the same book. PAPER and controlled
+       LIVE still apply no corporate actions (E8.4b). No external gate moved.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

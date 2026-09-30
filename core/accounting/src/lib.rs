@@ -767,6 +767,78 @@ pub struct ShortCoverResult {
     pub allocations: Vec<(String, Decimal)>,
 }
 
+/// What a split needs of a lot, whichever side it is on.
+trait SplitLot: Clone {
+    fn quantity(&self) -> Decimal;
+    fn set_quantity(&mut self, quantity: Decimal);
+    fn unit_price(&self) -> Decimal;
+    fn set_unit_price(&mut self, price: Decimal);
+}
+
+impl SplitLot for TaxLot {
+    fn quantity(&self) -> Decimal {
+        self.remaining_quantity
+    }
+    fn set_quantity(&mut self, quantity: Decimal) {
+        self.remaining_quantity = quantity;
+    }
+    fn unit_price(&self) -> Decimal {
+        self.unit_cost
+    }
+    fn set_unit_price(&mut self, price: Decimal) {
+        self.unit_cost = price;
+    }
+}
+
+impl SplitLot for ShortTaxLot {
+    fn quantity(&self) -> Decimal {
+        self.remaining_quantity
+    }
+    fn set_quantity(&mut self, quantity: Decimal) {
+        self.remaining_quantity = quantity;
+    }
+    fn unit_price(&self) -> Decimal {
+        self.unit_proceeds
+    }
+    fn set_unit_price(&mut self, price: Decimal) {
+        self.unit_proceeds = price;
+    }
+}
+
+/// The lots of one instrument after a split, totalling exactly what their combined
+/// quantity becomes when scaled once. Each lot is scaled and rounded down on its own,
+/// so their total can fall short by a unit or two of the last place, and the newest
+/// lot takes the shortfall.
+fn split_lots<T: SplitLot>(lots: &[T], ratio: Decimal) -> Result<Vec<T>, AccountingError> {
+    let mut held = Decimal::ZERO;
+    let mut total = Decimal::ZERO;
+    let mut split = Vec::with_capacity(lots.len());
+    for lot in lots {
+        held = held.checked_add(lot.quantity())?;
+        let mut scaled = lot.clone();
+        scaled.set_quantity(lot.quantity().checked_mul(ratio)?);
+        scaled.set_unit_price(lot.unit_price().checked_div(ratio)?);
+        if scaled.unit_price() <= Decimal::ZERO {
+            return Err(AccountingError(
+                "split would round a lot's unit cost to nothing".to_owned(),
+            ));
+        }
+        total = total.checked_add(scaled.quantity())?;
+        split.push(scaled);
+    }
+    let shortfall = held.checked_mul(ratio)?.checked_sub(total)?;
+    if shortfall < Decimal::ZERO {
+        return Err(AccountingError(
+            "split scaled the lots to more than their position".to_owned(),
+        ));
+    }
+    if let Some(newest) = split.last_mut() {
+        newest.set_quantity(newest.quantity().checked_add(shortfall)?);
+    }
+    split.retain(|lot| lot.quantity() > Decimal::ZERO);
+    Ok(split)
+}
+
 /// Idempotent exact long-lot accounting projection.
 #[derive(Clone, Debug, Default)]
 pub struct TaxLotBook {
@@ -1065,6 +1137,14 @@ impl TaxLotBook {
     /// Both sides are computed before either is replaced, so a failure leaves
     /// the book unchanged.
     ///
+    /// Scaling lot by lot rounds each one down, so with a ratio that is not
+    /// exact their total can fall short of the position they make up, which an
+    /// account scales once. The shortfall goes on the newest lot, so the lots
+    /// always total exactly what the position becomes and a sale of the whole
+    /// position is never refused for want of lots. A lot that rounds to nothing
+    /// is dropped, as a disposal drops an empty one, and a split that would round
+    /// a lot's unit cost to nothing is refused.
+    ///
     /// Without it a split scaled the position but not its lots, so a sale of
     /// more than the pre-split lot quantity was refused as exceeding the lots,
     /// and a smaller one realized P&L against the unadjusted cost (delivery
@@ -1079,39 +1159,29 @@ impl TaxLotBook {
         if ratio <= Decimal::ZERO {
             return Err(AccountingError("split ratio must be positive".to_owned()));
         }
-        let long = match self.lots.get(instrument_id) {
-            Some(lots) => Some(
-                lots.iter()
-                    .map(|lot| {
-                        Ok(TaxLot {
-                            remaining_quantity: lot.remaining_quantity.checked_mul(ratio)?,
-                            unit_cost: lot.unit_cost.checked_div(ratio)?,
-                            ..lot.clone()
-                        })
-                    })
-                    .collect::<Result<Vec<_>, AccountingError>>()?,
-            ),
-            None => None,
-        };
-        let short = match self.short_lots.get(instrument_id) {
-            Some(lots) => Some(
-                lots.iter()
-                    .map(|lot| {
-                        Ok(ShortTaxLot {
-                            remaining_quantity: lot.remaining_quantity.checked_mul(ratio)?,
-                            unit_proceeds: lot.unit_proceeds.checked_div(ratio)?,
-                            ..lot.clone()
-                        })
-                    })
-                    .collect::<Result<Vec<_>, AccountingError>>()?,
-            ),
-            None => None,
-        };
+        let long = self
+            .lots
+            .get(instrument_id)
+            .map(|lots| split_lots(lots, ratio))
+            .transpose()?;
+        let short = self
+            .short_lots
+            .get(instrument_id)
+            .map(|lots| split_lots(lots, ratio))
+            .transpose()?;
         if let Some(long) = long {
-            self.lots.insert(instrument_id.to_owned(), long);
+            if long.is_empty() {
+                self.lots.remove(instrument_id);
+            } else {
+                self.lots.insert(instrument_id.to_owned(), long);
+            }
         }
         if let Some(short) = short {
-            self.short_lots.insert(instrument_id.to_owned(), short);
+            if short.is_empty() {
+                self.short_lots.remove(instrument_id);
+            } else {
+                self.short_lots.insert(instrument_id.to_owned(), short);
+            }
         }
         Ok(())
     }
@@ -1840,6 +1910,172 @@ mod tests {
             .unwrap();
         assert_eq!(disposal.cost_basis, amount("1601"));
         assert!(book.lots("inst.us_equity.spy").is_empty());
+    }
+
+    fn spy_lot(lot_id: &str, quantity: &str, unit_cost: &str) -> TaxLot {
+        TaxLot {
+            lot_id: lot_id.to_owned(),
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            currency: currency("USD"),
+            opened_at: "2026-01-02T14:30:00Z".to_owned(),
+            remaining_quantity: amount(quantity),
+            unit_cost: amount(unit_cost),
+        }
+    }
+
+    fn total_of(lots: &[TaxLot]) -> Decimal {
+        lots.iter().fold(Decimal::ZERO, |total, lot| {
+            total.checked_add(lot.remaining_quantity).unwrap()
+        })
+    }
+
+    /// An account scales its position once, so its lots must total what that comes to
+    /// however many lots there are, or the last sale is refused for want of them. Two lots
+    /// of one, split by a third and then by one and a half, scaled to 0.49999999 each and
+    /// totalled 0.99999998 where the position was 0.99999999 (delivery state E8.6, found in
+    /// review).
+    #[test]
+    fn lots_after_inexact_splits_total_the_position_scaled_once() {
+        let mut book = TaxLotBook::default();
+        book.acquire(spy_lot("lot.1", "1", "100")).unwrap();
+        book.acquire(spy_lot("lot.2", "1", "100")).unwrap();
+
+        book.apply_split("inst.us_equity.spy", amount("0.33333333"))
+            .unwrap();
+        assert_eq!(
+            total_of(book.lots("inst.us_equity.spy")),
+            amount("0.66666666")
+        );
+        book.apply_split("inst.us_equity.spy", amount("1.5"))
+            .unwrap();
+        let lots = book.lots("inst.us_equity.spy");
+        assert_eq!(total_of(lots), amount("0.99999999"));
+        // The shortfall is the newest lot's, so the oldest keeps what scaling gave it.
+        assert_eq!(
+            lots.iter()
+                .map(|lot| lot.remaining_quantity)
+                .collect::<Vec<_>>(),
+            vec![amount("0.49999999"), amount("0.5")]
+        );
+        // A book that has been split is one a snapshot can restore.
+        assert!(TaxLotBook::recover(book.snapshot()).is_ok());
+    }
+
+    #[test]
+    fn short_lots_after_inexact_splits_total_the_position_scaled_once() {
+        let mut book = TaxLotBook::default();
+        for id in ["short.1", "short.2"] {
+            book.open_short(ShortTaxLot {
+                lot_id: id.to_owned(),
+                instrument_id: "inst.us_equity.spy".to_owned(),
+                currency: currency("USD"),
+                opened_at: "2026-01-02T14:30:00Z".to_owned(),
+                remaining_quantity: amount("1"),
+                unit_proceeds: amount("100"),
+            })
+            .unwrap();
+        }
+        for ratio in ["0.33333333", "1.5"] {
+            book.apply_split("inst.us_equity.spy", amount(ratio))
+                .unwrap();
+        }
+        let total = book
+            .short_lots("inst.us_equity.spy")
+            .iter()
+            .fold(Decimal::ZERO, |total, lot| {
+                total.checked_add(lot.remaining_quantity).unwrap()
+            });
+        assert_eq!(total, amount("0.99999999"));
+    }
+
+    /// A lot that scales to nothing is dropped, as a disposal drops an empty one, and the
+    /// rest still total what the position becomes.
+    #[test]
+    fn a_lot_that_rounds_to_nothing_is_dropped_and_the_total_still_holds() {
+        let mut book = TaxLotBook::default();
+        book.acquire(spy_lot("lot.1", "0.00000001", "100")).unwrap();
+        book.acquire(spy_lot("lot.2", "1", "100")).unwrap();
+        book.apply_split("inst.us_equity.spy", amount("0.5"))
+            .unwrap();
+        let lots = book.lots("inst.us_equity.spy");
+        assert_eq!(lots.len(), 1);
+        assert_eq!(lots[0].lot_id, "lot.2");
+        // 1.00000001 held, halved once, is 0.50000000 to the last place.
+        assert_eq!(total_of(lots), amount("0.5"));
+
+        // A position that rounds away entirely leaves no bucket behind, which a snapshot
+        // would refuse to restore.
+        let mut dust = TaxLotBook::default();
+        dust.acquire(spy_lot("lot.1", "0.00000001", "100")).unwrap();
+        dust.apply_split("inst.us_equity.spy", amount("0.5"))
+            .unwrap();
+        assert!(dust.lots("inst.us_equity.spy").is_empty());
+        assert!(TaxLotBook::recover(dust.snapshot()).is_ok());
+    }
+
+    #[test]
+    fn a_split_that_rounds_a_unit_cost_to_nothing_is_refused_and_changes_nothing() {
+        let mut book = TaxLotBook::default();
+        book.acquire(spy_lot("lot.1", "1", "0.00000001")).unwrap();
+        let before = book.lots("inst.us_equity.spy").to_vec();
+        let error = book
+            .apply_split("inst.us_equity.spy", amount("2"))
+            .unwrap_err();
+        assert!(error.0.contains("unit cost to nothing"), "{}", error.0);
+        assert_eq!(book.lots("inst.us_equity.spy"), before.as_slice());
+    }
+
+    /// Across many sequences of purchases and splits with ratios that do not scale
+    /// exactly, the lots total the position after every split. A pseudo-random walk
+    /// with a fixed seed, so a failure names a sequence that can be replayed.
+    #[test]
+    fn the_lots_total_the_position_after_every_split_of_any_sequence() {
+        let ratios = [
+            "0.33333333",
+            "0.5",
+            "0.66666667",
+            "0.99999999",
+            "1.5",
+            "2",
+            "3",
+            "10",
+        ];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for sequence in 0..400 {
+            let mut book = TaxLotBook::default();
+            let mut position = Decimal::ZERO;
+            let mut lot_number = 0;
+            for step in 0..8 {
+                if next(3) == 0 && position > Decimal::ZERO {
+                    let ratio = amount(ratios[next(ratios.len() as u64) as usize]);
+                    if book.apply_split("inst.us_equity.spy", ratio).is_err() {
+                        break;
+                    }
+                    position = position.checked_mul(ratio).unwrap();
+                } else {
+                    lot_number += 1;
+                    let quantity = Decimal::from_scaled(1 + i128::from(next(300_000_000)));
+                    book.acquire(spy_lot(
+                        &format!("lot.{lot_number}"),
+                        &quantity.to_string(),
+                        "100",
+                    ))
+                    .unwrap();
+                    position = position.checked_add(quantity).unwrap();
+                }
+                assert_eq!(
+                    total_of(book.lots("inst.us_equity.spy")),
+                    position,
+                    "sequence {sequence}, step {step}"
+                );
+            }
+        }
     }
 
     #[test]

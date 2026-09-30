@@ -103,6 +103,18 @@ effective time, and before that bar's market event. A run with no split holds no
 event and is unchanged. A split applies to every account that holds the instrument or to
 none, and each action applies once.
 
+A split changes how many shares an account holds and what one is worth, and leaves what the
+account is worth alone. The runner marks a position at the last bar of its instrument, so it
+divides that mark by the ratio at the moment it applies the split. Until the instrument's next
+bar, equity is what it was, and when no bar follows, the ending equity is right too. The
+rebased mark is exact to the platform's eight places and is replaced by the next close.
+
+The ledger's FIFO lots always total exactly what the position, scaled once, becomes. Scaling
+lot by lot rounds each one down, so with a ratio such as a third or two thirds their total can
+fall short by a unit of the last place. The shortfall goes on the newest lot, a lot that scales
+to nothing is dropped, and a split that would round a lot's unit cost to nothing is refused.
+A sale of the whole position is therefore never refused for want of lots.
+
 A cash dividend is income, which only the ledger books. The engine's portfolio holds a
 position and its trading P&L and no cash.
 
@@ -122,6 +134,21 @@ it at a price level it was not written for. That is the rule the replay already 
 a lot-size change. Two things still do not follow a split: the risk policy's
 share-denominated limits, which are the operator's configuration; and PAPER and controlled
 LIVE, which apply no corporate actions at all.
+
+Limits of the replay's split, each found in review and each a choice and not an oversight:
+
+- A ratio that does not divide a position evenly leaves a fractional position, and the replay
+  carries it exactly. An instrument whose lot size is larger than the smallest quantity cannot
+  then sell it, because the risk policy refuses a quantity that is not a whole number of lots.
+  A broker pays cash in lieu of the fraction, which this replay does not model.
+- A reverse split that would round a held position to nothing is refused by the engine and ends
+  the run, where the ledger alone would have dropped the position.
+- Two actions with the same effective time apply in action-id order, and the order decides
+  whether a dividend is paid on the shares before the split or after it. A dividend meant for
+  the shares before the split needs an id that sorts before the split's.
+- The engine applies a split to its portfolios and consumes the action before it records the
+  position events. A sink that fails part-way leaves an engine that has applied it, and a runner
+  can execute only once, so a failed run is over and is never resumed.
 
 ## Reproducibility record
 

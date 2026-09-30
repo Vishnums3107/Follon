@@ -82,9 +82,13 @@ impl Strategy for RoundTrip {
 }
 
 pub fn bar_at(price: &str) -> Bar {
+    bar_of(INSTRUMENT, price)
+}
+
+pub fn bar_of(instrument: &str, price: &str) -> Bar {
     let close = amount(price);
     Bar {
-        instrument_id: INSTRUMENT.to_owned(),
+        instrument_id: instrument.to_owned(),
         open: close,
         high: close.checked_add(amount("1")).unwrap(),
         low: close.checked_sub(amount("1")).unwrap(),
@@ -161,6 +165,11 @@ pub fn spec(input: &BacktestInput) -> BacktestSpec {
 }
 
 pub fn market() -> (InstrumentRegistry, StaticTradingCalendar) {
+    market_of(&[INSTRUMENT])
+}
+
+/// The session and reference data for each of `instrument_ids`.
+pub fn market_of(instrument_ids: &[&str]) -> (InstrumentRegistry, StaticTradingCalendar) {
     let calendar = StaticTradingCalendar::new(
         "cal.us_equities.nyse",
         vec![TradingSession {
@@ -171,26 +180,29 @@ pub fn market() -> (InstrumentRegistry, StaticTradingCalendar) {
     )
     .unwrap();
     let mut instruments = InstrumentRegistry::default();
-    instruments
-        .register(InstrumentVersion {
-            instrument: Instrument {
-                instrument_id: INSTRUMENT.to_owned(),
-                symbol: "SPY".to_owned(),
-                exchange_symbol: "SPY".to_owned(),
-                asset_class: AssetClass::Etf,
-                venue: "venue.nyse_arca".to_owned(),
-                currency: "USD".to_owned(),
-                broker_ids: BTreeMap::new(),
-                tick_size: amount("0.01"),
-                lot_size: amount("1"),
-                multiplier: amount("1"),
-                trading_calendar_id: "cal.us_equities.nyse".to_owned(),
-            },
-            effective_from: "2026-01-01T00:00:00Z".to_owned(),
-            effective_to: None,
-            reference_version: "reference-example-1".to_owned(),
-        })
-        .unwrap();
+    for instrument_id in instrument_ids {
+        let symbol = instrument_id.rsplit('.').next().unwrap().to_uppercase();
+        instruments
+            .register(InstrumentVersion {
+                instrument: Instrument {
+                    instrument_id: (*instrument_id).to_owned(),
+                    symbol: symbol.clone(),
+                    exchange_symbol: symbol,
+                    asset_class: AssetClass::Etf,
+                    venue: "venue.nyse_arca".to_owned(),
+                    currency: "USD".to_owned(),
+                    broker_ids: BTreeMap::new(),
+                    tick_size: amount("0.01"),
+                    lot_size: amount("1"),
+                    multiplier: amount("1"),
+                    trading_calendar_id: "cal.us_equities.nyse".to_owned(),
+                },
+                effective_from: "2026-01-01T00:00:00Z".to_owned(),
+                effective_to: None,
+                reference_version: "reference-example-1".to_owned(),
+            })
+            .unwrap();
+    }
     (instruments, calendar)
 }
 
@@ -217,6 +229,64 @@ pub fn engine() -> ReplayEngine {
         },
     )
     .unwrap()
+}
+
+/// Buys one share of `instrument` on the first bar it sees of it and does nothing else.
+pub struct BuyOnce {
+    pub instrument: &'static str,
+    pub bought: bool,
+}
+
+impl BuyOnce {
+    pub fn new(instrument: &'static str) -> Self {
+        Self {
+            instrument,
+            bought: false,
+        }
+    }
+}
+
+impl Strategy for BuyOnce {
+    fn on_bar(&mut self, bar: &Bar, replay_time: &str) -> Result<Option<OrderIntent>, EngineError> {
+        if self.bought || bar.instrument_id != self.instrument {
+            return Ok(None);
+        }
+        self.bought = true;
+        Ok(Some(OrderIntent {
+            intent_id: "intent-buy-once".to_owned(),
+            account_id: ACCOUNT.to_owned(),
+            strategy_id: "strategy-split-001".to_owned(),
+            instrument_id: bar.instrument_id.clone(),
+            correlation_id: "corr-buy-once".to_owned(),
+            side: Side::Buy,
+            quantity: Decimal::from_integer(1)?,
+            order_type: OrderType::Market,
+            limit_price: None,
+            time_in_force: TimeInForce::Day,
+            rationale: "corporate action valuation regression".to_owned(),
+            created_at: replay_time.to_owned(),
+            strategy_version: "strategy-split-v1".to_owned(),
+            configuration_version: "cfg-v1".to_owned(),
+            environment: "SIMULATION".to_owned(),
+        }))
+    }
+}
+
+/// Runs `input`, whose bars may name several instruments, with `strategy`.
+pub fn run_input(
+    strategy: &mut impl Strategy,
+    input: &BacktestInput,
+    instrument_ids: &[&str],
+) -> Result<CompletedBacktest, BacktestError> {
+    let spec = spec(input);
+    let (instruments, calendar) = market_of(instrument_ids);
+    let market = MarketPreconditions {
+        instruments: &instruments,
+        calendar: &calendar,
+    };
+    BacktestRunner::new(spec, engine())
+        .unwrap()
+        .run(strategy, input, &market)
 }
 
 /// Runs the five bars with `strategy` and the corporate `actions`.
