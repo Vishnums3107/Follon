@@ -90,6 +90,77 @@ class Ed25519Tests(unittest.TestCase):
         at_the_order = signature[:32] + int.to_bytes(ed25519.GROUP_ORDER, 32, "little")
         self.assertFalse(ed25519.verify(public, message, at_the_order))
 
+    def test_a_point_of_small_order_is_no_public_key_and_forges_nothing(self) -> None:
+        # The eight points whose order divides eight: the neutral element, the point of order
+        # two, the two of order four (one of which is the all-zero string) and the four of
+        # order eight. RFC 8032 lets a verifier accept a signature under any of them, and
+        # under one, with the matching commitment and a response of zero, anyone can sign
+        # anything without a private key. A review forged a whole ledger that way, so a key
+        # set must refuse them and verification must too (delivery state E6.6).
+        field = ed25519.FIELD
+        small_order = {
+            "neutral element": int.to_bytes(1, 32, "little"),
+            "order two": int.to_bytes(field - 1, 32, "little"),
+            "order four, sign clear (all zero)": bytes(32),
+            "order four, sign set": int.to_bytes(1 << 255, 32, "little"),
+            "order eight a": bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+            "order eight b": bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"),
+            "order eight c": bytes.fromhex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"),
+            "order eight d": bytes.fromhex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"),
+        }
+        message = b"any message at all"
+        for name, key in small_order.items():
+            with self.subTest(key=name):
+                self.assertFalse(ed25519.is_valid_public_key(key))
+                for commitment in small_order.values():
+                    for response in (0, 1, 5):
+                        signature = commitment + int.to_bytes(response, 32, "little")
+                        self.assertFalse(ed25519.verify(key, message, signature))
+        # Under the neutral element as the key, the commitment [S]B satisfies the verification
+        # equation for every message, and that commitment is no point of small order, so only
+        # the check on the key refuses it.
+        multiple_of_the_base = ed25519._compress(ed25519._multiply(5, ed25519.BASE))
+        forged = multiple_of_the_base + int.to_bytes(5, 32, "little")
+        self.assertFalse(ed25519.verify(small_order["neutral element"], message, forged))
+
+    def test_a_commitment_of_small_order_is_refused_even_under_an_honest_key(self) -> None:
+        # The neutral element as the commitment, with the response that makes the equation
+        # true, which the holder of the seed can compute. RFC 8032 accepts it. A verifier that
+        # refuses small-order commitments does not, and no honest signer produces one.
+        seed = bytes(range(1, 33))
+        public = ed25519.public_key(seed)
+        scalar, _ = ed25519._expand_seed(seed)
+        neutral = int.to_bytes(1, 32, "little")
+        message = b"a commitment of small order"
+        challenge = ed25519._hash_to_scalar(neutral + public + message)
+        response = challenge * scalar % ed25519.GROUP_ORDER
+        self.assertTrue(
+            ed25519._equal(
+                ed25519._multiply(response, ed25519.BASE),
+                ed25519._multiply(challenge, ed25519._decompress(public)),
+            ),
+            "the equation holds, so only the check on the commitment refuses this",
+        )
+        signature = neutral + int.to_bytes(response, 32, "little")
+        self.assertFalse(ed25519.verify(public, message, signature))
+
+    def test_an_honest_key_is_a_valid_public_key_and_a_torsion_tainted_one_is_not(self) -> None:
+        seed = bytes(range(1, 33))
+        honest = ed25519.public_key(seed)
+        self.assertTrue(ed25519.is_valid_public_key(honest))
+        # The honest point plus a point of order eight has the honest point's public half and a
+        # torsion component, so it lies outside the prime-order subgroup.
+        torsion = ed25519._decompress(
+            bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a")
+        )
+        tainted = ed25519._compress(ed25519._add(ed25519._decompress(honest), torsion))
+        self.assertNotEqual(tainted, honest)
+        self.assertFalse(ed25519.is_valid_public_key(tainted))
+        # Strings that are not points, or not 32 bytes, are not keys either.
+        for not_a_key in (b"\xff" * 32, honest[:-1], honest + b"\x00", b""):
+            with self.subTest(length=len(not_a_key)):
+                self.assertFalse(ed25519.is_valid_public_key(not_a_key))
+
     def test_a_pkcs8_private_key_yields_its_seed_in_either_version(self) -> None:
         seed = bytes(range(32))
         version_0 = bytes.fromhex("302e020100300506032b657004220420") + seed

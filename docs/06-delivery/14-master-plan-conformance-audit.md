@@ -5003,6 +5003,41 @@ These are mandatory master-plan acceptance conditions and are currently open:
        (E7.15, open). The tests ran against PostgreSQL 17 and CI runs 16, which the migration uses
        nothing newer than, and that job has not run. No external gate moved.
 
+121. Ed25519 verification refuses points of small order (2026-09-30, Security; a defect in item 111,
+     E6.4). Found by an independent review of the acceptance evidence, and reproduced here from the
+     probes it left.
+     - **Gap.** RFC 8032 lets a verifier accept a signature under a public key of small order, meaning a
+       point whose order divides eight. Under the neutral element, the commitment `[S]B` satisfies the
+       verification equation for every message and every `S`; under the other small-order points, a
+       matching commitment and a response of zero does. The trusted reviewer set checked only that a key
+       was 64 lowercase hex characters, so a set holding the neutral element, or the all-zero string a
+       template might leave as a placeholder and which decodes to a point of order four, counted a
+       ledger nobody signed. The reviewer forged 106 records that way and the promotion gate found every
+       gate eligible for production.
+     - **Behavior.** `ed25519.verify` refuses a key or a commitment of small order, as libsodium does.
+       `ed25519.is_valid_public_key` says whether 32 bytes encode a point of the prime-order subgroup
+       other than the neutral element, which is what an honest key is. Honest signatures are unchanged:
+       the RFC vectors and the cross-check against the `cryptography` package still hold.
+     - **Tests.** Three were added: the eight small-order points, as key and as commitment, with three
+       responses each, and the neutral element's forgery with a commitment that is not small; an honest
+       key, and one with a torsion component added, and inputs that are not keys; and a commitment of
+       small order under an honest key with the response that makes the equation true, which the
+       holder of a seed can compute and RFC 8032 accepts.
+     - **Rule 5.** 8 of 8 injected defects were caught: the key check, the commitment check or both
+       removed; the small-order test multiplying by four or by two instead of eight; the neutral element
+       accepted as a key; the subgroup check dropped; and the subgroup checked against the wrong order.
+       The commitment check changes no verdict for an honest signer, whose commitment has large order,
+       so it is defence in depth, and only the third test, which builds the one input where it alone
+       decides, holds it.
+     - **Measured result.** The Python suite rose from 173 to 176 passed. The final
+       `python tools/session_status.py` run measured all eight suites green and the full evidence pipeline
+       exited 0. The CI Python job's own steps, run by hand, passed: the JSON contract syntax check,
+       `unittest discover` over `tests/security`, and the SDK, bridge and storage adapter suites.
+     - **Boundary.** Enrolment does not yet refuse such a key: the set still loads one, which now
+       verifies nothing, and refusing it loudly is E6.6b. The rest of the review's findings on E6.4 and
+       E6.5, including that a rejection that fails to authenticate is silently ignored, are listed there,
+       open and reproduced.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

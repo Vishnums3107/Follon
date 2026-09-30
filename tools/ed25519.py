@@ -101,6 +101,25 @@ def _decompress(encoded: bytes) -> Point | None:
     return (x, y, 1, x * y % FIELD)
 
 
+def _has_small_order(point: Point) -> bool:
+    """Whether the point has order 1, 2, 4 or 8: eight times it is the neutral element."""
+    return _equal(_multiply(8, point), NEUTRAL)
+
+
+def is_valid_public_key(public: bytes) -> bool:
+    """Whether `public` encodes a point in the prime-order subgroup, other than the neutral one.
+
+    An honest public key is a multiple of the base point, so it lies in that subgroup. A point
+    of small order is not one, and a key that is one makes every signature check a formality:
+    with the neutral element, or the all-zero string that decodes to a point of order four,
+    anyone can sign anything without a private key. A key set holds only keys that pass.
+    """
+    point = _decompress(public)
+    if point is None or _equal(point, NEUTRAL):
+        return False
+    return _equal(_multiply(GROUP_ORDER, point), NEUTRAL)
+
+
 def _hash_to_scalar(data: bytes) -> int:
     return int.from_bytes(hashlib.sha512(data).digest(), "little") % GROUP_ORDER
 
@@ -133,12 +152,19 @@ def sign(seed: bytes, message: bytes) -> bytes:
 
 
 def verify(public: bytes, message: bytes, signature: bytes) -> bool:
-    """Whether `signature` is `public`'s signature of `message`. Never raises."""
+    """Whether `signature` is `public`'s signature of `message`. Never raises.
+
+    A key or a commitment of small order is refused, as libsodium refuses it. RFC 8032 does
+    not require that, and a verifier that follows it alone accepts a forged signature under
+    such a key, which is why a key set must not hold one either (`is_valid_public_key`).
+    """
     if len(public) != PUBLIC_KEY_BYTES or len(signature) != SIGNATURE_BYTES:
         return False
     key_point = _decompress(public)
     commitment_point = _decompress(signature[:32])
     if key_point is None or commitment_point is None:
+        return False
+    if _has_small_order(key_point) or _has_small_order(commitment_point):
         return False
     response = int.from_bytes(signature[32:], "little")
     if response >= GROUP_ORDER:
