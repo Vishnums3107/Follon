@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-30T09:02:24Z  
-**Branch:** `feat/acceptance-append-hardening`  
-**HEAD:** `baaca5b` -- fix(acceptance): make ledger appends root-safe and evidence-bound (2026-09-30T14:16:15+05:30)  
-**Uncommitted paths:** 4
+**Measured at:** 2026-09-30T09:55:28Z  
+**Branch:** `feat/working-order-exposure`  
+**HEAD:** `7f2cd73` -- Merge pull request #35 from Vishnums3107/feat/acceptance-append-hardening (2026-09-30T14:40:01+05:30)  
+**Uncommitted paths:** 17
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 658 | 0 | 9 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 668 | 0 | 9 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) -- `FOLLON_TEST_DATABASE_URL` is not set, so there is no disposable database to run against | **SKIPPED** | -- | -- | -- | -- |
@@ -76,7 +76,7 @@ already produced a real defect here.
 
 <!-- END GENERATED STATUS -- tools/session_status.py -->
 
-## Current repository assessment as of 27 September 2026
+## Baseline repository assessment from 27 September 2026
 
 The examined GitHub `main` snapshot is `4adb0909430d723c800fb1a2fd4bddb8aaddd792`,
 which merged [PR 30](https://github.com/Vishnums3107/Follon/pull/30). The local
@@ -295,7 +295,7 @@ for independent broker and reviewer evidence.
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |
 | E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open: `O_NOFOLLOW` on Unix, and on Windows `FILE_FLAG_OPEN_REPARSE_POINT` followed by a check of the handle's own file type. **Deferred 2026-09-29, not attempted:** the Unix half cannot be compiled or tested on this Windows host (no Linux toolchain, no target, and Docker and WSL are stopped), and half a no-follow open would be worse than none. The guard sites, ten across eight crates, each check and then open; converting them means removing the check so the open itself is the guard. | open, needs a Linux environment |
 | E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
-| E7.14 | Position limits and the aggregate composition judge an order against the filled position and ignore working orders, so several orders that are each within a limit can together exceed it once they fill. Cash already counts what working orders reserve. **Found in review 2026-09-30**, and left open while E7.4b's reduce-only rule was fixed: counting working exposure in `breaches_position_limit` and in the aggregate candidate changes what `projected_position` and the portfolio metrics mean in the evidence every decision records. | open |
+| E7.14 | Position limits and aggregate exposure now count the unfilled quantity of working plain orders and combination legs, at their current marks. `projected_position` still means filled plus candidate; `working_position_delta` and `committed_position` make the position-limit check explicit. Aggregate metrics report the all-fill projection, while separate possible-absolute-net, concentration, delta and gamma bounds check every subset of working fills, so an order that may never fill cannot hide a breach. Gross, leverage and bucket limits count every working contribution. Cash, equity and margin remain observed, not prospective. Evidence names the exposure basis and bound values. Both PAPER and controlled LIVE paths use this rule. Audit item 126. | **done** 2026-09-30 |
 | E7.15 | Append-only stops a row changing and not a parent gaining children. A journal line can still be inserted into a transaction that is already committed, and a route decision or benchmark into an execution plan that already exists, so a posted transaction's meaning can change without an UPDATE. **Found in review 2026-09-30 and left open:** a guard would let a child in only within the transaction that created its parent, which is a rule about transaction identity and needs the adapter's writers checked first. Not every child table qualifies: sentiments, receipts and the rest arrive later by design. | open |
 
 ### E8 — Accounting and state parity (assessment priority 5)
@@ -845,6 +845,23 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-09-30 — session 16
+
+- E7.14 now includes remaining working plain and combination quantities in
+  PAPER and controlled LIVE position checks and aggregate exposure. The
+  aggregate kernel tests the largest net, concentration, delta and gamma
+  result any subset of working fills permits, so an unfilled offset or
+  diversifier cannot weaken a check. Standalone benchmark and gRPC risk inputs
+  accept working exposure, and the gRPC output reports the bounds (audit item
+  126).
+- Measured: Rust workspace 668 passed / 0 failed / 9 ignored; all seven
+  available suites green, with PostgreSQL integration skipped without a
+  disposable database. The evidence pipeline regenerated 46 artifacts and
+  exited 0. These are local engineering results; no broker or production gate
+  moved.
+- **Next action:** E7.15, child insert guards for already committed parents,
+  after inspecting every database writer that creates the affected children.
 
 ### 2026-09-30 — session 15
 

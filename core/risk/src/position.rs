@@ -5,7 +5,7 @@ use follon_fx::{FxPricingSnapshot, FxValueDate};
 
 use crate::*;
 
-/// Fully attributed marked position.
+/// Fully attributed marked exposure contribution, filled or still working.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RiskPosition {
     /// Account identity.

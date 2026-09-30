@@ -3,6 +3,49 @@
 use super::*;
 
 #[test]
+fn a_working_combo_leg_claims_its_unfilled_ratio_for_the_position_limit() {
+    let mut risk_policy = policy_permitting_shorts();
+    risk_policy.max_position_quantity = decimal("position", "5").unwrap();
+    let mut service = service_with(risk_policy);
+    let mut combo = combo_intent("intent-combo-working-ratio", "2026-01-02T14:31:00Z");
+    combo.combo_quantity = decimal("units", "2").unwrap();
+    combo.legs[0].ratio = 2;
+    combo.price_limit =
+        follon_domain::ComboPriceLimit::MaximumDebit(decimal("debit", "10").unwrap());
+    let first = service
+        .submit_combo_intent(
+            combo,
+            combo_market("2026-01-02T14:31:00Z"),
+            "2026-01-02T14:31:00Z",
+        )
+        .unwrap();
+    assert!(first.decision.approved, "{:?}", first.decision.reason_codes);
+    let mut plain = intent("intent-after-working-combo", "2026-01-02T14:31:01Z");
+    plain.instrument_id = "inst.us_option.spy.near".to_owned();
+    plain.quantity = decimal("quantity", "2").unwrap();
+    let second = service
+        .submit_intent(
+            plain,
+            PaperMarketData {
+                instrument_id: "inst.us_option.spy.near".to_owned(),
+                mark_price: decimal("mark", "7.50").unwrap(),
+                observed_at: "2026-01-02T14:31:01Z".to_owned(),
+            },
+            "2026-01-02T14:31:01Z",
+        )
+        .unwrap();
+    assert!(!second.decision.approved);
+    assert!(second
+        .decision
+        .reason_codes
+        .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+    assert!(second
+        .decision
+        .evaluated_limits
+        .contains("working_position_delta=4.00000000,committed_position=6.00000000"));
+}
+
+#[test]
 fn combo_risk_approves_a_priced_vertical_and_records_exact_evidence() {
     let mut service = service_permitting_shorts();
     let decision = service

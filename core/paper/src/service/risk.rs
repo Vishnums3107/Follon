@@ -68,6 +68,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             Side::Buy => context.position_quantity.checked_add(intent.quantity)?,
             Side::Sell => context.position_quantity.checked_sub(intent.quantity)?,
         };
+        let working_position_delta = self.working_position_delta(&intent.instrument_id)?;
+        let committed_position = projected_position.checked_add(working_position_delta)?;
         let recent_order_count = self.recent_order_count(decided_at)?;
         let mut reasons = self.kill_switches.rejection_reasons(intent);
         if intent.quantity > self.risk_policy.max_order_quantity {
@@ -108,7 +110,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         }
         if self
             .risk_policy
-            .breaches_position_limit(projected_position)?
+            .breaches_position_limit(committed_position)?
         {
             reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
         }
@@ -137,7 +139,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                             .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
                     );
                     portfolio_risk_limits = format!(
-                    ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
+                    ",portfolio_exposure_basis=filled_working_candidate_v2,portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
                     decision.metrics.net_exposure,
@@ -154,6 +156,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     render_bucket_map(&decision.metrics.currency_gross),
                     render_bucket_map(&decision.metrics.strategy_gross),
                 );
+                    portfolio_risk_limits.push_str(&format!(
+                        ",portfolio_possible_abs_net_exposure={},portfolio_possible_concentration_bps={},portfolio_possible_abs_delta={},portfolio_possible_abs_gamma={}",
+                        decision.metrics.possible_abs_net_exposure,
+                        decision.metrics.possible_concentration_bps,
+                        decision.metrics.possible_abs_delta,
+                        decision.metrics.possible_abs_gamma,
+                    ));
                 }
                 // Equity is not positive, so no aggregate ratio exists to check.
                 // Skipping the check outright would let an underwater account
@@ -186,7 +195,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             correlation_id: intent.correlation_id.clone(),
             actor: "paper_risk_engine".to_owned(),
             evaluated_limits: format!(
-                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={},instrument_lot_size={}{}",
+                "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},working_position_delta={},committed_position={},available_cash={},instrument_tick_size={},instrument_lot_size={}{}",
                 self.risk_policy.max_order_quantity,
                 self.risk_policy.max_order_notional,
                 self.risk_policy.max_price_deviation_bps,
@@ -204,6 +213,8 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 requested_price_deviation_bps,
                 estimated_notional,
                 projected_position,
+                working_position_delta,
+                committed_position,
                 context.available_cash,
                 self.risk_policy
                     .instrument_tick_sizes
@@ -350,8 +361,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 .map(|portfolio| portfolio.position_snapshot().quantity)
                 .unwrap_or(Decimal::ZERO);
             let projected = held.checked_add(intent.projected_leg_delta(leg)?)?;
+            let working_delta = self.working_position_delta(&leg.instrument_id)?;
+            let committed = projected.checked_add(working_delta)?;
             every_leg_reduces &= self.reduces_open_position(&leg.instrument_id, held, projected)?;
-            if self.risk_policy.breaches_position_limit(projected)? {
+            if self.risk_policy.breaches_position_limit(committed)? {
                 reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
             }
             // Self-trade is assessed per leg against every working order, and a
@@ -361,13 +374,15 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 reasons.push("SELF_TRADE_RISK".to_owned());
             }
             leg_evidence.push(format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}",
                 leg.instrument_id,
                 leg.side.as_str(),
                 leg_quantity,
                 leg.limit_price,
                 mark.mark_price,
-                deviation_bps
+                deviation_bps,
+                working_delta,
+                committed
             ));
         }
 
@@ -417,7 +432,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                             .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
                     );
                     portfolio_risk_limits = format!(
-                    ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
+                    ",portfolio_exposure_basis=filled_working_candidate_v2,portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
                     decision.metrics.net_exposure,
@@ -430,6 +445,13 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     margin_used,
                     decision.metrics.margin_utilization_bps,
                 );
+                    portfolio_risk_limits.push_str(&format!(
+                        ",portfolio_possible_abs_net_exposure={},portfolio_possible_concentration_bps={},portfolio_possible_abs_delta={},portfolio_possible_abs_gamma={}",
+                        decision.metrics.possible_abs_net_exposure,
+                        decision.metrics.possible_concentration_bps,
+                        decision.metrics.possible_abs_delta,
+                        decision.metrics.possible_abs_gamma,
+                    ));
                 }
                 // The group is atomic, so every leg must move its own position
                 // toward flat for the structure to reduce risk (E7.4b).
@@ -589,6 +611,14 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         Ok(reduces_position_with_working(current, projected, working)?)
     }
 
+    /// Signed unfilled quantity of every working plain order and combination leg.
+    /// This is added to a new candidate before checking the position limit.
+    fn working_position_delta(&self, instrument_id: &str) -> Result<Decimal, PaperError> {
+        self.working_quantity(instrument_id, Side::Buy)?
+            .checked_sub(self.working_quantity(instrument_id, Side::Sell)?)
+            .map_err(Into::into)
+    }
+
     /// The quantity working orders of either kind will still take off `position` in
     /// `instrument_id`: sells against a long, buys against a short. A combination's legs
     /// count individually, by the combination units still unfilled.
@@ -604,10 +634,15 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
         } else {
             return Ok(Decimal::ZERO);
         };
+        self.working_quantity(instrument_id, reducing)
+    }
+
+    /// Unfilled working quantity on one side of one instrument, across both order kinds.
+    fn working_quantity(&self, instrument_id: &str, side: Side) -> Result<Decimal, PaperError> {
         let mut total = Decimal::ZERO;
         for order in self.orders.values() {
             let intent = &order.oms.intent;
-            if order.working() && intent.instrument_id == instrument_id && intent.side == reducing {
+            if order.working() && intent.instrument_id == instrument_id && intent.side == side {
                 total = total.checked_add(intent.quantity.checked_sub(order.filled_quantity)?)?;
             }
         }
@@ -618,7 +653,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             let intent = &order.oms.intent;
             let unfilled = intent.combo_quantity.checked_sub(order.filled_quantity)?;
             for leg in &intent.legs {
-                if leg.instrument_id == instrument_id && leg.side == reducing {
+                if leg.instrument_id == instrument_id && leg.side == side {
                     let ratio = Decimal::from_integer(i64::from(leg.ratio))?;
                     total = total.checked_add(unfilled.checked_mul(ratio)?)?;
                 }

@@ -13,18 +13,26 @@ pub struct AggregateRiskMetrics {
     pub gross_exposure: Decimal,
     /// Signed net marked exposure.
     pub net_exposure: Decimal,
+    /// Largest absolute net exposure under any subset of working fills.
+    pub possible_abs_net_exposure: Decimal,
     /// Gross/equity ratio in basis points.
     pub leverage_bps: Decimal,
-    /// Largest-position/gross ratio in basis points.
+    /// Largest instrument's gross contribution / total gross, in basis points.
     pub concentration_bps: Decimal,
+    /// Largest concentration under any subset of working fills.
+    pub possible_concentration_bps: Decimal,
     /// Peak-to-current drawdown in basis points.
     pub drawdown_bps: Decimal,
     /// Margin/equity ratio in basis points.
     pub margin_utilization_bps: Decimal,
     /// Total signed delta.
     pub total_delta: Decimal,
+    /// Largest absolute delta under any subset of working fills.
+    pub possible_abs_delta: Decimal,
     /// Total signed gamma.
     pub total_gamma: Decimal,
+    /// Largest absolute gamma under any subset of working fills.
+    pub possible_abs_gamma: Decimal,
     /// Per-sector gross exposure.
     pub sector_gross: BTreeMap<String, Decimal>,
     /// Per-asset-class gross exposure.
@@ -83,12 +91,16 @@ pub fn evaluate_portfolio_risk_with_candidates(
     if snapshot.equity <= Decimal::ZERO
         || snapshot.peak_equity <= Decimal::ZERO
         || snapshot.margin_used < Decimal::ZERO
-        || snapshot.positions.len() > 1_000_000
+        || snapshot
+            .positions
+            .len()
+            .saturating_add(snapshot.working_positions.len())
+            > 1_000_000
         || snapshot.resting_orders.len() > 1_000_000
     {
         return Err(RiskError("invalid portfolio risk snapshot".to_owned()));
     }
-    let mut positions = snapshot.positions.clone();
+    let mut base_positions = snapshot.positions.clone();
     let mut reasons = Vec::new();
     for order in candidates {
         order.validate()?;
@@ -111,7 +123,7 @@ pub fn evaluate_portfolio_risk_with_candidates(
             Side::Buy => order.quantity,
             Side::Sell => negate(order.quantity)?,
         };
-        positions.push(RiskPosition {
+        base_positions.push(RiskPosition {
             account_id: order.account_id.clone(),
             strategy_id: order.strategy_id.clone(),
             instrument_id: order.instrument_id.clone(),
@@ -126,11 +138,25 @@ pub fn evaluate_portfolio_risk_with_candidates(
         });
         let _ = order.signed_exposure()?;
     }
-    let metrics = aggregate_metrics(
+    let base_metrics = aggregate_metrics(
+        &base_positions,
+        snapshot.equity,
+        snapshot.peak_equity,
+        snapshot.margin_used,
+    )?;
+    let mut positions = base_positions.clone();
+    positions.extend(snapshot.working_positions.iter().cloned());
+    let mut metrics = aggregate_metrics(
         &positions,
         snapshot.equity,
         snapshot.peak_equity,
         snapshot.margin_used,
+    )?;
+    apply_working_bounds(
+        &mut metrics,
+        &base_metrics,
+        &base_positions,
+        &snapshot.working_positions,
     )?;
     if policy.global_kill_switch {
         reasons.push("GLOBAL_KILL_SWITCH_ACTIVE".to_owned());
@@ -138,13 +164,13 @@ pub fn evaluate_portfolio_risk_with_candidates(
     if metrics.gross_exposure > policy.max_gross_exposure {
         reasons.push("MAX_GROSS_EXPOSURE_EXCEEDED".to_owned());
     }
-    if absolute(metrics.net_exposure)? > policy.max_abs_net_exposure {
+    if metrics.possible_abs_net_exposure > policy.max_abs_net_exposure {
         reasons.push("MAX_NET_EXPOSURE_EXCEEDED".to_owned());
     }
     if metrics.leverage_bps > policy.max_leverage_bps {
         reasons.push("MAX_LEVERAGE_EXCEEDED".to_owned());
     }
-    if metrics.concentration_bps > policy.max_concentration_bps {
+    if metrics.possible_concentration_bps > policy.max_concentration_bps {
         reasons.push("MAX_CONCENTRATION_EXCEEDED".to_owned());
     }
     if snapshot.daily_pnl < negate(policy.max_daily_loss)? {
@@ -156,10 +182,10 @@ pub fn evaluate_portfolio_risk_with_candidates(
     if metrics.margin_utilization_bps > policy.max_margin_utilization_bps {
         reasons.push("MAX_MARGIN_UTILIZATION_EXCEEDED".to_owned());
     }
-    if absolute(metrics.total_delta)? > policy.max_abs_delta {
+    if metrics.possible_abs_delta > policy.max_abs_delta {
         reasons.push("MAX_DELTA_EXCEEDED".to_owned());
     }
-    if absolute(metrics.total_gamma)? > policy.max_abs_gamma {
+    if metrics.possible_abs_gamma > policy.max_abs_gamma {
         reasons.push("MAX_GAMMA_EXCEEDED".to_owned());
     }
     // One atomic group is one order here, however many legs it carries -- see
@@ -224,6 +250,72 @@ pub fn evaluate_portfolio_risk_with_candidates(
     })
 }
 
+/// Bound each signed metric by allowing any working row to fill or remain open.
+/// Gross and bucket limits already sum every row's absolute contribution, so
+/// adding all working rows is their upper bound. Concentration is different:
+/// an unrelated working instrument must not dilute a concentrated candidate.
+fn apply_working_bounds(
+    metrics: &mut AggregateRiskMetrics,
+    base: &AggregateRiskMetrics,
+    base_positions: &[RiskPosition],
+    working_positions: &[RiskPosition],
+) -> Result<(), RiskError> {
+    let mut net_low = base.net_exposure;
+    let mut net_high = base.net_exposure;
+    let mut delta_low = base.total_delta;
+    let mut delta_high = base.total_delta;
+    let mut gamma_low = base.total_gamma;
+    let mut gamma_high = base.total_gamma;
+    let mut base_instrument_gross = BTreeMap::new();
+    let mut working_instrument_gross = BTreeMap::new();
+    for position in base_positions {
+        add_bucket(
+            &mut base_instrument_gross,
+            &position.instrument_id,
+            absolute(position.signed_exposure()?)?,
+        )?;
+    }
+    for position in working_positions {
+        let signed = position.signed_exposure()?;
+        if signed >= Decimal::ZERO {
+            net_high = net_high.checked_add(signed)?;
+        } else {
+            net_low = net_low.checked_add(signed)?;
+        }
+        if position.delta >= Decimal::ZERO {
+            delta_high = delta_high.checked_add(position.delta)?;
+        } else {
+            delta_low = delta_low.checked_add(position.delta)?;
+        }
+        if position.gamma >= Decimal::ZERO {
+            gamma_high = gamma_high.checked_add(position.gamma)?;
+        } else {
+            gamma_low = gamma_low.checked_add(position.gamma)?;
+        }
+        add_bucket(
+            &mut working_instrument_gross,
+            &position.instrument_id,
+            absolute(signed)?,
+        )?;
+    }
+    metrics.possible_abs_net_exposure = absolute(net_low)?.max(absolute(net_high)?);
+    metrics.possible_abs_delta = absolute(delta_low)?.max(absolute(delta_high)?);
+    metrics.possible_abs_gamma = absolute(gamma_low)?.max(absolute(gamma_high)?);
+    metrics.possible_concentration_bps = base.concentration_bps;
+    for (instrument, working_gross) in working_instrument_gross {
+        let instrument_gross = base_instrument_gross
+            .get(&instrument)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+            .checked_add(working_gross)?;
+        let scenario_gross = base.gross_exposure.checked_add(working_gross)?;
+        metrics.possible_concentration_bps = metrics
+            .possible_concentration_bps
+            .max(ratio_bps(instrument_gross, scenario_gross)?);
+    }
+    Ok(())
+}
+
 fn aggregate_metrics(
     positions: &[RiskPosition],
     equity: Decimal,
@@ -232,7 +324,10 @@ fn aggregate_metrics(
 ) -> Result<AggregateRiskMetrics, RiskError> {
     let mut gross = Decimal::ZERO;
     let mut net = Decimal::ZERO;
-    let mut largest = Decimal::ZERO;
+    // A portfolio may hold several strategy rows and several working orders in
+    // one instrument. Concentration is by instrument, so those rows must not
+    // make the same exposure appear diversified (E7.14).
+    let mut instrument_gross = BTreeMap::<String, Decimal>::new();
     let mut delta = Decimal::ZERO;
     let mut gamma = Decimal::ZERO;
     let mut sector = BTreeMap::new();
@@ -245,7 +340,11 @@ fn aggregate_metrics(
         let absolute_exposure = absolute(signed)?;
         gross = gross.checked_add(absolute_exposure)?;
         net = net.checked_add(signed)?;
-        largest = largest.max(absolute_exposure);
+        add_bucket(
+            &mut instrument_gross,
+            &position.instrument_id,
+            absolute_exposure,
+        )?;
         delta = delta.checked_add(position.delta)?;
         gamma = gamma.checked_add(position.gamma)?;
         add_bucket(&mut sector, &position.sector, absolute_exposure)?;
@@ -253,24 +352,34 @@ fn aggregate_metrics(
         add_bucket(&mut currency, &position.currency, absolute_exposure)?;
         add_bucket(&mut strategy, &position.strategy_id, absolute_exposure)?;
     }
+    let largest = instrument_gross
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(Decimal::ZERO);
     let drawdown = if peak_equity > equity {
         ratio_bps(peak_equity.checked_sub(equity)?, peak_equity)?
     } else {
         Decimal::ZERO
     };
+    let concentration_bps = if gross == Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        ratio_bps(largest, gross)?
+    };
     Ok(AggregateRiskMetrics {
         gross_exposure: gross,
         net_exposure: net,
+        possible_abs_net_exposure: absolute(net)?,
         leverage_bps: ratio_bps(gross, equity)?,
-        concentration_bps: if gross == Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            ratio_bps(largest, gross)?
-        },
+        concentration_bps,
+        possible_concentration_bps: concentration_bps,
         drawdown_bps: drawdown,
         margin_utilization_bps: ratio_bps(margin_used, equity)?,
         total_delta: delta,
+        possible_abs_delta: absolute(delta)?,
         total_gamma: gamma,
+        possible_abs_gamma: absolute(gamma)?,
         sector_gross: sector,
         asset_class_gross: asset,
         currency_gross: currency,

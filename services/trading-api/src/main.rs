@@ -898,6 +898,11 @@ impl TradingOperatingSystem for OperatingSystemService {
                 .iter()
                 .map(risk_position)
                 .collect::<Result<Vec<_>, _>>()?,
+            working_positions: request
+                .working_positions
+                .iter()
+                .map(risk_position)
+                .collect::<Result<Vec<_>, _>>()?,
             resting_orders: request
                 .resting_orders
                 .iter()
@@ -949,6 +954,10 @@ impl TradingOperatingSystem for OperatingSystemService {
                 margin_utilization_bps: metrics.margin_utilization_bps.to_string(),
                 total_delta: metrics.total_delta.to_string(),
                 total_gamma: metrics.total_gamma.to_string(),
+                possible_abs_net_exposure: metrics.possible_abs_net_exposure.to_string(),
+                possible_concentration_bps: metrics.possible_concentration_bps.to_string(),
+                possible_abs_delta: metrics.possible_abs_delta.to_string(),
+                possible_abs_gamma: metrics.possible_abs_gamma.to_string(),
             }),
         }))
     }

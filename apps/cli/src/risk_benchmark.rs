@@ -65,6 +65,8 @@ struct SnapshotDocument {
     daily_pnl: String,
     margin_used: String,
     positions: Vec<PositionDocument>,
+    #[serde(default)]
+    working_positions: Vec<PositionDocument>,
     resting_orders: Vec<RestingOrderDocument>,
     recent_order_count: u32,
 }
@@ -321,21 +323,12 @@ fn snapshot(
         positions: document
             .positions
             .into_iter()
-            .map(|position| {
-                Ok(RiskPosition {
-                    account_id: position.account_id,
-                    strategy_id: position.strategy_id,
-                    instrument_id: position.instrument_id,
-                    asset_class: position.asset_class,
-                    sector: position.sector,
-                    currency: position.currency,
-                    quantity: decimal(&position.quantity)?,
-                    mark_price: decimal(&position.mark_price)?,
-                    multiplier: decimal(&position.multiplier)?,
-                    delta: decimal(&position.delta)?,
-                    gamma: decimal(&position.gamma)?,
-                })
-            })
+            .map(risk_position)
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
+        working_positions: document
+            .working_positions
+            .into_iter()
+            .map(risk_position)
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
         resting_orders: document
             .resting_orders
@@ -350,6 +343,22 @@ fn snapshot(
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
         recent_order_count: document.recent_order_count,
+    })
+}
+
+fn risk_position(position: PositionDocument) -> Result<RiskPosition, Box<dyn std::error::Error>> {
+    Ok(RiskPosition {
+        account_id: position.account_id,
+        strategy_id: position.strategy_id,
+        instrument_id: position.instrument_id,
+        asset_class: position.asset_class,
+        sector: position.sector,
+        currency: position.currency,
+        quantity: decimal(&position.quantity)?,
+        mark_price: decimal(&position.mark_price)?,
+        multiplier: decimal(&position.multiplier)?,
+        delta: decimal(&position.delta)?,
+        gamma: decimal(&position.gamma)?,
     })
 }
 
@@ -491,6 +500,7 @@ mod tests {
                 daily_pnl: "0".to_owned(),
                 margin_used: "0".to_owned(),
                 positions: Vec::new(),
+                working_positions: Vec::new(),
                 resting_orders: Vec::new(),
                 recent_order_count: 0
             },

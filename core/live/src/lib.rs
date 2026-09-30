@@ -3177,6 +3177,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             Side::Buy => current_position.checked_add(intent.quantity)?,
             Side::Sell => current_position.checked_sub(intent.quantity)?,
         };
+        let working_position_delta = self.working_position_delta(&intent.instrument_id)?;
+        let committed_position = projected_position.checked_add(working_position_delta)?;
         let rate_window_start =
             decision_at - time::Duration::seconds(self.policy.order_rate_window_seconds as i64);
         // Rate-window membership is keyed off each order's own risk *decision* time
@@ -3230,7 +3232,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         if self.working_order_count() >= self.policy.max_open_orders {
             reasons.push("MAX_OPEN_ORDERS_EXCEEDED".to_owned());
         }
-        if self.policy.breaches_position_limit(projected_position)? {
+        if self.policy.breaches_position_limit(committed_position)? {
             reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
         }
         if intent.side == Side::Buy && estimated_notional > available_cash {
@@ -3271,7 +3273,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
                     );
                     portfolio_risk_limits = format!(
-                    ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
+                    ",portfolio_exposure_basis=filled_working_candidate_v2,portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={},portfolio_sector_gross={},portfolio_asset_class_gross={},portfolio_currency_gross={},portfolio_strategy_gross={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
                     decision.metrics.net_exposure,
@@ -3288,6 +3290,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     render_bucket_map(&decision.metrics.currency_gross),
                     render_bucket_map(&decision.metrics.strategy_gross),
                 );
+                    portfolio_risk_limits.push_str(&format!(
+                        ",portfolio_possible_abs_net_exposure={},portfolio_possible_concentration_bps={},portfolio_possible_abs_delta={},portfolio_possible_abs_gamma={}",
+                        decision.metrics.possible_abs_net_exposure,
+                        decision.metrics.possible_concentration_bps,
+                        decision.metrics.possible_abs_delta,
+                        decision.metrics.possible_abs_gamma,
+                    ));
                 }
                 // Equity is not positive, so no aggregate ratio exists to check.
                 // Skipping the check outright would let an underwater account
@@ -3311,7 +3320,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             reasons.push("APPROVED".to_owned());
         }
         let evaluated_limits = format!(
-            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},available_cash={},instrument_tick_size={},instrument_lot_size={}{}",
+            "max_order_quantity={},max_order_notional={},max_price_deviation_bps={},canary_max_order_notional={},canary_max_orders={},max_open_orders={},max_position_quantity={},max_realized_loss={},max_market_data_age_seconds={},max_order_rate={},order_rate_window_seconds={},recent_order_count={},market_instrument_id={},market_mark_price={},market_observed_at={},requested_price={},requested_price_deviation_bps={},estimated_notional={},projected_position={},working_position_delta={},committed_position={},available_cash={},instrument_tick_size={},instrument_lot_size={}{}",
             self.policy.max_order_quantity,
             self.policy.max_order_notional,
             self.policy.max_price_deviation_bps,
@@ -3331,6 +3340,8 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             requested_price_deviation_bps,
             estimated_notional,
             projected_position,
+            working_position_delta,
+            committed_position,
             available_cash,
             self.policy
                 .instrument_tick_sizes
@@ -3463,6 +3474,45 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
     /// Extracted so the single-order and combination paths observe exactly the
     /// same portfolio, equity, peak, daily baseline and margin figures; the only
     /// difference between them is which candidates are then added.
+    #[allow(clippy::too_many_arguments)]
+    fn working_risk_position(
+        &self,
+        composition: &PortfolioRiskComposition,
+        account_id: &str,
+        strategy_id: &str,
+        instrument_id: &str,
+        side: Side,
+        quantity: Decimal,
+        mark_price: Decimal,
+    ) -> Result<RiskPosition, LiveError> {
+        let candidate = self.risk_candidate(
+            composition,
+            "working.exposure",
+            account_id,
+            strategy_id,
+            instrument_id,
+            side,
+            quantity,
+            mark_price,
+        )?;
+        Ok(RiskPosition {
+            account_id: candidate.account_id,
+            strategy_id: candidate.strategy_id,
+            instrument_id: candidate.instrument_id,
+            asset_class: candidate.asset_class,
+            sector: candidate.sector,
+            currency: candidate.currency,
+            quantity: match side {
+                Side::Buy => quantity,
+                Side::Sell => Decimal::ZERO.checked_sub(quantity)?,
+            },
+            mark_price: candidate.mark_price,
+            multiplier: candidate.multiplier,
+            delta: candidate.delta,
+            gamma: candidate.gamma,
+        })
+    }
+
     fn portfolio_risk_state(
         &self,
         composition: &PortfolioRiskComposition,
@@ -3538,6 +3588,60 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     delta: Decimal::ZERO,
                     gamma: Decimal::ZERO,
                 });
+            }
+        }
+        let mut working_positions = Vec::new();
+        // Risk exposure includes quantities the broker may still fill, even though
+        // cash, equity and the filled-position ledger have not moved yet (E7.14).
+        for order in self.orders.values().filter(|order| order.working()) {
+            let intent = &order.oms.intent;
+            let remaining = intent.quantity.checked_sub(order.filled_quantity)?;
+            if remaining > Decimal::ZERO {
+                let mark = self
+                    .marks
+                    .get(&intent.instrument_id)
+                    .copied()
+                    .unwrap_or(order.market.mark_price);
+                working_positions.push(self.working_risk_position(
+                    composition,
+                    &intent.account_id,
+                    &intent.strategy_id,
+                    &intent.instrument_id,
+                    intent.side,
+                    remaining,
+                    mark,
+                )?);
+            }
+        }
+        for order in self.combo_orders.values().filter(|order| order.working()) {
+            let intent = &order.oms.intent;
+            let unfilled = intent.combo_quantity.checked_sub(order.filled_quantity)?;
+            if unfilled == Decimal::ZERO {
+                continue;
+            }
+            for leg in &intent.legs {
+                let mark = self
+                    .marks
+                    .get(&leg.instrument_id)
+                    .copied()
+                    .or_else(|| {
+                        order
+                            .market
+                            .mark_for(&leg.instrument_id)
+                            .map(|seen| seen.mark_price)
+                    })
+                    .ok_or_else(|| LiveError("working combo leg has no market mark".to_owned()))?;
+                let quantity =
+                    unfilled.checked_mul(Decimal::from_integer(i64::from(leg.ratio))?)?;
+                working_positions.push(self.working_risk_position(
+                    composition,
+                    &intent.account_id,
+                    &intent.strategy_id,
+                    &leg.instrument_id,
+                    leg.side,
+                    quantity,
+                    mark,
+                )?);
             }
         }
         let resting_orders = self
@@ -3627,6 +3731,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             daily_pnl: equity.checked_sub(self.daily_baseline_equity)?,
             margin_used,
             positions,
+            working_positions,
             resting_orders,
             recent_order_count: 0,
         };
@@ -5869,6 +5974,105 @@ mod tests {
             .map(|instrument| (instrument.to_owned(), amount("1")))
             .collect(),
         }
+    }
+
+    #[test]
+    fn live_position_limit_counts_unfilled_working_orders() {
+        let path = journal_path("working-position-limit");
+        let mut risk_policy = policy();
+        risk_policy.max_position_quantity = amount("3");
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        let first = intent("LIVE", "intent.live.position.first");
+        let approval = approval_for(&service, &first);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        service
+            .submit_canary_intent(
+                first,
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("first working order");
+        let second = service
+            .evaluate_risk(
+                &intent("LIVE", "intent.live.position.second"),
+                &market(),
+                "2026-01-02T14:30:01Z",
+                false,
+            )
+            .expect("second assessment");
+        assert!(!second.approved);
+        assert!(second
+            .reason_codes
+            .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+        assert!(second
+            .evaluated_limits
+            .contains("working_position_delta=2.00000000,committed_position=4.00000000"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_aggregate_limit_counts_unfilled_working_orders() {
+        let path = journal_path("working-aggregate-limit");
+        let mut risk_policy = policy();
+        let mut aggregate = permissive_portfolio_risk_policy();
+        aggregate.max_gross_exposure = amount("30");
+        risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+            policy: aggregate,
+            instrument_buckets: BTreeMap::new(),
+            margin_rates: None,
+        });
+        let mut service = test_service_with_policy(LiveRunMode::Canary, &path, risk_policy);
+        let first = intent("LIVE", "intent.live.aggregate.first");
+        let approval = approval_for(&service, &first);
+        service
+            .register_approval(approval, "2026-01-02T14:30:00Z", "operator.approver.001")
+            .expect("four-eyes approval");
+        service
+            .connect(
+                &TestSecrets,
+                "operator.approver.001",
+                "2026-01-02T14:30:00Z",
+            )
+            .expect("managed-secret connection");
+        service
+            .submit_canary_intent(
+                first,
+                market(),
+                "approval.live.001",
+                "2026-01-02T14:30:00Z",
+                "operator.requester.001",
+            )
+            .expect("first working order");
+        let second = service
+            .evaluate_risk(
+                &intent("LIVE", "intent.live.aggregate.second"),
+                &market(),
+                "2026-01-02T14:30:01Z",
+                false,
+            )
+            .expect("second assessment");
+        assert!(!second.approved);
+        assert!(second
+            .reason_codes
+            .contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()));
+        assert!(second
+            .evaluated_limits
+            .contains("portfolio_gross_exposure=40.00000000"));
+        assert!(second
+            .evaluated_limits
+            .contains("portfolio_exposure_basis=filled_working_candidate_v2"));
+        let _ = fs::remove_file(&path);
     }
 
     /// The same policy with net short exposure explicitly permitted, bounded at

@@ -3,6 +3,38 @@
 use super::*;
 
 #[test]
+fn paper_position_limit_counts_unfilled_working_orders() {
+    let mut risk_policy = policy();
+    risk_policy.max_position_quantity = decimal("position", "150").unwrap();
+    let mut service = service_with(risk_policy);
+    let mut first_intent = intent("intent-position-first", "2026-01-02T14:31:00Z");
+    first_intent.quantity = decimal("quantity", "100").unwrap();
+    let first = service
+        .submit_intent(
+            first_intent,
+            market("2026-01-02T14:31:00Z"),
+            "2026-01-02T14:31:00Z",
+        )
+        .unwrap();
+    assert!(first.decision.approved);
+    let mut second_intent = intent("intent-position-second", "2026-01-02T14:31:01Z");
+    second_intent.quantity = decimal("quantity", "100").unwrap();
+    let second = service
+        .submit_intent(
+            second_intent,
+            market("2026-01-02T14:31:01Z"),
+            "2026-01-02T14:31:01Z",
+        )
+        .unwrap();
+    assert!(!second.decision.approved);
+    assert!(second.order_id.is_none());
+    assert!(second
+        .decision
+        .reason_codes
+        .contains(&"POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned()));
+}
+
+#[test]
 fn kill_switch_blocks_new_paper_orders_without_strategy_or_broker_health() {
     let mut service = service();
     service

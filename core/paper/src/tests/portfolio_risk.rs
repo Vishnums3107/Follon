@@ -39,6 +39,153 @@ fn permissive_portfolio_risk_policy() -> follon_risk::PortfolioRiskPolicy {
 }
 
 #[test]
+fn paper_aggregate_limit_counts_unfilled_working_orders() {
+    let mut aggregate = permissive_portfolio_risk_policy();
+    aggregate.max_gross_exposure = decimal("gross", "15000").unwrap();
+    let mut risk_policy = policy();
+    risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+        policy: aggregate,
+        instrument_buckets: BTreeMap::new(),
+        margin_rates: None,
+    });
+    let mut service = service_with(risk_policy);
+    let mut first_intent = intent("intent-aggregate-first", "2026-01-02T14:31:00Z");
+    first_intent.quantity = decimal("quantity", "100").unwrap();
+    let first = service
+        .submit_intent(
+            first_intent,
+            market("2026-01-02T14:31:00Z"),
+            "2026-01-02T14:31:00Z",
+        )
+        .unwrap();
+    assert!(first.decision.approved);
+    let mut second_intent = intent("intent-aggregate-second", "2026-01-02T14:31:01Z");
+    second_intent.quantity = decimal("quantity", "100").unwrap();
+    let second = service
+        .submit_intent(
+            second_intent,
+            market("2026-01-02T14:31:01Z"),
+            "2026-01-02T14:31:01Z",
+        )
+        .unwrap();
+    assert!(!second.decision.approved);
+    assert!(second.order_id.is_none());
+    assert!(second
+        .decision
+        .reason_codes
+        .contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()));
+    assert!(second
+        .decision
+        .evaluated_limits
+        .contains("portfolio_gross_exposure=20000.00000000"));
+    assert!(second
+        .decision
+        .evaluated_limits
+        .contains("portfolio_exposure_basis=filled_working_candidate_v2"));
+}
+
+#[test]
+fn paper_aggregate_exposure_tracks_the_unfilled_part_and_releases_it_on_cancel() {
+    let mut aggregate = permissive_portfolio_risk_policy();
+    aggregate.max_gross_exposure = decimal("gross", "15000").unwrap();
+    let mut risk_policy = policy();
+    risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+        policy: aggregate,
+        instrument_buckets: BTreeMap::new(),
+        margin_rates: None,
+    });
+    let mut service = service_with(risk_policy);
+    let mut first_intent = intent("intent-partial-exposure", "2026-01-02T14:31:00Z");
+    first_intent.quantity = decimal("quantity", "100").unwrap();
+    let first = service
+        .submit_intent(
+            first_intent,
+            market("2026-01-02T14:31:00Z"),
+            "2026-01-02T14:31:00Z",
+        )
+        .unwrap();
+    let first_id = first.order_id.unwrap();
+    fill_order(&mut service, &first_id, "50", "100", "2026-01-02T14:31:01Z");
+    let mut too_much = intent("intent-after-partial", "2026-01-02T14:31:02Z");
+    too_much.quantity = decimal("quantity", "51").unwrap();
+    let rejected = service
+        .submit_intent(
+            too_much,
+            market("2026-01-02T14:31:02Z"),
+            "2026-01-02T14:31:02Z",
+        )
+        .unwrap();
+    assert!(rejected
+        .decision
+        .reason_codes
+        .contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()));
+    assert!(rejected
+        .decision
+        .evaluated_limits
+        .contains("portfolio_gross_exposure=15100.00000000"));
+    service.cancel_order(&first_id).unwrap();
+    service.synchronize().unwrap();
+    let mut available = intent("intent-after-cancel", "2026-01-02T14:31:03Z");
+    available.quantity = decimal("quantity", "100").unwrap();
+    let accepted = service
+        .submit_intent(
+            available,
+            market("2026-01-02T14:31:03Z"),
+            "2026-01-02T14:31:03Z",
+        )
+        .unwrap();
+    assert!(
+        accepted.decision.approved,
+        "{:?}",
+        accepted.decision.reason_codes
+    );
+}
+
+#[test]
+fn paper_aggregate_limit_counts_each_leg_of_a_working_combo() {
+    let mut aggregate = permissive_portfolio_risk_policy();
+    aggregate.max_gross_exposure = decimal("gross", "60").unwrap();
+    let mut risk_policy = policy_permitting_shorts();
+    risk_policy.portfolio_risk = Some(PortfolioRiskComposition {
+        policy: aggregate,
+        instrument_buckets: BTreeMap::new(),
+        margin_rates: None,
+    });
+    let mut service = service_with(risk_policy);
+    let first = service
+        .submit_combo_intent(
+            combo_intent("intent-aggregate-combo", "2026-01-02T14:31:00Z"),
+            combo_market("2026-01-02T14:31:00Z"),
+            "2026-01-02T14:31:00Z",
+        )
+        .unwrap();
+    assert!(first.decision.approved, "{:?}", first.decision.reason_codes);
+    let mut plain = intent("intent-after-aggregate-combo", "2026-01-02T14:31:01Z");
+    plain.instrument_id = "inst.us_option.spy.near".to_owned();
+    plain.quantity = decimal("quantity", "2").unwrap();
+    let second = service
+        .submit_intent(
+            plain,
+            PaperMarketData {
+                instrument_id: "inst.us_option.spy.near".to_owned(),
+                mark_price: decimal("mark", "7.50").unwrap(),
+                observed_at: "2026-01-02T14:31:01Z".to_owned(),
+            },
+            "2026-01-02T14:31:01Z",
+        )
+        .unwrap();
+    assert!(!second.decision.approved);
+    assert!(second
+        .decision
+        .reason_codes
+        .contains(&"MAX_GROSS_EXPOSURE_EXCEEDED".to_owned()));
+    assert!(second
+        .decision
+        .evaluated_limits
+        .contains("portfolio_gross_exposure=65.00000000"));
+}
+
+#[test]
 fn every_portfolio_risk_limit_is_part_of_the_configuration_fingerprint() {
     // Version 1 of the portfolio-risk fingerprint part omitted these, so a
     // journal reopened under any change to them (delivery state E7.4).

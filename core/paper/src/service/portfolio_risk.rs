@@ -156,6 +156,62 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 });
             }
         }
+        let mut working_positions = Vec::new();
+        // A working order has not changed cash or the filled position yet, but its
+        // unfilled quantity can become exposure. Add it at the current mark before
+        // the new candidate, so a sequence of individually legal orders cannot
+        // pass a portfolio limit in aggregate (E7.14).
+        for order in self.orders.values().filter(|order| order.working()) {
+            let intent = &order.oms.intent;
+            let remaining = intent.quantity.checked_sub(order.filled_quantity)?;
+            if remaining > Decimal::ZERO {
+                let mark = self
+                    .marks
+                    .get(&intent.instrument_id)
+                    .copied()
+                    .unwrap_or(order.market.mark_price);
+                working_positions.push(self.working_risk_position(
+                    composition,
+                    &intent.account_id,
+                    &intent.strategy_id,
+                    &intent.instrument_id,
+                    intent.side,
+                    remaining,
+                    mark,
+                )?);
+            }
+        }
+        for order in self.combo_orders.values().filter(|order| order.working()) {
+            let intent = &order.oms.intent;
+            let unfilled = intent.combo_quantity.checked_sub(order.filled_quantity)?;
+            if unfilled == Decimal::ZERO {
+                continue;
+            }
+            for leg in &intent.legs {
+                let mark = self
+                    .marks
+                    .get(&leg.instrument_id)
+                    .copied()
+                    .or_else(|| {
+                        order
+                            .market
+                            .mark_for(&leg.instrument_id)
+                            .map(|seen| seen.mark_price)
+                    })
+                    .ok_or_else(|| PaperError("working combo leg has no market mark".to_owned()))?;
+                let quantity =
+                    unfilled.checked_mul(Decimal::from_integer(i64::from(leg.ratio))?)?;
+                working_positions.push(self.working_risk_position(
+                    composition,
+                    &intent.account_id,
+                    &intent.strategy_id,
+                    &leg.instrument_id,
+                    leg.side,
+                    quantity,
+                    mark,
+                )?);
+            }
+        }
         let mut resting_orders = self
             .orders
             .values()
@@ -259,10 +315,50 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             daily_pnl: equity.checked_sub(self.daily_baseline_equity)?,
             margin_used,
             positions,
+            working_positions,
             resting_orders,
             recent_order_count: 0,
         };
         Ok(Some((snapshot, margin_used)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn working_risk_position(
+        &self,
+        composition: &PortfolioRiskComposition,
+        account_id: &str,
+        strategy_id: &str,
+        instrument_id: &str,
+        side: Side,
+        quantity: Decimal,
+        mark_price: Decimal,
+    ) -> Result<RiskPosition, PaperError> {
+        let candidate = self.risk_candidate(
+            composition,
+            "working.exposure",
+            account_id,
+            strategy_id,
+            instrument_id,
+            side,
+            quantity,
+            mark_price,
+        )?;
+        Ok(RiskPosition {
+            account_id: candidate.account_id,
+            strategy_id: candidate.strategy_id,
+            instrument_id: candidate.instrument_id,
+            asset_class: candidate.asset_class,
+            sector: candidate.sector,
+            currency: candidate.currency,
+            quantity: match side {
+                Side::Buy => quantity,
+                Side::Sell => Decimal::ZERO.checked_sub(quantity)?,
+            },
+            mark_price: candidate.mark_price,
+            multiplier: candidate.multiplier,
+            delta: candidate.delta,
+            gamma: candidate.gamma,
+        })
     }
 
     /// Builds one aggregate-risk candidate row, classified by the operator's

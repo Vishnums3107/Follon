@@ -459,6 +459,8 @@ message PortfolioRiskRequest {
   repeated RestingOrder resting_orders = 8;
   uint32 recent_order_count = 9;
   optional CandidateOrder candidate = 10;
+  // Signed unfilled marked exposure; each row may or may not fill.
+  repeated PortfolioPosition working_positions = 11;
 }
 
 message RiskMetrics {
@@ -470,6 +472,10 @@ message RiskMetrics {
   string margin_utilization_bps = 6;
   string total_delta = 7;
   string total_gamma = 8;
+  string possible_abs_net_exposure = 9;
+  string possible_concentration_bps = 10;
+  string possible_abs_delta = 11;
+  string possible_abs_gamma = 12;
 }
 
 message PortfolioRiskResponse {
