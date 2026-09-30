@@ -2,25 +2,29 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://follon.local/contracts/v2/trusted-reviewers.schema.json",
   "title": "Follon trusted acceptance reviewer key set",
-  "description": "The keys whose signatures make an acceptance record count. An operator provisions and controls this file. An empty set trusts no one, so no record counts. A reviewer who leaves is removed by writing a new set, and every audit and promotion receipt names the SHA-256 of the set it used.",
+  "description": "The keys whose signatures make an acceptance record count. An operator provisions and controls this file. Every record in a ledger root must be signed by a key listed here for the reviewer it names, or the audit fails, so an empty set passes only an empty root. A key is never removed: a reviewer who leaves stays listed, and a key that may no longer be trusted is marked revoked, which stops its acceptances counting and keeps its rejections. Each public key must be an Ed25519 point of the prime-order subgroup, and no two entries may share one. Version 1 sets, which had no status, are still read with every key active. Every audit and promotion receipt names the SHA-256 of the set it used.",
   "type": "object",
   "additionalProperties": false,
   "required": ["trusted_reviewers_schema_version", "reviewers"],
   "properties": {
-    "trusted_reviewers_schema_version": { "const": 1 },
+    "trusted_reviewers_schema_version": { "const": 2 },
     "reviewers": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["key_id", "reviewer_id", "public_key_hex"],
+        "required": ["key_id", "reviewer_id", "public_key_hex", "status"],
         "properties": {
           "key_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
           "reviewer_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "minLength": 1 },
           "public_key_hex": {
             "type": "string",
             "pattern": "^[a-f0-9]{64}$",
-            "description": "The 32-byte Ed25519 public key, as `follon-admin release-keygen` writes it in a trusted key file."
+            "description": "The 32-byte Ed25519 public key, as `follon-admin release-keygen` writes it in a trusted key file. A key of small order, such as the all-zero string, is refused."
+          },
+          "status": {
+            "enum": ["active", "revoked"],
+            "description": "active: the key's signatures count. revoked: the key still verifies what it signed, its acceptances no longer count, and its rejections still disqualify."
           }
         }
       }

@@ -72,7 +72,7 @@ class ReleasePromotionGateTests(unittest.TestCase):
         # such a document, even inside the ledger root, changes nothing.
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory)
-            for version in (1, 2, 3):
+            for version in (1, 2, 3, 4):
                 (workspace.ledgers / f"acceptance-status-v{version}.json").write_text(
                     json.dumps({"acceptance_status_schema_version": version, "all_gates_eligible": True}),
                     encoding="utf-8",
@@ -123,12 +123,15 @@ class ReleasePromotionGateTests(unittest.TestCase):
             with self.assertRaisesRegex(PromotionError, "open acceptance gates"):
                 ready(workspace, "production")
 
-    def test_evidence_nobody_trusts_does_not_open_a_gate(self) -> None:
+    def test_evidence_no_listed_key_signed_fails_verification(self) -> None:
+        # Every record must be signed by a listed key, so a set that lists none
+        # fails the audit for staging too, not only production (E6.6b).
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, trust=False)
             write_every_gate(workspace)
-            with self.assertRaisesRegex(PromotionError, "open acceptance gates"):
-                ready(workspace, "production")
+            for environment in ("staging", "production"):
+                with self.assertRaisesRegex(PromotionError, "failed verification.*no listed reviewer key"):
+                    ready(workspace, environment)
 
     def test_evidence_without_its_retained_artifact_does_not_open_a_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

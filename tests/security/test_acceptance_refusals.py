@@ -182,7 +182,7 @@ class NothingEscapesTests(LedgerHarness):
             "a 5,000-digit version": b'{"trusted_reviewers_schema_version":' + b"1" * 5000 + b',"reviewers":[]}',
             "bytes that are not UTF-8": b'{"a":"\xff"}',
         }
-        for field in ("key_id", "reviewer_id", "public_key_hex"):
+        for field in ("key_id", "reviewer_id", "public_key_hex", "status"):
             for index, value in enumerate(HOSTILE_VALUES):
                 documents[f"{field} #{index}"] = json.dumps({**valid, "reviewers": [{**entry, field: value}]}).encode()
         for index, value in enumerate(HOSTILE_VALUES):

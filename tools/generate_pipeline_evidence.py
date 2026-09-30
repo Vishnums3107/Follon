@@ -83,8 +83,10 @@ def publish_acceptance_status(var_dir: Path, release_id: str) -> Path:
     truth when no ledger has been retained, and the tool refuses a missing
     root rather than reporting zero. The same goes for the retained artifact
     root, and for the trusted reviewer set: a set nobody has provisioned is
-    empty, so no signature counts. An operator's own set, written before the
-    pipeline runs, is never overwritten (E6.4).
+    empty and lists no key, so an empty root audits clean and a root holding
+    any record fails, since every record must be signed by a listed key
+    (E6.6b). An operator's own set, written before the pipeline runs, is never
+    overwritten (E6.4).
     """
     ledger_root = var_dir / ACCEPTANCE_LEDGER_DIRECTORY
     ledger_root.mkdir(parents=True, exist_ok=True)
@@ -93,7 +95,7 @@ def publish_acceptance_status(var_dir: Path, release_id: str) -> Path:
     reviewers = var_dir / ACCEPTANCE_REVIEWERS_FILE
     if not reviewers.exists():
         reviewers.write_text(
-            json.dumps({"trusted_reviewers_schema_version": 1, "reviewers": []}) + "\n",
+            json.dumps({"trusted_reviewers_schema_version": 2, "reviewers": []}) + "\n",
             encoding="utf-8",
             newline="\n",
         )

@@ -9,8 +9,6 @@ from io import StringIO
 from pathlib import Path
 
 from acceptance_fixtures import (
-    DEFAULT_ARTIFACT,
-    DEFAULT_ARTIFACT_SHA256,
     OTHER_SEED,
     RELEASE_ID,
     REVIEWER_ID,
@@ -18,6 +16,8 @@ from acceptance_fixtures import (
     REVIEWER_SEED,
     SESSION_TYPES,
     Workspace,
+    artifact_for,
+    artifact_sha256,
     attributes_for,
     make_chain,
     make_record,
@@ -28,12 +28,16 @@ from acceptance_fixtures import (
 )
 from tools import ed25519, generate_pipeline_evidence
 from tools.acceptance_evidence import (
+    ARTIFACT_SHARED,
     ARTIFACT_UNVERIFIED,
     CRITERIA_NOT_MET,
+    CUSTOMER_KIND_CONFLICT,
+    DISQUALIFIED,
     GATES,
     MIN_SESSION_SECONDS,
     OTHER_RELEASE,
-    UNAUTHENTICATED,
+    REVIEWER_REVOKED,
+    SUBSCRIPTION_SHARED,
     ZERO_HASH,
     EvidenceError,
     append_record,
@@ -44,15 +48,20 @@ from tools.acceptance_evidence import (
     retain_artifact,
 )
 
+SECOND_REVIEWER_ID = "reviewer.three"
+SECOND_KEY_ID = "reviewer.key.three.001"
+
+
+def audit_of(records: list[dict[str, object]], **workspace_options: object) -> dict[str, object]:
+    """Audits one ledger of `records` in a fresh workspace."""
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Workspace(directory, **workspace_options)
+        workspace.write("paper", records)
+        return workspace.audit()
+
 
 class LedgerIntegrityTests(unittest.TestCase):
     """A malformed, mis-chained or mis-hashed record makes the whole ledger untrusted."""
-
-    def report_for(self, records: list[dict[str, object]]) -> dict[str, object]:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(directory)
-            workspace.write("paper", records)
-            return workspace.audit()
 
     def refused(self, record: dict[str, object]) -> str:
         with tempfile.TemporaryDirectory() as directory:
@@ -73,12 +82,11 @@ class LedgerIntegrityTests(unittest.TestCase):
             )
             partner = make_chain(("evidence.partner.1", "partner.1", {"evidence_type": "design_partner"}))
             paper_path = workspace.write("paper", paper)
-            partner_path = workspace.ledgers / "partners" / "partner.acceptance.ndjson"
-            write_ledger(partner_path, partner)
+            partner_path = workspace.write("partners/partner", partner)
 
             report = workspace.audit()
 
-            self.assertEqual(report["acceptance_status_schema_version"], 3)
+            self.assertEqual(report["acceptance_status_schema_version"], 4)
             self.assertEqual(report["release_id"], RELEASE_ID)
             self.assertEqual(
                 report["trusted_reviewers_sha256"],
@@ -105,17 +113,18 @@ class LedgerIntegrityTests(unittest.TestCase):
             self.assertEqual(report["counted_records"], 3)
 
     def test_chain_and_unique_subject_counts_are_verified(self) -> None:
-        report = self.report_for(
+        report = audit_of(
             make_chain(("evidence.paper.1", "session.paper.1", {}), ("evidence.paper.2", "session.paper.2", {}))
         )
         self.assertEqual(report["gates"]["paper_session"]["observed"], 2)
         self.assertFalse(report["all_gates_eligible"])
 
     def test_one_subject_counts_once(self) -> None:
-        report = self.report_for(
+        report = audit_of(
             make_chain(("evidence.paper.1", "session.paper.1", {}), ("evidence.paper.2", "session.paper.1", {}))
         )
         self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+        self.assertEqual(report["counted_records"], 2)
 
     def test_tampering_fails_closed(self) -> None:
         record = make_record(ZERO_HASH, "evidence.paper.1", "session.paper.1")
@@ -131,43 +140,6 @@ class LedgerIntegrityTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(EvidenceError, "duplicate evidence_id"):
                 load_ledgers(root)
-
-    def test_a_rejection_after_acceptance_disqualifies_the_subject(self) -> None:
-        # Before E6.2 the later rejection only incremented a counter, and the
-        # subject still counted toward the gate.
-        report = self.report_for(
-            make_chain(
-                ("evidence.paper.1", "session.paper.1", {}),
-                ("evidence.paper.2", "session.paper.1", {"outcome": "rejected"}),
-            )
-        )
-        gate = report["gates"]["paper_session"]
-        self.assertEqual(gate["observed"], 0)
-        self.assertEqual(gate["disqualified_subjects"], 1)
-        self.assertEqual(gate["rejected_records"], 1)
-
-    def test_a_rejection_before_acceptance_disqualifies_the_subject(self) -> None:
-        # No correction record exists, so a later acceptance cannot overturn it.
-        report = self.report_for(
-            make_chain(
-                ("evidence.paper.1", "session.paper.1", {"outcome": "rejected"}),
-                ("evidence.paper.2", "session.paper.1", {}),
-            )
-        )
-        self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
-        self.assertEqual(report["gates"]["paper_session"]["disqualified_subjects"], 1)
-
-    def test_a_rejection_disqualifies_only_its_own_subject_in_its_own_gate(self) -> None:
-        report = self.report_for(
-            make_chain(
-                ("evidence.paper.1", "session.paper.1", {}),
-                ("evidence.paper.2", "session.paper.2", {"outcome": "rejected"}),
-                ("evidence.partner.1", "session.paper.1", {"evidence_type": "design_partner", "outcome": "rejected"}),
-            )
-        )
-        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
-        self.assertEqual(report["gates"]["paper_session"]["disqualified_subjects"], 0)
-        self.assertEqual(report["gates"]["design_partner"]["observed"], 0)
 
     def test_the_schema_version_must_be_the_integer_two(self) -> None:
         # JSON `true` equals 1 in Python and passed an equality check. Version 1
@@ -207,90 +179,49 @@ class LedgerIntegrityTests(unittest.TestCase):
         self.assertIn("distinct", self.refused(record))
 
 
-class ReviewerAuthenticationTests(unittest.TestCase):
-    """A record counts only if a trusted reviewer signed it (E6.4)."""
+class DisqualificationTests(unittest.TestCase):
+    """A signed statement that a subject did not qualify disqualifies it in its gate."""
 
-    def audit(self, records, **workspace_options) -> dict[str, object]:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(directory, **workspace_options)
-            workspace.write("paper", records)
-            return workspace.audit()
-
-    def assert_not_counted(self, report: dict[str, object], reason: str, evidence_id: str) -> None:
-        self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
-        self.assertIn(evidence_id, report["not_counted"][reason])
-
-    def test_a_record_signed_by_a_trusted_reviewer_counts(self) -> None:
-        report = self.audit(make_chain(("evidence.paper.1", "session.paper.1", {})))
-        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
-        self.assertEqual(report["not_counted"], {})
-
-    def test_a_signature_from_another_key_does_not_count(self) -> None:
-        records = make_chain(("evidence.paper.1", "session.paper.1", {"seed": OTHER_SEED}))
-        self.assert_not_counted(self.audit(records), UNAUTHENTICATED, "evidence.paper.1")
-
-    def test_a_key_the_set_does_not_hold_does_not_count(self) -> None:
-        records = make_chain(("evidence.paper.1", "session.paper.1", {"reviewer_key_id": "reviewer.key.unknown"}))
-        self.assert_not_counted(self.audit(records), UNAUTHENTICATED, "evidence.paper.1")
-
-    def test_an_empty_set_trusts_no_one(self) -> None:
-        records = make_chain(("evidence.paper.1", "session.paper.1", {}))
-        self.assert_not_counted(self.audit(records, trust=False), UNAUTHENTICATED, "evidence.paper.1")
-
-    def test_a_trusted_key_cannot_sign_for_another_reviewer(self) -> None:
-        # The key is trusted for `reviewer.two`. A record naming another reviewer
-        # is not that reviewer's, however valid the signature.
-        records = make_chain(("evidence.paper.1", "session.paper.1", {"reviewed_by": "reviewer.three"}))
-        self.assert_not_counted(self.audit(records), UNAUTHENTICATED, "evidence.paper.1")
-
-    def test_a_signed_field_edited_and_rehashed_does_not_count(self) -> None:
-        # Rewriting the ledger is not enough: the chain and hashes can be redone,
-        # the signature cannot.
-        (record,) = make_chain(("evidence.paper.1", "session.paper.1", {}))
-        forged = resign(record, notes="Edited after review.")
-        self.assert_not_counted(self.audit([forged]), UNAUTHENTICATED, "evidence.paper.1")
-
-    def test_a_signed_record_moved_elsewhere_in_the_chain_does_not_authenticate(self) -> None:
-        # The signature covers the previous hash, so a record cannot be lifted out
-        # of the place the reviewer signed it and re-chained.
-        _, second = make_chain(
-            ("evidence.paper.1", "session.paper.1", {}), ("evidence.paper.2", "session.paper.2", {})
-        )
-        # `second` was signed to follow another record. Lifted out and re-chained
-        # after this one, the chain and hashes are valid, but the signature is not.
-        other = make_record(ZERO_HASH, "evidence.paper.0", "session.paper.0")
-        moved = resign(second, prev_hash=other["record_hash"])
-        report = self.audit([other, moved])
-        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
-        self.assertEqual(report["not_counted"][UNAUTHENTICATED], ["evidence.paper.2"])
-
-    def test_the_signature_covers_the_documented_message(self) -> None:
-        # Built here from the documented recipe, not from the tool's own helper, so a
-        # change to the domain string or the canonical form fails this test and not
-        # only the wire format every reviewer's tooling depends on.
-        (record,) = make_chain(("evidence.paper.1", "session.paper.1", {}))
-        body = {key: value for key, value in record.items() if key not in ("record_hash", "reviewer_signature")}
-        message = b"follon-acceptance-evidence-v2\n" + json.dumps(
-            body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("utf-8")
-        independent = ed25519.sign(REVIEWER_SEED, message).hex()
-        self.assertEqual(independent, record["reviewer_signature"])
-        report = self.audit(make_chain(("evidence.paper.1", "session.paper.1", {"reviewer_signature": independent})))
-        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
-
-    def test_a_forged_rejection_does_not_disqualify_a_subject(self) -> None:
-        # A rejection only lowers a count, so an untrusted one could only sabotage.
-        report = self.audit(
+    def test_a_rejection_after_acceptance_disqualifies_the_subject(self) -> None:
+        # Before E6.2 the later rejection only incremented a counter, and the
+        # subject still counted toward the gate.
+        report = audit_of(
             make_chain(
                 ("evidence.paper.1", "session.paper.1", {}),
-                ("evidence.paper.2", "session.paper.1", {"outcome": "rejected", "seed": OTHER_SEED}),
+                ("evidence.paper.2", "session.paper.1", {"outcome": "rejected"}),
             )
         )
         gate = report["gates"]["paper_session"]
-        self.assertEqual((gate["observed"], gate["disqualified_subjects"], gate["rejected_records"]), (1, 0, 0))
+        self.assertEqual((gate["observed"], gate["disqualified_subjects"], gate["rejected_records"]), (0, 1, 1))
+        self.assertEqual(report["not_counted"], {DISQUALIFIED: ["evidence.paper.1"]})
+        self.assertEqual(report["counted_records"], 0)
 
-    def test_a_trusted_rejection_disqualifies_regardless_of_artifact_and_release(self) -> None:
-        report = self.audit(
+    def test_a_rejection_before_acceptance_disqualifies_the_subject(self) -> None:
+        # No correction record exists, so a later acceptance cannot overturn it.
+        report = audit_of(
+            make_chain(
+                ("evidence.paper.1", "session.paper.1", {"outcome": "rejected"}),
+                ("evidence.paper.2", "session.paper.1", {}),
+            )
+        )
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
+        self.assertEqual(report["gates"]["paper_session"]["disqualified_subjects"], 1)
+
+    def test_a_rejection_disqualifies_only_its_own_subject_in_its_own_gate(self) -> None:
+        report = audit_of(
+            make_chain(
+                ("evidence.paper.1", "session.paper.1", {}),
+                ("evidence.paper.2", "session.paper.2", {"outcome": "rejected"}),
+                ("evidence.partner.1", "session.paper.1", {"evidence_type": "design_partner", "outcome": "rejected"}),
+            )
+        )
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+        self.assertEqual(report["gates"]["paper_session"]["disqualified_subjects"], 1)
+        self.assertEqual(report["gates"]["design_partner"]["disqualified_subjects"], 1)
+        self.assertEqual(report["gates"]["design_partner"]["observed"], 0)
+
+    def test_a_rejection_disqualifies_regardless_of_its_artifact_and_release(self) -> None:
+        report = audit_of(
             make_chain(
                 ("evidence.paper.1", "session.paper.1", {}),
                 (
@@ -303,34 +234,302 @@ class ReviewerAuthenticationTests(unittest.TestCase):
         gate = report["gates"]["paper_session"]
         self.assertEqual((gate["observed"], gate["disqualified_subjects"]), (0, 1))
 
+    def test_a_failing_acceptance_disqualifies_its_subject_when_a_clean_one_follows(self) -> None:
+        # The review's finding (4): the failing record only failed to count, and the
+        # clean one after it counted the subject (E6.6b).
+        failing = {**attributes_for("paper_session"), "unplanned_reconnects": 1}
+        for order in ("failing first", "clean first"):
+            specifications = [
+                ("evidence.paper.1", "session.paper.1", {"attributes": failing}),
+                ("evidence.paper.2", "session.paper.1", {}),
+            ]
+            if order == "clean first":
+                specifications.reverse()
+            with self.subTest(order):
+                report = audit_of(make_chain(*specifications))
+                gate = report["gates"]["paper_session"]
+                self.assertEqual((gate["observed"], gate["disqualified_subjects"]), (0, 1))
+                self.assertEqual(report["not_counted"][CRITERIA_NOT_MET], ["evidence.paper.1"])
+                self.assertEqual(report["not_counted"][DISQUALIFIED], ["evidence.paper.1", "evidence.paper.2"])
+
+    def test_a_failing_acceptance_disqualifies_in_every_release(self) -> None:
+        failing = {**attributes_for("paper_session"), "reconciliation_discrepancies": 1}
+        report = audit_of(
+            make_chain(
+                ("evidence.paper.1", "session.paper.1", {"attributes": failing, "release_id": "release.other"}),
+                ("evidence.paper.2", "session.paper.1", {}),
+            )
+        )
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
+
+    def test_a_lone_rejection_is_a_disqualified_subject_and_no_counted_record(self) -> None:
+        failing = {**attributes_for("paper_session"), "reconciliation_discrepancies": 2}
+        report = audit_of(make_chain(("evidence.x.1", "session.x.1", {"outcome": "rejected", "attributes": failing})))
+        gate = report["gates"]["paper_session"]
+        self.assertEqual((gate["rejected_records"], gate["disqualified_subjects"]), (1, 1))
+        self.assertEqual((report["verified_records"], report["counted_records"]), (1, 0))
+        self.assertEqual(report["not_counted"], {})
+
+
+class SignatureTests(unittest.TestCase):
+    """Every record must be signed by a key the trusted set lists for its reviewer (E6.4, E6.6b)."""
+
+    def assert_audit_fails_naming(self, records: list[dict[str, object]], *evidence_ids: str, **options) -> None:
+        with self.assertRaisesRegex(EvidenceError, "no listed reviewer key signed") as caught:
+            audit_of(records, **options)
+        for evidence_id in evidence_ids:
+            self.assertIn(evidence_id, str(caught.exception))
+
+    def test_a_record_signed_by_a_listed_reviewer_counts(self) -> None:
+        report = audit_of(make_chain(("evidence.paper.1", "session.paper.1", {})))
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+        self.assertEqual(report["not_counted"], {})
+
+    def test_a_signature_from_another_key_fails_the_audit(self) -> None:
+        records = make_chain(("evidence.paper.1", "session.paper.1", {"seed": OTHER_SEED}))
+        self.assert_audit_fails_naming(records, "evidence.paper.1")
+
+    def test_a_key_the_set_does_not_list_fails_the_audit(self) -> None:
+        records = make_chain(("evidence.paper.1", "session.paper.1", {"reviewer_key_id": "reviewer.key.unknown"}))
+        self.assert_audit_fails_naming(records, "evidence.paper.1")
+
+    def test_an_empty_set_fails_a_ledger_that_holds_a_record_and_passes_one_that_holds_none(self) -> None:
+        self.assert_audit_fails_naming(make_chain(("evidence.paper.1", "session.paper.1", {})), trust=False)
+        report = audit_of([], trust=False)
+        self.assertEqual((report["verified_records"], report["counted_records"]), (0, 0))
+
+    def test_a_listed_key_cannot_sign_for_another_reviewer(self) -> None:
+        # The key is listed for `reviewer.two`. A record naming another reviewer
+        # is not that reviewer's, however valid the signature.
+        records = make_chain(("evidence.paper.1", "session.paper.1", {"reviewed_by": SECOND_REVIEWER_ID}))
+        self.assert_audit_fails_naming(records, "evidence.paper.1")
+
+    def test_a_signed_field_edited_and_rehashed_fails_the_audit(self) -> None:
+        # Rewriting the ledger is not enough: the chain and hashes can be redone,
+        # the signature cannot.
+        (record,) = make_chain(("evidence.paper.1", "session.paper.1", {}))
+        self.assert_audit_fails_naming([resign(record, notes="Edited after review.")], "evidence.paper.1")
+
+    def test_a_rejection_edited_into_an_acceptance_fails_the_audit(self) -> None:
+        # The review's finding (2). Ignoring a record that no longer authenticates let
+        # anyone who can write the ledger requalify a rejected session by editing it.
+        # Failing only on an unsigned rejection would not do: the edit makes it an
+        # acceptance, so every record must be signed.
+        clean, rejection = make_chain(
+            ("evidence.paper.1", "session.paper.1", {}),
+            ("evidence.paper.2", "session.paper.1", {"outcome": "rejected"}),
+        )
+        self.assertEqual(audit_of([clean, rejection])["gates"]["paper_session"]["observed"], 0)
+        edited = resign(rejection, outcome="accepted")
+        self.assert_audit_fails_naming([clean, edited], "evidence.paper.2")
+
+    def test_dropping_a_reviewer_from_the_set_fails_the_audit(self) -> None:
+        # The runbook once said a reviewer who leaves is removed from the set. Removing
+        # the reviewer who rejected a session made the rejection inert and requalified it.
+        records = [
+            make_record(ZERO_HASH, "evidence.paper.1", "session.paper.1"),
+        ]
+        rejection = make_record(
+            records[0]["record_hash"], "evidence.paper.2", "session.paper.1", outcome="rejected",
+            seed=OTHER_SEED, reviewed_by=SECOND_REVIEWER_ID, reviewer_key_id=SECOND_KEY_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            workspace.write("paper", [*records, rejection])
+            workspace.trust(
+                (REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED), (SECOND_KEY_ID, SECOND_REVIEWER_ID, OTHER_SEED)
+            )
+            self.assertEqual(workspace.audit()["gates"]["paper_session"]["disqualified_subjects"], 1)
+            workspace.trust((REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED))
+            with self.assertRaisesRegex(EvidenceError, "no listed reviewer key signed: evidence.paper.2"):
+                workspace.audit()
+
+    def test_a_signed_record_moved_elsewhere_in_the_chain_fails_the_audit(self) -> None:
+        # The signature covers the previous hash, so a record cannot be lifted out
+        # of the place the reviewer signed it and re-chained.
+        _, second = make_chain(
+            ("evidence.paper.1", "session.paper.1", {}), ("evidence.paper.2", "session.paper.2", {})
+        )
+        other = make_record(ZERO_HASH, "evidence.paper.0", "session.paper.0")
+        moved = resign(second, prev_hash=other["record_hash"])
+        self.assert_audit_fails_naming([other, moved], "evidence.paper.2")
+
+    def test_a_forged_rejection_fails_the_audit(self) -> None:
+        # E6.4 ignored it, reasoning that it could only lower a count. It cannot now be
+        # told from a real rejection whose reviewer was dropped, so it fails.
+        records = make_chain(
+            ("evidence.paper.1", "session.paper.1", {}),
+            ("evidence.paper.2", "session.paper.1", {"outcome": "rejected", "seed": OTHER_SEED}),
+        )
+        self.assert_audit_fails_naming(records, "evidence.paper.2")
+
+    def test_the_failure_names_the_first_five_unsigned_records_and_counts_the_rest(self) -> None:
+        records = make_chain(
+            *[(f"evidence.paper.{index}", f"session.paper.{index}", {"seed": OTHER_SEED}) for index in range(7)]
+        )
+        with self.assertRaises(EvidenceError) as caught:
+            audit_of(records)
+        self.assertEqual(
+            str(caught.exception),
+            "records that no listed reviewer key signed: evidence.paper.0, evidence.paper.1, "
+            "evidence.paper.2, evidence.paper.3, evidence.paper.4 and 2 more",
+        )
+
+    def test_the_signature_covers_the_documented_message(self) -> None:
+        # Built here from the documented recipe, not from the tool's own helper, so a
+        # change to the domain string or the canonical form fails this test and not
+        # only the wire format every reviewer's tooling depends on.
+        (record,) = make_chain(("evidence.paper.1", "session.paper.1", {}))
+        body = {key: value for key, value in record.items() if key not in ("record_hash", "reviewer_signature")}
+        message = b"follon-acceptance-evidence-v2\n" + json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        independent = ed25519.sign(REVIEWER_SEED, message).hex()
+        self.assertEqual(independent, record["reviewer_signature"])
+        report = audit_of(make_chain(("evidence.paper.1", "session.paper.1", {"reviewer_signature": independent})))
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+
+
+class RevocationTests(unittest.TestCase):
+    """A key that may no longer be trusted is revoked, never removed (E6.6b)."""
+
+    def audit_revoked(self, records: list[dict[str, object]]) -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            workspace.write("paper", records)
+            workspace.trust((REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED, "revoked"))
+            return workspace.audit()
+
+    def test_a_revoked_keys_acceptance_does_not_count(self) -> None:
+        report = self.audit_revoked(make_chain(("evidence.paper.1", "session.paper.1", {})))
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
+        self.assertEqual(report["not_counted"], {REVIEWER_REVOKED: ["evidence.paper.1"]})
+
+    def test_a_revoked_keys_rejection_still_disqualifies(self) -> None:
+        # Revoking must not be a way to requalify a subject: a rejection only ever
+        # lowers a count, so keeping it fails safe.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            clean = make_record(
+                ZERO_HASH, "evidence.paper.1", "session.paper.1",
+                seed=OTHER_SEED, reviewed_by=SECOND_REVIEWER_ID, reviewer_key_id=SECOND_KEY_ID,
+            )
+            rejection = make_record(clean["record_hash"], "evidence.paper.2", "session.paper.1", outcome="rejected")
+            workspace.write("paper", [clean, rejection])
+            workspace.trust(
+                (REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED, "revoked"),
+                (SECOND_KEY_ID, SECOND_REVIEWER_ID, OTHER_SEED),
+            )
+            gate = workspace.audit()["gates"]["paper_session"]
+        self.assertEqual((gate["observed"], gate["disqualified_subjects"]), (0, 1))
+
+    def test_a_revoked_key_still_verifies_what_it_signed(self) -> None:
+        # Its records stay checkable, so editing one is still caught.
+        (record,) = make_chain(("evidence.paper.1", "session.paper.1", {}))
+        with self.assertRaisesRegex(EvidenceError, "no listed reviewer key signed"):
+            self.audit_revoked([resign(record, notes="Edited after revocation.")])
+
+    def test_another_reviewers_acceptance_still_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            first = make_record(ZERO_HASH, "evidence.paper.1", "session.paper.1")
+            second = make_record(
+                first["record_hash"], "evidence.paper.2", "session.paper.2",
+                seed=OTHER_SEED, reviewed_by=SECOND_REVIEWER_ID, reviewer_key_id=SECOND_KEY_ID,
+            )
+            workspace.write("paper", [first, second])
+            workspace.trust(
+                (REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED, "revoked"),
+                (SECOND_KEY_ID, SECOND_REVIEWER_ID, OTHER_SEED, "active"),
+            )
+            report = workspace.audit()
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+        self.assertEqual(report["not_counted"], {REVIEWER_REVOKED: ["evidence.paper.1"]})
+
+
+class ReviewerSetTests(unittest.TestCase):
+    """The trusted reviewer set is strict, and enrols only honest public keys (E6.4, E6.6b)."""
+
+    def load(self, document: object) -> object:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviewers.json"
+            path.write_text(document if isinstance(document, str) else json.dumps(document), encoding="utf-8")
+            return load_trusted_reviewers(path)
+
     def test_the_reviewer_file_is_strict(self) -> None:
         valid = reviewers_document((REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED))
         entry = valid["reviewers"][0]
         malformed = {
             "not json": "{",
             "unknown top-level field": {**valid, "extra": 1},
-            "wrong schema version": {**valid, "trusted_reviewers_schema_version": 2},
+            # With no entries, so that only the version check can refuse it.
+            "unknown schema version": {"trusted_reviewers_schema_version": 3, "reviewers": []},
             "boolean schema version": {**valid, "trusted_reviewers_schema_version": True},
             "reviewers not a list": {**valid, "reviewers": {}},
             "unknown entry field": {**valid, "reviewers": [{**entry, "extra": 1}]},
+            "version 2 without a status": {
+                **valid, "reviewers": [{k: v for k, v in entry.items() if k != "status"}],
+            },
+            "version 1 with a status": {**valid, "trusted_reviewers_schema_version": 1},
+            "an unknown status": {**valid, "reviewers": [{**entry, "status": "retired"}]},
             "non-canonical key id": {**valid, "reviewers": [{**entry, "key_id": "Key One"}]},
             "short public key": {**valid, "reviewers": [{**entry, "public_key_hex": "ab"}]},
             "duplicate key": {**valid, "reviewers": [entry, entry]},
         }
         for name, document in malformed.items():
-            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "reviewers.json"
-                path.write_text(document if isinstance(document, str) else json.dumps(document), encoding="utf-8")
-                with self.assertRaises(EvidenceError):
-                    load_trusted_reviewers(path)
+            with self.subTest(name), self.assertRaises(EvidenceError):
+                self.load(document)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "reviewers.json"
             path.write_text(json.dumps(valid), encoding="utf-8")
             loaded = load_trusted_reviewers(path)
             self.assertEqual(loaded.sha256, hashlib.sha256(path.read_bytes()).hexdigest())
             self.assertEqual(set(loaded.keys), {REVIEWER_KEY_ID})
+            self.assertEqual(loaded.keys[REVIEWER_KEY_ID].status, "active")
             with self.assertRaises(EvidenceError):
                 load_trusted_reviewers(Path(directory) / "missing.json")
+
+    def test_a_version_1_set_is_read_with_every_key_active(self) -> None:
+        # Version 1 had no status, and the pipeline wrote one before E6.6b.
+        document = {
+            "trusted_reviewers_schema_version": 1,
+            "reviewers": [
+                {"key_id": REVIEWER_KEY_ID, "reviewer_id": REVIEWER_ID, "public_key_hex": ed25519.public_key(REVIEWER_SEED).hex()}
+            ],
+        }
+        self.assertEqual(self.load(document).keys[REVIEWER_KEY_ID].status, "active")
+        self.assertEqual(self.load({"trusted_reviewers_schema_version": 1, "reviewers": []}).keys, {})
+
+    def test_a_key_that_is_not_an_honest_public_key_is_refused(self) -> None:
+        # The review's finding (1). Audit item 121 made such a key verify nothing; a set
+        # that enrols one now fails, instead of seeming to trust someone it cannot.
+        field = ed25519.FIELD
+        honest = ed25519.public_key(REVIEWER_SEED)
+        torsion = ed25519._decompress(
+            bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a")
+        )
+        refused = {
+            "the all-zero placeholder": bytes(32),
+            "the neutral element": int.to_bytes(1, 32, "little"),
+            "the point of order two": int.to_bytes(field - 1, 32, "little"),
+            "an honest key plus a torsion point": ed25519._compress(ed25519._add(ed25519._decompress(honest), torsion)),
+            "a string that is no point": b"\xff" * 32,
+        }
+        valid = reviewers_document((REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED))
+        entry = valid["reviewers"][0]
+        for name, key in refused.items():
+            with self.subTest(name):
+                document = {**valid, "reviewers": [{**entry, "public_key_hex": key.hex()}]}
+                with self.assertRaisesRegex(EvidenceError, "not a valid Ed25519 public key"):
+                    self.load(document)
+        self.assertEqual(set(self.load(valid).keys), {REVIEWER_KEY_ID})
+
+    def test_one_public_key_cannot_be_two_reviewers(self) -> None:
+        document = reviewers_document(
+            (REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED), (SECOND_KEY_ID, SECOND_REVIEWER_ID, REVIEWER_SEED)
+        )
+        with self.assertRaisesRegex(EvidenceError, "repeats the public key"):
+            self.load(document)
 
 
 class ArtifactRetentionTests(unittest.TestCase):
@@ -339,8 +538,8 @@ class ArtifactRetentionTests(unittest.TestCase):
     def audit_with(self, prepare) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory)
-            prepare(workspace)
             workspace.write("paper", make_chain(("evidence.paper.1", "session.paper.1", {})))
+            prepare(workspace)
             return workspace.audit()
 
     def test_a_retained_artifact_lets_its_record_count(self) -> None:
@@ -348,24 +547,22 @@ class ArtifactRetentionTests(unittest.TestCase):
         self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
 
     def test_a_missing_artifact_means_the_record_cannot_be_checked(self) -> None:
-        report = self.audit_with(lambda workspace: (workspace.artifacts / DEFAULT_ARTIFACT_SHA256).unlink())
+        report = self.audit_with(lambda workspace: workspace.artifact_path("session.paper.1").unlink())
         self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
         self.assertEqual(report["not_counted"][ARTIFACT_UNVERIFIED], ["evidence.paper.1"])
 
     def test_an_artifact_that_no_longer_matches_its_digest_does_not_count(self) -> None:
-        report = self.audit_with(
-            lambda workspace: (workspace.artifacts / DEFAULT_ARTIFACT_SHA256).write_bytes(b"replaced")
-        )
+        report = self.audit_with(lambda workspace: workspace.artifact_path("session.paper.1").write_bytes(b"replaced"))
         self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
         self.assertEqual(report["not_counted"][ARTIFACT_UNVERIFIED], ["evidence.paper.1"])
 
     def test_a_link_in_the_artifact_root_does_not_count(self) -> None:
         def replace_with_a_link(workspace: Workspace) -> None:
             elsewhere = workspace.artifacts.parent / "elsewhere"
-            elsewhere.write_bytes(DEFAULT_ARTIFACT)
-            (workspace.artifacts / DEFAULT_ARTIFACT_SHA256).unlink()
+            elsewhere.write_bytes(artifact_for("session.paper.1"))
+            workspace.artifact_path("session.paper.1").unlink()
             try:
-                (workspace.artifacts / DEFAULT_ARTIFACT_SHA256).symlink_to(elsewhere)
+                workspace.artifact_path("session.paper.1").symlink_to(elsewhere)
             except (OSError, NotImplementedError):
                 self.skipTest("cannot create a symbolic link here")
 
@@ -376,9 +573,9 @@ class ArtifactRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "session.log"
-            source.write_bytes(DEFAULT_ARTIFACT)
+            source.write_bytes(artifact_for("session.paper.1"))
             digest = retain_artifact(source, root / "store")
-            self.assertEqual(digest, DEFAULT_ARTIFACT_SHA256)
+            self.assertEqual(digest, artifact_sha256("session.paper.1"))
             self.assertTrue(artifact_is_retained(root / "store", digest))
             self.assertEqual(retain_artifact(source, root / "store"), digest)
             (root / "store" / digest).write_bytes(b"different")
@@ -387,6 +584,85 @@ class ArtifactRetentionTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceError, "regular file"):
                 retain_artifact(root, root / "store")
             self.assertFalse(artifact_is_retained(root / "store", "c" * 64))
+
+
+class ExclusiveBackingTests(unittest.TestCase):
+    """One artifact backs one subject, one subscription one customer, and a customer is one kind (E6.6b)."""
+
+    def test_one_artifact_cannot_back_two_subjects(self) -> None:
+        # The review's finding (3): thirty sessions could be one artifact.
+        shared = artifact_sha256("session.paper.1")
+        report = audit_of(
+            make_chain(
+                *[
+                    (f"evidence.paper.{index}", f"session.paper.{index}", {"source_artifact_sha256": shared})
+                    for index in range(1, 31)
+                ]
+            )
+        )
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
+        self.assertEqual(len(report["not_counted"][ARTIFACT_SHARED]), 30)
+
+    def test_one_artifact_may_back_one_subject_many_times(self) -> None:
+        report = audit_of(
+            make_chain(("evidence.paper.1", "session.paper.1", {}), ("evidence.paper.2", "session.paper.1", {}))
+        )
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+        self.assertNotIn(ARTIFACT_SHARED, report["not_counted"])
+
+    def test_an_artifact_shared_across_gates_or_releases_counts_for_neither(self) -> None:
+        shared = artifact_sha256("session.paper.1")
+        for name, (subject_id, keywords) in {
+            "another gate": ("subject.x.2", {"evidence_type": "design_partner", "source_artifact_sha256": shared}),
+            "another release": ("subject.x.2", {"release_id": "release.other", "source_artifact_sha256": shared}),
+            # One id in two gates names two subjects, so the artifact backs two.
+            "the same id in another gate": ("session.paper.1", {"evidence_type": "design_partner"}),
+        }.items():
+            with self.subTest(name):
+                report = audit_of(
+                    make_chain(("evidence.paper.1", "session.paper.1", {}), ("evidence.x.2", subject_id, keywords))
+                )
+                self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
+                self.assertIn("evidence.paper.1", report["not_counted"][ARTIFACT_SHARED])
+
+    def test_a_rejection_citing_an_artifact_does_not_share_it(self) -> None:
+        shared = artifact_sha256("session.paper.1")
+        report = audit_of(
+            make_chain(
+                ("evidence.paper.1", "session.paper.1", {}),
+                ("evidence.paper.2", "session.paper.2", {"outcome": "rejected", "source_artifact_sha256": shared}),
+            )
+        )
+        self.assertEqual(report["gates"]["paper_session"]["observed"], 1)
+
+    def test_one_subscription_cannot_back_two_customers(self) -> None:
+        # Ten paying professionals could be one subscription.
+        records = make_chain(
+            *[
+                (
+                    f"evidence.customer.{index}",
+                    f"customer.{index}",
+                    {
+                        "evidence_type": "paying_customer",
+                        "attributes": {"customer_kind": "professional", "subscription_id": "subscription.one"},
+                    },
+                )
+                for index in range(10)
+            ]
+        )
+        report = audit_of(records)
+        gate = report["gates"]["paying_customer"]
+        self.assertEqual((gate["observed"], gate["eligible"]), (0, False))
+        self.assertEqual(len(report["not_counted"][SUBSCRIPTION_SHARED]), 10)
+
+    def test_a_customer_is_one_kind(self) -> None:
+        records = make_chain(
+            ("evidence.customer.1", "customer.1", {"evidence_type": "paying_customer", "customer_kind": "professional"}),
+            ("evidence.customer.2", "customer.1", {"evidence_type": "paying_customer", "customer_kind": "organisation"}),
+        )
+        report = audit_of(records)
+        self.assertEqual(report["gates"]["paying_customer"]["observed"], 0)
+        self.assertEqual(report["not_counted"][CUSTOMER_KIND_CONFLICT], ["evidence.customer.1", "evidence.customer.2"])
 
 
 class ReleaseBindingTests(unittest.TestCase):
@@ -437,16 +713,14 @@ class SessionCriteriaTests(unittest.TestCase):
     """What a clean session is, fixed before any session counts (E6.5)."""
 
     def counted(self, evidence_type: str, **changes: object) -> bool:
-        attributes = {**attributes_for(evidence_type), **changes}
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(directory)
-            workspace.write(
-                "x", make_chain(("evidence.x.1", "subject.x.1", {"evidence_type": evidence_type, "attributes": attributes}))
-            )
-            report = workspace.audit()
-            if not report["counted_records"]:
-                self.assertEqual(report["not_counted"], {CRITERIA_NOT_MET: ["evidence.x.1"]})
-            return bool(report["counted_records"])
+        attributes = {**attributes_for(evidence_type, subject_id="subject.x.1"), **changes}
+        report = audit_of(
+            make_chain(("evidence.x.1", "subject.x.1", {"evidence_type": evidence_type, "attributes": attributes}))
+        )
+        if not report["counted_records"]:
+            # A failing acceptance also disqualifies its own subject (E6.6b).
+            self.assertEqual(report["not_counted"], {CRITERIA_NOT_MET: ["evidence.x.1"], DISQUALIFIED: ["evidence.x.1"]})
+        return bool(report["counted_records"])
 
     def test_a_clean_session_lasts_at_least_a_regular_us_equity_session(self) -> None:
         # 6.5 hours. Pinned by value, because the tests below are written in terms of
@@ -475,21 +749,6 @@ class SessionCriteriaTests(unittest.TestCase):
 
     def test_planned_reconnect_drills_never_disqualify(self) -> None:
         self.assertTrue(self.counted("paper_session", planned_reconnect_drills=5))
-
-    def test_a_rejection_may_record_why_a_session_failed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(directory)
-            failing = {**attributes_for("paper_session"), "reconciliation_discrepancies": 2}
-            workspace.write(
-                "x",
-                make_chain(
-                    ("evidence.x.1", "session.x.1", {"outcome": "rejected", "attributes": failing}),
-                ),
-            )
-            report = workspace.audit()
-            gate = report["gates"]["paper_session"]
-            self.assertEqual((gate["rejected_records"], gate["disqualified_subjects"]), (1, 0))
-            self.assertEqual(report["not_counted"], {})
 
     def test_the_other_gates_have_their_own_criteria(self) -> None:
         self.assertTrue(self.counted("design_partner"))
@@ -627,22 +886,27 @@ class AppendWorkflowTests(unittest.TestCase):
             "attributes": attributes_for("paper_session"),
         }
 
+    def artifact(self, directory: str, subject_id: str = "session.paper.1") -> Path:
+        path = Path(directory) / f"{subject_id}.log"
+        path.write_bytes(artifact_for(subject_id))
+        return path
+
     def test_an_appended_record_is_signed_chained_retained_and_counted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
-            artifact = Path(directory) / "session.log"
-            artifact.write_bytes(DEFAULT_ARTIFACT)
             ledger = workspace.ledgers / "paper.acceptance.ndjson"
 
-            first = append_record(ledger, self.template(), artifact, workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID)
+            first = append_record(
+                ledger, self.template(), self.artifact(directory), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID
+            )
             second = append_record(
-                ledger, self.template("evidence.paper.2", "session.paper.2"), artifact, workspace.artifacts,
-                REVIEWER_SEED, REVIEWER_KEY_ID,
+                ledger, self.template("evidence.paper.2", "session.paper.2"),
+                self.artifact(directory, "session.paper.2"), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID,
             )
 
             self.assertEqual(first["prev_hash"], ZERO_HASH)
             self.assertEqual(second["prev_hash"], first["record_hash"])
-            self.assertEqual(first["source_artifact_sha256"], DEFAULT_ARTIFACT_SHA256)
+            self.assertEqual(first["source_artifact_sha256"], artifact_sha256("session.paper.1"))
             report = workspace.audit()
             self.assertEqual(report["gates"]["paper_session"]["observed"], 2)
             self.assertEqual(report["not_counted"], {})
@@ -650,8 +914,7 @@ class AppendWorkflowTests(unittest.TestCase):
     def test_an_append_is_refused_before_anything_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
-            artifact = Path(directory) / "session.log"
-            artifact.write_bytes(DEFAULT_ARTIFACT)
+            artifact = self.artifact(directory)
             ledger = workspace.ledgers / "paper.acceptance.ndjson"
             append_record(ledger, self.template(), artifact, workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID)
             before = ledger.read_bytes()
@@ -692,23 +955,22 @@ class AppendWorkflowTests(unittest.TestCase):
     def test_a_tampered_ledger_refuses_further_appends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
-            artifact = Path(directory) / "session.log"
-            artifact.write_bytes(DEFAULT_ARTIFACT)
             ledger = workspace.ledgers / "paper.acceptance.ndjson"
-            append_record(ledger, self.template(), artifact, workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID)
+            append_record(
+                ledger, self.template(), self.artifact(directory), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID
+            )
             ledger.write_text(ledger.read_text(encoding="utf-8").replace("Independently", "Casually"), encoding="utf-8")
             with self.assertRaisesRegex(EvidenceError, "hash does not match"):
                 append_record(
-                    ledger, self.template("evidence.paper.2", "session.paper.2"), artifact,
-                    workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID,
+                    ledger, self.template("evidence.paper.2", "session.paper.2"),
+                    self.artifact(directory, "session.paper.2"), workspace.artifacts, REVIEWER_SEED, REVIEWER_KEY_ID,
                 )
 
     def test_the_command_line_signs_appends_and_audits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
             root = Path(directory)
-            artifact = root / "session.log"
-            artifact.write_bytes(DEFAULT_ARTIFACT)
+            artifact = self.artifact(directory)
             key = root / "reviewer.pk8"
             key.write_bytes(pkcs8(REVIEWER_SEED))
             template = root / "record.json"
@@ -753,8 +1015,7 @@ class AppendWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory, retain=False)
             root = Path(directory)
-            artifact = root / "session.log"
-            artifact.write_bytes(DEFAULT_ARTIFACT)
+            artifact = self.artifact(directory)
             key = root / "reviewer.pk8"
             key.write_bytes(pkcs8(REVIEWER_SEED))
             template = root / "record.json"
@@ -807,7 +1068,8 @@ class PipelineAcceptanceRootTests(unittest.TestCase):
     """The evidence pipeline counts only the operational ledger root (E6.1)."""
 
     def publish(self, var_dir: Path) -> dict[str, object]:
-        target = generate_pipeline_evidence.publish_acceptance_status(var_dir, RELEASE_ID)
+        with redirect_stdout(StringIO()):
+            target = generate_pipeline_evidence.publish_acceptance_status(var_dir, RELEASE_ID)
         return json.loads(target.read_text(encoding="utf-8"))
 
     def test_a_ledger_elsewhere_under_var_is_never_counted(self) -> None:
@@ -831,9 +1093,9 @@ class PipelineAcceptanceRootTests(unittest.TestCase):
             self.assertEqual(report["gates"]["paying_customer"]["observed"], 0)
             self.assertFalse(report["gates"]["paying_customer"]["eligible"])
 
-    def test_a_ledger_nobody_trusts_verifies_but_counts_nothing(self) -> None:
-        # The pipeline provisions an empty reviewer set, so no signature counts
-        # until an operator supplies their own (E6.4).
+    def test_a_ledger_nobody_listed_a_key_for_fails_the_pipeline(self) -> None:
+        # The pipeline provisions an empty reviewer set, which lists no key, so a record
+        # in the operational root cannot be authenticated and the audit fails (E6.6b).
         with tempfile.TemporaryDirectory() as directory:
             var_dir = Path(directory)
             root = var_dir / generate_pipeline_evidence.ACCEPTANCE_LEDGER_DIRECTORY
@@ -842,13 +1104,14 @@ class PipelineAcceptanceRootTests(unittest.TestCase):
                 root / "paper.acceptance.ndjson",
                 [make_record(ZERO_HASH, "evidence.paper.1", "session.paper.1")],
             )
-
-            report = self.publish(var_dir)
-
-            self.assertEqual(report["verified_records"], 1)
-            self.assertEqual(report["counted_records"], 0)
-            self.assertEqual(report["gates"]["paper_session"]["observed"], 0)
-            self.assertIn("evidence.paper.1", report["not_counted"][UNAUTHENTICATED])
+            output = StringIO()
+            with redirect_stdout(output), self.assertRaises(SystemExit):
+                generate_pipeline_evidence.publish_acceptance_status(var_dir, RELEASE_ID)
+            self.assertIn("no listed reviewer key signed: evidence.paper.1", output.getvalue())
+            self.assertEqual(
+                json.loads((var_dir / generate_pipeline_evidence.ACCEPTANCE_REVIEWERS_FILE).read_text(encoding="utf-8")),
+                {"trusted_reviewers_schema_version": 2, "reviewers": []},
+            )
 
     def test_an_operators_reviewer_set_and_artifacts_make_a_ledger_count(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -860,7 +1123,7 @@ class PipelineAcceptanceRootTests(unittest.TestCase):
             reviewers = var_dir / generate_pipeline_evidence.ACCEPTANCE_REVIEWERS_FILE
             document = json.dumps(reviewers_document((REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED)))
             reviewers.write_text(document, encoding="utf-8")
-            (store / DEFAULT_ARTIFACT_SHA256).write_bytes(DEFAULT_ARTIFACT)
+            (store / artifact_sha256("session.paper.1")).write_bytes(artifact_for("session.paper.1"))
             write_ledger(
                 root / "paper.acceptance.ndjson",
                 [make_record(ZERO_HASH, "evidence.paper.1", "session.paper.1")],

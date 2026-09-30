@@ -5094,6 +5094,77 @@ These are mandatory master-plan acceptance conditions and are currently open:
      - **Boundary.** Findings (1) to (5), (7) and (8) are unchanged by this item, and the promotion
        gate's wiring, the rest of finding (9), is untested still. All remain E6.6b.
 
+123. Every acceptance record must be signed by a listed key, and what a subject is backed by is its
+     own (2026-09-30, Security; defects in items 111 and 121, E6.4 and E6.5). Findings (1) to (4) of the
+     review recorded as E6.6b, each reproduced against the committed code first.
+     - **Gap.**
+       - A record that did not authenticate was listed as `UNAUTHENTICATED` and ignored, and E6.4 had
+         reasoned that an untrusted rejection could only lower a count. It could also be the only trace of
+         a real rejection. Anyone who could write the ledger could edit a trusted rejection into an
+         acceptance and rehash it, and the session counted again; the runbook's own instruction, to
+         remove a reviewer who leaves from the set, made every rejection they signed inert the same way.
+         The review proposed failing the audit on an unsigned negative record, which would not have
+         closed it, because the edit makes the record positive.
+       - The set enrolled any 64 hex characters. Since item 121 a key of small order verifies nothing,
+         so a set holding the all-zero placeholder quietly trusted no one it seemed to.
+       - One artifact could back any number of subjects, so thirty sessions could be one session log,
+         and one subscription any number of customers, so ten paying professionals could be one
+         subscription. A customer recorded as a professional and as an organisation counted in both.
+       - An acceptance whose own attributes failed the criteria only failed to count, and a clean
+         acceptance of the same session, before or after it, counted the subject.
+     - **Behavior.**
+       - Every record in the root must be signed by a key the trusted set lists for the reviewer the
+         record names; otherwise the audit fails, naming the first five such records and how many more.
+         An empty set passes only an empty root.
+       - Trusted reviewer set version 2 gives each key a status, `active` or `revoked`, and a key is
+         never removed. A revoked key still verifies what it signed, so an edit to one of its records is
+         caught; its acceptances stop counting (`REVIEWER_REVOKED`) and its rejections still disqualify,
+         so revoking cannot requalify anyone. Version 1 sets, which the pipeline wrote before, are read
+         with every key active, and the pipeline now writes version 2.
+       - Enrolment refuses a key that is not an Ed25519 point of the prime-order subgroup other than
+         the neutral element (`ed25519.is_valid_public_key`), and one public key under two entries,
+         which would let one key holder sign as two reviewers.
+       - A rejection, or an acceptance whose attributes fail the criteria, disqualifies its subject in
+         its gate, in every release, whatever its artifact (`DISQUALIFIED` on each acceptance of it).
+       - Among accepted records, in every gate and release, an artifact cited for two subjects counts
+         for neither (`ARTIFACT_SHARED`); one id in two gates names two subjects. A subscription cited
+         for two customers counts for neither (`SUBSCRIPTION_SHARED`), and a customer recorded as two
+         kinds counts as neither (`CUSTOMER_KIND_CONFLICT`). A rejection's citation shares nothing.
+       - Status schema 4: `counted_records` counts only acceptances that count, where a clean rejection
+         counted before; `disqualified_subjects` counts every disqualified subject, where it counted only
+         those that also had an acceptance; `not_counted` lists acceptances only. The promotion gate
+         requires schema 4. The reviewer-set JSON Schema describes version 2, and the runbook no longer
+         says to remove a reviewer.
+     - **Tests.** The acceptance fixtures gave every subject one artifact and one subscription, the very
+       defect, so each subject now has its own. `test_acceptance_evidence.py` gained a signature class
+       (another key, an unlisted key, a key bound to another reviewer, an edited, moved or forged record,
+       the rejection edited into an acceptance, the dropped reviewer, the empty set, the failure's
+       message), a revocation class, a reviewer-set class (every small-order and tainted key refused,
+       one public key twice, version 1 read as active, an unknown status), a disqualification class
+       (the failing acceptance before and after a clean one, in another release, a lone rejection) and
+       an exclusive-backing class (thirty sessions on one artifact, one artifact across gates, releases
+       and one id in two gates, a rejection's citation, ten customers on one subscription, one customer
+       of two kinds). The promotion gate's tests now expect a set that lists no key to fail
+       verification for staging as well as production.
+     - **Rule 5.** 23 of 23 injected defects were caught by the intended tests: unsigned records
+       ignored, the failure naming three; a key not bound to its reviewer; the signature unverified; a
+       revoked acceptance counted and a revoked rejection ignored; a failing acceptance not
+       disqualifying, the `DISQUALIFIED` reason dropped, and the disqualified count ignoring failing
+       acceptances; a shared artifact counted, keyed by id alone, or shared by a rejection; a shared
+       subscription and a two-kind customer counted; a small-order key and one public key twice
+       enrolled; any status accepted, version 1 requiring one, version 3 accepted; rejections counted as
+       records; status schema 3 left in the tool or the gate; and the pipeline writing a version 1 set.
+       One first survived: an unknown set version was refused for its entries rather than its version,
+       so that case now holds no entries, and it was then caught.
+     - **Measured result.** The Python suite rose from 196 to 214 passed, and `unittest discover` over
+       `tests/security` passed 151. The final `python tools/session_status.py` run measured all eight
+       suites green, and the full evidence pipeline exited 0: its audit read this machine's version 1
+       reviewer set, which the pipeline had written before, and published status schema 4.
+     - **Boundary.** A leaving reviewer who keeps their key can still sign; revoking is the operator's
+       only remedy, and it withdraws every acceptance the key made, which is the cost of having no
+       trusted time to say which came after they left. One artifact per subject is checked within one
+       ledger root only. Findings (5), (7) and (8) and the promotion gate's wiring remain E6.6b.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
