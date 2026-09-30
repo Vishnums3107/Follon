@@ -398,8 +398,10 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 .map(|portfolio| portfolio.position_snapshot().quantity)
                 .unwrap_or(Decimal::ZERO);
             let projected = held.checked_add(intent.projected_leg_delta(leg)?)?;
+            let working_delta = self.working_position_delta(&leg.instrument_id)?;
+            let committed = projected.checked_add(working_delta)?;
             every_leg_reduces &= self.reduces_open_position(&leg.instrument_id, held, projected)?;
-            if self.policy.breaches_position_limit(projected)? {
+            if self.policy.breaches_position_limit(committed)? {
                 reasons.push("POSITION_LIMIT_OR_SHORT_SELL_EXCEEDED".to_owned());
             }
             // Self-trade is assessed per leg against every working order, and a
@@ -409,13 +411,15 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 reasons.push("SELF_TRADE_RISK".to_owned());
             }
             leg_evidence.push(format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}",
                 leg.instrument_id,
                 leg.side.as_str(),
                 leg_quantity,
                 leg.limit_price,
                 mark.mark_price,
-                deviation_bps
+                deviation_bps,
+                working_delta,
+                committed
             ));
         }
 
@@ -489,7 +493,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                             .filter(|reason| reason != "APPROVED" && reason != "SELF_TRADE_RISK"),
                     );
                     portfolio_risk_limits = format!(
-                    ",portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
+                    ",portfolio_exposure_basis=filled_working_candidate_v2,portfolio_risk_policy_version={},portfolio_gross_exposure={},portfolio_net_exposure={},portfolio_leverage_bps={},portfolio_concentration_bps={},portfolio_peak_equity={},portfolio_drawdown_bps={},portfolio_daily_baseline_equity={},portfolio_daily_pnl={},portfolio_margin_used={},portfolio_margin_utilization_bps={}",
                     decision.policy_version,
                     decision.metrics.gross_exposure,
                     decision.metrics.net_exposure,
@@ -502,6 +506,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     margin_used,
                     decision.metrics.margin_utilization_bps,
                 );
+                    portfolio_risk_limits.push_str(&format!(
+                        ",portfolio_possible_abs_net_exposure={},portfolio_possible_concentration_bps={},portfolio_possible_abs_delta={},portfolio_possible_abs_gamma={}",
+                        decision.metrics.possible_abs_net_exposure,
+                        decision.metrics.possible_concentration_bps,
+                        decision.metrics.possible_abs_delta,
+                        decision.metrics.possible_abs_gamma,
+                    ));
                 }
                 // The group is atomic, so every leg must move its own position
                 // toward flat for the structure to reduce risk (E7.4b).
@@ -1273,6 +1284,13 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         Ok(reduces_position_with_working(current, projected, working)?)
     }
 
+    /// Signed unfilled quantity of every working plain order and combination leg.
+    pub(super) fn working_position_delta(&self, instrument_id: &str) -> Result<Decimal, LiveError> {
+        self.working_quantity(instrument_id, Side::Buy)?
+            .checked_sub(self.working_quantity(instrument_id, Side::Sell)?)
+            .map_err(Into::into)
+    }
+
     /// The quantity working orders of either kind will still take off `position` in
     /// `instrument_id`: sells against a long, buys against a short. A combination's legs
     /// count individually, by the combination units still unfilled.
@@ -1288,10 +1306,15 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
         } else {
             return Ok(Decimal::ZERO);
         };
+        self.working_quantity(instrument_id, reducing)
+    }
+
+    /// Unfilled working quantity on one side of one instrument, across both order kinds.
+    fn working_quantity(&self, instrument_id: &str, side: Side) -> Result<Decimal, LiveError> {
         let mut total = Decimal::ZERO;
         for order in self.orders.values() {
             let intent = &order.oms.intent;
-            if order.working() && intent.instrument_id == instrument_id && intent.side == reducing {
+            if order.working() && intent.instrument_id == instrument_id && intent.side == side {
                 total = total.checked_add(intent.quantity.checked_sub(order.filled_quantity)?)?;
             }
         }
@@ -1302,7 +1325,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             let intent = &order.oms.intent;
             let unfilled = intent.combo_quantity.checked_sub(order.filled_quantity)?;
             for leg in &intent.legs {
-                if leg.instrument_id == instrument_id && leg.side == reducing {
+                if leg.instrument_id == instrument_id && leg.side == side {
                     let ratio = Decimal::from_integer(i64::from(leg.ratio))?;
                     total = total.checked_add(unfilled.checked_mul(ratio)?)?;
                 }

@@ -202,6 +202,7 @@ fn aggregates_long_short_and_bucket_exposure_exactly() {
             position("instrument.a", "200", "100"),
             position("instrument.b", "-100", "50"),
         ],
+        working_positions: vec![],
         resting_orders: vec![],
         recent_order_count: 0,
     };
@@ -211,6 +212,86 @@ fn aggregates_long_short_and_bucket_exposure_exactly() {
     assert_eq!(decision.metrics.net_exposure, amount("15000"));
     assert_eq!(decision.metrics.leverage_bps, amount("5000"));
     assert_eq!(decision.metrics.drawdown_bps, amount("384.61538461"));
+}
+
+#[test]
+fn concentration_combines_rows_of_one_instrument_including_working_exposure() {
+    let snapshot = PortfolioRiskSnapshot {
+        equity: amount("100000"),
+        peak_equity: amount("100000"),
+        daily_pnl: Decimal::ZERO,
+        margin_used: Decimal::ZERO,
+        positions: vec![
+            position("instrument.a", "100", "100"),
+            position("instrument.a", "100", "100"),
+        ],
+        working_positions: vec![],
+        resting_orders: vec![],
+        recent_order_count: 0,
+    };
+    let decision = evaluate_portfolio_risk(&policy(), &snapshot, None).unwrap();
+    assert!(!decision.approved);
+    assert_eq!(decision.metrics.gross_exposure, amount("20000"));
+    assert_eq!(decision.metrics.concentration_bps, amount("10000"));
+    assert!(decision
+        .reason_codes
+        .contains(&"MAX_CONCENTRATION_EXCEEDED".to_owned()));
+}
+
+#[test]
+fn opposing_working_fills_cannot_hide_a_net_limit_breach() {
+    let mut limits = policy();
+    limits.max_abs_net_exposure = amount("5000");
+    limits.max_concentration_bps = amount("10000");
+    let snapshot = PortfolioRiskSnapshot {
+        equity: amount("100000"),
+        peak_equity: amount("100000"),
+        daily_pnl: Decimal::ZERO,
+        margin_used: Decimal::ZERO,
+        positions: vec![],
+        working_positions: vec![
+            position("instrument.a", "100", "100"),
+            position("instrument.b", "-100", "100"),
+        ],
+        resting_orders: vec![],
+        recent_order_count: 0,
+    };
+    let decision = evaluate_portfolio_risk(&limits, &snapshot, None).unwrap();
+    assert!(!decision.approved);
+    assert_eq!(decision.metrics.net_exposure, Decimal::ZERO);
+    assert_eq!(decision.metrics.possible_abs_net_exposure, amount("10000"));
+    assert!(decision
+        .reason_codes
+        .contains(&"MAX_NET_EXPOSURE_EXCEEDED".to_owned()));
+}
+
+#[test]
+fn an_unfilled_diversifier_cannot_hide_concentration() {
+    let mut limits = policy();
+    limits.max_concentration_bps = amount("6000");
+    let snapshot = PortfolioRiskSnapshot {
+        equity: amount("100000"),
+        peak_equity: amount("100000"),
+        daily_pnl: Decimal::ZERO,
+        margin_used: Decimal::ZERO,
+        positions: vec![
+            position("instrument.a", "50", "100"),
+            position("instrument.b", "50", "100"),
+        ],
+        working_positions: vec![
+            position("instrument.a", "100", "100"),
+            position("instrument.b", "100", "100"),
+        ],
+        resting_orders: vec![],
+        recent_order_count: 0,
+    };
+    let decision = evaluate_portfolio_risk(&limits, &snapshot, None).unwrap();
+    assert!(!decision.approved);
+    assert_eq!(decision.metrics.concentration_bps, amount("5000"));
+    assert_eq!(decision.metrics.possible_concentration_bps, amount("7500"));
+    assert!(decision
+        .reason_codes
+        .contains(&"MAX_CONCENTRATION_EXCEEDED".to_owned()));
 }
 
 #[test]
@@ -225,6 +306,7 @@ fn candidate_is_checked_for_permissions_self_trade_rate_and_aggregate_limits() {
         daily_pnl: amount("-6000"),
         margin_used: amount("6000"),
         positions: vec![position("instrument.existing", "300", "100")],
+        working_positions: vec![],
         resting_orders: vec![RestingOrder {
             order_id: "order.resting".to_owned(),
             account_id: "account.main".to_owned(),
@@ -285,6 +367,7 @@ fn simultaneous_candidate_legs_breach_a_bucket_limit_neither_leg_reaches_alone()
         daily_pnl: Decimal::ZERO,
         margin_used: Decimal::ZERO,
         positions: vec![],
+        working_positions: vec![],
         resting_orders: vec![],
         recent_order_count: 0,
     };
@@ -349,6 +432,7 @@ fn an_atomic_group_counts_as_one_order_not_one_per_leg() {
         daily_pnl: Decimal::ZERO,
         margin_used: Decimal::ZERO,
         positions: vec![],
+        working_positions: vec![],
         resting_orders: vec![],
         recent_order_count: 0,
     };
@@ -450,6 +534,7 @@ fn fx_candidate_uses_frozen_price_evidence_and_normal_risk_policy() {
             daily_pnl: Decimal::ZERO,
             margin_used: Decimal::ZERO,
             positions: vec![],
+            working_positions: vec![],
             resting_orders: vec![],
             recent_order_count: 0,
         },

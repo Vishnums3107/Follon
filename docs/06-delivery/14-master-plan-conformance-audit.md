@@ -5231,6 +5231,42 @@ These are mandatory master-plan acceptance conditions and are currently open:
        and it cannot prove broker evidence or approver identity. A durable external
        ledger-head anchor remains E6.6b finding (8).
 
+126. Working-order exposure cannot slip through a sequence of pre-trade decisions
+     (2026-09-30, Risk; E7.14).
+     - **Gap.** PAPER and controlled LIVE checked each new intent against filled
+       position and ignored unfilled working quantity. Two individually legal
+       orders could exceed the position or aggregate exposure limit together.
+       Merely treating every working order as certain to fill would also let an
+       unfilled opposite order hide net exposure, or an unfilled diversifier
+       lower concentration.
+     - **Behavior.** Plain and combination position checks include the remaining
+       signed quantity of every working order and leg. The journal retains both
+       the filled-plus-candidate projection and the working delta and committed
+       position. The aggregate snapshot separates filled positions from working
+       exposure, with every working quantity marked at its current price.
+       Gross, leverage and bucket checks count all working rows; net exposure,
+       concentration, delta and gamma check the largest possible value under
+       any subset of working fills. The all-fill projection and the conservative
+       bounds are separately recorded in decision evidence. Concentration
+       groups rows by instrument, so adding a second row for one instrument
+       cannot make it appear diversified. The standalone risk benchmark accepts
+       optional `working_positions`; the gRPC risk request and response carry
+       working positions and the four bound values as additive proto fields.
+     - **Tests.** PAPER tests exercise the position limit, simultaneous plain
+       orders, partial fill and cancel release, and working combination ratios
+       and aggregate legs. LIVE tests exercise the same plain-order position
+       and aggregate gates. Kernel tests reproduce net offset and concentration
+       dilution by unfilled orders, and same-instrument row splitting.
+     - **Measured result.** The Rust workspace passed 668 tests, with 9 ignored;
+       strict Clippy, formatting, Tauri host (33), Python (232), both desktop
+       suites and the 46-artifact evidence pipeline passed. PostgreSQL
+       integration was skipped because no disposable database was configured.
+     - **Boundary.** The bounds deliberately treat working combination legs
+       independently; that may refuse an atomic group conservatively. Cash,
+       equity and margin utilisation use observed broker/account state rather
+       than prospective working-order margin. This does not substitute for
+       broker reconciliation or the external PAPER release gates.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

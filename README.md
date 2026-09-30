@@ -130,9 +130,11 @@ for the deployment and evidence sequence.
 - The primary strategy backtest route is funded and long-only. Advanced
   margin, financing, and short accounting are separate model calculations;
   their presence does not enable those strategies in the primary runner.
-- Native and gRPC PAPER routes omit the optional aggregate portfolio-risk
-  composition. Native requests use operator-attested price/time and lack
-  separate operator authentication; browser REST projections remain read-only.
+- Native and gRPC PAPER routes can compose the optional aggregate portfolio-risk
+  policy when configured. Working orders enter pre-trade exposure checks at
+  their remaining quantity. Native requests use operator-attested price/time
+  and lack separate operator authentication; browser REST projections remain
+  read-only.
 - Acceptance tools verify canonical, signed reviewer records and re-hash
   retained artifacts before counting them. That establishes what a listed
   reviewer attested and what bytes were retained; an independent operator must

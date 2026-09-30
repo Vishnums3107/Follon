@@ -17,8 +17,11 @@ pub struct PortfolioRiskSnapshot {
     pub daily_pnl: Decimal,
     /// Current margin requirement in reporting currency.
     pub margin_used: Decimal,
-    /// Fully attributed positions.
+    /// Fully attributed, filled marked positions.
     pub positions: Vec<RiskPosition>,
+    /// Unfilled marked exposure rows from working orders. Each can fill or not
+    /// fill independently for the conservative pre-trade bounds.
+    pub working_positions: Vec<RiskPosition>,
     /// Current working orders.
     pub resting_orders: Vec<RestingOrder>,
     /// Orders observed inside the configured rate window.
