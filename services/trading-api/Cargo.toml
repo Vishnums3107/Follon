@@ -13,6 +13,7 @@ follon-execution = { path = "../../core/execution" }
 follon-identity = { path = "../../core/identity" }
 follon-ibkr-paper-adapter = { path = "../../adapters/brokers/ibkr" }
 follon-live = { path = "../../core/live" }
+follon-market-data = { path = "../../core/market-data" }
 follon-paper = { path = "../../core/paper" }
 follon-postgres = { path = "../../adapters/persistence/postgres" }
 follon-risk = { path = "../../core/risk" }

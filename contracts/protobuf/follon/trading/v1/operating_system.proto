@@ -17,6 +17,11 @@ service TradingOperatingSystem {
   // Risk-manager operation: drain broker evidence, then compare the account
   // snapshot. Set reconnect after an ambiguous disconnect or route restart.
   rpc ReconcilePaperAccount(PaperReconciliationRequest) returns (PaperReconciliationResponse);
+  // Risk-manager operation: apply a split or cash dividend the broker has applied
+  // to the OMS's own books. Refused unless the account holds held_quantity, and a
+  // split while an order works in the instrument. The PAPER journal records the
+  // operator and server time; a retry with the same terms changes nothing.
+  rpc ApplyPaperCorporateAction(PaperCorporateActionRequest) returns (PaperCorporateActionResponse);
   // Operator login: password first, then a mandatory TOTP second factor.
   rpc BeginOperatorLogin(BeginOperatorLoginRequest) returns (BeginOperatorLoginResponse);
   rpc CompleteOperatorLogin(CompleteOperatorLoginRequest) returns (OperatorSession);
@@ -316,6 +321,40 @@ message PaperReconciliationResponse {
   repeated PaperReconciliationIssue issues = 4;
   uint32 unknown_orders = 5;
   bool broker_connected = 6;
+  uint64 audit_sequence = 7;
+  string audit_head_hash = 8;
+}
+
+enum CorporateActionKind {
+  CORPORATE_ACTION_KIND_UNSPECIFIED = 0;
+  CORPORATE_ACTION_KIND_SPLIT = 1;
+  CORPORATE_ACTION_KIND_CASH_DIVIDEND = 2;
+}
+
+message PaperCorporateActionRequest {
+  string tenant_id = 1;
+  string account_id = 2;
+  string action_id = 3;
+  CorporateActionKind kind = 4;
+  string instrument_id = 5;
+  // Canonical second-precision UTC time the action took effect.
+  string effective_at = 6;
+  // A split's new units per old unit, or a dividend's cash per unit.
+  string value = 7;
+  // The signed position the action applies to, as the broker's notice states it.
+  string held_quantity = 8;
+}
+
+message PaperCorporateActionResponse {
+  string action_id = 1;
+  string quantity_before = 2;
+  string quantity_after = 3;
+  // Cash a dividend credited (negative for a short); zero for a split.
+  string cash_delta = 4;
+  // The operator and server time the action was first applied. A retry returns
+  // these unchanged and appends nothing.
+  string applied_by = 5;
+  string applied_at = 6;
   uint64 audit_sequence = 7;
   string audit_head_hash = 8;
 }

@@ -13,7 +13,9 @@
 //!
 //! `ReconcilePaperAccount` requires risk-policy management permission. It
 //! drains the broker event queue and compares the account snapshot; no
-//! background polling is implied.
+//! background polling is implied. `ApplyPaperCorporateAction` requires the same
+//! permission and applies a split or dividend the broker applied to the OMS's
+//! own books, journaled with the operator.
 //!
 //! `ActivateLiveKillSwitch` and `ReleaseLiveKillSwitch` need the same
 //! kill-switch permission, against a configured controlled-LIVE route. That
@@ -49,12 +51,13 @@ use follon_live::{
     LiveBrokerAccountSnapshot, LiveBrokerAdapter, LiveBrokerEvent, LiveBrokerOrderRequest,
     LiveBrokerSubmitResult, LiveConfiguration, LiveError, LiveKillSwitchScope, LiveTradingService,
 };
+use follon_market_data::CorporateAction;
 use follon_paper::{
     BrokerAccountSnapshot, BrokerCancelRequest, BrokerComboRequest, BrokerEvent,
     BrokerOrderRequest, BrokerReplaceRequest, BrokerSubmitResult, IbkrPaperAdapter,
     KillSwitchRegistry, KillSwitchScope, PaperAccount, PaperBrokerAdapter, PaperBrokerCapabilities,
-    PaperComboMarketData, PaperError, PaperMarketData, PaperRiskPolicy, PaperTradingService,
-    PortfolioRiskDocument, ShortExposurePolicy,
+    PaperComboMarketData, PaperCorporateAction, PaperError, PaperMarketData, PaperRiskPolicy,
+    PaperTradingService, PortfolioRiskDocument, ShortExposurePolicy,
 };
 use follon_postgres::{PersistenceError, PostgresStore};
 use follon_risk::{
@@ -82,14 +85,16 @@ use api::{
 };
 use api::{
     BucketLimit, CancelPaperOrderRequest, CancelPaperOrderResponse, CancelReplaceInstruction,
-    ChildInstruction, ChildOrderKind, ComboLegInstruction, ComboPriceLimitKind, CurrencyAmount,
-    ExecutionAlgorithmKind, ExecutionPlanRequest, ExecutionPlanResponse, ExecutionSide,
-    HealthRequest, HealthResponse, MarginAccountRequest, MarginAccountResponse, OmsOrderState,
-    OptionComboRequest, OptionComboResponse, OrderTimeInForceKind, PaperComboMarketObservation,
-    PaperOrderKind, PaperReconciliationIssue, PaperReconciliationRequest,
-    PaperReconciliationResponse, PassiveRepricingRequest, PassiveRepricingResponse,
-    PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics, SubmitPaperComboRequest,
-    SubmitPaperComboResponse, SubmitPaperOrderRequest, SubmitPaperOrderResponse,
+    ChildInstruction, ChildOrderKind, ComboLegInstruction, ComboPriceLimitKind,
+    CorporateActionKind, CurrencyAmount, ExecutionAlgorithmKind, ExecutionPlanRequest,
+    ExecutionPlanResponse, ExecutionSide, HealthRequest, HealthResponse, MarginAccountRequest,
+    MarginAccountResponse, OmsOrderState, OptionComboRequest, OptionComboResponse,
+    OrderTimeInForceKind, PaperComboMarketObservation, PaperCorporateActionRequest,
+    PaperCorporateActionResponse, PaperOrderKind, PaperReconciliationIssue,
+    PaperReconciliationRequest, PaperReconciliationResponse, PassiveRepricingRequest,
+    PassiveRepricingResponse, PortfolioRiskRequest, PortfolioRiskResponse, RiskMetrics,
+    SubmitPaperComboRequest, SubmitPaperComboResponse, SubmitPaperOrderRequest,
+    SubmitPaperOrderResponse,
 };
 
 type PaperComboRoute = Arc<Mutex<PaperTradingService<PaperRouteAdapter>>>;
@@ -786,6 +791,60 @@ impl TradingOperatingSystem for OperatingSystemService {
         }))
     }
 
+    async fn apply_paper_corporate_action(
+        &self,
+        request: Request<PaperCorporateActionRequest>,
+    ) -> Result<Response<PaperCorporateActionResponse>, Status> {
+        let token = bearer_token(&request)?;
+        let request = request.into_inner();
+        validate_tenant(&request.tenant_id)?;
+        let now = now_epoch_seconds()?;
+        let operator = self
+            .identity()?
+            .authorize(
+                &token,
+                &request.tenant_id,
+                Permission::RiskPolicyManage,
+                now,
+            )
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        validate_canonical_id("account_id", &request.account_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let action = corporate_action(&request)?;
+        let held_quantity = decimal("held_quantity", &request.held_quantity)?;
+        let route = self.paper_combo_route.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "PAPER Risk/OMS route is not configured; no corporate action was applied",
+            )
+        })?;
+        let applied_at = utc_timestamp(now)?;
+        let mut service = route
+            .lock()
+            .map_err(|_| Status::internal("PAPER route lock poisoned"))?;
+        if request.account_id != service.account_id() {
+            return Err(Status::permission_denied("access denied"));
+        }
+        let receipt = service
+            .apply_corporate_action(PaperCorporateAction {
+                action,
+                held_quantity,
+                applied_by: operator.user_id,
+                applied_at,
+            })
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let dashboard = service.dashboard();
+        Ok(Response::new(PaperCorporateActionResponse {
+            action_id: receipt.action.action_id().to_owned(),
+            quantity_before: receipt.quantity_before.to_string(),
+            quantity_after: receipt.quantity_after.to_string(),
+            cash_delta: receipt.cash_delta.to_string(),
+            applied_by: receipt.applied_by,
+            applied_at: receipt.applied_at,
+            audit_sequence: dashboard.audit_sequence,
+            audit_head_hash: dashboard.audit_head_hash,
+        }))
+    }
+
     async fn begin_operator_login(
         &self,
         request: Request<BeginOperatorLoginRequest>,
@@ -1267,6 +1326,37 @@ fn execution_side(side: Side) -> ExecutionSide {
         Side::Buy => ExecutionSide::Buy,
         Side::Sell => ExecutionSide::Sell,
     }
+}
+
+/// The corporate action a request names, in the market-data contract replay uses.
+fn corporate_action(request: &PaperCorporateActionRequest) -> Result<CorporateAction, Status> {
+    let value = decimal("value", &request.value)?;
+    let action_id = request.action_id.clone();
+    let instrument_id = request.instrument_id.clone();
+    let effective_at = request.effective_at.clone();
+    let action = match CorporateActionKind::try_from(request.kind) {
+        Ok(CorporateActionKind::Split) => CorporateAction::Split {
+            action_id,
+            instrument_id,
+            effective_at,
+            ratio: value,
+        },
+        Ok(CorporateActionKind::CashDividend) => CorporateAction::CashDividend {
+            action_id,
+            instrument_id,
+            effective_at,
+            amount: value,
+        },
+        _ => {
+            return Err(Status::invalid_argument(
+                "corporate action kind must be SPLIT or CASH_DIVIDEND",
+            ))
+        }
+    };
+    action
+        .validate()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(action)
 }
 
 fn decimal(name: &str, value: &str) -> Result<Decimal, Status> {
@@ -3536,6 +3626,269 @@ mod tests {
             tonic::Code::FailedPrecondition
         );
         assert_eq!(route.lock().unwrap().dashboard().audit_sequence, 1);
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    fn paper_corporate_action_request(held_quantity: &str) -> PaperCorporateActionRequest {
+        PaperCorporateActionRequest {
+            tenant_id: "tenant.alpha".to_owned(),
+            account_id: "acct.grpc.paper.test".to_owned(),
+            action_id: "ca.split.spy.grpc".to_owned(),
+            kind: CorporateActionKind::Split as i32,
+            instrument_id: "inst.us_equity.spy".to_owned(),
+            effective_at: "2026-01-05T13:30:00Z".to_owned(),
+            value: "2".to_owned(),
+            held_quantity: held_quantity.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn paper_corporate_action_rpc_applies_a_split_the_venue_applied() {
+        let (service, route, scratch) = configured_paper_service("corporate-action");
+        let trader = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let order_id = service
+            .submit_paper_order(authorized(
+                paper_order_request("intent.grpc.paper.split"),
+                &trader,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .order_id
+            .unwrap();
+        {
+            let mut paper = route.lock().unwrap();
+            let PaperRouteAdapter::Model(adapter) = paper.broker_mut() else {
+                panic!("the test route uses the model");
+            };
+            adapter
+                .queue_fill(
+                    &order_id,
+                    decimal("quantity", "2").unwrap(),
+                    decimal("price", "100").unwrap(),
+                    decimal("fee", "0").unwrap(),
+                    "2026-01-02T14:31:00Z",
+                )
+                .unwrap();
+        }
+        service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("apply the fill");
+        // The venue splits its books first; the RPC brings the OMS along.
+        {
+            let mut paper = route.lock().unwrap();
+            let PaperRouteAdapter::Model(adapter) = paper.broker_mut() else {
+                panic!("the test route uses the model");
+            };
+            adapter
+                .apply_corporate_action(
+                    &corporate_action(&paper_corporate_action_request("2")).unwrap(),
+                )
+                .unwrap();
+        }
+        let applied = service
+            .apply_paper_corporate_action(authorized(paper_corporate_action_request("2"), &manager))
+            .await
+            .expect("a risk manager applies the split")
+            .into_inner();
+        assert_eq!(applied.action_id, "ca.split.spy.grpc");
+        assert_eq!(
+            (
+                applied.quantity_before.as_str(),
+                applied.quantity_after.as_str(),
+                applied.cash_delta.as_str()
+            ),
+            ("2.00000000", "4.00000000", "0.00000000")
+        );
+        assert_eq!(applied.applied_by, "user.risk");
+        assert_eq!(applied.audit_head_hash.len(), 64);
+        let reconciled = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reconciled.snapshot_matches, "{:?}", reconciled.issues);
+
+        // A retry returns the first receipt and journals nothing more.
+        let (sequence, head) = {
+            let dashboard = route.lock().unwrap().dashboard();
+            (dashboard.audit_sequence, dashboard.audit_head_hash)
+        };
+        let retried = service
+            .apply_paper_corporate_action(authorized(paper_corporate_action_request("2"), &manager))
+            .await
+            .expect("an idempotent retry")
+            .into_inner();
+        assert_eq!(
+            retried,
+            PaperCorporateActionResponse {
+                audit_sequence: sequence,
+                audit_head_hash: head,
+                ..applied.clone()
+            }
+        );
+        assert_eq!(route.lock().unwrap().dashboard().audit_sequence, sequence);
+        // The same identity with other terms is refused.
+        let mut changed = paper_corporate_action_request("2");
+        changed.value = "3".to_owned();
+        assert_eq!(
+            service
+                .apply_paper_corporate_action(authorized(changed, &manager))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn paper_corporate_action_rpc_requires_a_manager_a_matching_account_and_a_sound_request()
+    {
+        let (service, route, scratch) = configured_paper_service("corporate-action-auth");
+        let request = || paper_corporate_action_request("0");
+        assert_eq!(
+            service
+                .apply_paper_corporate_action(Request::new(request()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let trader = trader_token(&service).await;
+        assert_eq!(
+            service
+                .apply_paper_corporate_action(authorized(request(), &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let manager = risk_token(&service).await;
+        let mut wrong_tenant = request();
+        wrong_tenant.tenant_id = "tenant.beta".to_owned();
+        let mut wrong_account = request();
+        wrong_account.account_id = "acct.other".to_owned();
+        for (name, refused, code) in [
+            (
+                "another tenant",
+                wrong_tenant,
+                tonic::Code::PermissionDenied,
+            ),
+            (
+                "another account",
+                wrong_account,
+                tonic::Code::PermissionDenied,
+            ),
+            (
+                "no kind",
+                PaperCorporateActionRequest {
+                    kind: CorporateActionKind::Unspecified as i32,
+                    ..request()
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "an unknown kind",
+                PaperCorporateActionRequest {
+                    kind: 99,
+                    ..request()
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "a value that is not a decimal",
+                PaperCorporateActionRequest {
+                    value: "two".to_owned(),
+                    ..request()
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "a ratio that is not positive",
+                PaperCorporateActionRequest {
+                    value: "0".to_owned(),
+                    ..request()
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "an effective time that is not canonical",
+                PaperCorporateActionRequest {
+                    effective_at: "2026-01-05T13:30:00+00:00".to_owned(),
+                    ..request()
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "a held quantity that is not a decimal",
+                PaperCorporateActionRequest {
+                    held_quantity: "none".to_owned(),
+                    ..request()
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "a position the account does not hold",
+                paper_corporate_action_request("5"),
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                "an action that takes effect later",
+                PaperCorporateActionRequest {
+                    effective_at: "2099-01-01T00:00:00Z".to_owned(),
+                    ..request()
+                },
+                tonic::Code::FailedPrecondition,
+            ),
+        ] {
+            let outcome = service
+                .apply_paper_corporate_action(authorized(refused, &manager))
+                .await;
+            match outcome {
+                Ok(_) => panic!("{name} was applied"),
+                Err(status) => assert_eq!(status.code(), code, "{name}: {status:?}"),
+            }
+        }
+        let mut no_route = OperatingSystemService {
+            database: None,
+            paper_combo_route: None,
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        no_route.identity = Some(operator_identity());
+        let manager_elsewhere = risk_token(&no_route).await;
+        assert_eq!(
+            no_route
+                .apply_paper_corporate_action(authorized(request(), &manager_elsewhere))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        // Nothing above was applied or journaled.
+        assert!(route.lock().unwrap().corporate_actions().is_empty());
+        assert_eq!(route.lock().unwrap().dashboard().audit_sequence, 1);
+        // The sound request applies, to a flat account.
+        let applied = service
+            .apply_paper_corporate_action(authorized(request(), &manager))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            (
+                applied.quantity_before.as_str(),
+                applied.quantity_after.as_str()
+            ),
+            ("0.00000000", "0.00000000")
+        );
         drop(service);
         drop(route);
         let _ = std::fs::remove_dir_all(scratch);

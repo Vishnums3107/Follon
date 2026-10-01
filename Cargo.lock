@@ -635,6 +635,7 @@ dependencies = [
  "follon-ibkr-paper-adapter",
  "follon-identity",
  "follon-live",
+ "follon-market-data",
  "follon-paper",
  "follon-postgres",
  "follon-risk",

@@ -123,7 +123,8 @@ for the deployment and evidence sequence.
   by configuration. Its checked-in Python backend submits single market/limit
   DAY orders only; the route can submit and cancel those orders. An authenticated
   risk manager can drain broker events and compare the account snapshot through
-  `ReconcilePaperAccount`.
+  `ReconcilePaperAccount`, and apply a split or dividend the broker applied
+  through `ApplyPaperCorporateAction`.
   The real adapter declares exactly that, so the PAPER OMS refuses a
   combination, a GTC intent or a replacement on that route before any order
   exists.

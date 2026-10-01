@@ -258,6 +258,15 @@ def kill_switch_request(scope: str = KILL_SCOPE, tenant: str = TENANT) -> bytes:
     return pb_string(1, tenant) + pb_string(2, scope)
 
 
+def corporate_action_request(kind: int = 1, tenant: str = TENANT) -> bytes:
+    """A split of SPY stated against a flat position; kind 1 is SPLIT."""
+    return b"".join([
+        pb_string(1, tenant), pb_string(2, "acct.dast.paper"), pb_string(3, "ca.dast.split"),
+        pb_varint(4, kind), pb_string(5, "inst.us_equity.spy"), pb_string(6, "2026-01-05T13:30:00Z"),
+        pb_string(7, "2"), pb_string(8, "0"),
+    ])
+
+
 # --- the dashboard ------------------------------------------------------------
 
 
@@ -603,6 +612,17 @@ def scan_api(scan: Scan, api: Api, operators: dict[str, tuple[str, bytes]], pass
                 code == grpc.StatusCode.OK and changed and not active)
     code, _ = api.call("ReleaseLiveKillSwitch", kill_switch_request("everything"), token=risk)
     scan.record("G34", target, "malformed input", "an unknown controlled-LIVE kill-switch scope is refused",
+                "INVALID_ARGUMENT", code.name, code == grpc.StatusCode.INVALID_ARGUMENT)
+
+    # Corporate actions change positions, so only a risk manager applies one.
+    code, _ = api.call("ApplyPaperCorporateAction", corporate_action_request())
+    scan.record("G35", target, "authentication", "a corporate action with no session is refused",
+                "UNAUTHENTICATED", code.name, code == grpc.StatusCode.UNAUTHENTICATED)
+    code, _ = api.call("ApplyPaperCorporateAction", corporate_action_request(), token=desk)
+    scan.record("G36", target, "authorization", "a trading role cannot apply a corporate action",
+                "PERMISSION_DENIED", code.name, code == grpc.StatusCode.PERMISSION_DENIED)
+    code, _ = api.call("ApplyPaperCorporateAction", corporate_action_request(kind=7), token=risk)
+    scan.record("G37", target, "malformed input", "an unknown corporate-action kind is refused",
                 "INVALID_ARGUMENT", code.name, code == grpc.StatusCode.INVALID_ARGUMENT)
     code, _ = api.call("CheckHealth", b"")
     scan.record("G99", target, "availability", "the API is still healthy after every probe",

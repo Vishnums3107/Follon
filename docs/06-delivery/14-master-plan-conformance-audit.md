@@ -5485,6 +5485,45 @@ These are mandatory master-plan acceptance conditions and are currently open:
        dividend is not confirmed against the broker's cash, which also moves for
        other reasons and is reconciled separately.
 
+131. A risk manager applies a corporate action through the authenticated PAPER route
+     (2026-10-01, Architecture; E8.4b-3).
+     - **Gap.** Item 129 gave the PAPER service a corporate-action command, but the
+       configured gRPC PAPER route, the only deployed way to operate the real IBKR
+       PAPER bridge, could not reach it, so an account whose broker split a holding
+       still could not be brought back in step there.
+     - **Behavior.** `ApplyPaperCorporateAction` (versioned proto, additive) takes the
+       tenant, account, action id, `CorporateActionKind` (`SPLIT` or `CASH_DIVIDEND`),
+       instrument, effective time, value and the stated position. It requires a bearer
+       session whose role grants risk-policy management, as reconciliation does, in
+       the request's tenant, and refuses an account other than the route's. The kind,
+       value and action are validated at the boundary (`INVALID_ARGUMENT`); the
+       service's own refusals are `FAILED_PRECONDITION`. The operator is the session's
+       user and the time is the server's, never the caller's. The response carries the
+       receipt and the journal head; a retry with the same terms returns the first
+       receipt and appends nothing. The DAST scan gained probes G35 to G37: no session,
+       a trading role and an unknown kind are each refused.
+     - **Tests.** Two route tests: a fill, the model venue's split, the RPC applying it
+       as `user.risk`, a clean reconciliation, an idempotent retry that journals
+       nothing and a changed retry refused; and the refusals for no session, a trader,
+       another tenant or account, an unspecified or unknown kind, a value or held
+       quantity that is not a decimal, a ratio that is not positive, a non-canonical
+       effective time, a position the account does not hold, an action that takes
+       effect later and no configured route, after which nothing was journaled.
+     - **Rule 5.** 7 of 7 injected defects were caught by the intended failing tests: a
+       trading permission accepted, the account check removed, a split read as a
+       dividend, an unknown kind read as a split, the boundary validation removed, the
+       stated position dropped, and the operator replaced.
+     - **Measured result.** The Rust workspace rose from 696 to 698 passed. The
+       full status gate passed all eight suites: Rust workspace 698 passed / 0 failed
+       / 11 ignored, PostgreSQL 11, Tauri 33, Python 257, formatting, strict Clippy
+       and both desktop suites. The evidence pipeline exited 0 with 45 local
+       artifacts, and its DAST step passed 88 probes of 88.
+     - **Boundary.** The route applies what an operator states; it reads no feed. The
+       desktop gateway has no corporate-action command, and the real bridge applies
+       nothing itself: IBKR's books are what its snapshot reports. Found while writing
+       these tests and left to the next item: `validate_utc_timestamp` accepted a
+       space for the `T`, so the non-canonical-time case here uses an offset instead.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

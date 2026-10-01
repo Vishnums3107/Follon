@@ -96,7 +96,12 @@ route restart. Its response includes the persisted reconciliation identity,
 discrepancies, UNKNOWN count, connection state and audit chain head. A matching
 snapshot is not a clean-session certificate. The route does not poll in the
 background, and no real TWS or IB Gateway PAPER reconciliation has been retained
-(E5.5 and E5.6).
+(E5.5 and E5.6). The same risk manager can call `ApplyPaperCorporateAction` to
+bring the OMS's books along with a split or cash dividend the broker applied. The
+request names the position the action applies to and is refused unless the
+account holds exactly that, and a split is refused while an order works in the
+instrument; the journal records the operator and server time, and a retry with
+the same terms appends nothing (E8.4b).
 
 Every call also needs an authenticated operator. A configured route requires
 the operator directory named by `FOLLON_TRADING_API_OPERATOR_DIRECTORY`.
