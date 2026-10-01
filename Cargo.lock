@@ -589,6 +589,7 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-instrument",
+ "follon-market-data",
  "follon-risk",
  "fs2",
  "proptest",

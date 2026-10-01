@@ -882,6 +882,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "follon-market-data"
+version = "0.1.0"
+dependencies = [
+ "follon-domain",
+ "serde",
+ "sha2",
+ "time",
+]
+
+[[package]]
 name = "follon-news"
 version = "0.1.0"
 dependencies = [
@@ -897,6 +907,7 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-instrument",
+ "follon-market-data",
  "follon-risk",
  "fs2",
  "serde",

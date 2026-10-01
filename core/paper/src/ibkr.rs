@@ -1,6 +1,7 @@
 //! PAPER adapter over the IBKR paper transport.
 
 use follon_domain::{validate_canonical_id, validate_utc_timestamp, Decimal, OrderState, Side};
+use follon_market_data::CorporateAction;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::*;
@@ -120,6 +121,56 @@ impl IbkrPaperAdapter {
             executed_at: executed_at.to_owned(),
         });
         Ok(execution_id)
+    }
+
+    /// Simulates the venue applying a corporate action to its own books, as
+    /// [`Self::queue_fill`] simulates an execution: a split scales the position
+    /// and a cash dividend credits a long or debits a short. The OMS applies the
+    /// same action independently, through
+    /// [`PaperTradingService::apply_corporate_action`], and reconciliation
+    /// compares the two. A venue's handling of an order resting across a split
+    /// is not modelled, so the model refuses a split while one is working.
+    pub fn apply_corporate_action(&mut self, action: &CorporateAction) -> Result<(), PaperError> {
+        action.validate()?;
+        let instrument_id = action.instrument_id();
+        let held = self
+            .positions
+            .get(instrument_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        match action {
+            CorporateAction::Split { ratio, .. } => {
+                let resting = self.orders.values().any(|order| {
+                    order.request.instrument_id == instrument_id
+                        && matches!(
+                            order.state,
+                            OrderState::Acknowledged | OrderState::PartiallyFilled
+                        )
+                }) || self.combos.values().any(|combo| {
+                    matches!(
+                        combo.state,
+                        OrderState::Acknowledged | OrderState::PartiallyFilled
+                    ) && combo
+                        .request
+                        .legs
+                        .iter()
+                        .any(|leg| leg.instrument_id == instrument_id)
+                });
+                if resting {
+                    return Err(PaperError(
+                        "the paper model does not carry a working order across a split".to_owned(),
+                    ));
+                }
+                if held != Decimal::ZERO {
+                    self.positions
+                        .insert(instrument_id.to_owned(), held.checked_mul(*ratio)?);
+                }
+            }
+            CorporateAction::CashDividend { amount, .. } => {
+                self.cash = self.cash.checked_add(held.checked_mul(*amount)?)?;
+            }
+        }
+        Ok(())
     }
 }
 

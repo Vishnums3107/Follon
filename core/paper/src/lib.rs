@@ -9,6 +9,7 @@
 mod account;
 mod broker;
 mod combinations;
+mod corporate_action;
 mod dashboard;
 mod error;
 mod fault;
@@ -36,6 +37,7 @@ pub use qualification::{
 
 pub use account::*;
 pub use broker::*;
+pub use corporate_action::*;
 pub use dashboard::*;
 pub use error::*;
 pub use fault::*;

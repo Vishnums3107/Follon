@@ -237,6 +237,11 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                     operated_at: operation.operated_at.clone(),
                 })
                 .collect(),
+            corporate_actions: self
+                .corporate_actions
+                .iter()
+                .map(PersistentCorporateAction::from)
+                .collect(),
         }
     }
 
@@ -737,8 +742,10 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 operated_at: persisted.operated_at,
             });
         }
+        let corporate_actions = restore_corporate_actions(state.corporate_actions)?;
         self.orders = orders;
         self.risk_evidence = risk_evidence;
+        self.corporate_actions = corporate_actions;
         self.combo_orders = combo_orders;
         self.combo_risk_evidence = combo_risk_evidence;
         self.portfolios = portfolios;

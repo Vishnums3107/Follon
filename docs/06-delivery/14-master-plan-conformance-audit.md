@@ -5360,6 +5360,74 @@ These are mandatory master-plan acceptance conditions and are currently open:
        receipt's digest with it, is for. Anchors are not signed; their custody, not a
        signature, is the control.
 
+129. PAPER applies an operator-stated split or dividend to its own books (2026-10-01,
+     Reliability and quality; E8.4b-1, decided as Settled direction item 7 records).
+     - **Gap.** PAPER applied no corporate action. When the broker split a held
+       position, the OMS kept the pre-split quantity, cost, FIFO lots, attribution
+       and mark: reconciliation reported a position mismatch that nothing could
+       clear, and a sale of the post-split position was refused as exceeding what
+       the OMS believed it held. A test reproduces both against the model venue. A
+       dividend left the OMS's cash short of the broker's. The item had been held on
+       the PAPER journal schema-migration question, which it does not need: a field
+       never written while empty leaves every earlier journal byte-for-byte as it
+       was, as E3.3b's and E5.2b's fields already do, and the checked-in journal
+       fixture still opens.
+     - **Behavior.** `PaperTradingService::apply_corporate_action` takes a
+       `PaperCorporateAction`: the action in the market-data contract replay and
+       backtests already use, the signed position it was stated against, the operator
+       and the time. It is refused, changing nothing, unless the action is well formed
+       and applied no earlier than it took effect and the account holds exactly the
+       stated position. A split is also refused while a plain order or a combination
+       leg works in the instrument, an `UNKNOWN` one included (E8.2's replay rule),
+       when the position it leaves is not a whole number of the instrument's lots,
+       since cash in lieu is not modelled, and when it would round the cached mark to
+       nothing. Otherwise a split scales the position and divides its average cost
+       (`Portfolio::apply_split`), scales the FIFO lots (`TaxLotBook::apply_split`,
+       E8.1's arithmetic), scales every strategy's attributed quantity and divides
+       the cached mark, all computed on copies and committed together; a dividend
+       credits a long or debits a short by the position times the amount. The receipt
+       (before, after, cash moved, operator, time) is journaled. An action applies
+       once: the same terms again return the first receipt and change nothing, other
+       terms under the same id are refused. Restore rebuilds each receipt and refuses
+       one whose effect does not follow from its action, or a journal applying one
+       action twice. `IbkrPaperAdapter::apply_corporate_action` lets the model venue
+       apply the action to its own books, as `queue_fill` simulates an execution, so
+       reconciliation can be exercised; it refuses a split while an order rests.
+     - **Tests.** `core/paper/src/tests/corporate_actions.rs` (17 tests): a split's
+       position, average cost, lots, cash and receipt, a clean reconciliation, and a
+       sale of the whole post-split position realizing against the split cost; the
+       reproduction without it; the rebased mark and scaled attribution seen in a later
+       aggregate decision's gross exposure; refusals for a working plain order, a
+       working combination leg, a fractional lot, a stated position that differs, an
+       action applied early, malformed requests and a mark rounded to nothing, each
+       leaving the books unchanged; a dividend on a long and a short, both reconciling
+       clean, and one with an order working; actions on a flat instrument; retries;
+       a restart that restores every receipt and books, with a journal that never
+       mentions an action until one is applied; and restore's refusals.
+     - **Rule 5.** 21 of 21 injected defects were caught, counting only tests that
+       failed: the effective time, the identity and terms of a retry and the stated
+       position unchecked; a working plain order or combination leg, a fractional lot
+       or a zero mark allowed; the lots, attribution, mark or position not split; a
+       short credited and a dividend not credited; the action not journaled, not
+       written into the snapshot or dropped on restore; a journaled effect or a
+       repeated action not refused; and the model venue not splitting or not paying.
+       The runner first counted a test as failing when its name merely appeared in
+       cargo's output, which lists passing tests too; it now reads only failed test
+       names, and the 21 were rerun under it.
+     - **Measured result.** The Rust workspace rose from 668 to 685 passed. The
+       full status gate passed all eight suites: Rust workspace 685 passed / 0 failed
+       / 11 ignored, PostgreSQL 11, Tauri 33, Python 257, formatting, strict Clippy
+       and both desktop suites. The evidence pipeline exited 0 with 45 local
+       artifacts.
+     - **Boundary.** The operator states the action; nothing reads one from a feed,
+       and the stated position is a check, not a source. A dividend is credited on the
+       position held when it is applied, so it must be applied before the position
+       changes after the ex-date. A venue's own response to a split, which adjusts or
+       cancels a resting order, is not modelled: the order must be cancelled first.
+       The risk policy's share-denominated limits do not follow a split. The real IBKR
+       bridge applies nothing itself; its snapshot shows what IBKR did. Controlled
+       LIVE (E8.4b-2) and the authenticated gRPC route (E8.4b-3) are separate slices.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

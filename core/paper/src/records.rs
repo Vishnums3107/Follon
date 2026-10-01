@@ -1,9 +1,10 @@
 //! Durable journal record shapes and their conversions to and from domain types.
 
 use follon_domain::{
-    validate_canonical_id, validate_utc_timestamp, ComboIntent, OrderIntent, OrderState, OrderType,
-    RiskDecision, Side, TimeInForce,
+    validate_canonical_id, validate_utc_timestamp, ComboIntent, Decimal, OrderIntent, OrderState,
+    OrderType, RiskDecision, Side, TimeInForce,
 };
+use follon_market_data::CorporateAction;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -115,6 +116,10 @@ pub(crate) struct PersistentPaperState {
     /// so a journal without one re-serializes byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) order_operations: Vec<PersistentOrderOperation>,
+    /// Operator-attested corporate actions, in the order applied (E8.4b). Never
+    /// written while empty, so a journal without one re-serializes byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) corporate_actions: Vec<PersistentCorporateAction>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -131,6 +136,134 @@ pub(crate) struct PersistentOrderOperation {
     pub(crate) action: String,
     pub(crate) operator: String,
     pub(crate) operated_at: String,
+}
+
+/// One applied corporate action. `action_type` and `value` follow the
+/// corporate-action CSV contract: `SPLIT` with its ratio, or `CASH_DIVIDEND`
+/// with its amount per unit.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistentCorporateAction {
+    pub(crate) action_id: String,
+    pub(crate) action_type: String,
+    pub(crate) instrument_id: String,
+    pub(crate) effective_at: String,
+    pub(crate) value: String,
+    pub(crate) applied_by: String,
+    pub(crate) applied_at: String,
+    pub(crate) quantity_before: String,
+    pub(crate) quantity_after: String,
+    pub(crate) cash_delta: String,
+}
+
+impl From<&PaperCorporateActionReceipt> for PersistentCorporateAction {
+    fn from(receipt: &PaperCorporateActionReceipt) -> Self {
+        let (action_type, value) = match &receipt.action {
+            CorporateAction::Split { ratio, .. } => ("SPLIT", ratio),
+            CorporateAction::CashDividend { amount, .. } => ("CASH_DIVIDEND", amount),
+        };
+        Self {
+            action_id: receipt.action.action_id().to_owned(),
+            action_type: action_type.to_owned(),
+            instrument_id: receipt.action.instrument_id().to_owned(),
+            effective_at: receipt.action.effective_at().to_owned(),
+            value: value.to_string(),
+            applied_by: receipt.applied_by.clone(),
+            applied_at: receipt.applied_at.clone(),
+            quantity_before: receipt.quantity_before.to_string(),
+            quantity_after: receipt.quantity_after.to_string(),
+            cash_delta: receipt.cash_delta.to_string(),
+        }
+    }
+}
+
+impl TryFrom<PersistentCorporateAction> for PaperCorporateActionReceipt {
+    type Error = PaperError;
+
+    /// Restores a receipt, refusing one whose effect is not what its action does to
+    /// the quantity it records: a split scales the position by its ratio and moves
+    /// no cash, and a dividend moves the quantity times its amount and no position.
+    fn try_from(persisted: PersistentCorporateAction) -> Result<Self, Self::Error> {
+        let value = decimal("persisted corporate action value", &persisted.value)?;
+        let action = match persisted.action_type.as_str() {
+            "SPLIT" => CorporateAction::Split {
+                action_id: persisted.action_id,
+                instrument_id: persisted.instrument_id,
+                effective_at: persisted.effective_at,
+                ratio: value,
+            },
+            "CASH_DIVIDEND" => CorporateAction::CashDividend {
+                action_id: persisted.action_id,
+                instrument_id: persisted.instrument_id,
+                effective_at: persisted.effective_at,
+                amount: value,
+            },
+            _ => {
+                return Err(PaperError(
+                    "persisted corporate action type is invalid".to_owned(),
+                ))
+            }
+        };
+        action.validate()?;
+        validate_canonical_id("persisted corporate action operator", &persisted.applied_by)?;
+        validate_utc_timestamp("persisted corporate action time", &persisted.applied_at)?;
+        if persisted.applied_at.as_str() < action.effective_at() {
+            return Err(PaperError(
+                "persisted corporate action was applied before it took effect".to_owned(),
+            ));
+        }
+        let quantity_before = decimal(
+            "persisted corporate action quantity before",
+            &persisted.quantity_before,
+        )?;
+        let quantity_after = decimal(
+            "persisted corporate action quantity after",
+            &persisted.quantity_after,
+        )?;
+        let cash_delta = decimal("persisted corporate action cash", &persisted.cash_delta)?;
+        let consistent = match &action {
+            CorporateAction::Split { ratio, .. } => {
+                quantity_after == quantity_before.checked_mul(*ratio)?
+                    && cash_delta == Decimal::ZERO
+            }
+            CorporateAction::CashDividend { amount, .. } => {
+                quantity_after == quantity_before
+                    && cash_delta == quantity_before.checked_mul(*amount)?
+            }
+        };
+        if !consistent {
+            return Err(PaperError(
+                "persisted corporate action effect does not follow from its action".to_owned(),
+            ));
+        }
+        Ok(Self {
+            action,
+            applied_by: persisted.applied_by,
+            applied_at: persisted.applied_at,
+            quantity_before,
+            quantity_after,
+            cash_delta,
+        })
+    }
+}
+
+/// Restores the journaled corporate actions in the order applied, refusing a
+/// journal that applies one action twice: each action applies once.
+pub(crate) fn restore_corporate_actions(
+    persisted: Vec<PersistentCorporateAction>,
+) -> Result<Vec<PaperCorporateActionReceipt>, PaperError> {
+    let mut action_ids = BTreeSet::new();
+    let mut receipts = Vec::with_capacity(persisted.len());
+    for record in persisted {
+        let receipt = PaperCorporateActionReceipt::try_from(record)?;
+        if !action_ids.insert(receipt.action.action_id().to_owned()) {
+            return Err(PaperError(
+                "paper journal applies one corporate action twice".to_owned(),
+            ));
+        }
+        receipts.push(receipt);
+    }
+    Ok(receipts)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -11,6 +11,7 @@ follon-accounting = { path = "../accounting" }
 follon-control-plane = { path = "../control-plane" }
 follon-domain = { path = "../domain" }
 follon-instrument = { path = "../instrument" }
+follon-market-data = { path = "../market-data" }
 follon-risk = { path = "../risk" }
 fs2 = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }

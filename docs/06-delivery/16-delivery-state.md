@@ -56,14 +56,14 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-10-01T03:58:26Z  
+**Measured at:** 2026-10-01T04:11:49Z  
 **Branch:** `feat/session-18-backlog`  
-**HEAD:** `6adefe5` -- fix(postgres): seal evidence children with parent transaction (2026-09-30T16:15:02+05:30)  
-**Uncommitted paths:** 10
+**HEAD:** `5e289e3` -- fix(acceptance): a ledger anchor detects a deleted tail -- audit item 128 (2026-10-01T09:30:52+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 668 | 0 | 11 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 685 | 0 | 11 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 11 | 0 | 0 |
@@ -307,7 +307,7 @@ independent broker and reviewer evidence, or for the custody of the anchors.
 | E8.1 | FIFO tax lots follow a split exactly as the position does: each lot's quantity scaled by the ratio and its unit cost divided by it, so its total cost is unchanged. **Reproduced, then fixed** in both the primary ledger and the advanced account, long and short: before, a post-split partial sale realized -45 where +5 was due, and the rest was refused (audit item 93). **A review on 2026-09-30 found the lots could still total less than the position** after ratios that do not scale exactly, because the position is scaled once where the lots are scaled one by one, so a sale of the whole position was refused. The shortfall now goes on the newest lot (audit item 119). | **done** 2026-09-28; review fix 2026-09-30 |
 | E8.2 | The replay engine's own portfolio, and so the fingerprinted event stream, applies corporate actions as the ledger does. **Reproduced, then fixed:** a strategy that held one share across a 2:1 split and sold the two it then held aborted the run (the engine still held one), and one that sold the one it remembered left the engine flat while the ledger held a share, with no error. **Now** `ReplayEngine::apply_split` scales every account's position in the instrument by the ledger's own arithmetic, or none of them, and records each as a `Position` event (actor `portfolio_engine`, source `corporate_action`) when the replay applies the split; `BacktestRunner` forwards every split to it. A working order across a split is refused, E3.6g's decision applied to splits. A run with no split is unchanged. Audit item 112. Not modelled: a venue's own response to a split. The worker's snapshot and cash follow in E8.3; PAPER, LIVE and capsule replay are E8.4. **A review on 2026-09-30 found the runner's marks were not rebased:** a split multiplied the position and left the instrument's mark, so equity jumped at the split whenever another instrument's bar was the one it waited on, and the ending equity was wrong when none followed. The mark is now divided by the ratio when the split is applied (audit item 119). The replay's remaining limits are listed in the backtesting capability doc. | **done** 2026-09-29; review fix 2026-09-30 |
 | E8.3 | The worker's position snapshot and cash reflect splits and dividends. **Decided 2026-09-29 by the agent, with no SDK or protocol change (Settled direction item 6).** The snapshot a worker is handed is built by the host for every callback, and it followed fills only, so a split or a dividend left it stale until the next fill: a worker that sized its exit from it sold a quantity the account no longer held, and reported cash the ledger did not have. **Now** `BacktestRunner` delivers each effect through a new defaulted `Strategy::on_corporate_action`, a Rust trait method that no existing strategy has to change for. `ProcessStrategyWorker` applies it to the services the snapshot is built from: a split takes the engine's position and divides the mark, and a dividend credits the cash the ledger booked. An effect is delivered only when the action changed the account. A fixture worker process that sells whatever its snapshot says it holds sells the post-split quantity, and its cash equals the ledger's. Audit item 113. The Python SDK gains nothing: a strategy sees a corporate action as a correct portfolio. | **done** 2026-09-29 |
-| E8.4 | Corporate actions in the other environments. **E8.4a, capsule replay (done 2026-09-29, audit item 114):** `capsule-package` and `capsule-verify` take the evaluation's `--actions` file and apply it in the replay. It is bound by the dataset's content hash, which already covered the actions, and never carried. Packaging refuses an evaluation that applied actions unless they are supplied, and a replay with different or no actions cannot reproduce the receipt. **A review on 2026-09-30 found an evaluation whose actions all fell outside its bars applied none, so packaging passed that check and then refused without naming the cause;** it now says to pass the same file (audit item 119). **E8.4b, PAPER and controlled LIVE, is open:** neither applies a corporate action. A PAPER or LIVE account that holds a split instrument is corrected by the broker, and reconciliation reports the difference. Applying one in the model service needs a design: who may submit it, how it is journalled, and what happens to a resting order, which E8.2 refuses in replay. | E8.4a **done** 2026-09-29; E8.4b open |
+| E8.4 | Corporate actions in the other environments. **E8.4a, capsule replay (done 2026-09-29, audit item 114):** `capsule-package` and `capsule-verify` take the evaluation's `--actions` file and apply it in the replay. It is bound by the dataset's content hash, which already covered the actions, and never carried. Packaging refuses an evaluation that applied actions unless they are supplied, and a replay with different or no actions cannot reproduce the receipt. **A review on 2026-09-30 found an evaluation whose actions all fell outside its bars applied none, so packaging passed that check and then refused without naming the cause;** it now says to pass the same file (audit item 119). **E8.4b, PAPER and controlled LIVE**, was held for a design: who may submit an action, how it is journalled, and what happens to a resting order. It was believed to wait on the PAPER journal schema-migration question; it does not, because a field that is never written while empty leaves every earlier journal byte-for-byte as it was, as E3.3b's and E5.2b's fields already do. **Decided 2026-10-01 by the agent (Settled direction item 7).** An operator states the action and the position it applies to; the service refuses it unless the account holds exactly that position, refuses a split while an order works in the instrument (E8.2's rule) or when it would leave a fraction of a lot, applies the ledger's arithmetic to the position, average cost, FIFO lots, strategy attribution, cached mark and cash, and journals it with the operator. **E8.4b-1, PAPER (done 2026-10-01, audit item 129):** `PaperTradingService::apply_corporate_action`, with the model venue's own `IbkrPaperAdapter::apply_corporate_action` so reconciliation can be exercised. **E8.4b-2, controlled LIVE**, and **E8.4b-3, the authenticated gRPC PAPER route**, follow. | E8.4a **done** 2026-09-29; E8.4b-1 **done** 2026-10-01; E8.4b-2 and -3 open |
 | E8.5 | The two P&L conventions stated and tested. **Done 2026-09-29 (audit item 108):** the primary ledger puts fees in the cost basis, so its realized and unrealized P&L are net of fees. The advanced account reports trading P&L before separately attributed charges. Five tests hold both, and that the two agree on cash, equity and FIFO tax P&L, and differ by exactly the fees. The conventions table is in the backtesting capability doc. **Clean-clone check, 2026-09-29:** committed HEAD `843f3bf`, cloned to a new directory and built from an empty target directory, passed `cargo test --workspace --all-targets` (638 passed, 0 failed, 8 ignored), `cargo fmt --check`, `cargo clippy -D warnings` and `pytest` (169 passed, and one skipped because that test needs the key the evidence pipeline generates). Nothing the working tree held but git did not was needed. It did not cover the Tauri workspace, the desktop bundle or the pipeline. A backup of a PostgreSQL database was restored once through `tools/postgres_recovery.py` (audit item 115). **Still open:** a clean-machine install, a recovery exercise on replacement hardware, and a recovery of the PAPER and LIVE journals. | conventions **done**; clean-clone check **done**; install and recovery evidence open |
 
 ### E1 — Risk-gated multi-leg combo order path (conformance row 5.6)
@@ -835,6 +835,25 @@ the reversal here with its date.
      leaves a live order the core believes is over, where a mistaken notice leaves an
      order that the next status or reconciliation settles.
 
+7. **2026-10-01 — decisions taken by the agent while the operator was away.**
+   Asked again to complete the project without stopping for questions, session 18
+   took the most conservative workable option for each design it needed. Each is
+   reversible on an explicit operator instruction, recorded here with its date.
+   - **E8.4b: corporate actions in PAPER and controlled LIVE are operator-stated
+     and position-checked.** The operator states the action and the position it
+     applies to, and the service refuses it unless the account holds exactly that,
+     so an action can never be applied twice by accident or to a position that
+     changed after the broker's notice was read. A split is refused while an order
+     of either kind works in the instrument, E8.2's rule for replay, and when it
+     would leave a fraction of a lot, because cash in lieu is not modelled. A
+     dividend is credited on the position held when it is applied. The
+     alternatives were to read actions from a feed, which this repository has no
+     licensed source for, or to let reconciliation alone correct the books, which
+     reports the difference forever and leaves the OMS selling what the account no
+     longer holds. The journal gains a field that is never written while empty, so
+     no earlier journal changes, and the PAPER schema-migration question stays open
+     and unneeded.
+
 ### Still unanswered
 
 **There is no trading strategy with claimed or tested edge anywhere in this
@@ -859,6 +878,14 @@ short — detail belongs in the conformance audit.
   audit given one fails on a deleted tail, and production promotion needs one
   that covers the root. 16 of 16 injections caught. Measured: Rust 668 / 0 / 11,
   PostgreSQL 11, Tauri 33, Python 257, both desktop suites, the pipeline exit 0.
+- E8.4b-1 applies an operator-stated split or dividend to PAPER's own books
+  (audit item 129), decided as Settled direction item 7: refused unless the
+  account holds the stated position, and for a split while an order works in the
+  instrument or when it would leave a fraction of a lot. It was believed to need
+  the journal schema-migration question; a field never written while empty does
+  not. 21 of 21 injections caught, counted only from failed tests after the
+  runner was found also counting passing tests' names. Measured: Rust 685 / 0 /
+  11, all eight suites green, the pipeline exit 0.
 
 ### 2026-09-30 — session 17
 

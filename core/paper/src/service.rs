@@ -70,6 +70,8 @@ pub struct PaperTradingService<B> {
     /// [`Self::apply_strategy_attribution_fill`].
     pub(crate) strategy_attribution: BTreeMap<String, BTreeMap<String, Decimal>>,
     pub(crate) execution_ids: BTreeSet<String>,
+    /// Operator-attested corporate actions, in the order applied (E8.4b).
+    corporate_actions: Vec<PaperCorporateActionReceipt>,
     incidents: BTreeMap<String, ReconciliationIncident>,
     last_reconciled_at: Option<String>,
     last_reconciliation_clean: Option<bool>,
@@ -81,6 +83,7 @@ pub struct PaperTradingService<B> {
 }
 
 mod broker_events;
+mod corporate_actions;
 mod kill_switch;
 mod orders;
 mod persistence;
@@ -123,6 +126,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
             tax_lots: TaxLotBook::default(),
             marks: BTreeMap::new(),
             execution_ids: BTreeSet::new(),
+            corporate_actions: Vec::new(),
             incidents: BTreeMap::new(),
             last_reconciled_at: None,
             last_reconciliation_clean: None,

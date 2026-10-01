@@ -16,6 +16,7 @@ include!("../combo_lifecycle_tests.rs");
 
 mod combo_orders;
 mod combo_risk;
+mod corporate_actions;
 mod instrument_grid;
 mod journal;
 mod oms;
