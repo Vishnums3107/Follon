@@ -5637,8 +5637,10 @@ These are mandatory master-plan acceptance conditions and are currently open:
        and retained-handle identity after pathname replacement. Removing the
        no-follow flag made the swap regression fail (exit 101); restoration
        passed. Ubuntu CI additionally runs a bounded FIFO refusal regression.
-       Independent read-only review found no material issue. Unix runtime
-       validation is pending CI until that job completes.
+       Independent read-only review found no material issue. Ubuntu formatting,
+       strict Clippy and the full workspace tests passed on `c641332` in
+       [foundation run 36851197124](https://github.com/Vishnums3107/Follon/actions/runs/36851197124),
+       verifying the Unix implementation and FIFO regression as well.
      - **Boundary.** Parent directories remain trusted and protected. This
        does not prevent parent-directory replacement, hard links, mutation by
        an authorized writer, or hostile Windows device names. It is a regular
