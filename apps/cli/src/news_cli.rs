@@ -1,7 +1,7 @@
 //! Operator CLI for local-fixture news scoring and deterministic replay output.
 
 use std::env;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -157,7 +157,7 @@ fn handle_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
-        Some(File::create(p)?)
+        Some(follon_file_safety::create_truncated(p)?)
     } else {
         None
     };

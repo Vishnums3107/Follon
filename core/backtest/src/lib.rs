@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
@@ -2036,21 +2036,19 @@ impl FileExperimentStore {
         let path = path.as_ref().to_path_buf();
         refuse_symbolic_link(&path)?;
         let mut catalog = ExperimentCatalog::default();
-        if path.exists() {
-            for (index, line) in fs::read_to_string(&path)
-                .map_err(|error| BacktestError(error.to_string()))?
-                .lines()
-                .filter(|line| !line.is_empty())
-                .enumerate()
-            {
-                let record = ExperimentRecord::from_canonical_json(line).map_err(|error| {
-                    BacktestError(format!(
-                        "invalid experiment record on line {}: {error}",
-                        index + 1
-                    ))
-                })?;
-                catalog.record(record)?;
-            }
+        let contents = match follon_file_safety::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(BacktestError(error.to_string())),
+        };
+        for (index, line) in contents.lines().filter(|line| !line.is_empty()).enumerate() {
+            let record = ExperimentRecord::from_canonical_json(line).map_err(|error| {
+                BacktestError(format!(
+                    "invalid experiment record on line {}: {error}",
+                    index + 1
+                ))
+            })?;
+            catalog.record(record)?;
         }
         Ok(Self { path, catalog })
     }
@@ -2073,11 +2071,9 @@ impl FileExperimentStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| BacktestError(error.to_string()))?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|error| BacktestError(error.to_string()))?;
+        let mut file =
+            follon_file_safety::open(&self.path, follon_file_safety::Access::Append, true)
+                .map_err(|error| BacktestError(error.to_string()))?;
         file.write_all(record.canonical_json().as_bytes())
             .and_then(|_| file.write_all(b"\n"))
             .and_then(|_| file.sync_data())

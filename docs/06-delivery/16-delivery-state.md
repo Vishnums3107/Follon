@@ -56,19 +56,19 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-10-01T07:39:33Z  
+**Measured at:** 2026-10-01T10:47:07Z  
 **Branch:** `feat/resume-end-to-end-2026-10-01`  
-**HEAD:** `2e9f990` -- feat(trading-api): apply a PAPER corporate action over gRPC -- audit item 131 (2026-10-01T10:06:14+05:30)  
-**Uncommitted paths:** 13
+**HEAD:** `c641332` -- fix(storage): enforce no-follow regular evidence handles (2026-10-01T16:16:11+05:30)  
+**Uncommitted paths:** 0
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 699 | 0 | 11 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 705 | 0 | 11 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 11 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 259 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 262 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -295,7 +295,7 @@ independent broker and reviewer evidence, or for the custody of the anchors.
 | E7.9 | The risk benchmark records when it was measured; its `observed_at` was the fixture's scenario time. **Now** the artifact is schema 2: `measured_at` is the wall-clock UTC second the run began, `scenario_observed_at` is the fixture's own as-of time, and no field named `observed_at` remains. The desktop's benchmark table shows both. Audit item 106. | **done** 2026-09-29 |
 | E7.10 | Native Tauri IPC writes authenticate an operator. Settled direction item 3 keeps this warm, and the assessment lists it under priority 4. | **decision** |
 | E7.11 | The licence conflict. The root `LICENSE` is MIT, while the Cargo metadata and the strategy SDK declare Apache-2.0. **Decided 2026-09-29: MIT.** The Cargo workspace, the desktop host, the strategy SDK and the storage adapter now declare MIT, the Python packages as a PEP 639 SPDX expression, and a test keeps every declaration equal to `LICENSE` (audit item 95). | **done** 2026-09-29 |
-| E7.12 | E3.11's remainder: a link swapped in between a guard's check and its open. Closing it needs a no-follow open: `O_NOFOLLOW` on Unix, and on Windows `FILE_FLAG_OPEN_REPARSE_POINT` followed by a check of the handle's own file type. **Deferred 2026-09-29, not attempted:** the Unix half cannot be compiled or tested on this Windows host (no Linux toolchain, no target, and Docker and WSL are stopped), and half a no-follow open would be worse than none. The guard sites, ten across eight crates, each check and then open; converting them means removing the check so the open itself is the guard. | open, needs a Linux environment |
+| E7.12 | No-follow evidence opens, deferred on 2026-09-29 for lack of Linux verification. Implemented 2026-10-01 in core/file-safety: Unix no-follow/nonblocking flags, Windows reparse-point handles, handle validation before reading or truncating, and integration across durable journals, replay/experiment stores and immutable/news outputs. Five Windows regressions and a missing-flag injection passed; all eight final local suites and the evidence pipeline passed. Ubuntu formatting, strict Clippy and workspace tests, including the FIFO regression, passed on c641332 in run 36851197124. Trusted parents and hard-link exclusions remain explicit. Audit item 136. | done 2026-10-01 |
 | E7.13 | The dashboard answers a refused method without reading its body. Closing the socket with the body unread resets the connection, which can destroy the 501 before the client reads it. Scan probe H32 flaked that way on 2026-09-28. In isolation it lost 12 responses in 1,000 with a body and none without, and every time when the body followed the headers. Behind nginx it would surface as a 502. **Fixed:** every request's declared body, up to 64 KiB, is read before the response, and a 15-second socket timeout bounds each read. H32's own request lost 19 responses in 1,000 before and none after (audit item 88). | **done** 2026-09-28 |
 | E7.14 | Position limits and aggregate exposure now count the unfilled quantity of working plain orders and combination legs, at their current marks. `projected_position` still means filled plus candidate; `working_position_delta` and `committed_position` make the position-limit check explicit. Aggregate metrics report the all-fill projection, while separate possible-absolute-net, concentration, delta and gamma bounds check every subset of working fills, so an order that may never fill cannot hide a breach. Gross, leverage and bucket limits count every working contribution. Cash, equity and margin remain observed, not prospective. Evidence names the exposure basis and bound values. Both PAPER and controlled LIVE paths use this rule. Audit item 126. | **done** 2026-09-30 |
 | E7.15 | Migration 0007 stops an append-only parent gaining children after its creation transaction commits. A journal line belongs to its journal transaction; route decisions and benchmarks belong to their execution plan. Parent insert triggers record the full PostgreSQL transaction ID, and child insert triggers require that ID and the parent's tuple insertion ID to be current. Older parents have no creation ID and cannot gain children. `ENABLE ALWAYS` keeps both guards active under replica mode. The adapter's only writers for these tables create parent and children in one transaction; no later-arriving receipt or sentiment is covered. A parent created inside a subtransaction and a child inserted outside it is conservatively refused. Audit item 127. | **done** 2026-09-30 |
@@ -866,6 +866,46 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-10-01 — session 20
+
+- Resumed the existing branch and completed its uncommitted currency slice:
+  the IBKR bridge only accepts account-summary cash in the configured account
+  currency. Missing matching cash fails reconciliation (audit item 135).
+- Independent review found stale cash could survive a snapshot timeout. A
+  failing regression reproduced it; retiring the request under the callback
+  lock and cancelling subscriptions on every exit fixes the retry lifecycle.
+- Adapter swaps continue to require separate journals: existing fingerprints
+  already refuse changing model/bridge, broker account, client, map or currency.
+  Existing evidence is retained; no automatic migration or balance adoption is
+  introduced. Opening books must independently match the broker before a new
+  bridge account can submit.
+- The user explicitly authorized pushing all changes and raising a PR. All
+  eight suites passed in the generated measurement, including disposable
+  PostgreSQL integration; desktop typecheck passed separately. Publication is
+  complete in [PR 38](https://github.com/Vishnums3107/Follon/pull/38). E5.3 market inputs and the
+  remaining operational/install gaps follow; real Gateway history remains
+  external evidence that code and fixtures cannot manufacture.
+- E7.12 uses one shared no-follow regular-file open across durable journals,
+  replay/experiment storage and immutable/news outputs (audit item 136).
+  Windows link regressions passed and caught an injected missing flag;
+  independent review found no material issue. All eight final local suites
+  passed, and the end-to-end pipeline exited 0 with 46 local inventory artifacts.
+  Ubuntu formatting, strict Clippy and the workspace tests also passed on
+  `c641332` in [run 36851197124](https://github.com/Vishnums3107/Follon/actions/runs/36851197124),
+  verifying the Unix open and bounded FIFO regression. E7.12 is complete within
+  its documented final-component boundary. Local DAST passed 88 probes with
+  zero failures; it remains a repository-authored scan.
+- All six foundation CI jobs passed for the currency commit `e87c662`.
+  All six foundation jobs also passed for the file-safety commit `c641332`
+  in run 36851197124. The final documentation checkpoint may queue another
+  foundation run; it changes no executable behavior.
+  The session reached its usage limit, so no new slice was started afterward.
+- **Next action:** define and implement independently fresh market inputs for the broker-PAPER route
+  (E5.3). Account/currency scope, opening books and real Gateway reconciliation
+  need operator-environment evidence; adapter changes use new isolated journals
+  and never migrate model balances automatically. External acceptance remains
+  open. No LIVE or commercial release was performed.
 
 ### 2026-10-01 — session 19
 

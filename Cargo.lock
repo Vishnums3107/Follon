@@ -400,6 +400,7 @@ dependencies = [
  "follon-accounting",
  "follon-control-plane",
  "follon-domain",
+ "follon-file-safety",
  "follon-instrument",
  "follon-market-data",
  "proptest",
@@ -417,6 +418,7 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-execution",
+ "follon-file-safety",
  "follon-fx",
  "follon-identity",
  "follon-instrument",
@@ -439,6 +441,7 @@ name = "follon-commercial"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "follon-file-safety",
  "fs2",
  "ring",
  "serde",
@@ -452,6 +455,7 @@ name = "follon-control-plane"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "follon-file-safety",
  "follon-instrument",
  "follon-news",
  "proptest",
@@ -476,6 +480,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "follon-file-safety"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -528,6 +540,7 @@ dependencies = [
  "follon-accounting",
  "follon-control-plane",
  "follon-domain",
+ "follon-file-safety",
  "follon-instrument",
  "follon-market-data",
  "follon-risk",
@@ -564,6 +577,7 @@ name = "follon-operations"
 version = "0.1.0"
 dependencies = [
  "follon-domain",
+ "follon-file-safety",
  "fs2",
  "serde",
  "serde_json",
@@ -589,6 +603,7 @@ dependencies = [
  "follon-accounting",
  "follon-control-plane",
  "follon-domain",
+ "follon-file-safety",
  "follon-instrument",
  "follon-market-data",
  "follon-risk",

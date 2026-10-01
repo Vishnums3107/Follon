@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -340,12 +340,7 @@ impl CommercialLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CommercialError> {
         let path = path.as_ref().to_path_buf();
         reject_symlink_path("commercial ledger", &path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
+        let mut file = follon_file_safety::open(&path, follon_file_safety::Access::ReadWrite, true)
             .map_err(io_error)?;
         FileExt::try_lock_exclusive(&file).map_err(|error| {
             CommercialError(format!(
@@ -1877,7 +1872,8 @@ fn validate_relative_path(value: &str) -> Result<PathBuf, CommercialError> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, CommercialError> {
-    let mut file = File::open(path).map_err(io_error)?;
+    let mut file = follon_file_safety::open(path, follon_file_safety::Access::Read, false)
+        .map_err(io_error)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 32 * 1024];
     loop {
@@ -2000,10 +1996,11 @@ fn parse_bool_detail(record: &CommercialLedgerRecord, key: &str) -> Result<bool,
 
 fn verify_ledger_file(path: &Path) -> Result<Vec<CommercialLedgerRecord>, CommercialError> {
     reject_symlink_path("commercial ledger", path)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut file = File::open(path).map_err(io_error)?;
+    let mut file = match follon_file_safety::open(path, follon_file_safety::Access::Read, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error(error)),
+    };
     FileExt::try_lock_shared(&file).map_err(|error| {
         CommercialError(format!(
             "commercial ledger cannot obtain a stable shared lock: {error}"

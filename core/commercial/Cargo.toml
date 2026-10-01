@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+follon-file-safety = { path = "../file-safety" }
 follon-domain = { path = "../domain" }
 fs2 = "0.4.3"
 ring = "0.17.14"

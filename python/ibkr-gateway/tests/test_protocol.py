@@ -102,11 +102,17 @@ class ConfigurationTests(unittest.TestCase):
             "--client-id", "7",
             "--account-id", "acct.paper.1",
             "--broker-account", "DU1234567",
+            "--account-currency", "USD",
             "--instrument-map", "instruments.json",
             "--tws-timezone", "America/New_York",
             "--environment", "PAPER",
         ]
         self.assertEqual(parse_arguments(base).port, 7497)
+        for currency in ("", "US", "USDD", "usd", "U$D", "U\u015aD"):
+            modified = list(base)
+            modified[modified.index("--account-currency") + 1] = currency
+            with self.subTest(currency=currency), self.assertRaises(BridgeFailure):
+                parse_arguments(modified)
 
         for name, value in (("--environment", "LIVE"), ("--host", "example.com"), ("--port", "7496")):
             modified = list(base)
@@ -202,6 +208,7 @@ _BASE_ARGUMENTS = [
     "--client-id", "7",
     "--account-id", "acct.paper.1",
     "--broker-account", "DU1234567",
+    "--account-currency", "USD",
     "--instrument-map", "instruments.json",
     "--tws-timezone", "America/New_York",
     "--environment", "PAPER",
@@ -253,6 +260,73 @@ def _submit_payload(client_order_id: str) -> dict:
 
 
 class OfficialBackendSnapshotTests(unittest.TestCase):
+    def test_account_cash_uses_only_the_configured_currency(self) -> None:
+        backend = _build_official_backend()
+        backend.app.active_account_summary_request = 91
+        backend.app.accountSummary(91, "DU1234567", "TotalCashValue", "9999", "EUR")
+        self.assertIsNone(backend.app.cash)
+        backend.app.accountSummary(91, "DU1234567", "TotalCashValue", "1000", "USD")
+        self.assertEqual(backend.app.cash, "1000")
+        for request_id, account, tag, currency in (
+            (90, "DU1234567", "TotalCashValue", "USD"),
+            (91, "DU0000000", "TotalCashValue", "USD"),
+            (91, "DU1234567", "NetLiquidation", "USD"),
+            (91, "DU1234567", "TotalCashValue", "EUR"),
+            (91, "DU1234567", "TotalCashValue", "BASE"),
+        ):
+            backend.app.accountSummary(request_id, account, tag, "9999", currency)
+        self.assertEqual(backend.app.cash, "1000")
+
+    def test_snapshot_refuses_a_missing_configured_currency(self) -> None:
+        backend = _build_official_backend()
+        backend.app.reqAllOpenOrders = lambda: backend.app.openOrderEnd()
+        backend.app.reqCompletedOrders = lambda api_only: backend.app.completedOrdersEnd()
+        backend.app.reqPositions = lambda: backend.app.positionEnd()
+
+        def account_summary(request_id: int, group: str, tags: str) -> None:
+            backend.app.accountSummary(request_id, "DU1234567", "TotalCashValue", "1000", "EUR")
+            backend.app.accountSummaryEnd(request_id)
+
+        backend.app.reqAccountSummary = account_summary
+        backend.app.cancelPositions = lambda: None
+        backend.app.cancelAccountSummary = lambda request_id: None
+        backend._refresh_executions = lambda: None
+        with self.assertRaisesRegex(BridgeFailure, "no cash value"):
+            backend.snapshot({"account_id": "acct.paper.1"})
+
+    def test_failed_snapshot_cannot_supply_cash_to_its_retry(self) -> None:
+        backend = _build_official_backend()
+        old_requests: list[int] = []
+        cancelled: list[int] = []
+        backend.app.reqAllOpenOrders = lambda: backend.app.openOrderEnd()
+        backend.app.reqCompletedOrders = lambda api_only: backend.app.completedOrdersEnd()
+        backend.app.reqPositions = lambda: backend.app.positionEnd()
+        backend.app.reqAccountSummary = lambda request_id, group, tags: old_requests.append(request_id)
+        backend.app.cancelPositions = lambda: None
+        backend.app.cancelAccountSummary = cancelled.append
+        backend._refresh_executions = lambda: None
+        original_wait = backend._wait
+        backend._wait = lambda predicate, message: (_ for _ in ()).throw(BridgeFailure(message))
+        with self.assertRaisesRegex(BridgeFailure, "timed out"):
+            backend.snapshot({"account_id": "acct.paper.1"})
+        old_request = old_requests[0]
+
+        def late_open_orders() -> None:
+            backend.app.accountSummary(old_request, "DU1234567", "TotalCashValue", "1000", "USD")
+            backend.app.openOrderEnd()
+
+        def foreign_account_summary(request_id: int, group: str, tags: str) -> None:
+            backend.app.accountSummary(request_id, "DU1234567", "TotalCashValue", "2000", "EUR")
+            backend.app.accountSummaryEnd(request_id)
+
+        backend._wait = original_wait
+        backend.app.reqAllOpenOrders = late_open_orders
+        backend.app.reqAccountSummary = foreign_account_summary
+        with self.assertRaisesRegex(BridgeFailure, "no cash value"):
+            backend.snapshot({"account_id": "acct.paper.1"})
+        self.assertIsNone(backend.app.active_account_summary_request)
+        self.assertIn(old_request, cancelled)
+
     def test_snapshot_sees_other_clients_orders_without_owning_them(self) -> None:
         backend = _build_official_backend()
         requested: list[str] = []

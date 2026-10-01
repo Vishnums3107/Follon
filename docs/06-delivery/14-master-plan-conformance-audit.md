@@ -5595,6 +5595,57 @@ These are mandatory master-plan acceptance conditions and are currently open:
        background poller or real Gateway run, and the configured cash/currency
        policy and adapter-swap journal handling remain under E5.5–E5.6.
 
+135. PAPER bridge cash reconciliation is scoped to the configured currency
+     (2026-10-01, Reliability and quality; E5.5c).
+     - **Gap.** The bridge accepted `TotalCashValue` from any currency callback
+       for the account, so callback order could determine the cash used by the
+       single-currency PAPER books.
+     - **Behavior.** The route passes its account currency as the required
+       `--account-currency` bridge argument. Both boundaries validate three
+       uppercase ASCII letters. Only the active request, configured broker
+       account, `TotalCashValue` tag and matching currency may supply cash. A
+       missing matching value fails the snapshot. No conversion or `BASE`
+       relabelling occurs; the account-summary value is not a settled-cash or
+       per-currency-ledger claim. Operators must review the account's reporting
+       currency and opening balance.
+     - **Tests.** Official-backend regressions cover foreign currencies, `BASE`,
+       stale requests, foreign accounts, other tags and missing matching cash.
+       The launcher/parser contract checks propagation of `EUR`; malformed
+       currencies are refused at both boundaries. Review found a late cash
+       callback could survive a failed snapshot and populate its retry. A
+       regression failed before the fix; snapshot start and every exit now
+       retire the old request under the callback lock, and subscriptions are
+       cancelled on failure too. Focused bridge tests: 42 passed. No real
+       Gateway acceptance evidence was produced.
+
+136. Durable evidence opens refuse links at the OS boundary
+     (2026-10-01, Reliability and quality; E7.12).
+     - **Gap.** Path metadata checks preceded ordinary opens. A final-component
+       link planted between the check and open could redirect a journal or a
+       truncating news output, or masquerade as immutable evidence on read.
+     - **Behavior.** `core/file-safety` centralizes Unix `O_NOFOLLOW | O_NONBLOCK`
+       and Windows `FILE_FLAG_OPEN_REPARSE_POINT` plus anonymous SQOS. The opened
+       handle must be regular, and every Windows reparse point is refused.
+       Truncation follows validation; exclusive create stays exclusive. PAPER,
+       LIVE, operations and commercial journals, replay event/experiment stores,
+       commercial artifact hashing, CLI immutable reads and news output use it.
+       Replay recovery and append now share one handle. Immutable publication
+       removes staging files even if a competing destination read is refused.
+       Locks, hashes, persisted schemas and trading arithmetic are unchanged.
+     - **Tests.** Five Windows helper regressions actually created symlinks and
+       verified normal access, final links, dangling targets, preflight swaps,
+       and retained-handle identity after pathname replacement. Removing the
+       no-follow flag made the swap regression fail (exit 101); restoration
+       passed. Ubuntu CI additionally runs a bounded FIFO refusal regression.
+       Independent read-only review found no material issue. Ubuntu formatting,
+       strict Clippy and the full workspace tests passed on `c641332` in
+       [foundation run 36851197124](https://github.com/Vishnums3107/Follon/actions/runs/36851197124),
+       verifying the Unix implementation and FIFO regression as well.
+     - **Boundary.** Parent directories remain trusted and protected. This
+       does not prevent parent-directory replacement, hard links, mutation by
+       an authorized writer, or hostile Windows device names. It is a regular
+       evidence-file contract, not filesystem confinement or strategy sandboxing.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

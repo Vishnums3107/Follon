@@ -7,7 +7,7 @@
 //! makes the operator-facing projection repeatable and safe to render locally.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -1529,12 +1529,7 @@ impl OperationalJournal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
+        let mut file = follon_file_safety::open(&path, follon_file_safety::Access::ReadWrite, true)
             .map_err(io_error)?;
         FileExt::try_lock_exclusive(&file).map_err(|error| {
             OperationsError(format!(
@@ -1573,11 +1568,15 @@ impl OperationalJournal {
     ) -> Result<(JournalInspection, Vec<JournalRecord>), OperationsError> {
         let path = path.as_ref();
         refuse_symbolic_link(path)?;
-        if !path.exists() {
-            return Ok((JournalInspection::empty(), Vec::new()));
-        }
         for attempt in 0..JOURNAL_READ_ATTEMPTS {
-            let mut file = File::open(path).map_err(io_error)?;
+            let mut file =
+                match follon_file_safety::open(path, follon_file_safety::Access::Read, false) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok((JournalInspection::empty(), Vec::new()));
+                    }
+                    Err(error) => return Err(io_error(error)),
+                };
             match FileExt::try_lock_shared(&file) {
                 Ok(()) => {
                     return verify_journal_file(&mut file)

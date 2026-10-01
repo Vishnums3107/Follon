@@ -61,6 +61,7 @@ The fixed process arguments have this shape (values are illustrative):
 C:\approved-python\python.exe C:\Follon\python\ibkr-gateway\src\follon_ibkr_gateway.py \
   --host 127.0.0.1 --port 7497 --client-id 7 \
   --account-id acct.paper.001 --broker-account DU_REVIEWED_ACCOUNT \
+  --account-currency USD \
   --instrument-map C:\protected-config\ibkr-instruments.json \
   --tws-timezone America/New_York --environment PAPER --timeout-seconds 10
 ```
@@ -70,6 +71,15 @@ The gRPC PAPER route builds exactly this list from its configuration's
 section's `request_timeout_seconds` (see
 `contracts/json-schema/v1/paper-command-route.schema.json` and
 `tests/fixtures/config/paper-command-route-v1-bridge.json`).
+
+`--account-currency` is required and comes from the route's account currency,
+not a second independently configurable value. Cash reconciliation uses only
+`TotalCashValue` for the configured broker account, active request and exact
+currency. A missing matching value fails the snapshot; `BASE` and other
+currencies are never relabelled or converted. This is IBKR's reported account
+summary cash, not a per-currency cash ledger or settled buying power. Configure
+the PAPER books in the account's reporting currency and independently review
+the opening balance before trading.
 
 Use absolute, ACL-protected paths in the Rust process configuration. Record the
 interpreter digest, official API version, bridge digest, TWS/Gateway build,
@@ -103,12 +113,10 @@ Run the bridge contract suite:
 PYTHONPATH=python/ibkr-gateway/src python -m unittest discover -s python/ibkr-gateway/tests -v
 ```
 
-Eight of its fourteen tests need neither TWS nor `ibapi`: they verify the
-private protocol and the fail-closed PAPER configuration. The other six (the
-four `OfficialBackendSubmitRetryTests` and two of the
-`OfficialBackendExecutionTimeTests`) exercise the official backend and import
-the official Python API, so without it they error with
-`No module named 'ibapi'`. They pass against `ibapi` 9.81.1.post1, the only
+The protocol and configuration tests need neither TWS nor `ibapi`. The
+`OfficialBackend*` tests exercise the official backend and import the official
+Python API, so without it they error with `No module named 'ibapi'`. The tests
+pass against `ibapi` 9.81.1.post1, the only
 version they have been run against. CI installs exactly that release,
 hash-pinned in `requirements-ci.txt`, as the operator approved on 2026-09-29
 (delivery state E4.2):

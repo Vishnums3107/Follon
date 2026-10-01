@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 
@@ -161,13 +161,13 @@ impl FileEventStore {
             }
             _ => {}
         }
+        let mut file =
+            follon_file_safety::open(path, follon_file_safety::Access::ReadAppend, true)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
         let mut event_ids = HashSet::new();
-        if path.exists() {
-            for (index, line) in fs::read_to_string(path)?
-                .lines()
-                .filter(|line| !line.is_empty())
-                .enumerate()
-            {
+        {
+            for (index, line) in contents.lines().filter(|line| !line.is_empty()).enumerate() {
                 let record = parse_canonical_event(line, index + 1)?;
                 let object = record.as_object().expect("validated event is an object");
                 let event_id = json_required_string(object, "event_id", index + 1)?;
@@ -189,10 +189,7 @@ impl FileEventStore {
                 }
             }
         }
-        Ok(Self {
-            file: OpenOptions::new().create(true).append(true).open(path)?,
-            event_ids,
-        })
+        Ok(Self { file, event_ids })
     }
 }
 

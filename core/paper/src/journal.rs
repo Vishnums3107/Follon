@@ -2,7 +2,7 @@
 
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -59,18 +59,14 @@ impl FilePaperJournal {
                 fs::create_dir_all(parent).map_err(|error| PaperError(error.to_string()))?;
             }
         }
-        let mut file = match OpenOptions::new()
-            .create(create)
-            .read(true)
-            .append(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(error) => return Err(PaperError(error.to_string())),
-        };
+        let mut file =
+            match follon_file_safety::open(&path, follon_file_safety::Access::ReadAppend, create) {
+                Ok(file) => file,
+                Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(PaperError(error.to_string())),
+            };
         file.try_lock_exclusive().map_err(|error| {
             PaperError(format!(
                 "paper journal is already open by another operator/process: {error}"

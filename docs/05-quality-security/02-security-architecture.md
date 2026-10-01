@@ -17,6 +17,15 @@ Use NIST SSDF as the secure-development process baseline and target OWASP ASVS L
 
 ## Absolute boundary
 
+Local Rust evidence journals and immutable-artifact readers use
+`core/file-safety` to refuse a final-component link at the actual open, then
+validate the opened handle before reading or truncating. PAPER/LIVE and
+operations/commercial journals retain their exclusive locks and hash-chain
+checks. Replay event-store recovery reads and appends through the same handle.
+This closes the preflight-check/open gap; protected parent directories and
+the exclusion of hard-link attacks remain deployment assumptions. See the
+[file-safety contract](../../core/file-safety/README.md).
+
 Broker credentials must never be exposed to strategy code. The strategy-worker boundary is a security boundary as well as a reliability boundary.
 
 ## First implementation controls
