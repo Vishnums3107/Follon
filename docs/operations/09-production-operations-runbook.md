@@ -18,6 +18,7 @@ python tools/release_promotion_gate.py `
   --acceptance-ledger-root <acceptance-ledger-root> `
   --acceptance-trusted-reviewers <trusted-reviewers.json> `
   --acceptance-artifact-root <acceptance-artifact-root> `
+  --acceptance-ledger-anchor <latest-ledger-anchor.json> `
   --requester <user.id> --approver <different.user.id> `
   --change-ticket <change.id> --receipt <new-promotion-receipt.json>
 ```
@@ -26,10 +27,12 @@ The gate recomputes the acceptance status from the ledger root with
 `tools/acceptance_evidence.py audit`, for the release the manifest names; it
 takes no status document, because a supplied one could simply declare every gate
 eligible. Production promotion fails while any external acceptance target is
-below its required count. The receipt (schema 3) is an eligibility decision: it
-binds the release, the SHA-256 of the trusted reviewer set the audit used, the
-recomputed status's SHA-256, and each ledger file counted, by path, SHA-256,
-record count, and chain head. The gate verifies temporary snapshots of the release
+below its required count, and without a ledger anchor that covers every ledger
+and record in the root (see *Ledger anchors* below). The receipt (schema 4) is an
+eligibility decision: it binds the release, the SHA-256 of the trusted reviewer
+set the audit used, the recomputed status's SHA-256, each ledger file counted, by
+path, SHA-256, record count, and chain head, and each ledger anchor the root was
+held to, by SHA-256 and time. The gate verifies temporary snapshots of the release
 manifest, signature, and trusted key, and uses those same bytes for the release
 ID and receipt digests, so a later change at an input path cannot alter what the
 receipt claims was verified. The receipt is created under a fresh temporary name
@@ -41,7 +44,8 @@ status without promoting, run:
 ```powershell
 python tools/acceptance_evidence.py audit <acceptance-ledger-root> `
   --trusted-reviewers <trusted-reviewers.json> `
-  --artifact-root <acceptance-artifact-root> --release-id <release.id>
+  --artifact-root <acceptance-artifact-root> --release-id <release.id> `
+  --anchor <latest-ledger-anchor.json>
 ```
 
 ## Acceptance evidence
@@ -150,6 +154,39 @@ with a `status` of `active`. The audit refuses a set holding a key that is not a
 honest Ed25519 public key, such as the all-zero placeholder, or one public key
 under two entries. Use a key of the reviewer's own, never the release-signing
 key.
+
+### Ledger anchors
+
+A hash chain verifies whatever prefix of it remains, so deleting the newest
+records of a ledger leaves an audit that passes, and deleting a trailing
+rejection requalifies its subject. **After every append, anchor the root and keep
+the anchor where the ledger root's writers cannot reach it**, for example
+attached to the change ticket that recorded the review:
+
+```powershell
+python tools/acceptance_evidence.py anchor <acceptance-ledger-root> `
+  --trusted-reviewers <trusted-reviewers.json> `
+  --output <anchor-directory>/<evidence.id>.anchor.json
+```
+
+`anchor` verifies the whole root, every signature included, and refuses to
+anchor one that does not verify. It writes each ledger's path, record count and
+chain head, the time and the reviewer set's SHA-256, to a new file: it refuses a
+path inside the ledger root, which would share the root's custody, and never
+overwrites an existing file. `contracts/json-schema/v2/acceptance-ledger-anchor.schema.json`
+describes it.
+
+An audit or a promotion given an anchor (`--anchor`, or
+`--acceptance-ledger-anchor` on the gate; each may repeat) fails unless every
+anchored ledger is still present and still holds its anchored records unchanged.
+Records appended since are allowed, but the status then reports that the anchor
+does not cover the root (`covers_root: false`), because nothing shows that a
+record appended after it was not deleted. **Production promotion needs an anchor
+that covers every ledger and record of the root**, so present the latest one.
+The receipt names each anchor's SHA-256; compare it with the copy kept in custody.
+An anchor protects only what it lists, and only while the copy relied on is the
+one kept outside the host: an anchor taken after a deletion vouches for the
+truncated root.
 
 The evidence pipeline (step 23) audits only `var/acceptance/`, the operational
 ledger root, for the release the pipeline's own manifest names, and every

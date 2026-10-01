@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://follon.local/contracts/v2/acceptance-ledger-anchor.schema.json",
+  "title": "Follon acceptance ledger anchor",
+  "description": "The record count and chain head of every ledger in a verified acceptance ledger root, written by `tools/acceptance_evidence.py anchor` to a new file outside the root. A hash chain verifies whatever prefix of it remains, so it cannot show that its newest records were deleted; an audit given this anchor fails unless every anchored ledger still holds its anchored records unchanged. The anchor protects only what it lists and only while it is kept where the ledger root's writers cannot reach it. Production promotion needs one that covers every ledger and record of the root.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["acceptance_ledger_anchor_schema_version", "anchored_at", "trusted_reviewers_sha256", "ledgers"],
+  "properties": {
+    "acceptance_ledger_anchor_schema_version": { "const": 1 },
+    "anchored_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "When the root was anchored, in UTC to the second."
+    },
+    "trusted_reviewers_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "The SHA-256 of the trusted reviewer set every anchored record was verified against. It records what the anchor attested; a later audit may use a larger set."
+    },
+    "ledgers": {
+      "type": "array",
+      "description": "Every ledger file in the root, once each, ordered by path.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "records", "head"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "\\.acceptance\\.ndjson$",
+            "description": "The ledger's path relative to the root, with forward slashes."
+          },
+          "records": { "type": "integer", "minimum": 0 },
+          "head": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "The record hash of the ledger's last anchored record, or 64 zeros for a ledger that held none."
+          }
+        }
+      }
+    }
+  }
+}

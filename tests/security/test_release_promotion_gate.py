@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from acceptance_fixtures import RELEASE_ID, Workspace, links_supported, make_chain
+from acceptance_fixtures import ANCHORED_AT, RELEASE_ID, Workspace, links_supported, make_chain
 from tools import release_promotion_gate
 from tools.acceptance_evidence import GATES
 from tools.release_promotion_gate import (
@@ -47,7 +47,11 @@ def write_every_gate(workspace: Workspace, short_by: dict[str, int] | None = Non
         )
 
 
-def ready(workspace: Workspace, target: str, release_id: str = RELEASE_ID):
+def ready(workspace: Workspace, target: str, release_id: str = RELEASE_ID, anchors: list[Path] | None = None):
+    """Runs the acceptance subcheck. Production is given an anchor of the root as it
+    now stands unless `anchors` says otherwise, since it refuses to run without one."""
+    if anchors is None:
+        anchors = [workspace.anchor()] if target == "production" else []
     return acceptance_ready(
         REPOSITORY_ROOT,
         workspace.ledgers,
@@ -55,7 +59,22 @@ def ready(workspace: Workspace, target: str, release_id: str = RELEASE_ID):
         trusted_reviewers=workspace.reviewers,
         artifact_root=workspace.artifacts,
         release_id=release_id,
+        ledger_anchors=anchors,
     )
+
+
+def audit_response(release_id: str = RELEASE_ID, **changes: object) -> SimpleNamespace:
+    """A well-formed acceptance audit response, as the tool's process returns it."""
+    status = {
+        "acceptance_status_schema_version": 5,
+        "release_id": release_id,
+        "trusted_reviewers_sha256": "a" * 64,
+        "all_gates_eligible": False,
+        "ledgers": [],
+        "ledger_anchors": [],
+        **changes,
+    }
+    return SimpleNamespace(returncode=0, stdout=json.dumps(status).encode(), stderr=b"")
 
 
 class ReleasePromotionGateTests(unittest.TestCase):
@@ -131,13 +150,16 @@ class ReleasePromotionGateTests(unittest.TestCase):
 
     def test_evidence_no_listed_key_signed_fails_verification(self) -> None:
         # Every record must be signed by a listed key, so a set that lists none
-        # fails the audit for staging too, not only production (E6.6b).
+        # fails the audit for staging too, not only production (E6.6b). The root
+        # was anchored while its reviewer was still listed.
         with tempfile.TemporaryDirectory() as directory:
-            workspace = Workspace(directory, trust=False)
+            workspace = Workspace(directory)
             write_every_gate(workspace)
+            anchor = workspace.anchor()
+            workspace.trust()
             for environment in ("staging", "production"):
                 with self.assertRaisesRegex(PromotionError, "failed verification.*no listed reviewer key"):
-                    ready(workspace, environment)
+                    ready(workspace, environment, anchors=[anchor])
 
     def test_evidence_without_its_retained_artifact_does_not_open_a_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -159,6 +181,7 @@ class ReleasePromotionGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory)
             write_every_gate(workspace)
+            anchor = workspace.anchor()
             ledger = workspace.ledgers / "paper_session.acceptance.ndjson"
             ledger.write_text(
                 ledger.read_text(encoding="utf-8").replace("Independently reviewed", "Edited"),
@@ -167,7 +190,47 @@ class ReleasePromotionGateTests(unittest.TestCase):
             )
             for environment in ("staging", "production"):
                 with self.assertRaisesRegex(PromotionError, "failed verification"):
-                    ready(workspace, environment)
+                    ready(workspace, environment, anchors=[anchor])
+
+    def test_production_needs_an_anchor_before_anything_is_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            write_every_gate(workspace)
+            with mock.patch.object(release_promotion_gate.subprocess, "run") as run:
+                with self.assertRaisesRegex(PromotionError, "requires a ledger anchor kept outside"):
+                    ready(workspace, "production", anchors=[])
+            run.assert_not_called()
+            # Staging is not held to it, and an anchor given there is still checked.
+            self.assertEqual(ready(workspace, "staging")[0]["ledger_anchors"], [])
+            status, _ = ready(workspace, "staging", anchors=[workspace.anchor()])
+            self.assertEqual([anchor["covers_root"] for anchor in status["ledger_anchors"]], [True])
+
+    def test_production_needs_an_anchor_that_covers_the_whole_root(self) -> None:
+        # A record appended after the anchor is not protected by it: deleting that
+        # record, a rejection perhaps, would leave the old anchor holding. So the
+        # anchor a production promotion relies on must cover the root as it stands.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            write_every_gate(workspace)
+            stale = workspace.anchor()
+            workspace.write(
+                "later", make_chain(("evidence.later.1", "subject.later.1", {"evidence_type": "design_partner"}))
+            )
+            with self.assertRaisesRegex(PromotionError, "covers every ledger and record"):
+                ready(workspace, "production", anchors=[stale])
+            status, _ = ready(workspace, "production", anchors=[stale, workspace.anchor()])
+            self.assertTrue(status["all_gates_eligible"])
+            self.assertEqual([anchor["covers_root"] for anchor in status["ledger_anchors"]], [False, True])
+
+    def test_a_deleted_ledger_tail_blocks_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            write_every_gate(workspace)
+            anchor = workspace.anchor()
+            ledger = workspace.ledgers / "paper_session.acceptance.ndjson"
+            ledger.write_bytes(b"".join(ledger.read_bytes().splitlines(keepends=True)[:-1]))
+            with self.assertRaisesRegex(PromotionError, "failed verification.*deleted from its tail"):
+                ready(workspace, "production", anchors=[anchor])
 
     def test_staging_needs_verifiable_ledgers_but_not_eligibility(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -177,14 +240,8 @@ class ReleasePromotionGateTests(unittest.TestCase):
     def test_the_audit_response_must_name_the_requested_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory)
-            wrong = {
-                "acceptance_status_schema_version": 4,
-                "release_id": "release.other",
-                "trusted_reviewers_sha256": "a" * 64,
-                "all_gates_eligible": True,
-                "ledgers": [],
-            }
-            response = SimpleNamespace(returncode=0, stdout=json.dumps(wrong).encode(), stderr=b"")
+            anchored = [{"sha256": "b" * 64, "covers_root": True}]
+            response = audit_response("release.other", all_gates_eligible=True, ledger_anchors=anchored)
             with mock.patch.object(release_promotion_gate.subprocess, "run", return_value=response):
                 with self.assertRaisesRegex(PromotionError, "different release"):
                     ready(workspace, "production")
@@ -192,25 +249,36 @@ class ReleasePromotionGateTests(unittest.TestCase):
     def test_incomplete_audit_responses_are_refused_at_the_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Workspace(directory)
-            valid = {
-                "acceptance_status_schema_version": 4,
-                "release_id": RELEASE_ID,
-                "trusted_reviewers_sha256": "a" * 64,
-                "all_gates_eligible": False,
-                "ledgers": [],
-            }
+            valid = json.loads(audit_response().stdout)
+            # The well-formed response passes, so each refusal below is about its change.
+            with mock.patch.object(release_promotion_gate.subprocess, "run", return_value=audit_response()):
+                self.assertEqual(ready(workspace, "staging")[0], valid)
             malformed = {
-                "a boolean schema version": {**valid, "acceptance_status_schema_version": True},
-                "a missing reviewer digest": {key: value for key, value in valid.items() if key != "trusted_reviewers_sha256"},
-                "an invalid reviewer digest": {**valid, "trusted_reviewers_sha256": "not a digest"},
-                "a missing ledger list": {key: value for key, value in valid.items() if key != "ledgers"},
-                "a nonboolean eligibility": {**valid, "all_gates_eligible": "false"},
+                "a boolean schema version": {"acceptance_status_schema_version": True},
+                "schema 4": {"acceptance_status_schema_version": 4},
+                "a missing reviewer digest": {"trusted_reviewers_sha256": None},
+                "an invalid reviewer digest": {"trusted_reviewers_sha256": "not a digest"},
+                "a missing ledger list": {"ledgers": None},
+                "a nonboolean eligibility": {"all_gates_eligible": "false"},
+                "a missing anchor list": {"ledger_anchors": None},
+                "an anchor nobody passed": {"ledger_anchors": [{"sha256": "b" * 64, "covers_root": True}]},
             }
-            for name, status in malformed.items():
-                response = SimpleNamespace(returncode=0, stdout=json.dumps(status).encode(), stderr=b"")
+            for name, changes in malformed.items():
+                response = audit_response(**changes)
                 with self.subTest(name), mock.patch.object(release_promotion_gate.subprocess, "run", return_value=response):
                     with self.assertRaises(PromotionError):
                         ready(workspace, "staging")
+            anchor = workspace.anchor()
+            for name, entry in {
+                "an anchor without a digest": {"covers_root": True},
+                "an anchor with a malformed digest": {"sha256": "B" * 64, "covers_root": True},
+                "an anchor whose coverage is not a boolean": {"sha256": "b" * 64, "covers_root": 1},
+                "an anchor that is not an object": "b" * 64,
+            }.items():
+                response = audit_response(ledger_anchors=[entry])
+                with self.subTest(name), mock.patch.object(release_promotion_gate.subprocess, "run", return_value=response):
+                    with self.assertRaisesRegex(PromotionError, "incomplete status"):
+                        ready(workspace, "staging", anchors=[anchor])
 
     def test_the_release_is_the_one_the_manifest_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -247,8 +315,18 @@ class ReleasePromotionGateTests(unittest.TestCase):
                 change_ticket="change.1",
                 promoted_at="2026-09-28T10:00:00Z",
             )
-            self.assertEqual(receipt["release_promotion_receipt_schema_version"], 3)
+            self.assertEqual(receipt["release_promotion_receipt_schema_version"], 4)
             self.assertEqual(receipt["release_id"], RELEASE_ID)
+            anchor = workspace.anchors / "anchor-1.json"
+            self.assertEqual(
+                receipt["acceptance_ledger_anchors"],
+                [{
+                    "sha256": hashlib.sha256(anchor.read_bytes()).hexdigest(),
+                    "anchored_at": ANCHORED_AT,
+                    "ledgers": len(GATES),
+                    "covers_root": True,
+                }],
+            )
             self.assertEqual(
                 receipt["trusted_reviewers_sha256"],
                 hashlib.sha256(workspace.reviewers.read_bytes()).hexdigest(),
@@ -300,6 +378,8 @@ class ReleasePromotionGateTests(unittest.TestCase):
             for path in (artifacts, ledgers, acceptance_artifacts):
                 path.mkdir()
             reviewers.write_text("{}", encoding="utf-8")
+            anchor = root / "anchor.json"
+            anchor.write_text("{}", encoding="utf-8")
             original_manifest = b'{"release_id":"release.original"}'
             original_signature = b"original signature"
             original_key = b"original key"
@@ -323,14 +403,10 @@ class ReleasePromotionGateTests(unittest.TestCase):
                 calls.append("audit")
                 self.assertIn("audit", command)
                 self.assertEqual(command[command.index("--release-id") + 1], "release.original")
-                status = {
-                    "acceptance_status_schema_version": 4,
-                    "release_id": "release.original",
-                    "trusted_reviewers_sha256": "a" * 64,
-                    "all_gates_eligible": False,
-                    "ledgers": [],
-                }
-                return SimpleNamespace(returncode=0, stdout=json.dumps(status).encode(), stderr=b"")
+                self.assertEqual(command[command.index("--anchor") + 1], str(anchor.resolve()))
+                return audit_response(
+                    "release.original", ledger_anchors=[{"sha256": "b" * 64, "covers_root": True}]
+                )
 
             arguments = [
                 "--source-environment", "development", "--target-environment", "staging",
@@ -338,6 +414,7 @@ class ReleasePromotionGateTests(unittest.TestCase):
                 "--artifacts-root", str(artifacts), "--acceptance-ledger-root", str(ledgers),
                 "--acceptance-trusted-reviewers", str(reviewers),
                 "--acceptance-artifact-root", str(acceptance_artifacts),
+                "--acceptance-ledger-anchor", str(anchor),
                 "--requester", "user.release", "--approver", "user.approver",
                 "--change-ticket", "change.1", "--receipt", str(receipt_path),
             ]
@@ -346,6 +423,7 @@ class ReleasePromotionGateTests(unittest.TestCase):
             receipt = json.loads(receipt_path.read_bytes())
             self.assertEqual(calls, ["verify", "audit"])
             self.assertEqual(receipt["release_id"], "release.original")
+            self.assertEqual(receipt["acceptance_ledger_anchors"], [{"sha256": "b" * 64, "covers_root": True}])
             self.assertEqual(receipt["manifest_sha256"], hashlib.sha256(original_manifest).hexdigest())
             self.assertEqual(receipt["signature_sha256"], hashlib.sha256(original_signature).hexdigest())
             self.assertEqual(receipt["trusted_key_sha256"], hashlib.sha256(original_key).hexdigest())

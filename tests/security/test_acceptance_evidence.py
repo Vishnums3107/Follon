@@ -89,7 +89,8 @@ class LedgerIntegrityTests(unittest.TestCase):
 
             report = workspace.audit()
 
-            self.assertEqual(report["acceptance_status_schema_version"], 4)
+            self.assertEqual(report["acceptance_status_schema_version"], 5)
+            self.assertEqual(report["ledger_anchors"], [])
             self.assertEqual(report["release_id"], RELEASE_ID)
             self.assertEqual(
                 report["trusted_reviewers_sha256"],

@@ -27,10 +27,18 @@ untrustworthy, so the audit fails. A record that is well formed but does not qua
 is listed with its reason and is never counted. Whatever a ledger or a reviewer set
 holds, the audit refuses it with `EvidenceError` rather than raising anything else.
 
+A hash chain cannot show that its tail was deleted: what remains still verifies, and a
+deleted rejection requalifies its subject. An anchor, written by `anchor` after an append
+and kept outside the ledger root, records each ledger's record count and chain head. An
+audit given anchors fails unless every anchored ledger still holds its anchored records
+unchanged, and reports whether each anchor covers the whole root as it now stands.
+
     acceptance_evidence.py audit LEDGER_ROOT --trusted-reviewers FILE --artifact-root DIR --release-id ID
+                                         [--anchor FILE ...]
     acceptance_evidence.py append LEDGER --ledger-root DIR --trusted-reviewers FILE --record TEMPLATE
                                           --artifact FILE --artifact-root DIR
                                           --reviewer-key KEY.pk8 --reviewer-key-id ID
+    acceptance_evidence.py anchor LEDGER_ROOT --trusted-reviewers FILE --output FILE
 """
 
 from __future__ import annotations
@@ -43,10 +51,10 @@ import re
 import sys
 import tempfile
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +64,9 @@ except ImportError:  # run as a script: the tools directory itself is on sys.pat
     import ed25519  # type: ignore[no-redef]
 
 SCHEMA_VERSION = 2
-STATUS_SCHEMA_VERSION = 4
+# Version 5 lists the ledger anchors an audit was held to (E6.6b finding 8).
+STATUS_SCHEMA_VERSION = 5
+ANCHOR_SCHEMA_VERSION = 1
 # Version 1 sets had no key status, and every key they list is read as active.
 TRUSTED_REVIEWERS_SCHEMA_VERSIONS = (1, 2)
 KEY_STATUSES = ("active", "revoked")
@@ -66,6 +76,7 @@ LEDGER_SUFFIX = ".acceptance.ndjson"
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_REVIEWER_SET_BYTES = 1024 * 1024
+MAX_ANCHOR_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 APPEND_LOCK_NAME = ".append.lock"
 MAX_NOTES_CHARACTERS = 1024
@@ -120,6 +131,8 @@ BASE_KEYS = {
     "prev_hash",
     "record_hash",
 }
+ANCHOR_KEYS = {"acceptance_ledger_anchor_schema_version", "anchored_at", "trusted_reviewers_sha256", "ledgers"}
+ANCHOR_LEDGER_KEYS = {"path", "records", "head"}
 SESSION_ATTRIBUTES = (
     "session_seconds",
     "orders_submitted",
@@ -198,15 +211,15 @@ def sign_record(record: dict[str, Any], seed: bytes) -> str:
     return ed25519.sign(seed, signature_message(record)).hex()
 
 
-def validate_timestamp(value: object) -> None:
+def validate_timestamp(value: object, name: str = "occurred_at") -> None:
     # Exactly YYYY-MM-DDTHH:MM:SSZ. `fromisoformat` alone also accepted a
     # space for the `T` and ISO week dates, both the same length (E6.2).
     if not isinstance(value, str) or CANONICAL_UTC.fullmatch(value) is None:
-        raise EvidenceError("occurred_at must use second-precision YYYY-MM-DDTHH:MM:SSZ")
+        raise EvidenceError(f"{name} must use second-precision YYYY-MM-DDTHH:MM:SSZ")
     try:
         datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError as error:
-        raise EvidenceError("occurred_at is not a real UTC time") from error
+        raise EvidenceError(f"{name} is not a real UTC time") from error
 
 
 def is_count(value: object) -> bool:
@@ -537,15 +550,27 @@ def ledger_paths(root: Path) -> list[Path]:
     return sorted(found, key=lambda path: path.relative_to(root).as_posix())
 
 
-def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Returns every well-formed record and, for each ledger file, what binds a
-    status to exactly the bytes it counted: the file's path relative to the
-    root, its SHA-256, its record count, and its chain head (E6.3)."""
+@dataclass(frozen=True)
+class LedgerFile:
+    """One verified ledger file: its path relative to the root, its records in chain order,
+    and the SHA-256 of its exact bytes."""
+
+    path: str
+    records: list[dict[str, Any]]
+    sha256: str
+    head: str
+
+    def binding(self) -> dict[str, Any]:
+        """What binds a status to exactly the bytes it counted (E6.3)."""
+        return {"path": self.path, "sha256": self.sha256, "records": len(self.records), "head": self.head}
+
+
+def read_ledger_root(root: Path) -> list[LedgerFile]:
+    """Every ledger file under `root`, each verified, refusing an `evidence_id` two records share."""
     root = root.resolve(strict=True)
     if not root.is_dir():
         raise EvidenceError("evidence root must be a directory")
-    records: list[dict[str, Any]] = []
-    ledgers: list[dict[str, Any]] = []
+    files: list[LedgerFile] = []
     seen_ids: set[str] = set()
     for path in ledger_paths(root):
         ledger_records, data, head = read_ledger(path)
@@ -553,18 +578,146 @@ def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
             if record["evidence_id"] in seen_ids:
                 raise EvidenceError(f"duplicate evidence_id: {record['evidence_id']}")
             seen_ids.add(record["evidence_id"])
-        records.extend(ledger_records)
-        ledgers.append({
-            "path": path.relative_to(root).as_posix(),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "records": len(ledger_records),
-            "head": head,
-        })
-    return records, ledgers
+        files.append(LedgerFile(path.relative_to(root).as_posix(), ledger_records, hashlib.sha256(data).hexdigest(), head))
+    return files
+
+
+def load_ledger_files(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Returns every well-formed record and, for each ledger file, what binds a
+    status to exactly the bytes it counted: the file's path relative to the
+    root, its SHA-256, its record count, and its chain head (E6.3)."""
+    files = read_ledger_root(root)
+    return [record for ledger in files for record in ledger.records], [ledger.binding() for ledger in files]
 
 
 def load_ledgers(root: Path) -> list[dict[str, Any]]:
     return load_ledger_files(root)[0]
+
+
+def refuse_inside_root(path: Path, root: Path, what: str) -> None:
+    """An anchor kept under the ledger root shares the root's custody, so whoever can
+    delete a ledger's tail could rewrite its anchor too."""
+    resolved = path.resolve()
+    if resolved == root or resolved.is_relative_to(root):
+        raise EvidenceError(f"{what} must be kept outside the ledger root")
+
+
+def anchor_document(files: list[LedgerFile], trusted: TrustedReviewers, anchored_at: str) -> dict[str, Any]:
+    """The record count and chain head of every ledger in a verified root."""
+    return {
+        "acceptance_ledger_anchor_schema_version": ANCHOR_SCHEMA_VERSION,
+        "anchored_at": anchored_at,
+        "trusted_reviewers_sha256": trusted.sha256,
+        "ledgers": [{"path": ledger.path, "records": len(ledger.records), "head": ledger.head} for ledger in files],
+    }
+
+
+def validate_anchor(document: object) -> dict[str, Any]:
+    """Refuses an anchor that is not exactly the document `anchor` writes."""
+    if (
+        not isinstance(document, dict)
+        or set(document) != ANCHOR_KEYS
+        or type(document["acceptance_ledger_anchor_schema_version"]) is not int
+        or document["acceptance_ledger_anchor_schema_version"] != ANCHOR_SCHEMA_VERSION
+        or not isinstance(document["ledgers"], list)
+    ):
+        raise EvidenceError("the ledger anchor does not match its contract")
+    validate_timestamp(document["anchored_at"], "anchored_at")
+    digest = document["trusted_reviewers_sha256"]
+    if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
+        raise EvidenceError("the ledger anchor's trusted_reviewers_sha256 is not lowercase SHA-256")
+    paths: list[str] = []
+    for entry in document["ledgers"]:
+        if not isinstance(entry, dict) or set(entry) != ANCHOR_LEDGER_KEYS:
+            raise EvidenceError("a ledger anchor entry does not match its contract")
+        path, records, head = entry["path"], entry["records"], entry["head"]
+        if (
+            not isinstance(path, str)
+            or not path.endswith(LEDGER_SUFFIX)
+            or not is_count(records)
+            or not isinstance(head, str)
+            or SHA256.fullmatch(head) is None
+            or (records == 0) != (head == ZERO_HASH)
+        ):
+            raise EvidenceError("a ledger anchor entry is malformed")
+        paths.append(path)
+    # The order `anchor` writes, so one root has one anchor document.
+    if paths != sorted(set(paths)):
+        raise EvidenceError("a ledger anchor must list each ledger once, in path order")
+    return document
+
+
+def read_anchor(path: Path, root: Path) -> tuple[dict[str, Any], str]:
+    """An anchor document and the SHA-256 of its bytes. It must lie outside `root`."""
+    refuse_inside_root(path, root, "a ledger anchor")
+    data = read_regular_file(path, MAX_ANCHOR_BYTES, "the ledger anchor")
+    return validate_anchor(parse_json(data, "the ledger anchor is not JSON")), hashlib.sha256(data).hexdigest()
+
+
+def check_anchor(anchor: dict[str, Any], files: list[LedgerFile]) -> bool:
+    """Refuses a root that no longer holds what `anchor` recorded, and returns whether the
+    anchor covers the root exactly as it now stands.
+
+    Each record's hash covers its predecessor's, so a ledger whose record at the anchored
+    position still has the anchored hash still holds every anchored record unchanged.
+    Records appended after the anchor are allowed, but only an anchor that covers every
+    ledger and record of the root shows that nothing appended since was deleted.
+    """
+    current = {ledger.path: ledger for ledger in files}
+    for entry in anchor["ledgers"]:
+        path, anchored = entry["path"], entry["records"]
+        ledger = current.get(path)
+        if ledger is None:
+            raise EvidenceError(f"the anchored ledger {path} is missing from the ledger root")
+        if len(ledger.records) < anchored:
+            raise EvidenceError(
+                f"the ledger {path} holds {len(ledger.records)} records where its anchor holds {anchored}: "
+                "records were deleted from its tail"
+            )
+        if anchored and ledger.records[anchored - 1]["record_hash"] != entry["head"]:
+            raise EvidenceError(f"the ledger {path} no longer extends the chain head its anchor holds")
+    covered = {(entry["path"], entry["records"]) for entry in anchor["ledgers"]}
+    return covered == {(ledger.path, len(ledger.records)) for ledger in files}
+
+
+def anchor_root(ledger_root: Path, trusted_reviewers: Path, output: Path, *, anchored_at: str | None = None) -> dict[str, Any]:
+    """Writes an anchor of a verified ledger root to a new file outside it.
+
+    A root holding a record no listed key signed is refused, so a tampered root is never
+    anchored. The anchor is published only under a name that does not exist yet.
+    """
+    root = ledger_root.resolve(strict=True)
+    refuse_inside_root(output, root, "a ledger anchor")
+    trusted = load_trusted_reviewers(trusted_reviewers)
+    files = read_ledger_root(root)
+    require_signed([record for ledger in files for record in ledger.records], trusted)
+    if anchored_at is None:
+        anchored_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    document = anchor_document(files, trusted, anchored_at)
+    validate_anchor(document)
+    publish_new(output, canonical_json(document) + b"\n")
+    return document
+
+
+def publish_new(path: Path, content: bytes) -> None:
+    """Publishes `content` at `path` only if no file is there, without following a link.
+
+    The bytes go to a fresh exclusive temporary file first, and a hard link then creates
+    the final name, which fails rather than replace one that exists or appears meanwhile.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise EvidenceError(f"{path} already exists; an anchor is never overwritten") from error
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def customer_kind(record: dict[str, Any]) -> str | None:
@@ -577,10 +730,12 @@ def status(
     *,
     release_id: str,
     trusted_reviewers_sha256: str,
+    ledger_anchors: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Gate counts from the verdicts. Schema 4 (E6.6b): `counted_records` counts only
     acceptances that count, `disqualified_subjects` every subject a rejection or a failing
-    acceptance disqualified, and `not_counted` lists acceptances only."""
+    acceptance disqualified, and `not_counted` lists acceptances only. Schema 5 lists each
+    anchor the root was held to, by its SHA-256 and time, and whether it covers the root."""
     by_kind_of: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     disqualified: dict[str, set[str]] = defaultdict(set)
     rejected = defaultdict(int)
@@ -634,21 +789,46 @@ def status(
         "all_gates_eligible": all(gate["eligible"] for gate in gates.values()),
         "gates": gates,
         "ledgers": ledgers,
+        "ledger_anchors": list(ledger_anchors),
     }
 
 
 def audit(
-    ledger_root: Path, trusted_reviewers: Path, artifact_root: Path, release_id: str
+    ledger_root: Path,
+    trusted_reviewers: Path,
+    artifact_root: Path,
+    release_id: str,
+    anchors: Sequence[Path] = (),
 ) -> dict[str, Any]:
+    """Verifies a ledger root and counts its gates. Each anchor must still hold, or the
+    audit fails (E6.6b finding 8)."""
     if CANONICAL_ID.fullmatch(release_id) is None:
         raise EvidenceError("release_id is not a canonical ID")
     trusted = load_trusted_reviewers(trusted_reviewers)
     artifact_root = artifact_root.resolve(strict=True)
     if not artifact_root.is_dir():
         raise EvidenceError("artifact root must be a directory")
-    records, ledgers = load_ledger_files(ledger_root)
+    root = ledger_root.resolve(strict=True)
+    files = read_ledger_root(root)
+    ledger_anchors = []
+    for path in anchors:
+        anchor, digest = read_anchor(path, root)
+        covers_root = check_anchor(anchor, files)
+        ledger_anchors.append({
+            "sha256": digest,
+            "anchored_at": anchor["anchored_at"],
+            "ledgers": len(anchor["ledgers"]),
+            "covers_root": covers_root,
+        })
+    records = [record for ledger in files for record in ledger.records]
     verdicts = assess(records, trusted, artifact_root, release_id)
-    return status(verdicts, ledgers, release_id=release_id, trusted_reviewers_sha256=trusted.sha256)
+    return status(
+        verdicts,
+        [ledger.binding() for ledger in files],
+        release_id=release_id,
+        trusted_reviewers_sha256=trusted.sha256,
+        ledger_anchors=ledger_anchors,
+    )
 
 
 def read_artifact(artifact: Path) -> bytes:
@@ -800,7 +980,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--trusted-reviewers", type=Path, required=True)
     audit_parser.add_argument("--artifact-root", type=Path, required=True)
     audit_parser.add_argument("--release-id", required=True)
+    audit_parser.add_argument(
+        "--anchor", type=Path, action="append", default=[],
+        help="a ledger anchor, kept outside the root, that the root must still hold (repeatable)",
+    )
     audit_parser.add_argument("--output", type=Path)
+    anchor_parser = commands.add_parser("anchor", help="record every ledger's head in a new file outside the root")
+    anchor_parser.add_argument("ledger_root", type=Path)
+    anchor_parser.add_argument("--trusted-reviewers", type=Path, required=True)
+    anchor_parser.add_argument("--output", type=Path, required=True)
     append_parser = commands.add_parser("append", help="sign and append one record")
     append_parser.add_argument("ledger", type=Path)
     append_parser.add_argument("--ledger-root", type=Path, required=True)
@@ -828,13 +1016,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "audit":
             report = audit(
-                arguments.ledger_root, arguments.trusted_reviewers, arguments.artifact_root, arguments.release_id
+                arguments.ledger_root,
+                arguments.trusted_reviewers,
+                arguments.artifact_root,
+                arguments.release_id,
+                arguments.anchor,
             )
             encoded = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
             if arguments.output is None:
                 sys.stdout.write(encoded)
             else:
                 write_json(arguments.output, report)
+            return 0
+        if arguments.command == "anchor":
+            document = anchor_root(arguments.ledger_root, arguments.trusted_reviewers, arguments.output)
+            records = sum(entry["records"] for entry in document["ledgers"])
+            print(f"anchored {len(document['ledgers'])} ledgers, {records} records, at {document['anchored_at']}")
             return 0
         seed = read_reviewer_seed(arguments.reviewer_key)
         try:

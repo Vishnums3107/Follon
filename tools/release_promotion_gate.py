@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -124,6 +125,7 @@ def acceptance_ready(
     trusted_reviewers: Path,
     artifact_root: Path,
     release_id: str,
+    ledger_anchors: Sequence[Path] = (),
 ) -> tuple[dict[str, object], bytes]:
     """Recomputes acceptance from the ledger root with the published tool.
 
@@ -132,7 +134,14 @@ def acceptance_ready(
     It also counts only evidence a trusted reviewer signed, whose artifact is
     retained, and that exercised this release (E6.4). Returns the status and the
     exact bytes the tool emitted, which the receipt hashes.
+
+    Production also needs a ledger anchor, kept outside the root, that covers the
+    root exactly. A hash chain cannot show a deleted tail, and a deleted rejection
+    requalifies its subject; the anchor can (E6.6b finding 8).
     """
+    if target_environment == "production" and not ledger_anchors:
+        raise PromotionError("production promotion requires a ledger anchor kept outside the ledger root")
+    anchor_arguments = [argument for anchor in ledger_anchors for argument in ("--anchor", str(anchor))]
     result = subprocess.run(
         [
             sys.executable, str(repository_root / "tools" / "acceptance_evidence.py"), "audit",
@@ -140,6 +149,7 @@ def acceptance_ready(
             "--trusted-reviewers", str(trusted_reviewers),
             "--artifact-root", str(artifact_root),
             "--release-id", release_id,
+            *anchor_arguments,
         ],
         cwd=repository_root,
         shell=False,
@@ -158,20 +168,35 @@ def acceptance_ready(
     if (
         not isinstance(status, dict)
         or type(status.get("acceptance_status_schema_version")) is not int
-        or status["acceptance_status_schema_version"] != 4
+        or status["acceptance_status_schema_version"] != 5
     ):
         raise PromotionError("acceptance tool returned an unsupported status")
     if status.get("release_id") != release_id:
         raise PromotionError("acceptance tool reported a different release")
+    anchors = status.get("ledger_anchors")
     if (
         not isinstance(status.get("trusted_reviewers_sha256"), str)
         or re.fullmatch(r"[a-f0-9]{64}", status["trusted_reviewers_sha256"]) is None
         or not isinstance(status.get("ledgers"), list)
         or type(status.get("all_gates_eligible")) is not bool
+        or not isinstance(anchors, list)
+        or len(anchors) != len(ledger_anchors)
+        or not all(
+            isinstance(anchor, dict)
+            and isinstance(anchor.get("sha256"), str)
+            and re.fullmatch(r"[a-f0-9]{64}", anchor["sha256"]) is not None
+            and type(anchor.get("covers_root")) is bool
+            for anchor in anchors
+        )
     ):
         raise PromotionError("acceptance tool returned an incomplete status")
-    if target_environment == "production" and status.get("all_gates_eligible") is not True:
-        raise PromotionError("production promotion is blocked by open acceptance gates")
+    if target_environment == "production":
+        if not any(anchor["covers_root"] for anchor in anchors):
+            raise PromotionError(
+                "production promotion requires a ledger anchor that covers every ledger and record in the root"
+            )
+        if status.get("all_gates_eligible") is not True:
+            raise PromotionError("production promotion is blocked by open acceptance gates")
     return status, result.stdout
 
 
@@ -189,11 +214,13 @@ def promotion_receipt(
 ) -> dict[str, object]:
     """The eligibility receipt. Version 2 bound the recomputed acceptance status and
     every ledger file it counted (E6.3). Version 3 also names the release the evidence
-    was counted for and the reviewer key set it was authenticated against (E6.4)."""
+    was counted for and the reviewer key set it was authenticated against (E6.4).
+    Version 4 names every ledger anchor the root was held to, so the anchor a
+    promotion relied on can be compared with the copy kept in custody (E6.6b)."""
     if acceptance_status.get("release_id") != release.release_id:
         raise PromotionError("acceptance status does not belong to the verified release")
     return {
-        "release_promotion_receipt_schema_version": 3,
+        "release_promotion_receipt_schema_version": 4,
         "release_id": release.release_id,
         "trusted_reviewers_sha256": acceptance_status["trusted_reviewers_sha256"],
         "source_environment": source_environment,
@@ -203,6 +230,7 @@ def promotion_receipt(
         "trusted_key_sha256": release.trusted_key_sha256,
         "acceptance_status_sha256": hashlib.sha256(acceptance_status_bytes).hexdigest(),
         "acceptance_ledgers": acceptance_status["ledgers"],
+        "acceptance_ledger_anchors": acceptance_status["ledger_anchors"],
         "requester": requester,
         "approver": approver,
         "change_ticket": change_ticket,
@@ -243,6 +271,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--acceptance-ledger-root", required=True, type=Path)
     parser.add_argument("--acceptance-trusted-reviewers", required=True, type=Path)
     parser.add_argument("--acceptance-artifact-root", required=True, type=Path)
+    parser.add_argument(
+        "--acceptance-ledger-anchor", type=Path, action="append", default=[],
+        help="a ledger anchor kept outside the ledger root; production needs one that covers the root",
+    )
     parser.add_argument("--requester", required=True)
     parser.add_argument("--approver", required=True)
     parser.add_argument("--change-ticket", required=True)
@@ -271,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             trusted_reviewers=arguments.acceptance_trusted_reviewers.resolve(strict=True),
             artifact_root=arguments.acceptance_artifact_root.resolve(strict=True),
             release_id=release.release_id,
+            ledger_anchors=[anchor.resolve(strict=True) for anchor in arguments.acceptance_ledger_anchor],
         )
         promoted_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         write_receipt(arguments.receipt, promotion_receipt(

@@ -19,12 +19,14 @@ from tools.acceptance_evidence import (
     MIN_SESSION_SECONDS,
     SCHEMA_VERSION,
     ZERO_HASH,
+    anchor_root,
     audit,
     record_hash,
     sign_record,
 )
 
 RELEASE_ID = "release.unit.001"
+ANCHORED_AT = "2026-08-25T10:00:00Z"
 REVIEWER_ID = "reviewer.two"
 REVIEWER_KEY_ID = "reviewer.key.two.001"
 REVIEWER_SEED = bytes(range(1, 33))
@@ -163,7 +165,8 @@ def pkcs8(seed: bytes) -> bytes:
 
 
 class Workspace:
-    """A ledger root, a retained artifact root and a trusted reviewer set, in one directory.
+    """A ledger root, a retained artifact root and a trusted reviewer set, in one directory,
+    and beside them, outside the ledger root, a directory for its anchors.
 
     Writing a ledger retains the artifact of every subject it names, unless the workspace
     was made with `retain=False`.
@@ -173,10 +176,12 @@ class Workspace:
         root = Path(directory)
         self.ledgers = root / "ledgers"
         self.artifacts = root / "artifacts"
+        self.anchors = root / "anchors"
         self.reviewers = root / "reviewers.json"
         self.retain_artifacts = retain
         self.ledgers.mkdir()
         self.artifacts.mkdir()
+        self.anchors.mkdir()
         entries = [(REVIEWER_KEY_ID, REVIEWER_ID, REVIEWER_SEED)] if trust else []
         self.trust(*entries)
 
@@ -200,5 +205,11 @@ class Workspace:
                 self.retain(artifact_for(subject_id))
         return path
 
-    def audit(self, release_id: str = RELEASE_ID) -> dict[str, object]:
-        return audit(self.ledgers, self.reviewers, self.artifacts, release_id)
+    def anchor(self) -> Path:
+        """Anchors the ledger root as it now stands, in a new file outside it."""
+        path = self.anchors / f"anchor-{len(list(self.anchors.iterdir())) + 1}.json"
+        anchor_root(self.ledgers, self.reviewers, path, anchored_at=ANCHORED_AT)
+        return path
+
+    def audit(self, release_id: str = RELEASE_ID, anchors: tuple[Path, ...] = ()) -> dict[str, object]:
+        return audit(self.ledgers, self.reviewers, self.artifacts, release_id, anchors)

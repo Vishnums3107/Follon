@@ -56,10 +56,10 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-09-30T10:42:01Z  
-**Branch:** `feat/evidence-parent-transaction-guard`  
-**HEAD:** `dae3c6f` -- Merge pull request #36 from Vishnums3107/feat/working-order-exposure (2026-09-30T15:32:48+05:30)  
-**Uncommitted paths:** 4
+**Measured at:** 2026-10-01T03:58:26Z  
+**Branch:** `feat/session-18-backlog`  
+**HEAD:** `6adefe5` -- fix(postgres): seal evidence children with parent transaction (2026-09-30T16:15:02+05:30)  
+**Uncommitted paths:** 10
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
@@ -68,7 +68,7 @@ already produced a real defect here.
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 11 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 232 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 257 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -259,9 +259,10 @@ epic lands (see the correction under the external gates).
 `tools/acceptance_evidence.py` verifies canonical, hash-chained records signed
 by listed reviewers, re-hashes retained artifacts, and applies the published
 criteria before counting subjects. `tools/release_promotion_gate.py` recomputes
-the acceptance status from the operational ledger root. The remaining acceptance
-gap is a ledger-head anchor outside the mutable root; none of this substitutes
-for independent broker and reviewer evidence.
+the acceptance status from the operational ledger root. Since E6.6b-5 an anchor
+kept outside the mutable root detects a deleted ledger tail, and production
+promotion requires one that covers the root. None of this substitutes for
+independent broker and reviewer evidence, or for the custody of the anchors.
 
 | Slice | Scope | State |
 | --- | --- | --- |
@@ -271,11 +272,12 @@ for independent broker and reviewer evidence.
 | E6.4 | Reviewer authentication, artifact retention and release binding. **Now** a record is schema 2 and carries its reviewer's Ed25519 signature over a domain-separated canonical body. It counts only under a trusted reviewer key set (`--trusted-reviewers`, an operator-controlled file whose SHA-256 every status and receipt names), and only when the key belongs to the reviewer the record names. Its source artifact is re-hashed against a content-addressed artifact root, so a missing, altered or linked artifact is a record that cannot be checked. It names the release and, for a session, the environment, and counts only toward that release's gates. A rejection nobody trusted disqualifies no subject. `tools/ed25519.py` is RFC 8032 in pure Python, held to the RFC's vectors and, where the `cryptography` package is installed, to it, so the audit itself needs nothing installed. The status and the promotion receipt are schema 3. `audit` verifies and `append` signs, chains and retains. The version 1 schema is marked superseded, and no version 1 ledger was ever retained. Audit item 111. | **done** 2026-09-29 |
 | E6.5 | Session criteria and the customer threshold, **decided 2026-09-29 by the agent** (Settled direction item 6). A clean session lasts at least 23,400 s, submits and reconciles an order, and closes with no `UNKNOWN`, no discrepancy and no unexplained incident. An unplanned reconnect disqualifies it and a planned drill never does. Design-partner, options and customer records carry their own attributes and criteria. The customer gate is the roadmap's, 10 professionals or 3 organisations, instead of the tool's earlier 1. No correction record: a trusted rejection is permanent for its subject, and a session wrongly rejected is re-run under a new subject id. | **done** 2026-09-29 |
 | E6.6a | Ed25519 verification refuses a public key or a commitment of small order, and `is_valid_public_key` says whether a key is a point of the prime-order subgroup. **Found in review 2026-09-30:** RFC 8032 lets a verifier accept a signature under a small-order key, the trusted set only checked that a key was 64 hex characters, and a set holding the neutral element or the all-zero placeholder let anyone sign anything without a private key: a forged 106-record ledger opened every gate for production in the reviewer's probe. Audit item 121. | **done** 2026-09-30 |
-| E6.6b | The remaining findings from the E6.4/E6.5 review. Findings (1) to (4) were closed by E6.6b-2, (6) and the ledger checks of (9) by E6.6b-1, (7) by E6.6b-3, and (5) with the promotion wiring checks of (9) by E6.6b-4. **Still open:** (8) no external anchor detects a deleted ledger tail. These are engineering controls, not substitutes for independent broker evidence. | open |
+| E6.6b | The remaining findings from the E6.4/E6.5 review. Findings (1) to (4) were closed by E6.6b-2, (6) and the ledger checks of (9) by E6.6b-1, (7) by E6.6b-3, (5) with the promotion wiring checks of (9) by E6.6b-4, and (8) by E6.6b-5. These are engineering controls, not substitutes for independent broker evidence. | **done** 2026-10-01 |
 | E6.6b-1 | Finding (6), and the ledger checks of finding (9). **Now** whatever a ledger or reviewer set holds, the audit refuses it with `EvidenceError`: a value is type-checked before it is looked up or sorted, and a number longer than Python's integer limit or nesting deeper than it recurses is a refusal. Each line must be exactly its record's canonical JSON, because JSON keeps the last of two duplicate keys, and a line is split on the newline alone. The ledger root is walked without following links, any link or junction under it is refused, the suffix is matched exactly, and ledgers are bound in one order on every platform. A file is read at most one byte past its limit. Every identifier, digest, signature, notes and size check is held by a test at its boundary. Audit item 122. | **done** 2026-09-30 |
 | E6.6b-2 | Findings (1) to (4). **Now every record must be signed by a key the trusted set lists for the reviewer it names, or the audit fails.** The review proposed failing only on an unsigned negative record, which would not have closed it: editing a rejection into an acceptance makes it positive. A key is never removed: the set (version 2) gives each key a status, and a revoked key still verifies what it signed, its acceptances stop counting and its rejections still disqualify. Enrolment refuses a key that is not an honest Ed25519 public key and one public key under two entries. An acceptance whose attributes fail the criteria disqualifies its subject in every release, as a rejection does. One artifact backs one subject in any gate or release, one subscription one customer, and a customer is one kind; otherwise the acceptances count for none of them. Status schema 4 counts only counting acceptances and every disqualified subject. Audit item 123. | **done** 2026-09-30 |
 | E6.6b-3 | Finding (7). `append` holds an exclusive lock for the whole ledger root, verifies every existing signature, and refuses a duplicate `evidence_id` across files. The proposed record must be signed by the active key listed for its reviewer. Its artifact is read once, then retained from those exact bytes through a fresh exclusive temporary file. A linked target or artifact root is refused; a planted fixed-name `.partial` link is never opened. Audit item 124. | **done** 2026-09-30 |
 | E6.6b-4 | Finding (5) and the promotion checks of (9). The gate verifies temporary snapshots of the manifest, signature and trusted key, uses their original bytes for the release ID and receipt hashes, and refuses a snapshot changed during verification. The acceptance response must name that release and carry a valid schema, reviewer-set digest, ledger list and boolean eligibility. A receipt is published under a new name without overwriting a prior or concurrent one. A real staging promotion against pipeline artifacts passed; this grants no production eligibility. Audit item 125. | **done** 2026-09-30 |
+| E6.6b-5 | Finding (8). A hash chain verifies whatever prefix of it remains: deleting a ledger's newest records left an audit that passed, and deleting a trailing rejection requalified its subject. **Now** `anchor` writes each ledger's record count and chain head, from a root it has verified, to a new file outside the root. An audit or promotion given anchors fails unless every anchored ledger still holds its anchored records unchanged, and status schema 5 reports whether each anchor covers the root as it stands. Production promotion needs one that does, and receipt schema 4 names it. Custody of the anchors is operational: an anchor taken after a deletion vouches for the truncated root. Audit item 128. | **done** 2026-10-01 |
 
 ### E7 — The safety gaps (assessment priority 4)
 
@@ -845,6 +847,18 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-10-01 — session 18
+
+- Resumed on PR 37's head (`6adefe5`) in its own worktree and branch,
+  `feat/session-18-backlog`, because a peer session had just started in the
+  shared tree. Baseline: all eight suites green with a disposable PostgreSQL 17,
+  and the pipeline exit 0.
+- E6.6b-5 closes the review's last acceptance finding (audit item 128). An
+  anchor kept outside the ledger root records each ledger's count and head; an
+  audit given one fails on a deleted tail, and production promotion needs one
+  that covers the root. 16 of 16 injections caught. Measured: Rust 668 / 0 / 11,
+  PostgreSQL 11, Tauri 33, Python 257, both desktop suites, the pipeline exit 0.
 
 ### 2026-09-30 — session 17
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,10 +17,15 @@ from acceptance_fixtures import (
     REVIEWER_ID,
     REVIEWER_KEY_ID,
     REVIEWER_SEED,
+    Workspace,
+    make_chain,
     make_record,
     reviewers_document,
 )
 from tools.acceptance_evidence import (
+    ANCHOR_KEYS,
+    ANCHOR_LEDGER_KEYS,
+    ANCHOR_SCHEMA_VERSION,
     BASE_KEYS,
     GATES,
     KEY_STATUSES,
@@ -55,6 +61,42 @@ class AcceptanceContractTests(unittest.TestCase):
         self.assertEqual(set(entry["properties"]), set(entry["required"]))
         self.assertEqual(tuple(entry["properties"]["status"]["enum"]), KEY_STATUSES)
         self.assertIs(entry["additionalProperties"], False)
+
+    def test_the_anchor_schema_declares_what_the_tool_reads(self) -> None:
+        schema = load("acceptance-ledger-anchor.schema.json")
+        self.assertEqual(set(schema["required"]), ANCHOR_KEYS)
+        self.assertEqual(set(schema["properties"]), ANCHOR_KEYS)
+        self.assertEqual(schema["properties"]["acceptance_ledger_anchor_schema_version"], {"const": ANCHOR_SCHEMA_VERSION})
+        self.assertIs(schema["additionalProperties"], False)
+        entry = schema["properties"]["ledgers"]["items"]
+        self.assertEqual(set(entry["required"]), ANCHOR_LEDGER_KEYS)
+        self.assertEqual(set(entry["properties"]), ANCHOR_LEDGER_KEYS)
+        self.assertIs(entry["additionalProperties"], False)
+
+    @unittest.skipUnless(importlib.util.find_spec("jsonschema"), "full validation needs jsonschema")
+    def test_an_anchor_the_tool_writes_validates_and_a_malformed_one_does_not(self) -> None:
+        import jsonschema
+
+        schema = load("acceptance-ledger-anchor.schema.json")
+        validator = jsonschema.validators.validator_for(schema)(schema)
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            workspace.write("paper", make_chain(("evidence.x.1", "subject.x.1", {})))
+            workspace.write("empty", [])
+            anchor = json.loads(workspace.anchor().read_bytes())
+        self.assertEqual([error.message for error in validator.iter_errors(anchor)], [])
+        entry = anchor["ledgers"][1]
+        for name, document in {
+            "version 2": {**anchor, "acceptance_ledger_anchor_schema_version": 2},
+            "an extra field": {**anchor, "extra": True},
+            "a time with a space": {**anchor, "anchored_at": "2026-08-25 10:00:00Z"},
+            "a path that is not a ledger": {**anchor, "ledgers": [{**entry, "path": "paper.json"}]},
+            "a negative count": {**anchor, "ledgers": [{**entry, "records": -1}]},
+            "a short head": {**anchor, "ledgers": [{**entry, "head": "ab"}]},
+            "an entry field too many": {**anchor, "ledgers": [{**entry, "extra": 1}]},
+        }.items():
+            with self.subTest(refused=name):
+                self.assertFalse(validator.is_valid(document))
 
     @unittest.skipUnless(importlib.util.find_spec("jsonschema"), "full validation needs jsonschema")
     def test_every_record_type_validates_and_a_malformed_one_does_not(self) -> None:

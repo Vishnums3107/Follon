@@ -5300,6 +5300,66 @@ These are mandatory master-plan acceptance conditions and are currently open:
        Broker receipts and news sentiments arrive after their sources and are
        intentionally outside this rule.
 
+128. A deleted ledger tail no longer passes the acceptance audit (2026-10-01, Security;
+     E6.6b finding (8)).
+     - **Gap.** A ledger's hash chain verifies whatever prefix of it remains. Deleting
+       a ledger's newest records left an audit that passed with fewer records, and
+       deleting a trailing rejection requalified its subject: a test now shows the
+       audit counting a rejected session once its rejection line is removed. Nothing
+       outside the mutable ledger root recorded how long each ledger had been.
+     - **Behavior.** `acceptance_evidence.py anchor` verifies the whole root, every
+       signature included, and writes each ledger's path, record count and chain
+       head, with the time and the reviewer set's SHA-256, to a new file. It refuses a
+       path inside the ledger root, which would share the root's custody, and never
+       overwrites a file: the bytes go through a fresh exclusive temporary file and a
+       hard link that fails if the name exists or appears meanwhile. `audit --anchor`
+       (repeatable) fails unless every anchored ledger is present and its record at
+       the anchored position still has the anchored hash; each record's hash covers
+       its predecessor's, so that proves the anchored prefix unchanged. Records
+       appended later pass, and status schema 5 lists each anchor by SHA-256 and time
+       with `covers_root`, true only when the anchor lists every ledger at its current
+       count. The promotion gate passes `--acceptance-ledger-anchor` through, refuses
+       production before auditing when none is given and afterwards unless one covers
+       the root, requires status schema 5 with one well-formed anchor entry per anchor
+       given, and receipt schema 4 binds the anchors. An anchor must be exactly the
+       canonical document the tool writes: version, keys, timestamp, digests, a
+       record count of zero exactly when the head is the zero hash, and each ledger
+       once in path order. `contracts/json-schema/v2/acceptance-ledger-anchor.schema.json`
+       publishes it, and the runbook says to anchor after every append and keep the
+       anchor outside the host.
+     - **Tests.** `tests/security/test_acceptance_anchor.py` (20 tests) covers the
+       document written, a root that does not verify, a path inside the root, an
+       existing or concurrently created name, a deleted tail, a deleted rejection, a
+       deleted or emptied ledger, a prefix re-signed by a key holder, records and
+       ledgers appended later, several anchors, a linked or absent anchor, every
+       malformed anchor field, and the command line. The promotion gate's tests cover
+       the production precondition, an anchor that does not cover the root, a deleted
+       tail, malformed anchor responses and the receipt. The anchor schema's contract
+       tests hold it to the tool's keys and validate a written anchor.
+     - **Rule 5.** 16 of 16 injected defects were caught by the intended tests: the
+       count or the head unchecked, a missing ledger skipped, coverage always true or
+       blind to counts, an anchor accepted inside the root, an overwriting publish, an
+       unsigned root anchored, unordered or duplicated entries and a count disagreeing
+       with its head accepted, the status omitting anchors, production run without an
+       anchor or with one that does not cover the root, the gate not passing its
+       anchors or not checking the response's anchors, and the receipt not binding
+       them.
+     - **Measured result.** The Python suite rose from 232 to 257 passed. The
+       full status gate passed all eight suites: Rust workspace 668 passed / 0 failed
+       / 11 ignored, PostgreSQL 11, Tauri 33, Python 257, formatting, strict Clippy
+       and both desktop suites. The evidence pipeline exited 0 with 45 local
+       artifacts, and step 23 published status schema 5. Against the pipeline's
+       signed release, `anchor` anchored its empty operational root, a staging
+       promotion with that anchor passed and wrote receipt schema 4 naming it, and
+       production was refused without an anchor and, with one, by the open gates.
+     - **Boundary.** An anchor protects only the records it lists, and only while the
+       copy relied on is kept where the ledger root's writers cannot reach it. An
+       anchor taken after a deletion vouches for the truncated root, and an operator
+       who presents an older anchor of a root truncated back to it is not detected by
+       the tool: that is what keeping the latest anchor in custody, and comparing the
+       receipt's digest with it, is for. Anchors are not signed; their custody, not a
+       signature, is the control.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The
