@@ -1,6 +1,6 @@
 //! Shared operator-CLI primitives for immutable local research artifacts.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -19,7 +19,7 @@ pub fn write_immutable(path: &Path, contents: &str) -> Result<(), Box<dyn std::e
     // state E7.1, E3.11's rule).
     refuse_symbolic_link(path)?;
     if path.exists() {
-        return if fs::read_to_string(path)? == contents {
+        return if follon_file_safety::read_to_string(path)? == contents {
             Ok(())
         } else {
             Err(format!(
@@ -40,16 +40,12 @@ pub fn write_immutable(path: &Path, contents: &str) -> Result<(), Box<dyn std::e
         std::process::id(),
         &digest[..16]
     ));
-    let mut temporary_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| {
-            format!(
-                "cannot create immutable artifact staging file {}: {error}",
-                temporary.display()
-            )
-        })?;
+    let mut temporary_file = follon_file_safety::create_new(&temporary).map_err(|error| {
+        format!(
+            "cannot create immutable artifact staging file {}: {error}",
+            temporary.display()
+        )
+    })?;
     if let Err(error) = temporary_file
         .write_all(contents.as_bytes())
         .and_then(|_| temporary_file.sync_data())
@@ -65,9 +61,9 @@ pub fn write_immutable(path: &Path, contents: &str) -> Result<(), Box<dyn std::e
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing_matches = fs::read_to_string(path)? == contents;
+            let existing = follon_file_safety::read_to_string(path);
             fs::remove_file(&temporary)?;
-            if existing_matches {
+            if existing? == contents {
                 Ok(())
             } else {
                 Err(format!(

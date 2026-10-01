@@ -5618,6 +5618,32 @@ These are mandatory master-plan acceptance conditions and are currently open:
        cancelled on failure too. Focused bridge tests: 42 passed. No real
        Gateway acceptance evidence was produced.
 
+136. Durable evidence opens refuse links at the OS boundary
+     (2026-10-01, Reliability and quality; E7.12).
+     - **Gap.** Path metadata checks preceded ordinary opens. A final-component
+       link planted between the check and open could redirect a journal or a
+       truncating news output, or masquerade as immutable evidence on read.
+     - **Behavior.** `core/file-safety` centralizes Unix `O_NOFOLLOW | O_NONBLOCK`
+       and Windows `FILE_FLAG_OPEN_REPARSE_POINT` plus anonymous SQOS. The opened
+       handle must be regular, and every Windows reparse point is refused.
+       Truncation follows validation; exclusive create stays exclusive. PAPER,
+       LIVE, operations and commercial journals, replay event/experiment stores,
+       commercial artifact hashing, CLI immutable reads and news output use it.
+       Replay recovery and append now share one handle. Immutable publication
+       removes staging files even if a competing destination read is refused.
+       Locks, hashes, persisted schemas and trading arithmetic are unchanged.
+     - **Tests.** Five Windows helper regressions actually created symlinks and
+       verified normal access, final links, dangling targets, preflight swaps,
+       and retained-handle identity after pathname replacement. Removing the
+       no-follow flag made the swap regression fail (exit 101); restoration
+       passed. Ubuntu CI additionally runs a bounded FIFO refusal regression.
+       Independent read-only review found no material issue. Unix runtime
+       validation is pending CI until that job completes.
+     - **Boundary.** Parent directories remain trusted and protected. This
+       does not prevent parent-directory replacement, hard links, mutation by
+       an authorized writer, or hostile Windows device names. It is a regular
+       evidence-file contract, not filesystem confinement or strategy sandboxing.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

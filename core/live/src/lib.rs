@@ -7,7 +7,7 @@
 //! audit-journal uncertainty.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -1726,12 +1726,9 @@ impl LiveAuditJournal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| LiveError(error.to_string()))?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| LiveError(error.to_string()))?;
+        let mut file =
+            follon_file_safety::open(&path, follon_file_safety::Access::ReadAppend, true)
+                .map_err(|error| LiveError(error.to_string()))?;
         file.try_lock_exclusive().map_err(|error| {
             LiveError(format!(
                 "live audit journal is already open by another process: {error}"

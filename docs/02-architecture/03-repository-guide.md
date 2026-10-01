@@ -10,6 +10,7 @@ lands.
 | `apps/desktop` | React/Vite evidence dashboard, Tauri v2 native host, and bounded local HTTP server |
 | `apps/cli` | Operator and developer command-line tools |
 | `core/domain` | Pure shared domain types and invariants |
+| `core/file-safety` | Platform-specific no-follow regular-file handles for durable evidence; no trading policy or domain dependency |
 | `core/execution`, `core/risk`, `core/accounting` | Broker-neutral EMS, portfolio-wide risk, and exact multi-currency/margin accounting |
 | `core/identity` | Customer password rotation, TOTP/recovery MFA, session, tenant, revocation, and RBAC invariants |
 | `core/instrument` through `core/secrets` | Other trading-core modules, each owning one bounded capability |

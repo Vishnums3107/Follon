@@ -883,9 +883,14 @@ short — detail belongs in the conformance audit.
 - The user explicitly authorized pushing all changes and raising a PR. All
   eight suites passed in the generated measurement, including disposable
   PostgreSQL integration; desktop typecheck passed separately. Publication is
-  in progress. E5.3 market inputs and the
+  complete in [PR 38](https://github.com/Vishnums3107/Follon/pull/38). E5.3 market inputs and the
   remaining operational/install gaps follow; real Gateway history remains
   external evidence that code and fixtures cannot manufacture.
+- E7.12 uses one shared no-follow regular-file open across durable journals,
+  replay/experiment storage and immutable/news outputs (audit item 136).
+  Windows link regressions passed and caught an injected missing flag;
+  independent review found no material issue. Full-suite remeasurement and
+  Ubuntu CI verification are in progress before this slice is marked complete.
 
 ### 2026-10-01 — session 19
 
