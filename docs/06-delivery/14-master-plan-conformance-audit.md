@@ -5524,6 +5524,77 @@ These are mandatory master-plan acceptance conditions and are currently open:
        these tests and left to the next item: `validate_utc_timestamp` accepted a
        space for the `T`, so the non-canonical-time case here uses an offset instead.
 
+132. Canonical UTC validation requires its declared separator (2026-10-01,
+     Reliability and quality).
+     - **Gap.** The shared `validate_utc_timestamp` checked length, the final `Z`
+       and `time`'s RFC 3339 parser. That parser accepted a space instead of the
+       declared `T`, so two strings could describe one instant while durable
+       keys and evidence hashes differed.
+     - **Behavior.** The validator checks each ASCII byte of
+       `YYYY-MM-DDTHH:MM:SSZ`, then parses the date and time to reject invalid
+       calendar values. The accepted representation remains unchanged.
+     - **Test.** The domain ingress test failed on a space-separated timestamp
+       before the fix; it now also rejects lowercase separators, fractional
+       seconds, offsets and an impossible date. The focused test and Rust
+       formatting check pass.
+
+133. An IBKR PAPER account snapshot can see other API clients without treating
+     their activity as this route's own (2026-10-01, Reliability and quality;
+     E5.5a).
+     - **Gap.** The bridge used `reqOpenOrders`, which [IBKR limits to orders
+       submitted by the same API client ID](https://interactivebrokers.github.io/tws-api/open_orders.html). It therefore missed another
+       client's working order in the configured account. `reqExecutions` was
+       unfiltered after delivery, so a foreign execution with a canonical
+       `orderRef` could be journalled as this route's fill.
+     - **Behavior.** The snapshot uses `reqAllOpenOrders`. A foreign order is
+       retained under a synthetic ID based on its account-wide permanent ID
+       (or client and order ID when unavailable), so reconciliation reports it
+       as unexpected even if its `orderRef` collides with one of ours. Only a
+       canonical reference from the configured API client populates the
+       submit/cancel map. Foreign order statuses and executions never enter
+       the OMS event queue. Every returned open order advances the next submit
+       ID [as IBKR requires](https://interactivebrokers.github.io/tws-api/order_submission.html). The configured account still filters positions,
+       cash and orders.
+     - **Tests.** An in-process official-backend fixture delivers orders from
+       another API client, another account and this route. Its snapshot test
+       failed before the change and now checks the unexpected foreign ID,
+       ownership map, order-ID floor and foreign status. A second regression
+       failed before foreign executions were filtered; both a foreign client
+       and a foreign account are refused. All 39 bridge tests and the full
+       Python suite (259 passed) pass against pinned `ibapi` 9.81.1.post1.
+     - **Boundary.** This is a protocol fixture, not retained Gateway output.
+       The opening cash and currency scope, an adapter swap's journal identity,
+       and real-account reconciliation remain in E5.5–E5.6. Fresh market
+       input remains E5.3.
+
+134. A real PAPER bridge needs a clean opening reconciliation before it may
+     create an order (2026-10-01, Reliability and quality; E5.5b).
+     - **Gap.** On a new bridge journal, `broker_connected` was true before
+       anyone compared the configured opening cash, positions and working
+       orders with IBKR. A trader could submit while the OMS had an incomplete
+       or wrong account view.
+     - **Behavior.** `PaperBrokerAdapter::requires_clean_reconciliation`
+       defaults to false for the model; the real IBKR gateway opts in and the
+       route delegates to it. PAPER checks the last independently clean broker
+       report before either plain or combination submission, before risk
+       evidence or an order is created. Reconciliation is authorized to a risk
+       manager, and it remains available while the account is dirty. A restart
+       already marks the external session disconnected and requires a new
+       reconnect/reconciliation. Cancellation and corporate-action repair are
+       not blocked by this new submit gate.
+     - **Tests.** A bridge route test first failed because an order was
+       submitted without any reconciliation. It now verifies no order exists
+       before a clean report and that the supported order then flows through
+       risk, OMS and the process bridge. A second route test supplies a broker
+       cash balance different from configured cash, records `CASH_MISMATCH`,
+       and proves no order can be created. The existing bridge capability and
+       refusal tests now start from clean snapshots. The trading API has 47
+       passing tests; the PAPER and IBKR adapter package tests pass.
+     - **Boundary.** A clean report is not a market-data source, nor proof
+       that outside account activity cannot happen after it. There is no
+       background poller or real Gateway run, and the configured cash/currency
+       policy and adapter-swap journal handling remain under E5.5–E5.6.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

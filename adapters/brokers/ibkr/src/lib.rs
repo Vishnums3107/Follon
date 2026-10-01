@@ -707,6 +707,10 @@ impl<T: IbkrPaperGatewayTransport> IbkrPaperGatewayAdapter<T> {
 }
 
 impl<T: IbkrPaperGatewayTransport> PaperBrokerAdapter for IbkrPaperGatewayAdapter<T> {
+    fn requires_clean_reconciliation(&self) -> bool {
+        true
+    }
+
     /// Single DAY orders only, the narrowest set. The official-API bridge
     /// has no combination or replacement operation and places every order
     /// DAY, and `BrokerOrderRequest` carries no time in force, so a GTC intent

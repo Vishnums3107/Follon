@@ -160,6 +160,10 @@ impl PaperBrokerAdapter for PaperRouteAdapter {
         self.inner().permits_empty_journal(account_id)
     }
 
+    fn requires_clean_reconciliation(&self) -> bool {
+        self.inner().requires_clean_reconciliation()
+    }
+
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError> {
         self.inner_mut().submit(request)
     }
@@ -2629,7 +2633,13 @@ mod tests {
         };
         let (config, scratch) = write_route_config("bridge-combo", |document| {
             document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
-            document["ibkr_bridge"] = fake_bridge_section(&python);
+            document["initial_cash"] = "1000".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["bridge_script"] =
+                repository_path("tests/fixtures/ibkr/refusing-paper-bridge.py")
+                    .to_string_lossy()
+                    .into();
+            document["ibkr_bridge"] = bridge;
         });
         let route = paper_combo_route_from_path(&config).expect("bridge route opens");
         assert_eq!(
@@ -2649,6 +2659,13 @@ mod tests {
             transport_tls: false,
         };
         let token = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let opening = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("the bridge's opening account must reconcile")
+            .into_inner();
+        assert!(opening.snapshot_matches, "{:?}", opening.issues);
         let status = service
             .submit_paper_combo(authorized(
                 paper_combo_request("intent.grpc.bridge.1"),
@@ -3354,7 +3371,12 @@ mod tests {
         };
         let (config, scratch) = write_route_config("bridge-single", |document| {
             document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
-            document["ibkr_bridge"] = fake_bridge_section(&python);
+            let mut bridge = fake_bridge_section(&python);
+            bridge["bridge_script"] =
+                repository_path("tests/fixtures/ibkr/fake-paper-bridge-order-route.py")
+                    .to_string_lossy()
+                    .into();
+            document["ibkr_bridge"] = bridge;
         });
         let route = paper_combo_route_from_path(&config).unwrap();
         let service = OperatingSystemService {
@@ -3365,6 +3387,13 @@ mod tests {
             transport_tls: false,
         };
         let token = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let opening = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("the bridge's opening account must reconcile")
+            .into_inner();
+        assert!(opening.snapshot_matches, "{:?}", opening.issues);
         let mut gtc = paper_order_request("intent.grpc.bridge.gtc");
         gtc.time_in_force = OrderTimeInForceKind::GoodTilCancelled as i32;
         let error = service
@@ -3422,6 +3451,7 @@ mod tests {
         };
         let (config, scratch) = write_route_config("bridge-refusal", |document| {
             document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            document["initial_cash"] = "1000".into();
             let mut bridge = fake_bridge_section(&python);
             bridge["bridge_script"] =
                 repository_path("tests/fixtures/ibkr/refusing-paper-bridge.py")
@@ -3438,6 +3468,13 @@ mod tests {
             transport_tls: false,
         };
         let token = trader_token(&service).await;
+        let manager = risk_token(&service).await;
+        let opening = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("the bridge's opening cash matches the configured cash")
+            .into_inner();
+        assert!(opening.snapshot_matches, "{:?}", opening.issues);
         for intent in [
             "intent.grpc.bridge.refused.1",
             "intent.grpc.bridge.refused.2",
@@ -3463,6 +3500,62 @@ mod tests {
                 .state,
             OrderState::Rejected
         );
+        drop(service);
+        drop(route);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[tokio::test]
+    async fn a_dirty_bridge_account_cannot_submit_after_reconciliation() {
+        let Some(python) = python_executable() else {
+            eprintln!("Python is unavailable; the bridge account test was skipped");
+            return;
+        };
+        let (config, scratch) = write_route_config("bridge-dirty-account", |document| {
+            document["adapter_kind"] = "IBKR_PAPER_BRIDGE".into();
+            let mut bridge = fake_bridge_section(&python);
+            bridge["bridge_script"] =
+                repository_path("tests/fixtures/ibkr/refusing-paper-bridge.py")
+                    .to_string_lossy()
+                    .into();
+            document["ibkr_bridge"] = bridge;
+        });
+        let route = paper_combo_route_from_path(&config).unwrap();
+        let service = OperatingSystemService {
+            database: None,
+            paper_combo_route: Some(route.clone()),
+            live_kill_switch_route: None,
+            identity: Some(operator_identity()),
+            transport_tls: false,
+        };
+        let manager = risk_token(&service).await;
+        let trader = trader_token(&service).await;
+        let opening = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("the bridge reported its different opening cash")
+            .into_inner();
+        assert!(!opening.snapshot_matches);
+        assert!(opening
+            .issues
+            .iter()
+            .any(|issue| issue.category == "CASH_MISMATCH"));
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(
+                    paper_order_request("intent.grpc.bridge.dirty"),
+                    &trader,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(route
+            .lock()
+            .unwrap()
+            .order("order-intent.grpc.bridge.dirty")
+            .is_none());
         drop(service);
         drop(route);
         let _ = std::fs::remove_dir_all(scratch);
@@ -3948,11 +4041,28 @@ mod tests {
         };
         let trader = trader_token(&service).await;
         let manager = risk_token(&service).await;
+        let order_request = paper_order_request("intent.grpc.bridge.reconcile");
+        assert_eq!(
+            service
+                .submit_paper_order(authorized(order_request.clone(), &trader))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(route
+            .lock()
+            .unwrap()
+            .order("order-intent.grpc.bridge.reconcile")
+            .is_none());
+        let opening = service
+            .reconcile_paper_account(authorized(paper_reconciliation_request(false), &manager))
+            .await
+            .expect("the initial broker account must reconcile before trading")
+            .into_inner();
+        assert!(opening.snapshot_matches, "{:?}", opening.issues);
         let submitted = service
-            .submit_paper_order(authorized(
-                paper_order_request("intent.grpc.bridge.reconcile"),
-                &trader,
-            ))
+            .submit_paper_order(authorized(order_request, &trader))
             .await
             .expect("bridge accepted the single DAY order")
             .into_inner();

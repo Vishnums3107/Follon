@@ -3,6 +3,27 @@
 **Status:** executable controls are implemented; external ownership and
 operating evidence are not pre-approved by this repository.
 
+## Opening an IBKR PAPER command route
+
+Configure the `IBKR_PAPER_BRIDGE` route for one reviewed PAPER account and
+retain its journal. Before the first order, a risk manager calls
+`ReconcilePaperAccount` for that account. The bridge reports cash, positions
+and orders from the configured account; a foreign API client's open order is
+an unexpected-order discrepancy and is never treated as this route's order.
+The real bridge refuses a new plain or combination order until the most recent
+reconciliation is clean. A cash mismatch, including a configured opening
+balance that does not match the broker snapshot, blocks new submission. Inspect
+and resolve discrepancies through the account and journal; do not edit the
+configured balance merely to make an unexplained difference disappear.
+
+After a restart or disconnect, use `ReconcilePaperAccount` with reconnect and
+check its returned issues before submitting again. The route has no background
+poller, and a clean report does not certify that no other account activity
+occurred afterward. Retain actual Gateway logs and reconciliation outputs for
+the PAPER session gate. Currency scope and changing an adapter on an existing
+journal still require a reviewed procedure; this repository has not run the
+route against a real Gateway account.
+
 ## Promotion sequence
 
 Only `development -> staging -> production` is valid. Build immutable images,

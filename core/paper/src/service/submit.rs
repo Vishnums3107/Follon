@@ -54,12 +54,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 "paper intent account does not match service".to_owned(),
             ));
         }
-        if !self.broker_connected {
-            return Err(PaperError(
-                "paper broker session is disconnected; reconnect and reconcile before submission"
-                    .to_owned(),
-            ));
-        }
+        self.ensure_broker_ready_for_submission()?;
         if market.instrument_id != intent.instrument_id {
             return Err(PaperError(
                 "paper market observation instrument does not match intent".to_owned(),
@@ -255,12 +250,7 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
                 "paper combo intent account does not match service".to_owned(),
             ));
         }
-        if !self.broker_connected {
-            return Err(PaperError(
-                "paper broker session is disconnected; reconnect and reconcile before submission"
-                    .to_owned(),
-            ));
-        }
+        self.ensure_broker_ready_for_submission()?;
 
         let order_id = OmsComboOrder::order_id_for(&intent.intent_id);
         if let Some(existing) = self.combo_orders.get(&order_id) {
@@ -410,6 +400,23 @@ impl<B: PaperBrokerAdapter> PaperTradingService<B> {
     /// run it before risk is evaluated, because evaluation itself updates the
     /// mark cache and equity baselines, so a refusal records, moves and
     /// transmits nothing (delivery state E5.1).
+    fn ensure_broker_ready_for_submission(&self) -> Result<(), PaperError> {
+        if !self.broker_connected {
+            return Err(PaperError(
+                "paper broker session is disconnected; reconnect and reconcile before submission"
+                    .to_owned(),
+            ));
+        }
+        if self.broker.requires_clean_reconciliation()
+            && self.last_reconciliation_clean != Some(true)
+        {
+            return Err(PaperError(
+                "paper broker account requires a clean reconciliation before submission".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_route_carries(
         &self,
         time_in_force: TimeInForce,

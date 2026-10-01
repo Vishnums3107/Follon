@@ -349,14 +349,31 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 self.condition.notify_all()
 
         def openOrder(self, orderId: int, contract: Any, order: Any, orderState: Any) -> None:  # noqa: N802
-            if getattr(order, "account", "") != arguments.broker_account:
-                return
-            client_order_id = getattr(order, "orderRef", "")
-            if not CANONICAL_ID.fullmatch(client_order_id or ""):
-                client_order_id = f"unmapped-ibkr-order-{orderId}"
             with self.condition:
-                self.client_by_order[orderId] = client_order_id
-                self.order_by_client[client_order_id] = orderId
+                # reqAllOpenOrders can return orders from other API clients.
+                # IBKR requires our next ID to exceed every ID it returned.
+                if orderId >= 0 and self.next_order_id is not None:
+                    self.next_order_id = max(self.next_order_id, orderId + 1)
+                if getattr(order, "account", "") != arguments.broker_account:
+                    return
+                order_ref = getattr(order, "orderRef", "")
+                owned = (
+                    getattr(order, "clientId", None) == arguments.client_id
+                    and CANONICAL_ID.fullmatch(order_ref or "") is not None
+                )
+                if owned:
+                    client_order_id = order_ref
+                    self.client_by_order[orderId] = client_order_id
+                    self.order_by_client[client_order_id] = orderId
+                else:
+                    # A foreign orderRef can equal one of ours. Keep its account
+                    # evidence, but never use it for retry, cancel or poll events.
+                    perm_id = getattr(order, "permId", 0)
+                    if type(perm_id) is int and perm_id > 0:
+                        foreign_id = str(perm_id)
+                    else:
+                        foreign_id = f"{getattr(order, 'clientId', 'unknown')}-{orderId}"
+                    client_order_id = f"unmapped-ibkr-order-{foreign_id}"
                 state = normalize_order_state(getattr(orderState, "status", "Submitted"), "0", "0")
                 self.orders[client_order_id] = {
                     "client_order_id": client_order_id,
@@ -382,7 +399,9 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
             whyHeld: str,
             mktCapPrice: float,
         ) -> None:
-            del avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice
+            del avgFillPrice, permId, parentId, lastFillPrice, whyHeld, mktCapPrice
+            if clientId != arguments.client_id:
+                return
             with self.condition:
                 client_order_id = self.client_by_order.get(orderId)
                 if client_order_id is None:
@@ -479,6 +498,14 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                     self.condition.notify_all()
 
         def execDetails(self, reqId: int, contract: Any, execution: Any) -> None:  # noqa: N802
+            # reqExecutions is account-wide. Only this bridge client's fills
+            # belong in its OMS; other activity remains visible via the
+            # independent account snapshot and its reconciliation issues.
+            if (
+                getattr(execution, "acctNumber", None) != arguments.broker_account
+                or getattr(execution, "clientId", None) != arguments.client_id
+            ):
+                return
             with self.condition:
                 self.execution_data[execution.execId] = (contract, execution)
                 self.execution_ids_by_request.setdefault(reqId, set()).add(execution.execId)
@@ -830,7 +857,7 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 self.app.positions = {}
                 self.app.cash = None
                 self.app.orders = {}
-            self.app.reqOpenOrders()
+            self.app.reqAllOpenOrders()
             self.app.reqCompletedOrders(True)
             self.app.reqPositions()
             account_request_id = self._allocate_request_id()

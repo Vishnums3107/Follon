@@ -427,6 +427,12 @@ pub trait PaperBrokerAdapter {
     fn permits_empty_journal(&self, _account_id: &str) -> bool {
         true
     }
+    /// Requires an independently clean account snapshot before risk may
+    /// authorize a new order on this adapter. Real account routes opt in;
+    /// deterministic model adapters retain their existing behavior.
+    fn requires_clean_reconciliation(&self) -> bool {
+        false
+    }
     /// Submits exactly one client-idempotent paper order.
     fn submit(&mut self, request: &BrokerOrderRequest) -> Result<BrokerSubmitResult, PaperError>;
     /// Submits an atomic combination order.

@@ -127,7 +127,9 @@ for the deployment and evidence sequence.
   through `ApplyPaperCorporateAction`.
   The real adapter declares exactly that, so the PAPER OMS refuses a
   combination, a GTC intent or a replacement on that route before any order
-  exists.
+  exists. It also refuses new orders until the real account's latest
+  reconciliation is clean. The bridge includes other API clients' open orders
+  as discrepancies without taking ownership of them.
 - The primary strategy backtest route is funded and long-only. Advanced
   margin, financing, and short accounting are separate model calculations;
   their presence does not enable those strategies in the primary runner.

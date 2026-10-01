@@ -56,19 +56,19 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-10-01T04:34:35Z  
-**Branch:** `feat/session-18-backlog`  
-**HEAD:** `5ad9785` -- feat(live): apply an operator-stated split or dividend -- audit item 130 (2026-10-01T09:55:26+05:30)  
-**Uncommitted paths:** 8
+**Measured at:** 2026-10-01T07:39:33Z  
+**Branch:** `feat/resume-end-to-end-2026-10-01`  
+**HEAD:** `2e9f990` -- feat(trading-api): apply a PAPER corporate action over gRPC -- audit item 131 (2026-10-01T10:06:14+05:30)  
+**Uncommitted paths:** 13
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 698 | 0 | 11 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 699 | 0 | 11 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 11 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 257 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 259 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -250,7 +250,7 @@ epic lands (see the correction under the external gates).
 | E5.2 | The authenticated gRPC PAPER route composes the real bridge by configuration, with the model as the default. **E5.2a** binds the adapter and IBKR session to the journal fingerprint (audit item 99). **E5.2b** adds operator-attributed single-order submit and cancel over the journaled kernel (items 100–101). **E5.2c** adds a risk-manager `ReconcilePaperAccount` RPC: it drains broker events, compares the snapshot, returns its discrepancies and UNKNOWN count, and can explicitly reconnect. A stateful bridge protocol fixture applied a fill and reconciled its account; a model restart surfaced missing broker state rather than reporting clean (audit item 102). No background poller or real Gateway evidence is claimed. | E5.2a–c **done** 2026-09-29; E5.5 and E5.6 open |
 | E5.3 | Fresh market inputs for that route. The bridge requests no market data, so every mark is operator-attested today. | open |
 | E5.4 | The bridge protocol distinguishes a local refusal, where nothing reached IBKR, from transport ambiguity. Before, every `ok: false` reply stranded the order `UNKNOWN` and disconnected the session. **Now** a refused submission answers `REJECTED` (`IBKR_BRIDGE_REFUSED_<CODE>`) and leaves the session connected, a refused cancellation is reported as a `CANCEL_REJECTED` event so the order returns to working, and anything else stays `UNKNOWN`. IBKR's notices (131, 202, 399, 404, the 2100–2169 warnings) no longer reject a working order, and its cancel-failure codes (135, 136, 161, 10147, 10148) report a rejected cancellation. **A review on 2026-09-30 found 404 (held while shares are located) and 131 (an attribute is ignored) still rejecting, and a status that arrived after a rejection reopening the order** as `ACKNOWLEDGED`; both are fixed, and a finished order is now final against a late status or a second error (audit item 118). The code table is IBKR's documented one, not measured against a real TWS (E5.6). Audit item 103. | **done** 2026-09-29; review fix 2026-09-30 |
-| E5.5 | Reconciliation against a real account. The real snapshot reports IBKR `TotalCashValue` and every position and order, including unmapped ones, while the model starts from configured initial cash. The account scope, and the journal-fingerprint change an adapter swap causes, need a design. | open |
+| E5.5 | Reconciliation against a real account. **E5.5a:** the bridge requests all API clients' open orders for the configured account. A foreign order gets a broker-identity-based synthetic ID and becomes an `UNEXPECTED_BROKER_ORDER` discrepancy; it cannot populate this route's retry/cancel map or emit an OMS event. Execution callbacks are limited to the configured broker account and API client. The next submit ID advances past every open ID received, as IBKR requires (audit item 133). **E5.5b:** the real adapter declares that it requires a clean account reconciliation before PAPER risk can create an order. A missing or dirty report blocks both plain and combination submission, while cancellation and corrective reconciliation remain available. The model is unchanged (audit item 134). The snapshot still compares IBKR `TotalCashValue` with books initialized from configured cash. Currency scope, adapter-swap journal handling and a real Gateway reconciliation still need design and evidence. No background poller detects outside changes between reconciliations. | E5.5a-b done 2026-10-01; remainder open |
 | E5.6 | Retained Gateway evidence against a real TWS or IB Gateway PAPER session: restart, reconnect, cancellation races and reconciliation. | **external** |
 | E5.7 | E5.1's analogue for controlled LIVE. `IbkrControlledLiveAdapter` inherited a refusing `submit_combo`, and `core/live` recorded that refusal as a transport failure: the combination became `UNKNOWN`, the session disconnected, and the approval and a canary slot stayed consumed. **Now** every LIVE adapter declares `LiveBrokerCapabilities`, defaulting to single DAY orders. The service refuses a combination, a GTC intent or a replacement the adapter did not declare before the approval is looked at, a canary slot is spent or an order exists. It is a separate type from PAPER's, so PAPER can never widen what LIVE attempts. The IBKR LIVE adapter declares replacement only. Audit item 104. Still latent: no application composes a LIVE adapter that can trade. | **done** 2026-09-29 |
 
@@ -866,6 +866,30 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-10-01 — session 19
+
+- Resumed from `origin/main` (`2e9f990`) in a clean branch. A disposable
+  PostgreSQL 17 database let the status tool measure all eight suites green:
+  Rust 699 passed / 0 failed / 11 ignored, PostgreSQL 11, Tauri 33, Python
+  259, formatting, strict Clippy and both desktop suites. The evidence
+  pipeline exited 0 with 46 local artifacts. No external gate moved.
+- The domain UTC validator now requires the exact ASCII timestamp shape it
+  advertises, after a failing regression showed it accepted a space for `T`
+  (audit item 132).
+- E5.5a widens the bridge's account snapshot to orders from every API client
+  and keeps foreign orders and executions out of this route's OMS state. Two
+  focused regressions failed before their fixes; all 39 bridge tests and the
+  259-test Python suite pass (audit item 133). Real broker account scope and
+  opening-balance evidence remain open.
+- E5.5b requires a clean reconciliation of the real bridge account before
+  PAPER accepts a new plain or combination order. A route test failed before
+  the gate; another proves that a broker cash mismatch leaves submission
+  blocked. The trading API's 47 tests and the PAPER/IBKR package tests pass
+  (audit item 134).
+- **Next action:** finish E5.5's currency and adapter-swap
+  design, then validate it against a real IBKR PAPER account. E5.3 still needs
+  independently fresh market data; E7.12 needs a Linux test environment.
 
 ### 2026-10-01 — session 18
 

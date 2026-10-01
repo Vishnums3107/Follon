@@ -46,8 +46,16 @@ impl std::error::Error for DomainError {}
 /// identical to temporal ordering and prevents equivalent instants from
 /// acquiring multiple hashes through offsets or fractional formatting.
 pub fn validate_utc_timestamp(name: &str, value: &str) -> Result<(), DomainError> {
-    if value.len() != 20 || !value.ends_with('Z') || OffsetDateTime::parse(value, &Rfc3339).is_err()
-    {
+    let bytes = value.as_bytes();
+    let canonical_shape = bytes.len() == 20
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        });
+    if !canonical_shape || OffsetDateTime::parse(value, &Rfc3339).is_err() {
         return Err(DomainError(format!(
             "{name} must be canonical second-precision UTC"
         )));

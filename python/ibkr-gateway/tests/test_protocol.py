@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from zoneinfo import ZoneInfoNotFoundError
 
@@ -156,7 +157,16 @@ class _FakeContract:
 
 class _FakeExecution:
     def __init__(
-        self, *, exec_id: str, order_ref: str, order_id: int, shares: str, price: str, time: str
+        self,
+        *,
+        exec_id: str,
+        order_ref: str,
+        order_id: int,
+        shares: str,
+        price: str,
+        time: str,
+        client_id: int = 7,
+        account: str = "DU1234567",
     ) -> None:
         self.execId = exec_id
         self.orderRef = order_ref
@@ -165,6 +175,8 @@ class _FakeExecution:
         self.price = price
         self.time = time
         self.cumQty = shares
+        self.clientId = client_id
+        self.acctNumber = account
 
 
 class _FakeCommissionReport:
@@ -238,6 +250,79 @@ def _submit_payload(client_order_id: str) -> dict:
         "quantity": "10",
         "limit_price": None,
     }
+
+
+class OfficialBackendSnapshotTests(unittest.TestCase):
+    def test_snapshot_sees_other_clients_orders_without_owning_them(self) -> None:
+        backend = _build_official_backend()
+        requested: list[str] = []
+
+        def all_open_orders() -> None:
+            requested.append("all_open_orders")
+            for order_id, account, client_id, order_ref, perm_id in (
+                (301, "DU1234567", 8, "order.ours", 901),
+                (302, "DU0000000", 8, "order.other.account", 902),
+                (303, "DU1234567", 7, "order.ours", 903),
+            ):
+                backend.app.openOrder(
+                    order_id,
+                    _FakeContract(265598),
+                    SimpleNamespace(
+                        account=account,
+                        clientId=client_id,
+                        orderRef=order_ref,
+                        permId=perm_id,
+                    ),
+                    SimpleNamespace(status="Submitted"),
+                )
+            backend.app.openOrderEnd()
+
+        def account_summary(request_id: int, group: str, tags: str) -> None:
+            self.assertEqual((group, tags), ("All", "TotalCashValue"))
+            backend.app.accountSummary(request_id, "DU1234567", "TotalCashValue", "1000", "USD")
+            backend.app.accountSummaryEnd(request_id)
+
+        backend.app.reqOpenOrders = lambda: self.fail("snapshot requested only this client's orders")
+        backend.app.reqAllOpenOrders = all_open_orders
+        backend.app.reqCompletedOrders = lambda api_only: backend.app.completedOrdersEnd()
+        backend.app.reqPositions = lambda: backend.app.positionEnd()
+        backend.app.reqAccountSummary = account_summary
+        backend.app.cancelPositions = lambda: None
+        backend.app.cancelAccountSummary = lambda request_id: None
+        backend._refresh_executions = lambda: None
+
+        snapshot = backend.snapshot({"account_id": "acct.paper.1"})
+
+        self.assertEqual(requested, ["all_open_orders"])
+        self.assertEqual(
+            [order["client_order_id"] for order in snapshot["orders"]],
+            ["order.ours", "unmapped-ibkr-order-901"],
+        )
+        self.assertNotIn(301, backend.app.client_by_order)
+        self.assertEqual(set(backend.app.order_by_client), {"order.ours"})
+        self.assertEqual(backend.app.order_by_client["order.ours"], 303)
+        self.assertEqual(backend.app.next_order_id, 304)
+        backend.app.orderStatus(301, "Filled", 1, 0, 0.0, 901, 0, 0.0, 8, "", 0.0)
+        self.assertTrue(backend.app.events.empty())
+
+    def test_foreign_executions_never_enter_the_oms_event_queue(self) -> None:
+        for client_id, account in ((8, "DU1234567"), (7, "DU0000000")):
+            with self.subTest(client_id=client_id, account=account):
+                backend = _build_official_backend()
+                execution = _FakeExecution(
+                    exec_id="exec.foreign",
+                    order_ref="order.ours",
+                    order_id=301,
+                    shares="1",
+                    price="100",
+                    time="20260102 09:31:00 America/New_York",
+                    client_id=client_id,
+                    account=account,
+                )
+                backend.app.execDetails(9101, _FakeContract(265598), execution)
+                backend.app.commissionReport(_FakeCommissionReport("exec.foreign", "1"))
+                self.assertNotIn("exec.foreign", backend.app.execution_data)
+                self.assertTrue(backend.app.events.empty())
 
 
 class OfficialBackendSubmitRetryTests(unittest.TestCase):

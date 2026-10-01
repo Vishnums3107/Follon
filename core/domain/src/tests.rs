@@ -225,6 +225,10 @@ fn timestamps_and_bar_prices_are_canonical_at_ingress() {
     assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00Z").is_ok());
     assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00.1Z").is_err());
     assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00+00:00").is_err());
+    assert!(validate_utc_timestamp("time", "2026-01-02 14:30:00Z").is_err());
+    assert!(validate_utc_timestamp("time", "2026-01-02t14:30:00Z").is_err());
+    assert!(validate_utc_timestamp("time", "2026-01-02T14:30:00z").is_err());
+    assert!(validate_utc_timestamp("time", "2026-02-30T14:30:00Z").is_err());
     let invalid = Bar {
         instrument_id: "inst.us_equity.spy".to_owned(),
         open: Decimal::ZERO,
