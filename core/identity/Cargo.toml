@@ -9,7 +9,7 @@ authors.workspace = true
 [dependencies]
 argon2 = { version = "0.5.3", features = ["std"] }
 follon-domain = { path = "../domain" }
-hmac = "0.12.1"
+hmac = "0.13.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
