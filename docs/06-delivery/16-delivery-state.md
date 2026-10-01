@@ -56,19 +56,19 @@ already produced a real defect here.
 > run replaces this block wholesale. Every exit code below is the suite
 > process's own return code, captured directly rather than through a pipe.
 
-**Measured at:** 2026-10-01T07:39:33Z  
+**Measured at:** 2026-10-01T10:37:22Z  
 **Branch:** `feat/resume-end-to-end-2026-10-01`  
-**HEAD:** `2e9f990` -- feat(trading-api): apply a PAPER corporate action over gRPC -- audit item 131 (2026-10-01T10:06:14+05:30)  
-**Uncommitted paths:** 13
+**HEAD:** `d6a1634` -- fix(paper): require clean broker reconciliation before submission (2026-10-01T13:11:17+05:30)  
+**Uncommitted paths:** 6
 
 | Suite | Status | Exit | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
-| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 699 | 0 | 11 |
+| Rust workspace (`cargo test --workspace --all-targets`) | **PASS** | 0 | 700 | 0 | 11 |
 | Rust formatting (`cargo fmt --all -- --check`) | **PASS** | 0 | -- | -- | -- |
 | Rust lints (`cargo clippy --workspace --all-targets -D warnings`) | **PASS** | 0 | -- | -- | -- |
 | PostgreSQL integration (`cargo test -p follon-postgres -- --ignored`) | **PASS** | 0 | 11 | 0 | 0 |
 | Tauri host workspace (`cargo test` in `apps/desktop/src-tauri`) | **PASS** | 0 | 33 | 0 | 0 |
-| Python suite (`pytest`) | **PASS** | 0 | 259 | 0 | 0 |
+| Python suite (`pytest`) | **PASS** | 0 | 262 | 0 | 0 |
 | Desktop evidence regressions (`npm run test:evidence`) | **PASS** | 0 | -- | -- | -- |
 | Desktop server contract (`apps/desktop/test/server_contract.py`) | **PASS** | 0 | -- | -- | -- |
 
@@ -866,6 +866,26 @@ not an engineering gap and no amount of E1/E2/E3 work closes it.
 
 Newest first. One entry per session, written at the end of it. Keep entries
 short — detail belongs in the conformance audit.
+
+### 2026-10-01 — session 20 (in progress)
+
+- Resumed the existing branch and completed its uncommitted currency slice:
+  the IBKR bridge only accepts account-summary cash in the configured account
+  currency. Missing matching cash fails reconciliation (audit item 135).
+- Independent review found stale cash could survive a snapshot timeout. A
+  failing regression reproduced it; retiring the request under the callback
+  lock and cancelling subscriptions on every exit fixes the retry lifecycle.
+- Adapter swaps continue to require separate journals: existing fingerprints
+  already refuse changing model/bridge, broker account, client, map or currency.
+  Existing evidence is retained; no automatic migration or balance adoption is
+  introduced. Opening books must independently match the broker before a new
+  bridge account can submit.
+- The user explicitly authorized pushing all changes and raising a PR. All
+  eight suites passed in the generated measurement, including disposable
+  PostgreSQL integration; desktop typecheck passed separately. Publication is
+  in progress. E5.3 market inputs and the
+  remaining operational/install gaps follow; real Gateway history remains
+  external evidence that code and fixtures cannot manufacture.
 
 ### 2026-10-01 — session 19
 

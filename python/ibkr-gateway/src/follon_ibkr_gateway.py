@@ -482,13 +482,13 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
         def accountSummary(  # noqa: N802
             self, reqId: int, account: str, tag: str, value: str, currency: str
         ) -> None:
-            del currency
-            if (
-                reqId == self.active_account_summary_request
-                and account == arguments.broker_account
-                and tag == "TotalCashValue"
-            ):
-                with self.condition:
+            with self.condition:
+                if (
+                    reqId == self.active_account_summary_request
+                    and account == arguments.broker_account
+                    and tag == "TotalCashValue"
+                    and currency == arguments.account_currency
+                ):
                     self.cash = value
 
         def accountSummaryEnd(self, reqId: int) -> None:  # noqa: N802
@@ -855,27 +855,34 @@ def create_official_backend(arguments: argparse.Namespace, instruments: dict[str
                 self.app.account_summary_done = False
                 self.app.completed_orders_done = False
                 self.app.positions = {}
+                self.app.active_account_summary_request = None
                 self.app.cash = None
                 self.app.orders = {}
-            self.app.reqAllOpenOrders()
-            self.app.reqCompletedOrders(True)
-            self.app.reqPositions()
             account_request_id = self._allocate_request_id()
-            with self.app.condition:
-                self.app.active_account_summary_request = account_request_id
-            self.app.reqAccountSummary(account_request_id, "All", "TotalCashValue")
-            self._refresh_executions()
-            self._wait(
-                lambda: self.app.open_orders_done
-                and self.app.positions_done
-                and self.app.account_summary_done
-                and self.app.completed_orders_done,
-                "IBKR account snapshot timed out",
-            )
-            self.app.cancelPositions()
-            self.app.cancelAccountSummary(account_request_id)
-            with self.app.condition:
-                self.app.active_account_summary_request = None
+            try:
+                self.app.reqAllOpenOrders()
+                self.app.reqCompletedOrders(True)
+                self.app.reqPositions()
+                with self.app.condition:
+                    self.app.active_account_summary_request = account_request_id
+                self.app.reqAccountSummary(account_request_id, "All", "TotalCashValue")
+                self._refresh_executions()
+                self._wait(
+                    lambda: self.app.open_orders_done
+                    and self.app.positions_done
+                    and self.app.account_summary_done
+                    and self.app.completed_orders_done,
+                    "IBKR account snapshot timed out",
+                )
+            finally:
+                # Retire the identity before cancelling: late callbacks must
+                # never populate a later snapshot, including after a timeout.
+                with self.app.condition:
+                    self.app.active_account_summary_request = None
+                try:
+                    self.app.cancelPositions()
+                finally:
+                    self.app.cancelAccountSummary(account_request_id)
             if self.app.cash is None:
                 raise BridgeFailure("IBKR account snapshot has no cash value")
             return {
@@ -974,6 +981,7 @@ def parse_arguments(values: list[str]) -> argparse.Namespace:
     parser.add_argument("--client-id", required=True, type=int)
     parser.add_argument("--account-id", required=True)
     parser.add_argument("--broker-account", required=True)
+    parser.add_argument("--account-currency", required=True)
     parser.add_argument("--instrument-map", required=True, type=Path)
     parser.add_argument("--tws-timezone", required=True)
     parser.add_argument("--environment", required=True)
@@ -989,6 +997,8 @@ def parse_arguments(values: list[str]) -> argparse.Namespace:
         or not arguments.broker_account
         or len(arguments.broker_account) > 64
         or any(character in arguments.broker_account for character in "\r\n")
+        or len(arguments.account_currency) != 3
+        or not all("A" <= character <= "Z" for character in arguments.account_currency)
     ):
         raise BridgeFailure("invalid PAPER-only IBKR bridge configuration")
     ZoneInfo(arguments.tws_timezone)

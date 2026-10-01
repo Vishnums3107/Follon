@@ -1579,6 +1579,7 @@ struct IbkrBridgeLaunch {
 /// argument list (delivery state E5.2a).
 fn ibkr_bridge_launch(
     account_id: &str,
+    account_currency: &str,
     bridge: IbkrBridgeDocument,
 ) -> Result<IbkrBridgeLaunch, String> {
     let gateway = IbkrPaperGatewayConfiguration {
@@ -1604,6 +1605,13 @@ fn ibkr_bridge_launch(
         || bridge.broker_account.contains(['\r', '\n'])
     {
         return Err("PAPER command-route IBKR bridge broker_account is invalid".to_owned());
+    }
+    if account_currency.len() != 3
+        || !account_currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase())
+    {
+        return Err("PAPER command-route IBKR bridge account currency is invalid".to_owned());
     }
     // The bridge refuses a linked or oversized map; so does the route, and it
     // binds the map's exact bytes into the journal fingerprint.
@@ -1639,6 +1647,8 @@ fn ibkr_bridge_launch(
             account_id.to_owned(),
             "--broker-account".to_owned(),
             bridge.broker_account,
+            "--account-currency".to_owned(),
+            account_currency.to_owned(),
             "--instrument-map".to_owned(),
             bridge.instrument_map,
             "--tws-timezone".to_owned(),
@@ -1679,7 +1689,7 @@ fn paper_route_adapter(
             "a PAPER command route on the IBKR bridge requires an ibkr_bridge section".to_owned(),
         ),
         ("IBKR_PAPER_BRIDGE", Some(bridge)) => {
-            let launch = ibkr_bridge_launch(&account.account_id, bridge)?;
+            let launch = ibkr_bridge_launch(&account.account_id, &account.currency, bridge)?;
             let transport = IbkrPaperBridgeProcessTransport::start(launch.process)
                 .map_err(|error| format!("PAPER command-route IBKR bridge: {error}"))?;
             IbkrPaperGatewayAdapter::new(launch.gateway, transport)
@@ -2555,7 +2565,8 @@ mod tests {
         section["port"] = 4002.into();
         section["client_id"] = 31.into();
         let bridge: IbkrBridgeDocument = serde_json::from_value(section).expect("bridge section");
-        let launch = ibkr_bridge_launch("acct.grpc.paper.test", bridge).expect("bridge launch");
+        let launch =
+            ibkr_bridge_launch("acct.grpc.paper.test", "EUR", bridge).expect("bridge launch");
         let arguments = &launch.process.arguments;
         assert!(arguments[0].ends_with("follon_ibkr_gateway.py"));
         let parsed = std::process::Command::new(&launch.process.executable)
@@ -2587,6 +2598,7 @@ mod tests {
                 "client_id": 31,
                 "account_id": "acct.grpc.paper.test",
                 "broker_account": "DU_TEST_ACCOUNT",
+                "account_currency": "EUR",
                 "instrument_map": repository_path("tests/fixtures/ibkr/placeholder-instrument-map.json")
                     .to_string_lossy(),
                 "tws_timezone": "America/New_York",
@@ -2600,6 +2612,21 @@ mod tests {
             std::time::Duration::from_secs(5)
         );
         assert_eq!(launch.process.max_response_bytes, 65536);
+    }
+
+    #[test]
+    fn the_bridge_launcher_refuses_invalid_account_currencies_before_starting() {
+        for currency in ["", "US", "USDD", "usd", "U$D", "UŚD"] {
+            let bridge: IbkrBridgeDocument =
+                serde_json::from_value(fake_bridge_section(Path::new("/unused"))).unwrap();
+            let refusal = ibkr_bridge_launch("acct.grpc.paper.test", currency, bridge)
+                .err()
+                .expect("invalid currency must be refused before launching a process");
+            assert_eq!(
+                refusal, "PAPER command-route IBKR bridge account currency is invalid",
+                "{currency}"
+            );
+        }
     }
 
     /// The service reads the checked-in fixtures its schema describes, so the
