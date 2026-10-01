@@ -5428,6 +5428,63 @@ These are mandatory master-plan acceptance conditions and are currently open:
        bridge applies nothing itself; its snapshot shows what IBKR did. Controlled
        LIVE (E8.4b-2) and the authenticated gRPC route (E8.4b-3) are separate slices.
 
+130. Controlled LIVE applies an operator-stated split or dividend, and a split only once
+     the broker shows it (2026-10-01, Reliability and quality; E8.4b-2).
+     - **Gap.** Controlled LIVE applied no corporate action, so after a broker split
+       its OMS believed it held the pre-split quantity at the pre-split cost:
+       reconciliation reported a mismatch, the unresolved incident blocked every
+       canary, and nothing could clear it. A dividend left internal cash short of the
+       broker's in the same way.
+     - **Behavior.** `LiveTradingService::apply_corporate_action` takes a
+       `LiveCorporateAction` and applies PAPER's rules (audit item 129) through its
+       own implementation in `core/live/src/corporate_actions.rs`, as every LIVE gate
+       is separate from PAPER's (E1.4a): the action well formed and applied no
+       earlier than it took effect, the account holding exactly the stated position,
+       and for a split no order of either kind working in the instrument and a
+       position left in whole lots. LIVE adds a check PAPER does not: a split is
+       applied only while the broker session is connected and the broker's own
+       snapshot already holds the position the split leaves. Applied earlier, the OMS
+       would let a canary sell shares the account does not yet hold. The receipt is
+       audited as a `live.corporate_action.applied.v1` journal record whose actor is
+       the operator and whose correlation id names the action; the journal field is
+       never written while empty, so no earlier LIVE journal changes. Restore
+       refuses an effect that does not follow from its action and a journal applying
+       one action twice.
+     - **Tests.** `core/live/src/corporate_action_tests.rs` (11 tests, included into
+       the LIVE test module to reuse its broker and fixtures): a split refused until
+       the broker shows it and then applied to the position, average cost and lots,
+       reconciling clean, audited with the operator and restored after a restart; a
+       split refused while disconnected, with a working plain order, with a working
+       combination leg, when it would leave a fraction of a lot, and when it would
+       round the cached mark to nothing; the rebased mark and scaled attribution seen
+       in a later aggregate decision; a dividend on a long and a short, each
+       reconciling clean; the stated-position, effective-time, operator and retry
+       rules; a journal that never mentions an action until one is applied; and
+       restore's refusals.
+     - **Rule 5.** 22 of 22 injected defects were caught by the intended failing
+       tests: the effective time, retry identity and terms and stated position
+       unchecked; a working plain order or combination leg, a fractional lot, a
+       disconnected session, a split ahead of the broker and a zero mark allowed; the
+       lots, attribution, mark or position not split; a short credited and a
+       dividend not credited; the action not audited or audited under another actor;
+       the snapshot omitting or restore dropping the actions; and restore accepting
+       an effect that does not follow or one action twice.
+     - **Measured result.** The Rust workspace rose from 685 to 696 passed. The
+       full status gate passed all eight suites: Rust workspace 696 passed / 0 failed
+       / 11 ignored, PostgreSQL 11, Tauri 33, Python 257, formatting, strict Clippy
+       and both desktop suites. The evidence pipeline exited 0 with 45 local
+       artifacts.
+     - **Correction to item 129.** Its slice left the backtesting capability doc
+       saying that PAPER and controlled LIVE apply no corporate actions: the edit
+       that would have replaced the sentence never reached the file. The doc now
+       describes both environments.
+     - **Boundary.** As in PAPER, the operator states the action and a dividend is
+       credited on the position held when it is applied. No application composes a
+       LIVE adapter that can trade, and the controlled-LIVE route exposes only its
+       kill switches, so this is reachable from the library and its tests alone. A
+       dividend is not confirmed against the broker's cash, which also moves for
+       other reasons and is reconciled separately.
+
 ## Business-readiness decision
 
 **Not approved for capital-bearing or customer-facing production use.** The

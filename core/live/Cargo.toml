@@ -11,6 +11,7 @@ follon-accounting = { path = "../accounting" }
 follon-control-plane = { path = "../control-plane" }
 follon-domain = { path = "../domain" }
 follon-instrument = { path = "../instrument" }
+follon-market-data = { path = "../market-data" }
 follon-risk = { path = "../risk" }
 follon-secrets = { path = "../secrets" }
 fs2 = "0.4.3"

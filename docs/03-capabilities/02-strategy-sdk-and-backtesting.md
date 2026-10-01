@@ -131,9 +131,26 @@ A venue's response to a split, which adjusts or cancels a resting order, is not 
 An order resting in the instrument cannot be carried across the split, because its
 quantity and limit are in pre-split units, so the replay refuses the run rather than fill
 it at a price level it was not written for. That is the rule the replay already applies to
-a lot-size change. Two things still do not follow a split: the risk policy's
-share-denominated limits, which are the operator's configuration; and PAPER and controlled
-LIVE, which apply no corporate actions at all.
+a lot-size change. The risk policy's share-denominated limits do not follow a split: they
+are the operator's configuration.
+
+PAPER applies a corporate action when an operator states it, through
+`PaperTradingService::apply_corporate_action`, with the arithmetic above: a split scales the
+position, its average cost, its FIFO lots, the strategy attribution and the cached mark, and a
+cash dividend credits a long or debits a short. The broker applies the action on its own books,
+and reconciliation compares the two. The request names the position the action was stated
+against, and is refused unless the account holds exactly that, so an action is never applied to
+a position that changed after the broker's notice was read. A split is refused while an order of
+either kind works in the instrument, as the replay refuses one, and when it would leave a
+fraction of a lot, since cash in lieu is not modelled. Each action applies once and is journaled
+with the operator who applied it.
+
+Controlled LIVE applies the same rules through its own implementation,
+`LiveTradingService::apply_corporate_action`, as every LIVE gate is separate from PAPER's, and
+audits each action as a `live.corporate_action.applied.v1` record whose actor is the operator.
+It adds one: a split is applied only while the broker session is connected and the broker
+already shows the position the split leaves, so the OMS never lets a canary sell shares the
+account does not yet hold.
 
 Limits of the replay's split, each found in review and each a choice and not an oversight:
 

@@ -26,8 +26,11 @@ use follon_instrument::{TradingCalendar, TradingSession};
 
 mod combinations;
 mod configuration;
+mod corporate_actions;
 
 pub use configuration::LiveConfiguration;
+use corporate_actions::{restore_live_corporate_actions, PersistentLiveCorporateAction};
+pub use corporate_actions::{LiveCorporateAction, LiveCorporateActionReceipt};
 
 pub use combinations::{
     combo_intent_fingerprint, LiveBrokerComboExecution, LiveBrokerComboExecutionLeg,
@@ -1491,6 +1494,10 @@ struct PersistentLiveState {
     /// the reader also requires each line to re-serialize byte-for-byte.
     #[serde(default)]
     combo_orders: BTreeMap<String, PersistentLiveComboOrder>,
+    /// Operator-attested corporate actions, in the order applied (E8.4b). Never
+    /// written while empty, so a journal without one re-serializes byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    corporate_actions: Vec<PersistentLiveCorporateAction>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1926,6 +1933,8 @@ pub struct LiveTradingService<B> {
     /// [`Self::apply_strategy_attribution_fill`].
     strategy_attribution: BTreeMap<String, BTreeMap<String, Decimal>>,
     execution_ids: BTreeSet<String>,
+    /// Operator-attested corporate actions, in the order applied (E8.4b).
+    corporate_actions: Vec<LiveCorporateActionReceipt>,
     incidents: BTreeMap<String, LiveIncident>,
     live_days: BTreeMap<String, PersistentLiveDay>,
     canary_submissions: u32,
@@ -1975,6 +1984,7 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
             tax_lots: TaxLotBook::default(),
             marks: BTreeMap::new(),
             execution_ids: BTreeSet::new(),
+            corporate_actions: Vec::new(),
             incidents: BTreeMap::new(),
             live_days: BTreeMap::new(),
             canary_submissions: 0,
@@ -4452,6 +4462,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                     )
                 })
                 .collect(),
+            corporate_actions: self
+                .corporate_actions
+                .iter()
+                .map(PersistentLiveCorporateAction::from)
+                .collect(),
         }
     }
 
@@ -4959,9 +4974,11 @@ impl<B: LiveBrokerAdapter> LiveTradingService<B> {
                 },
             );
         }
+        let corporate_actions = restore_live_corporate_actions(state.corporate_actions)?;
         self.orders = orders;
         self.combo_orders = combo_orders;
         self.approvals = approvals;
+        self.corporate_actions = corporate_actions;
         self.portfolios = portfolios;
         self.tax_lots = tax_lots;
         self.marks = marks;
@@ -5724,6 +5741,7 @@ mod tests {
 
     use super::*;
     include!("combo_lifecycle_tests.rs");
+    include!("corporate_action_tests.rs");
 
     static JOURNAL_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 

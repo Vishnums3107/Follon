@@ -529,6 +529,7 @@ dependencies = [
  "follon-control-plane",
  "follon-domain",
  "follon-instrument",
+ "follon-market-data",
  "follon-risk",
  "follon-secrets",
  "fs2",
